@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Path \"c:\\\\Users\\\\Dylan O'Neal\\\\Desktop\\\\Landmaster in\\\\images\" -Force)",
+      "PowerShell(\"ok\")",
+      "PowerShell($json = Get-Content \"c:\\\\Users\\\\Dylan O'Neal\\\\Downloads\\\\landmaster-backup-2026-05-06.json\" -Raw | ConvertFrom-Json; $json.pos | Sort-Object -Property createdDate -Descending | Select-Object -First 10 num, createdDate, status, supplier | Format-Table -AutoSize)"
+    ]
+  }
+}
