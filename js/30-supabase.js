@@ -20,6 +20,29 @@ async function _waitForDB() {
   return typeof DB !== "undefined" && !!DB;
 }
 
+// Fetch ALL parts from Supabase, paging past the default 1000-row limit
+async function _fetchAllParts() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("parts")
+      .select("pn, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
 async function cloudInit() {
   const ok = await _waitForDB();
   if (!ok) {
@@ -35,11 +58,10 @@ async function cloudInit() {
 
   _supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-  // Pull current cloud parts
-  const { data, error } = await _supa.from("parts").select("pn, data");
-  if (error) {
-    console.error("[cloud] initial fetch failed:", error);
-    showToast("Cloud sync failed: " + error.message, "crit");
+  // Pull current cloud parts (paginated to handle >1000 rows)
+  const data = await _fetchAllParts();
+  if (data === null) {
+    showToast("Cloud sync failed during initial fetch", "crit");
     return;
   }
 
@@ -162,8 +184,8 @@ window.cloudForcePush = async function () {
 
 window.cloudForcePull = async function () {
   if (!_supa) { console.log("Not connected"); return; }
-  const { data, error } = await _supa.from("parts").select("pn, data");
-  if (error) { console.error(error); return; }
+  const data = await _fetchAllParts();
+  if (data === null) { console.error("Force pull failed"); return; }
   DB.parts = data.map(r => ({ pn: r.pn, ...r.data }));
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   if (typeof bumpStatusCache === "function") bumpStatusCache();
