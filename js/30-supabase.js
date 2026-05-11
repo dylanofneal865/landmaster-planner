@@ -13,11 +13,11 @@ let _lastCloudPartsHash = null;
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
   let tries = 0;
-  while ((!window.DB || !Array.isArray(window.DB.parts)) && tries < 100) {
+  while ((typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) && tries < 100) {
     await new Promise(r => setTimeout(r, 50));
     tries++;
   }
-  return !!window.DB;
+  return typeof DB !== "undefined" && !!DB;
 }
 
 async function cloudInit() {
