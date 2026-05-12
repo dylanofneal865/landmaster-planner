@@ -9,6 +9,7 @@ const SUPABASE_KEY = "sb_publishable_ZKpVjpCIqANzi3suDX8SIQ_KeNyfsjr";
 let _supa = null;
 let _cloudReady = false;
 let _lastCloudPartsHash = null;
+let _lastCloudPosHash = null;
 
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
@@ -33,6 +34,29 @@ async function _fetchAllParts() {
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Fetch ALL POs from Supabase, paginated
+async function _fetchAllPos() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("pos")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] pos page fetch failed:", error);
       return null;
     }
     if (!data || data.length === 0) break;
@@ -84,6 +108,23 @@ async function cloudInit() {
     showToast(`Synced ${cloudParts.length} parts from cloud`, "ok", "Cloud connected");
   }
 
+  // ---- POs ----
+  const cloudPos = await _fetchAllPos();
+  if (cloudPos !== null) {
+    if (cloudPos.length === 0 && DB.pos && DB.pos.length > 0) {
+      showToast(`Pushing ${DB.pos.length} POs to cloud (one-time)…`, "info", "Cloud sync");
+      await _pushAllPos();
+      showToast(`Migrated ${DB.pos.length} POs to cloud`, "ok", "Cloud sync");
+    } else if (cloudPos.length > 0) {
+      DB.pos = cloudPos.map(r => ({ id: r.id, ...r.data }));
+      _origSaveDB ? _origSaveDB.call(window) : saveDB();
+      if (typeof bumpStatusCache === "function") bumpStatusCache();
+      if (typeof refresh === "function") refresh();
+      showToast(`Synced ${cloudPos.length} POs from cloud`, "ok");
+    }
+    _lastCloudPosHash = _hashPos(DB.pos || []);
+  }
+
   _cloudReady = true;
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
@@ -95,6 +136,14 @@ function _hashParts(parts) {
     return parts.length + ":" + JSON.stringify(parts).length;
   } catch (e) {
     return parts.length + ":?";
+  }
+}
+
+function _hashPos(pos) {
+  try {
+    return pos.length + ":" + JSON.stringify(pos).length;
+  } catch (e) {
+    return pos.length + ":?";
   }
 }
 
@@ -120,21 +169,52 @@ async function _pushAllParts() {
   return true;
 }
 
+async function _pushAllPos() {
+  if (!_supa) return false;
+  if (!DB.pos || DB.pos.length === 0) return true;
+
+  const rows = DB.pos.map(p => {
+    const { id, ...rest } = p;
+    return { id, data: rest };
+  });
+
+  const BATCH = 500;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const { error } = await _supa.from("pos").upsert(batch);
+    if (error) {
+      console.error("[cloud] pos batch upsert failed:", error);
+      showToast("Cloud push failed: " + error.message, "crit");
+      return false;
+    }
+  }
+  return true;
+}
+
 let _cloudPushTimer = null;
 function _schedulePush() {
   if (!_cloudReady) return;
-  const currentHash = _hashParts(DB.parts);
-  if (currentHash === _lastCloudPartsHash) return;
+  const partsHash = _hashParts(DB.parts);
+  const posHash = _hashPos(DB.pos || []);
+  const partsChanged = partsHash !== _lastCloudPartsHash;
+  const posChanged = posHash !== _lastCloudPosHash;
+  if (!partsChanged && !posChanged) return;
+
   clearTimeout(_cloudPushTimer);
   _showCloudIndicator(false, "syncing");
   _cloudPushTimer = setTimeout(async () => {
-    const ok = await _pushAllParts();
-    if (ok) {
-      _lastCloudPartsHash = _hashParts(DB.parts);
-      _showCloudIndicator(true);
-    } else {
-      _showCloudIndicator(false, "error");
+    let allOk = true;
+    if (partsChanged) {
+      const ok = await _pushAllParts();
+      if (ok) _lastCloudPartsHash = _hashParts(DB.parts);
+      else allOk = false;
     }
+    if (posChanged) {
+      const ok = await _pushAllPos();
+      if (ok) _lastCloudPosHash = _hashPos(DB.pos || []);
+      else allOk = false;
+    }
+    _showCloudIndicator(allOk, allOk ? undefined : "error");
   }, 1200);
 }
 
@@ -192,6 +272,29 @@ window.cloudForcePull = async function () {
   if (typeof refresh === "function") refresh();
   _lastCloudPartsHash = _hashParts(DB.parts);
   console.log("Pulled " + DB.parts.length + " parts from cloud");
+};
+
+window.cloudForcePushPos = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  _showCloudIndicator(false, "syncing");
+  const ok = await _pushAllPos();
+  if (ok) {
+    _lastCloudPosHash = _hashPos(DB.pos || []);
+    _showCloudIndicator(true);
+    console.log("Force-pushed " + (DB.pos?.length || 0) + " POs");
+  }
+};
+
+window.cloudForcePullPos = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  const data = await _fetchAllPos();
+  if (data === null) { console.error("Force pull failed"); return; }
+  DB.pos = data.map(r => ({ id: r.id, ...r.data }));
+  _origSaveDB ? _origSaveDB.call(window) : saveDB();
+  if (typeof bumpStatusCache === "function") bumpStatusCache();
+  if (typeof refresh === "function") refresh();
+  _lastCloudPosHash = _hashPos(DB.pos);
+  console.log("Pulled " + DB.pos.length + " POs from cloud");
 };
 
 if (document.readyState === "loading") {
