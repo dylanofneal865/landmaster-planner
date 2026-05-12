@@ -10,6 +10,7 @@ let _supa = null;
 let _cloudReady = false;
 let _lastCloudPartsHash = null;
 let _lastCloudPosHash = null;
+let _lastCloudDraftHash = null;
 
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
@@ -125,9 +126,27 @@ async function cloudInit() {
     _lastCloudPosHash = _hashPos(DB.pos || []);
   }
 
+  // ---- Draft Order ----
+  const cloudDraft = await _fetchCloudDraft();
+  if (cloudDraft !== null) {
+    if (typeof DRAFT_ORDER !== "undefined") {
+      if (cloudDraft.length === 0 && DRAFT_ORDER.length > 0) {
+        await _pushDraft();
+      } else if (cloudDraft.length > 0) {
+        // Replace local with cloud
+        DRAFT_ORDER.length = 0;
+        DRAFT_ORDER.push(...cloudDraft);
+        if (typeof draftOrderSave === "function") draftOrderSave();
+        if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+      }
+    }
+    _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+  }
+
   _cloudReady = true;
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
+  _hookDraftSave();
   _showCloudIndicator(true);
 }
 
@@ -191,6 +210,39 @@ async function _pushAllPos() {
   return true;
 }
 
+function _hashDraft(arr) {
+  try { return (arr?.length || 0) + ":" + JSON.stringify(arr || []).length; }
+  catch (e) { return (arr?.length || 0) + ":?"; }
+}
+
+async function _fetchCloudDraft() {
+  if (!_supa) return null;
+  const { data, error } = await _supa
+    .from("draft_order")
+    .select("data")
+    .eq("id", "current")
+    .maybeSingle();
+  if (error) {
+    console.error("[cloud] draft fetch failed:", error);
+    return null;
+  }
+  return data?.data?.items || null;
+}
+
+async function _pushDraft() {
+  if (!_supa) return false;
+  const items = (typeof DRAFT_ORDER !== "undefined" && Array.isArray(DRAFT_ORDER)) ? DRAFT_ORDER : [];
+  const { error } = await _supa.from("draft_order").upsert({
+    id: "current",
+    data: { items },
+  });
+  if (error) {
+    console.error("[cloud] draft push failed:", error);
+    return false;
+  }
+  return true;
+}
+
 let _cloudPushTimer = null;
 function _schedulePush() {
   if (!_cloudReady) return;
@@ -226,6 +278,35 @@ function _hookSaveDB() {
     _origSaveDB.apply(this, arguments);
     _schedulePush();
   };
+}
+
+let _origDraftOrderSave = null;
+function _hookDraftSave() {
+  if (_origDraftOrderSave) return;
+  if (typeof draftOrderSave !== "function") return;
+  _origDraftOrderSave = window.draftOrderSave;
+  window.draftOrderSave = function () {
+    _origDraftOrderSave.apply(this, arguments);
+    _scheduleDraftPush();
+  };
+}
+
+let _draftPushTimer = null;
+function _scheduleDraftPush() {
+  if (!_cloudReady) return;
+  const h = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+  if (h === _lastCloudDraftHash) return;
+  clearTimeout(_draftPushTimer);
+  _showCloudIndicator(false, "syncing");
+  _draftPushTimer = setTimeout(async () => {
+    const ok = await _pushDraft();
+    if (ok) {
+      _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+      _showCloudIndicator(true);
+    } else {
+      _showCloudIndicator(false, "error");
+    }
+  }, 800);
 }
 
 function _showCloudIndicator(ready, state) {
@@ -295,6 +376,20 @@ window.cloudForcePullPos = async function () {
   if (typeof refresh === "function") refresh();
   _lastCloudPosHash = _hashPos(DB.pos);
   console.log("Pulled " + DB.pos.length + " POs from cloud");
+};
+
+window.cloudForcePullDraft = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  const items = await _fetchCloudDraft();
+  if (items === null) { console.log("Pull failed"); return; }
+  if (typeof DRAFT_ORDER !== "undefined") {
+    DRAFT_ORDER.length = 0;
+    DRAFT_ORDER.push(...items);
+    if (typeof draftOrderSave === "function") draftOrderSave();
+    if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+    _lastCloudDraftHash = _hashDraft(DRAFT_ORDER);
+    console.log("Pulled " + items.length + " draft items from cloud");
+  }
 };
 
 if (document.readyState === "loading") {
