@@ -12,6 +12,8 @@ let _lastCloudPartsHash = null;
 let _lastCloudPosHash = null;
 let _lastCloudDraftHash = null;
 let _lastCloudAuditHash = null;
+let _lastCloudSettingsHash = null;
+let _lastCloudUsageHash = null;
 
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
@@ -187,6 +189,35 @@ async function cloudInit() {
     _lastCloudAuditHash = _hashAudit(DB.audit || []);
   }
 
+  // ---- Settings ----
+  const cloudSettings = await _fetchCloudSettings();
+  if (cloudSettings !== null) {
+    DB.settings = { ...DB.settings, ...cloudSettings };
+    _origSaveDB ? _origSaveDB.call(window) : saveDB();
+  } else if (DB.settings) {
+    await _pushSettings();
+  }
+  _lastCloudSettingsHash = _hashSettings(DB.settings);
+
+  // ---- Usage ----
+  const cloudUsage = await _fetchAllUsage();
+  if (cloudUsage !== null) {
+    if (cloudUsage.length === 0 && DB.usage && DB.usage.length > 0) {
+      showToast(`Pushing ${DB.usage.length} usage entries to cloud (one-time)…`, "info", "Cloud sync");
+      await _pushAllUsage();
+    } else if (cloudUsage.length > 0) {
+      const merged = new Map();
+      for (const r of cloudUsage) merged.set(r.id, { id: r.id, ...r.data });
+      for (const u of (DB.usage || [])) if (!merged.has(u.id)) merged.set(u.id, u);
+      DB.usage = Array.from(merged.values()).sort((a, b) => {
+        const ta = a.ts || ""; const tb = b.ts || "";
+        return tb.localeCompare(ta);
+      });
+      _origSaveDB ? _origSaveDB.call(window) : saveDB();
+    }
+    _lastCloudUsageHash = _hashUsage(DB.usage || []);
+  }
+
   _cloudReady = true;
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
@@ -288,6 +319,67 @@ async function _pushAllAudit() {
   return true;
 }
 
+async function _fetchCloudSettings() {
+  if (!_supa) return null;
+  const { data, error } = await _supa.from("settings").select("data").eq("id", "current").maybeSingle();
+  if (error) { console.error("[cloud] settings fetch failed:", error); return null; }
+  return data?.data || null;
+}
+
+async function _pushSettings() {
+  if (!_supa) return false;
+  const { error } = await _supa.from("settings").upsert({ id: "current", data: DB.settings || {} });
+  if (error) { console.error("[cloud] settings push failed:", error); return false; }
+  return true;
+}
+
+async function _fetchAllUsage() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa.from("usage").select("id, data").range(from, from + PAGE - 1);
+    if (error) { console.error("[cloud] usage page fetch failed:", error); return null; }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+async function _pushAllUsage() {
+  if (!_supa) return false;
+  if (!DB.usage || DB.usage.length === 0) return true;
+  let backfilled = 0;
+  for (const u of DB.usage) {
+    if (!u.id) {
+      u.id = "usage_" + (u.ts || Date.now()) + "_" + Math.random().toString(36).slice(2, 8);
+      backfilled++;
+    }
+  }
+  if (backfilled > 0) console.log("[cloud] backfilled " + backfilled + " usage IDs");
+  const rows = DB.usage.map(u => {
+    const { id, ...rest } = u;
+    return { id, data: rest };
+  });
+  const BATCH = 500;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const { error } = await _supa.from("usage").upsert(batch);
+    if (error) { console.error("[cloud] usage batch upsert failed:", error); showToast("Cloud push failed: " + error.message, "crit"); return false; }
+  }
+  return true;
+}
+
+function _hashSettings(s) {
+  try { return JSON.stringify(s || {}).length; } catch (e) { return 0; }
+}
+function _hashUsage(u) {
+  try { return (u?.length || 0) + ":" + JSON.stringify(u || []).length; } catch (e) { return (u?.length || 0) + ":?"; }
+}
+
 function _hashDraft(arr) {
   try { return (arr?.length || 0) + ":" + JSON.stringify(arr || []).length; }
   catch (e) { return (arr?.length || 0) + ":?"; }
@@ -327,10 +419,16 @@ function _schedulePush() {
   const partsHash = _hashParts(DB.parts);
   const posHash = _hashPos(DB.pos || []);
   const auditHash = _hashAudit(DB.audit || []);
+  const settingsHash = _hashSettings(DB.settings);
+  const usageHash = _hashUsage(DB.usage || []);
+
   const partsChanged = partsHash !== _lastCloudPartsHash;
   const posChanged = posHash !== _lastCloudPosHash;
   const auditChanged = auditHash !== _lastCloudAuditHash;
-  if (!partsChanged && !posChanged && !auditChanged) return;
+  const settingsChanged = settingsHash !== _lastCloudSettingsHash;
+  const usageChanged = usageHash !== _lastCloudUsageHash;
+
+  if (!partsChanged && !posChanged && !auditChanged && !settingsChanged && !usageChanged) return;
 
   clearTimeout(_cloudPushTimer);
   _showCloudIndicator(false, "syncing");
@@ -338,18 +436,23 @@ function _schedulePush() {
     let allOk = true;
     if (partsChanged) {
       const ok = await _pushAllParts();
-      if (ok) _lastCloudPartsHash = _hashParts(DB.parts);
-      else allOk = false;
+      if (ok) _lastCloudPartsHash = _hashParts(DB.parts); else allOk = false;
     }
     if (posChanged) {
       const ok = await _pushAllPos();
-      if (ok) _lastCloudPosHash = _hashPos(DB.pos || []);
-      else allOk = false;
+      if (ok) _lastCloudPosHash = _hashPos(DB.pos || []); else allOk = false;
     }
     if (auditChanged) {
       const ok = await _pushAllAudit();
-      if (ok) _lastCloudAuditHash = _hashAudit(DB.audit || []);
-      else allOk = false;
+      if (ok) _lastCloudAuditHash = _hashAudit(DB.audit || []); else allOk = false;
+    }
+    if (settingsChanged) {
+      const ok = await _pushSettings();
+      if (ok) _lastCloudSettingsHash = _hashSettings(DB.settings); else allOk = false;
+    }
+    if (usageChanged) {
+      const ok = await _pushAllUsage();
+      if (ok) _lastCloudUsageHash = _hashUsage(DB.usage || []); else allOk = false;
     }
     _showCloudIndicator(allOk, allOk ? undefined : "error");
   }, 1200);
