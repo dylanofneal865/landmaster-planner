@@ -11,7 +11,10 @@ function draftOrderLoad() {
     const raw = localStorage.getItem(DRAFT_ORDER_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) DRAFT_ORDER = parsed.filter(d => d && typeof d.pn === "string");
+    if (Array.isArray(parsed)) {
+      DRAFT_ORDER.length = 0;
+      DRAFT_ORDER.push(...parsed.filter(d => d && typeof d.pn === "string"));
+    }
   } catch (e) { /* ignore */ }
 }
 
@@ -36,7 +39,8 @@ function draftOrderAdd(pn, qty) {
 }
 
 function draftOrderRemove(pn) {
-  DRAFT_ORDER = DRAFT_ORDER.filter(d => d.pn !== pn);
+  const i = DRAFT_ORDER.findIndex(d => d.pn === pn);
+  if (i >= 0) DRAFT_ORDER.splice(i, 1);
   draftOrderSave();
   updateDraftOrderPill();
 }
