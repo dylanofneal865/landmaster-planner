@@ -89,6 +89,36 @@ function renderPartDetail(part) {
         </table></div>
         <p class="muted tiny" style="margin-top:8px;line-height:1.5">When this kit ships, each component's daily-use is automatically credited based on Qty per kit. Kits never generate purchase suggestions — their components do.</p>
       ` : ''}
+      ${(() => {
+        const parentKits = typeof getKitsForComponent === "function" ? getKitsForComponent(part.pn) : [];
+        if (!parentKits.length) return '';
+        return `
+          <div class="dr-section">Used in ${parentKits.length} kit${parentKits.length === 1 ? '' : 's'}</div>
+          <div class="tbl-wrap"><table class="tbl">
+            <thead><tr>
+              <th>Kit</th>
+              <th>Description</th>
+              <th class="right">Qty per kit</th>
+              <th class="dim">Type</th>
+            </tr></thead>
+            <tbody>
+              ${parentKits.map(k => {
+                const qtyStr = k.qty_per_kit % 1 === 0 ? fmtNum(k.qty_per_kit) : fmtNum(k.qty_per_kit, 2);
+                const kitInCatalog = DB.parts.some(pp => pp.pn === k.kit_pn);
+                return `
+                  <tr ${kitInCatalog ? `class="clickable" onclick="openPartDetail('${esc(k.kit_pn)}')"` : ''}>
+                    <td class="pn">${esc(k.kit_pn)}${!kitInCatalog ? ' <span class="pill warn" title="Kit BOM exists but kit is not in parts catalog">⚠</span>' : ''}</td>
+                    <td>${esc(k.kit_desc || '—')}</td>
+                    <td class="right num bold">${qtyStr}</td>
+                    <td class="dim tiny">${k.isStock ? 'Stock' : 'Non-stock'}</td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table></div>
+          <p class="muted tiny" style="margin-top:8px;line-height:1.5">Every sale of these kits credits this component's daily-use rate based on Qty per kit. This is part of why the part's demand is what it is today.</p>
+        ` ;
+      })()}
       <div class="stat-strip">
         <div class="stat"><div class="stat-label">On Hand</div><div class="stat-value">${fmtNum(part.onHand)}</div></div>
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
