@@ -14,16 +14,19 @@ let _lastCloudDraftHash = null;
 let _lastCloudAuditHash = null;
 let _lastCloudSettingsHash = null;
 let _lastCloudUsageHash = null;
+let _lastCloudKitBomsHash = null;
 
 // Delta tracking — only push records that actually changed
 const _dirtyParts = new Set();    // PNs of parts that changed locally
 const _dirtyPos = new Set();      // PO IDs that changed
 const _dirtyAudit = new Set();    // audit IDs (new entries only — audit is append-only)
 const _dirtyUsage = new Set();    // usage IDs that changed
+const _dirtyKitBoms = new Set();  // kit_pns that changed
 let _settingsDirty = false;
 const _partsSnapshot = new Map(); // last-pushed snapshot per PN (also stores audit_<id> markers and __settings__ blob)
 const _posSnapshot = new Map();
 const _usageSnapshot = new Map(); // separate to avoid overloading _partsSnapshot
+const _kitBomsSnapshot = new Map();
 
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
@@ -232,12 +235,34 @@ async function cloudInit() {
     _lastCloudUsageHash = _hashUsage(DB.usage || []);
   }
 
+  // ---- Kit BOMs ----
+  // Cloud-wins strategy. In-place mutation of DB.kitBoms.
+  const cloudKitBoms = await _fetchAllKitBoms();
+  if (cloudKitBoms !== null) {
+    if (!DB.kitBoms || typeof DB.kitBoms !== "object") DB.kitBoms = {};
+    if (cloudKitBoms.length === 0 && Object.keys(DB.kitBoms).length > 0) {
+      // Cloud is empty for the first time — push local up
+      showToast(`Pushing ${Object.keys(DB.kitBoms).length} kit BOMs to cloud (one-time)…`, "info", "Cloud sync");
+      await _pushAllKitBoms();
+    } else {
+      // Replace local entirely with cloud (in place)
+      for (const k of Object.keys(DB.kitBoms)) delete DB.kitBoms[k];
+      for (const r of cloudKitBoms) DB.kitBoms[r.kit_pn] = { kit_pn: r.kit_pn, ...r.data };
+      _origSaveDB ? _origSaveDB.call(window) : saveDB();
+      if (cloudKitBoms.length > 0) {
+        showToast(`Synced ${cloudKitBoms.length} kit BOMs from cloud`, "ok");
+      }
+    }
+    _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
+  }
+
   _cloudReady = true;
   // Prime snapshots so future _detectChanges() only flags real edits
   for (const p of DB.parts) _partsSnapshot.set(p.pn, JSON.stringify(p));
   for (const po of (DB.pos || [])) _posSnapshot.set(po.id, JSON.stringify(po));
   for (const a of (DB.audit || [])) if (a.id) _partsSnapshot.set("audit_" + a.id, "1");
   for (const u of (DB.usage || [])) if (u.id) _usageSnapshot.set(u.id, JSON.stringify(u));
+  for (const [kit_pn, kit] of Object.entries(DB.kitBoms || {})) _kitBomsSnapshot.set(kit_pn, JSON.stringify(kit));
   _partsSnapshot.set("__settings__", JSON.stringify(DB.settings || {}));
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
@@ -272,6 +297,9 @@ function _setupRealtimeSubscriptions() {
     })
     .on("postgres_changes", { event: "*", schema: "public", table: "usage" }, (payload) => {
       _handleRealtimeUsage(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" }, (payload) => {
+      _handleRealtimeKitBoms(payload);
     })
     .subscribe((status) => {
       console.log("[cloud] realtime status:", status);
@@ -379,6 +407,18 @@ function _handleRealtimeUsage(payload) {
     else DB.usage.push(merged);
   }
   _lastCloudUsageHash = _hashUsage(DB.usage || []);
+  _applyAndRefresh();
+}
+
+function _handleRealtimeKitBoms(payload) {
+  const { eventType, new: row, old } = payload;
+  if (!DB.kitBoms || typeof DB.kitBoms !== "object") DB.kitBoms = {};
+  if (eventType === "DELETE") {
+    delete DB.kitBoms[old.kit_pn];
+  } else {
+    DB.kitBoms[row.kit_pn] = { kit_pn: row.kit_pn, ...row.data };
+  }
+  _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
   _applyAndRefresh();
 }
 
@@ -604,6 +644,66 @@ function _hashSettings(s) {
 function _hashUsage(u) {
   try { return (u?.length || 0) + ":" + JSON.stringify(u || []).length; } catch (e) { return (u?.length || 0) + ":?"; }
 }
+function _hashKitBoms(k) {
+  try { return Object.keys(k || {}).length + ":" + JSON.stringify(k || {}).length; } catch (e) { return "?"; }
+}
+
+async function _fetchAllKitBoms() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa.from("kit_boms").select("kit_pn, data").range(from, from + PAGE - 1);
+    if (error) { console.error("[cloud] kit_boms page fetch failed:", error); return null; }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+async function _pushAllKitBoms() {
+  if (!_supa) return false;
+  const kits = DB.kitBoms || {};
+  const entries = Object.entries(kits);
+  if (entries.length === 0) return true;
+
+  const rows = entries.map(([kit_pn, kit]) => {
+    const { kit_pn: _, ...rest } = kit;
+    return { kit_pn, data: rest };
+  });
+
+  const BATCH = 500;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const { error } = await _supa.from("kit_boms").upsert(batch);
+    if (error) {
+      console.error("[cloud] kit_boms batch upsert failed:", error);
+      showToast("Cloud push failed: " + error.message, "crit");
+      return false;
+    }
+  }
+  return true;
+}
+
+async function _pushDirtyKitBoms() {
+  if (_dirtyKitBoms.size === 0) return true;
+  const rows = [];
+  for (const kit_pn of _dirtyKitBoms) {
+    const kit = DB.kitBoms?.[kit_pn];
+    if (kit) {
+      const { kit_pn: _, ...rest } = kit;
+      rows.push({ kit_pn, data: rest });
+    }
+  }
+  if (rows.length === 0) { _dirtyKitBoms.clear(); return true; }
+  const { error } = await _supa.from("kit_boms").upsert(rows);
+  if (error) { console.error("[cloud] dirty kit_boms push failed:", error); return false; }
+  _dirtyKitBoms.clear();
+  return true;
+}
 
 function _detectChanges() {
   // Parts: find pns whose JSON has changed since last push
@@ -643,6 +743,14 @@ function _detectChanges() {
   if (_partsSnapshot.get("__settings__") !== settingsJson) {
     _settingsDirty = true;
     _partsSnapshot.set("__settings__", settingsJson);
+  }
+  // Kit BOMs: per-kit JSON comparison
+  for (const [kit_pn, kit] of Object.entries(DB.kitBoms || {})) {
+    const json = JSON.stringify(kit);
+    if (_kitBomsSnapshot.get(kit_pn) !== json) {
+      _dirtyKitBoms.add(kit_pn);
+      _kitBomsSnapshot.set(kit_pn, json);
+    }
   }
 }
 
@@ -684,17 +792,18 @@ function _schedulePush() {
   if (!_cloudReady) return;
   if (_suppressNextLocalChange) return;
   _detectChanges();
-  if (_dirtyParts.size === 0 && _dirtyPos.size === 0 && _dirtyAudit.size === 0 && _dirtyUsage.size === 0 && !_settingsDirty) return;
+  if (_dirtyParts.size === 0 && _dirtyPos.size === 0 && _dirtyAudit.size === 0 && _dirtyUsage.size === 0 && _dirtyKitBoms.size === 0 && !_settingsDirty) return;
 
   clearTimeout(_cloudPushTimer);
   _showCloudIndicator(false, "syncing");
   _cloudPushTimer = setTimeout(async () => {
     let allOk = true;
     const promises = [];
-    if (_dirtyParts.size > 0) promises.push(_pushDirtyParts().then(ok => !ok && (allOk = false)));
-    if (_dirtyPos.size > 0)   promises.push(_pushDirtyPos().then(ok => !ok && (allOk = false)));
-    if (_dirtyAudit.size > 0) promises.push(_pushDirtyAudit().then(ok => !ok && (allOk = false)));
-    if (_dirtyUsage.size > 0) promises.push(_pushDirtyUsage().then(ok => !ok && (allOk = false)));
+    if (_dirtyParts.size > 0)   promises.push(_pushDirtyParts().then(ok => !ok && (allOk = false)));
+    if (_dirtyPos.size > 0)     promises.push(_pushDirtyPos().then(ok => !ok && (allOk = false)));
+    if (_dirtyAudit.size > 0)   promises.push(_pushDirtyAudit().then(ok => !ok && (allOk = false)));
+    if (_dirtyUsage.size > 0)   promises.push(_pushDirtyUsage().then(ok => !ok && (allOk = false)));
+    if (_dirtyKitBoms.size > 0) promises.push(_pushDirtyKitBoms().then(ok => !ok && (allOk = false)));
     if (_settingsDirty) {
       promises.push(_pushSettings().then(ok => { if (ok) _settingsDirty = false; else allOk = false; }));
     }
@@ -838,6 +947,18 @@ window.cloudForcePullDraft = async function () {
     _lastCloudDraftHash = _hashDraft(DRAFT_ORDER);
     console.log("Pulled " + items.length + " draft items from cloud");
   }
+};
+
+window.cloudForcePullKitBoms = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  const data = await _fetchAllKitBoms();
+  if (data === null) { console.error("Force pull failed"); return; }
+  if (!DB.kitBoms || typeof DB.kitBoms !== "object") DB.kitBoms = {};
+  for (const k of Object.keys(DB.kitBoms)) delete DB.kitBoms[k];
+  for (const r of data) DB.kitBoms[r.kit_pn] = { kit_pn: r.kit_pn, ...r.data };
+  _origSaveDB ? _origSaveDB.call(window) : saveDB();
+  _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
+  console.log("Pulled " + data.length + " kit BOMs from cloud");
 };
 
 if (document.readyState === "loading") {

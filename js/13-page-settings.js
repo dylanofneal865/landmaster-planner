@@ -150,6 +150,11 @@ registerRoute("settings", () => {
             <button class="btn" onclick="exportFullDB()">⇩ Export full database (JSON)</button>
             <button class="btn" onclick="importFullDBPrompt()">⇪ Restore database (JSON)</button>
           </div>
+          <div class="row gap-md" style="margin-top:8px;align-items:center">
+            <button class="btn" onclick="$('#kit-boms-import-input').click()">⇪ Import Kit BOMs</button>
+            <input type="file" id="kit-boms-import-input" accept=".xlsx" style="display:none" onchange="handleKitBomsImportFile(event)">
+            <span class="muted tiny">${Object.keys(DB.kitBoms||{}).length} kit BOMs loaded</span>
+          </div>
           <div class="row gap-md" style="margin-top:8px">
             <button class="btn" onclick="exportPartsAsCSV()">⇩ Export parts (CSV)</button>
             <button class="btn" onclick="exportAllPOsAsCSV()">⇩ Export all POs (CSV)</button>
@@ -278,6 +283,26 @@ function confirmReset() {
       <button class="btn danger" onclick="doReset()">Reset everything</button>
     </div>
   `);
+}
+
+function handleKitBomsImportFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file) return;
+
+  showToast(`Parsing ${file.name}…`, "info");
+  importKitBomsFromExcel(file).then(summary => {
+    logAudit(
+      "kit-boms-import",
+      `Imported ${summary.totalKits} kits with ${summary.totalComponents} components (${summary.skipped} skipped)`,
+      { ...summary, fileName: file.name }
+    );
+    showToast(`Imported ${summary.totalKits} kits · ${summary.totalComponents} components${summary.skipped > 0 ? ` · ${summary.skipped} skipped` : ""}`, "ok", "Kit BOMs");
+    refresh();
+  }).catch(err => {
+    console.error("Kit BOM import failed:", err);
+    showToast("Kit BOM import failed: " + (err.message || err), "crit");
+  });
 }
 
 async function doReset() {

@@ -28,6 +28,7 @@ const DEFAULTS = {
   pos: [],
   audit: [],
   usage: [],                 // transaction log: {id, ts, pn, qty, buildLine, reason, user, notes}
+  kitBoms: {},               // map of kit_pn -> { kit_pn, kit_desc, components: [{pn, qty, desc, isStock}] }
   poNum: 47120,
   meta: { lastImport: null, dataSource: "sample", loaded: null, welcomed: false, lastSalesOrderImport: null },
 };
@@ -61,6 +62,7 @@ function loadDB() {
       settings: { ...DEFAULTS.settings, ...(parsed.settings || {}) },
       meta: { ...DEFAULTS.meta, ...(parsed.meta || {}) },
       usage: Array.isArray(parsed.usage) ? parsed.usage : [],
+      kitBoms: (parsed.kitBoms && typeof parsed.kitBoms === "object" && !Array.isArray(parsed.kitBoms)) ? parsed.kitBoms : {},
     };
   } catch (e) { console.warn("loadDB failed", e); return null; }
 }
