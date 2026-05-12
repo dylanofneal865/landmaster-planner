@@ -387,10 +387,6 @@ function parseSalesOrderWorkbook(arrayBuffer, fileName) {
         unmatchedNotInCatalog.push({ pn: invId, desc: sheetDesc });
         continue;
       }
-      if (part.itemType !== "service") {
-        unmatchedNotTaggedService.push({ pn: invId, desc: part.desc || sheetDesc });
-        continue;
-      }
 
       if (existingKeys.has(sourceKey)) {
         alreadyImportedCount++;
@@ -472,18 +468,17 @@ function commitSalesOrderImport() {
     });
   }
 
-  // Remove historical "consolidated month" aggregates for service-tagged parts
-  // that now have real sales order data. These were placeholders from the
-  // original Big Sheet import; the new sales order data supersedes them.
-  const serviceTaggedPns = new Set(
-    DB.parts.filter(p => p.itemType === "service").map(p => p.pn)
-  );
+  // Remove historical "consolidated month" aggregates for ALL parts now that
+  // we have real sales order data. These were placeholders from the original
+  // Big Sheet import; the new sales order data supersedes them.
+  // In-place splice (not reassignment) so cloud-sync's reference to DB.usage stays valid.
   const beforeCleanup = DB.usage.length;
-  DB.usage = DB.usage.filter(u =>
-    !(serviceTaggedPns.has(u.pn) &&
-      !u.sourceKey &&
-      u.reason === "Historical (consolidated month)")
-  );
+  for (let i = DB.usage.length - 1; i >= 0; i--) {
+    const u = DB.usage[i];
+    if (!u.sourceKey && u.reason === "Historical (consolidated month)") {
+      DB.usage.splice(i, 1);
+    }
+  }
   const removedCount = beforeCleanup - DB.usage.length;
 
   const addedCount = survivors.length;
