@@ -184,6 +184,21 @@ let SERVICE_USAGE_STATE = {
   sortBy: "units",  // units | daily | diff | last
 };
 
+let _svcUsageSearchTimer = null;
+function _svcUsageSearchInput(value) {
+  SERVICE_USAGE_STATE.search = value;
+  clearTimeout(_svcUsageSearchTimer);
+  _svcUsageSearchTimer = setTimeout(() => {
+    refresh();
+    // Restore focus and cursor position after re-render
+    const inp = document.getElementById("svc-usage-search");
+    if (inp) {
+      inp.focus();
+      inp.setSelectionRange(value.length, value.length);
+    }
+  }, 200);
+}
+
 registerRoute("service-usage", () => {
   const demand = getAllDemand();
   const txCount = (DB.usage || []).length;
@@ -237,7 +252,7 @@ registerRoute("service-usage", () => {
       <div class="panel">
         <div class="filterbar">
           <div class="search-input">
-            <input class="input" placeholder="Search part # or description…" value="${esc(SERVICE_USAGE_STATE.search)}" oninput="SERVICE_USAGE_STATE.search = this.value; refresh()">
+            <input class="input" id="svc-usage-search" placeholder="Search part # or description…" value="${esc(SERVICE_USAGE_STATE.search)}" oninput="_svcUsageSearchInput(this.value)">
           </div>
           <select class="select" onchange="SERVICE_USAGE_STATE.sortBy = this.value; refresh()">
             <option value="units" ${SERVICE_USAGE_STATE.sortBy==='units'?'selected':''}>Sort: most units sold</option>
