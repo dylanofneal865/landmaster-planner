@@ -15,6 +15,16 @@ let _lastCloudAuditHash = null;
 let _lastCloudSettingsHash = null;
 let _lastCloudUsageHash = null;
 
+// Delta tracking — only push records that actually changed
+const _dirtyParts = new Set();    // PNs of parts that changed locally
+const _dirtyPos = new Set();      // PO IDs that changed
+const _dirtyAudit = new Set();    // audit IDs (new entries only — audit is append-only)
+const _dirtyUsage = new Set();    // usage IDs that changed
+let _settingsDirty = false;
+const _partsSnapshot = new Map(); // last-pushed snapshot per PN (also stores audit_<id> markers and __settings__ blob)
+const _posSnapshot = new Map();
+const _usageSnapshot = new Map(); // separate to avoid overloading _partsSnapshot
+
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
   let tries = 0;
@@ -219,6 +229,12 @@ async function cloudInit() {
   }
 
   _cloudReady = true;
+  // Prime snapshots so future _detectChanges() only flags real edits
+  for (const p of DB.parts) _partsSnapshot.set(p.pn, JSON.stringify(p));
+  for (const po of (DB.pos || [])) _posSnapshot.set(po.id, JSON.stringify(po));
+  for (const a of (DB.audit || [])) if (a.id) _partsSnapshot.set("audit_" + a.id, "1");
+  for (const u of (DB.usage || [])) if (u.id) _usageSnapshot.set(u.id, JSON.stringify(u));
+  _partsSnapshot.set("__settings__", JSON.stringify(DB.settings || {}));
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
   _hookDraftSave();
@@ -510,11 +526,120 @@ async function _pushAllUsage() {
   return true;
 }
 
+async function _pushDirtyParts() {
+  if (_dirtyParts.size === 0) return true;
+  const rows = [];
+  for (const pn of _dirtyParts) {
+    const p = DB.parts.find(x => x.pn === pn);
+    if (p) {
+      const { pn: _, ...rest } = p;
+      rows.push({ pn, data: rest });
+    }
+  }
+  if (rows.length === 0) { _dirtyParts.clear(); return true; }
+  const { error } = await _supa.from("parts").upsert(rows);
+  if (error) { console.error("[cloud] dirty parts push failed:", error); return false; }
+  _dirtyParts.clear();
+  return true;
+}
+
+async function _pushDirtyPos() {
+  if (_dirtyPos.size === 0) return true;
+  const rows = [];
+  for (const id of _dirtyPos) {
+    const po = DB.pos.find(x => x.id === id);
+    if (po) {
+      const { id: _, ...rest } = po;
+      rows.push({ id, data: rest });
+    }
+  }
+  if (rows.length === 0) { _dirtyPos.clear(); return true; }
+  const { error } = await _supa.from("pos").upsert(rows);
+  if (error) { console.error("[cloud] dirty pos push failed:", error); return false; }
+  _dirtyPos.clear();
+  return true;
+}
+
+async function _pushDirtyAudit() {
+  if (_dirtyAudit.size === 0) return true;
+  const rows = [];
+  for (const id of _dirtyAudit) {
+    const a = DB.audit.find(x => x.id === id);
+    if (a) {
+      const { id: _, ...rest } = a;
+      rows.push({ id, data: rest });
+    }
+  }
+  if (rows.length === 0) { _dirtyAudit.clear(); return true; }
+  const { error } = await _supa.from("audit").upsert(rows);
+  if (error) { console.error("[cloud] dirty audit push failed:", error); return false; }
+  _dirtyAudit.clear();
+  return true;
+}
+
+async function _pushDirtyUsage() {
+  if (_dirtyUsage.size === 0) return true;
+  const rows = [];
+  for (const id of _dirtyUsage) {
+    const u = DB.usage.find(x => x.id === id);
+    if (u) {
+      const { id: _, ...rest } = u;
+      rows.push({ id, data: rest });
+    }
+  }
+  if (rows.length === 0) { _dirtyUsage.clear(); return true; }
+  const { error } = await _supa.from("usage").upsert(rows);
+  if (error) { console.error("[cloud] dirty usage push failed:", error); return false; }
+  _dirtyUsage.clear();
+  return true;
+}
+
 function _hashSettings(s) {
   try { return JSON.stringify(s || {}).length; } catch (e) { return 0; }
 }
 function _hashUsage(u) {
   try { return (u?.length || 0) + ":" + JSON.stringify(u || []).length; } catch (e) { return (u?.length || 0) + ":?"; }
+}
+
+function _detectChanges() {
+  // Parts: find pns whose JSON has changed since last push
+  for (const p of DB.parts) {
+    const json = JSON.stringify(p);
+    if (_partsSnapshot.get(p.pn) !== json) {
+      _dirtyParts.add(p.pn);
+      _partsSnapshot.set(p.pn, json);
+    }
+  }
+  // POs
+  for (const po of (DB.pos || [])) {
+    const json = JSON.stringify(po);
+    if (_posSnapshot.get(po.id) !== json) {
+      _dirtyPos.add(po.id);
+      _posSnapshot.set(po.id, json);
+    }
+  }
+  // Audit: any new entries (append-only, compare by Set membership)
+  for (const a of (DB.audit || [])) {
+    if (a.id && !_partsSnapshot.has("audit_" + a.id)) {
+      _dirtyAudit.add(a.id);
+      _partsSnapshot.set("audit_" + a.id, "1");
+    }
+  }
+  // Usage: per-id JSON comparison
+  for (const u of (DB.usage || [])) {
+    if (!u.id) continue;
+    const json = JSON.stringify(u);
+    if (_usageSnapshot.get(u.id) !== json) {
+      _dirtyUsage.add(u.id);
+      _usageSnapshot.set(u.id, json);
+    }
+  }
+  // Settings: single blob comparison
+  const settingsJson = JSON.stringify(DB.settings || {});
+  if (_partsSnapshot.get("__settings__") !== settingsJson) {
+    _settingsDirty = true;
+    _partsSnapshot.set("__settings__", settingsJson);
+  }
 }
 
 function _hashDraft(arr) {
@@ -554,46 +679,24 @@ let _cloudPushTimer = null;
 function _schedulePush() {
   if (!_cloudReady) return;
   if (_suppressNextLocalChange) return;
-  const partsHash = _hashParts(DB.parts);
-  const posHash = _hashPos(DB.pos || []);
-  const auditHash = _hashAudit(DB.audit || []);
-  const settingsHash = _hashSettings(DB.settings);
-  const usageHash = _hashUsage(DB.usage || []);
-
-  const partsChanged = partsHash !== _lastCloudPartsHash;
-  const posChanged = posHash !== _lastCloudPosHash;
-  const auditChanged = auditHash !== _lastCloudAuditHash;
-  const settingsChanged = settingsHash !== _lastCloudSettingsHash;
-  const usageChanged = usageHash !== _lastCloudUsageHash;
-
-  if (!partsChanged && !posChanged && !auditChanged && !settingsChanged && !usageChanged) return;
+  _detectChanges();
+  if (_dirtyParts.size === 0 && _dirtyPos.size === 0 && _dirtyAudit.size === 0 && _dirtyUsage.size === 0 && !_settingsDirty) return;
 
   clearTimeout(_cloudPushTimer);
   _showCloudIndicator(false, "syncing");
   _cloudPushTimer = setTimeout(async () => {
     let allOk = true;
-    if (partsChanged) {
-      const ok = await _pushAllParts();
-      if (ok) _lastCloudPartsHash = _hashParts(DB.parts); else allOk = false;
+    const promises = [];
+    if (_dirtyParts.size > 0) promises.push(_pushDirtyParts().then(ok => !ok && (allOk = false)));
+    if (_dirtyPos.size > 0)   promises.push(_pushDirtyPos().then(ok => !ok && (allOk = false)));
+    if (_dirtyAudit.size > 0) promises.push(_pushDirtyAudit().then(ok => !ok && (allOk = false)));
+    if (_dirtyUsage.size > 0) promises.push(_pushDirtyUsage().then(ok => !ok && (allOk = false)));
+    if (_settingsDirty) {
+      promises.push(_pushSettings().then(ok => { if (ok) _settingsDirty = false; else allOk = false; }));
     }
-    if (posChanged) {
-      const ok = await _pushAllPos();
-      if (ok) _lastCloudPosHash = _hashPos(DB.pos || []); else allOk = false;
-    }
-    if (auditChanged) {
-      const ok = await _pushAllAudit();
-      if (ok) _lastCloudAuditHash = _hashAudit(DB.audit || []); else allOk = false;
-    }
-    if (settingsChanged) {
-      const ok = await _pushSettings();
-      if (ok) _lastCloudSettingsHash = _hashSettings(DB.settings); else allOk = false;
-    }
-    if (usageChanged) {
-      const ok = await _pushAllUsage();
-      if (ok) _lastCloudUsageHash = _hashUsage(DB.usage || []); else allOk = false;
-    }
+    await Promise.all(promises);
     _showCloudIndicator(allOk, allOk ? undefined : "error");
-  }, 1200);
+  }, 250);  // FAST debounce: 250ms instead of 1200ms
 }
 
 let _origSaveDB = null;
@@ -633,7 +736,7 @@ function _scheduleDraftPush() {
     } else {
       _showCloudIndicator(false, "error");
     }
-  }, 800);
+  }, 250);
 }
 
 function _showCloudIndicator(ready, state) {
