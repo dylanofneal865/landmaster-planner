@@ -258,12 +258,22 @@ function _setupRealtimeSubscriptions() {
     });
 }
 
+let _redrawTimer = null;
 function _applyAndRefresh() {
   _suppressNextLocalChange = true;
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   _suppressNextLocalChange = false;
   if (typeof bumpStatusCache === "function") bumpStatusCache();
-  if (typeof refresh === "function") refresh();
+  // Debounce redraws so a burst of realtime events causes one re-render, not many
+  clearTimeout(_redrawTimer);
+  _redrawTimer = setTimeout(() => {
+    const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
+    if (currentRoute && typeof navigate === "function") {
+      navigate(currentRoute);
+    } else if (typeof refresh === "function") {
+      refresh();
+    }
+  }, 150);
 }
 
 function _handleRealtimePart(payload) {
