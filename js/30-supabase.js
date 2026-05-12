@@ -179,17 +179,17 @@ async function cloudInit() {
   }
 
   // ---- Audit Log ----
+  // Cloud-wins strategy (NOT merge): cloud is source of truth.
+  // Local rows missing from cloud are treated as "deleted in cloud" and removed.
   const cloudAudit = await _fetchAllAudit();
   if (cloudAudit !== null) {
     if (cloudAudit.length === 0 && DB.audit && DB.audit.length > 0) {
+      // Cloud is empty for the first time — push local up
       showToast(`Pushing ${DB.audit.length} audit entries to cloud (one-time)…`, "info", "Cloud sync");
       await _pushAllAudit();
-    } else if (cloudAudit.length > 0) {
-      // Merge: union of local + cloud, deduped by id, sorted by timestamp
-      const merged = new Map();
-      for (const r of cloudAudit) merged.set(r.id, { id: r.id, ...r.data });
-      for (const a of (DB.audit || [])) if (!merged.has(a.id)) merged.set(a.id, a);
-      DB.audit = Array.from(merged.values()).sort((a, b) => {
+    } else {
+      // Cloud has data — replace local entirely with cloud
+      DB.audit = cloudAudit.map(r => ({ id: r.id, ...r.data })).sort((a, b) => {
         const ta = a.ts || a.time || "";
         const tb = b.ts || b.time || "";
         return tb.localeCompare(ta); // newest first
@@ -210,20 +210,24 @@ async function cloudInit() {
   _lastCloudSettingsHash = _hashSettings(DB.settings);
 
   // ---- Usage ----
+  // Cloud-wins strategy (NOT merge): cloud is source of truth.
+  // Local rows missing from cloud are treated as "deleted in cloud" and removed.
   const cloudUsage = await _fetchAllUsage();
   if (cloudUsage !== null) {
     if (cloudUsage.length === 0 && DB.usage && DB.usage.length > 0) {
+      // Cloud is empty for the first time — push local up
       showToast(`Pushing ${DB.usage.length} usage entries to cloud (one-time)…`, "info", "Cloud sync");
       await _pushAllUsage();
-    } else if (cloudUsage.length > 0) {
-      const merged = new Map();
-      for (const r of cloudUsage) merged.set(r.id, { id: r.id, ...r.data });
-      for (const u of (DB.usage || [])) if (!merged.has(u.id)) merged.set(u.id, u);
-      DB.usage = Array.from(merged.values()).sort((a, b) => {
+    } else {
+      // Cloud has data — replace local entirely with cloud
+      DB.usage = cloudUsage.map(r => ({ id: r.id, ...r.data })).sort((a, b) => {
         const ta = a.ts || ""; const tb = b.ts || "";
         return tb.localeCompare(ta);
       });
       _origSaveDB ? _origSaveDB.call(window) : saveDB();
+      if (cloudUsage.length > 0) {
+        showToast(`Synced ${cloudUsage.length} usage entries from cloud`, "ok");
+      }
     }
     _lastCloudUsageHash = _hashUsage(DB.usage || []);
   }
