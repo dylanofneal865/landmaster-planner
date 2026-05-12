@@ -42,7 +42,7 @@ function draftOrderRemove(pn) {
 }
 
 function draftOrderClear() {
-  DRAFT_ORDER = [];
+  DRAFT_ORDER.length = 0;
   draftOrderSave();
   updateDraftOrderPill();
 }
