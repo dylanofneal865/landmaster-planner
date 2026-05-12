@@ -223,6 +223,133 @@ async function cloudInit() {
   _hookSaveDB();
   _hookDraftSave();
   _showCloudIndicator(true);
+  _setupRealtimeSubscriptions();
+}
+
+let _realtimeChannel = null;
+let _suppressNextLocalChange = false; // prevents echo: don't re-push what we just received
+
+function _setupRealtimeSubscriptions() {
+  if (_realtimeChannel) return; // already subscribed
+  if (!_supa) return;
+
+  _realtimeChannel = _supa
+    .channel("landmaster-sync")
+    .on("postgres_changes", { event: "*", schema: "public", table: "parts" }, (payload) => {
+      _handleRealtimePart(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "pos" }, (payload) => {
+      _handleRealtimePO(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" }, (payload) => {
+      _handleRealtimeDraft(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "audit" }, (payload) => {
+      _handleRealtimeAudit(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (payload) => {
+      _handleRealtimeSettings(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "usage" }, (payload) => {
+      _handleRealtimeUsage(payload);
+    })
+    .subscribe((status) => {
+      console.log("[cloud] realtime status:", status);
+    });
+}
+
+function _applyAndRefresh() {
+  _suppressNextLocalChange = true;
+  _origSaveDB ? _origSaveDB.call(window) : saveDB();
+  _suppressNextLocalChange = false;
+  if (typeof bumpStatusCache === "function") bumpStatusCache();
+  if (typeof refresh === "function") refresh();
+}
+
+function _handleRealtimePart(payload) {
+  const { eventType, new: row, old } = payload;
+  if (eventType === "DELETE") {
+    const i = DB.parts.findIndex(p => p.pn === old.pn);
+    if (i >= 0) DB.parts.splice(i, 1);
+  } else {
+    const merged = { pn: row.pn, ...row.data };
+    const i = DB.parts.findIndex(p => p.pn === row.pn);
+    if (i >= 0) DB.parts[i] = merged;
+    else DB.parts.push(merged);
+  }
+  _lastCloudPartsHash = _hashParts(DB.parts);
+  _applyAndRefresh();
+}
+
+function _handleRealtimePO(payload) {
+  const { eventType, new: row, old } = payload;
+  if (eventType === "DELETE") {
+    const i = DB.pos.findIndex(p => p.id === old.id);
+    if (i >= 0) DB.pos.splice(i, 1);
+  } else {
+    const merged = { id: row.id, ...row.data };
+    const i = DB.pos.findIndex(p => p.id === row.id);
+    if (i >= 0) DB.pos[i] = merged;
+    else DB.pos.push(merged);
+  }
+  _lastCloudPosHash = _hashPos(DB.pos || []);
+  _applyAndRefresh();
+}
+
+function _handleRealtimeDraft(payload) {
+  const { new: row } = payload;
+  const items = row?.data?.items || [];
+  if (typeof DRAFT_ORDER !== "undefined") {
+    DRAFT_ORDER.length = 0;
+    DRAFT_ORDER.push(...items);
+    if (typeof draftOrderSave === "function") {
+      _suppressNextLocalChange = true;
+      draftOrderSave();
+      _suppressNextLocalChange = false;
+    }
+    if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+  }
+  _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+}
+
+function _handleRealtimeAudit(payload) {
+  const { eventType, new: row, old } = payload;
+  if (eventType === "DELETE") {
+    const i = DB.audit.findIndex(a => a.id === old.id);
+    if (i >= 0) DB.audit.splice(i, 1);
+  } else {
+    const merged = { id: row.id, ...row.data };
+    const i = DB.audit.findIndex(a => a.id === row.id);
+    if (i >= 0) DB.audit[i] = merged;
+    else DB.audit.unshift(merged); // newest first
+  }
+  _lastCloudAuditHash = _hashAudit(DB.audit || []);
+  _applyAndRefresh();
+}
+
+function _handleRealtimeSettings(payload) {
+  const { new: row } = payload;
+  if (row?.data) {
+    DB.settings = { ...DB.settings, ...row.data };
+    _lastCloudSettingsHash = _hashSettings(DB.settings);
+    _applyAndRefresh();
+  }
+}
+
+function _handleRealtimeUsage(payload) {
+  const { eventType, new: row, old } = payload;
+  if (!DB.usage) DB.usage = [];
+  if (eventType === "DELETE") {
+    const i = DB.usage.findIndex(u => u.id === old.id);
+    if (i >= 0) DB.usage.splice(i, 1);
+  } else {
+    const merged = { id: row.id, ...row.data };
+    const i = DB.usage.findIndex(u => u.id === row.id);
+    if (i >= 0) DB.usage[i] = merged;
+    else DB.usage.push(merged);
+  }
+  _lastCloudUsageHash = _hashUsage(DB.usage || []);
+  _applyAndRefresh();
 }
 
 function _hashParts(parts) {
@@ -416,6 +543,7 @@ async function _pushDraft() {
 let _cloudPushTimer = null;
 function _schedulePush() {
   if (!_cloudReady) return;
+  if (_suppressNextLocalChange) return;
   const partsHash = _hashParts(DB.parts);
   const posHash = _hashPos(DB.pos || []);
   const auditHash = _hashAudit(DB.audit || []);
@@ -482,6 +610,7 @@ function _hookDraftSave() {
 let _draftPushTimer = null;
 function _scheduleDraftPush() {
   if (!_cloudReady) return;
+  if (_suppressNextLocalChange) return;
   const h = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
   if (h === _lastCloudDraftHash) return;
   clearTimeout(_draftPushTimer);
