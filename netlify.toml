@@ -1,0 +1,11 @@
+# Netlify configuration for Landmaster Planner
+[build]
+  publish = "."
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Schedule the Acumatica sync to run every 2 minutes
+[functions."acumatica-sync"]
+  schedule = "*/2 * * * *"
