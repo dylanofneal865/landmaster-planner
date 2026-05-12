@@ -487,6 +487,38 @@ function commitSalesOrderImport() {
     });
   }
 
+  // ---- Kit explosion ----
+  // For each newly-imported sales-order line whose part is a kit,
+  // create one additional usage row per component.
+  // TODO: handle nested kits (a kit whose component is itself a kit).
+  let explodedCount = 0;
+  let skippedUnknownComponent = 0;
+  for (const r of survivors) {
+    if (!isKit(r.pn)) continue;
+    const components = getComponentsOfKit(r.pn);
+    for (const comp of components) {
+      if (!comp.qty || comp.qty <= 0) continue;
+      const compPart = DB.parts.find(p => p.pn === comp.pn);
+      if (!compPart) { skippedUnknownComponent++; continue; }
+
+      const compSourceKey = `kit-explosion-${r.sourceKey}-${comp.pn}`;
+      if (existingKeys.has(compSourceKey)) continue;
+
+      DB.usage.push({
+        id: uid("us"),
+        ts: r.ts,
+        pn: comp.pn,
+        qty: Math.round(r.qty * comp.qty),
+        buildLine: "kit-explosion",
+        reason: `From kit ${r.pn}`,
+        user: "imported",
+        sourceKey: compSourceKey,
+      });
+      existingKeys.add(compSourceKey);
+      explodedCount++;
+    }
+  }
+
   // Remove historical "consolidated month" aggregates for ALL parts now that
   // we have real sales order data. These were placeholders from the original
   // Big Sheet import; the new sales order data supersedes them.
@@ -505,10 +537,15 @@ function commitSalesOrderImport() {
   const unmatchedNotTagged = preview.unmatchedNotTaggedService.length;
   const unmatchedNotInCatalog = preview.unmatchedNotInCatalog.length;
 
+  const auditParts = [`${addedCount} added`];
+  if (explodedCount > 0) auditParts.push(`exploded into ${explodedCount} component usage rows`);
+  if (skippedUnknownComponent > 0) auditParts.push(`${skippedUnknownComponent} components skipped (unknown to catalog)`);
+  auditParts.push(`${alreadyImported} already in`);
+  if (removedCount > 0) auditParts.push(`${removedCount} historical aggregates removed`);
   logAudit(
     "sales-order-import",
-    `Imported sales orders: ${addedCount} added, ${alreadyImported} already in${removedCount > 0 ? `, ${removedCount} historical aggregates removed` : ''}`,
-    { added: addedCount, alreadyImported, removedHistoricalAggregates: removedCount, unmatchedNotTagged, unmatchedNotInCatalog, fileName: preview.fileName }
+    `Imported sales orders: ${auditParts.join(", ")}`,
+    { added: addedCount, alreadyImported, explodedCount, skippedUnknownComponent, removedHistoricalAggregates: removedCount, unmatchedNotTagged, unmatchedNotInCatalog, fileName: preview.fileName }
   );
 
   DB.meta.lastSalesOrderImport = {
@@ -528,6 +565,8 @@ function commitSalesOrderImport() {
     addedCount,
     alreadyImported,
     removedCount,
+    explodedCount,
+    skippedUnknownComponent,
     unmatchedNotTaggedService: preview.unmatchedNotTaggedService,
     unmatchedNotInCatalog: preview.unmatchedNotInCatalog,
   });
@@ -550,6 +589,8 @@ function showSalesOrderImportResult(result) {
       <div class="stat-strip" style="margin-bottom:10px">
         <div class="stat"><div class="stat-label">Added</div><div class="stat-value ok">${result.addedCount}</div></div>
         <div class="stat"><div class="stat-label">Already imported</div><div class="stat-value">${result.alreadyImported}</div></div>
+        ${result.explodedCount > 0 ? `<div class="stat"><div class="stat-label">Components exploded</div><div class="stat-value ok">${result.explodedCount}</div></div>` : ''}
+        ${result.skippedUnknownComponent > 0 ? `<div class="stat"><div class="stat-label">Components skipped</div><div class="stat-value warn">${result.skippedUnknownComponent}</div></div>` : ''}
       </div>
       ${result.removedCount > 0 ? `<p class="muted tiny" style="margin-bottom:6px">Removed ${result.removedCount} stale historical aggregate${result.removedCount===1?'':'s'} for service-tagged parts.</p>` : ''}
       <p class="muted tiny" style="margin-bottom:10px">Daily-use rates recalculated. Last imported: ${fmtDate(DB.meta.lastSalesOrderImport.date)}.</p>
