@@ -82,7 +82,7 @@ function applyDemandToParts() {
     if (!d) continue;
     const newDaily = d.appliedDaily;
     const oldDaily = Number(part.daily) || 0;
-    if (Math.abs(newDaily - oldDaily) > Math.max(0.05, oldDaily * 0.05)) {
+    if (newDaily !== oldDaily) {
       part.daily = newDaily;
       updated++;
     }

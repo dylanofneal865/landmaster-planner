@@ -271,7 +271,7 @@ registerRoute("service-usage", () => {
                     const diffColor = Math.abs(r.diff) < 0.05 ? "var(--t3)" : (r.diff > 0 ? "var(--crit)" : "var(--accent)");
                     const lastSale = r.demand.lastOrderDate ? fmtDate(r.demand.lastOrderDate) : "—";
                     const desc = r.part?.desc || "—";
-                    const hasChange = Math.abs(r.diff) >= 0.05;
+                    const hasChange = r.diff !== 0;
                     return `
                       <tr>
                         <td class="pn">${esc(r.pn)}</td>
@@ -316,7 +316,7 @@ function bulkApplyComputedDaily() {
     if (!d) continue;
     const newDaily = d.appliedDaily;
     const oldDaily = Number(part.daily) || 0;
-    if (Math.abs(newDaily - oldDaily) > 0.05) {
+    if (newDaily !== oldDaily) {
       part.daily = newDaily;
       updated++;
     }
