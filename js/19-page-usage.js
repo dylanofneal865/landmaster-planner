@@ -179,7 +179,337 @@ function renderUsageFor(itemType) {
 registerRoute("usage",          () => renderUsageFor(null));
 registerRoute("base-bom-usage", () => renderUsageFor("base_bom"));
 registerRoute("options-usage",  () => renderUsageFor("options"));
-registerRoute("service-usage",  () => renderUsageFor("service"));
+/* =====================================================
+   Service Usage page (rebuilt)
+   Demand-audit tool for service parts.
+   Shows the math behind each part's daily rate and lets
+   the user bulk-apply computed rates to DB.parts.
+   ===================================================== */
+
+// Threshold for "meaningfully different" — show parts whose new
+// daily differs from stored by more than max(0.1, 10%).
+function _isDailyChanged(stored, computed) {
+  const s = Number(stored) || 0;
+  const c = Number(computed) || 0;
+  return Math.abs(c - s) > Math.max(0.1, s * 0.10);
+}
+
+let SERVICE_USAGE_STATE = {
+  search: "",
+  sortBy: "velocity",  // velocity | diff | last | units
+  showAll: false,      // false = only "review me" list
+};
+
+registerRoute("service-usage", () => {
+  const demand = getAllDemand();
+  const txCount = (DB.usage || []).length;
+
+  // Build rows: every part with sales history, joined with stored data
+  const allRows = [];
+  for (const [pn, d] of demand.entries()) {
+    const part = DB.parts.find(p => p.pn === pn);
+    const storedDaily = Number(part?.daily) || 0;
+    const diff = d.appliedDaily - storedDaily;
+    const diffPct = storedDaily > 0 ? (diff / storedDaily) * 100 : (d.appliedDaily > 0 ? 999 : 0);
+    allRows.push({
+      pn, part, demand: d,
+      storedDaily,
+      computedDaily: d.appliedDaily,
+      diff,
+      diffPct,
+      changed: _isDailyChanged(storedDaily, d.appliedDaily),
+    });
+  }
+
+  // Filter to "review me" by default
+  let rows = SERVICE_USAGE_STATE.showAll ? allRows : allRows.filter(r => r.changed);
+
+  // Search
+  if (SERVICE_USAGE_STATE.search) {
+    const q = SERVICE_USAGE_STATE.search.toLowerCase();
+    rows = rows.filter(r =>
+      r.pn.toLowerCase().includes(q) ||
+      (r.part?.desc || "").toLowerCase().includes(q)
+    );
+  }
+
+  // Sort
+  rows.sort((a, b) => {
+    switch (SERVICE_USAGE_STATE.sortBy) {
+      case "diff": return Math.abs(b.diff) - Math.abs(a.diff);
+      case "last":
+        return (b.demand.lastOrderDate || "").localeCompare(a.demand.lastOrderDate || "");
+      case "units": return b.demand.totalUnits365 - a.demand.totalUnits365;
+      case "velocity":
+      default: return Math.abs(b.demand.velocityPct) - Math.abs(a.demand.velocityPct);
+    }
+  });
+
+  // Anomaly buckets (from all rows, not filtered)
+  const surging = allRows.filter(r => r.demand.velocity === "surging")
+    .sort((a, b) => b.demand.velocityPct - a.demand.velocityPct).slice(0, 5);
+  const dying = allRows.filter(r => r.demand.velocity === "dying")
+    .sort((a, b) => a.demand.velocityPct - b.demand.velocityPct).slice(0, 5);
+  const newParts = allRows.filter(r => r.demand.velocityPct === 999).slice(0, 5);
+
+  // Health stats
+  const reviewCount = allRows.filter(r => r.changed).length;
+  const surgingCount = allRows.filter(r => r.demand.velocity === "surging").length;
+  const dyingCount = allRows.filter(r => r.demand.velocity === "dying").length;
+
+  $("#main").innerHTML = `
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <div class="page-title">Service Usage</div>
+          <div class="page-sub mono">${txCount.toLocaleString()} TRANSACTIONS · ${allRows.length} PARTS WITH SALES HISTORY · ${reviewCount} NEED REVIEW</div>
+        </div>
+        <div class="page-actions">
+          <button class="btn primary" onclick="bulkApplyComputedDaily()" ${reviewCount === 0 ? "disabled" : ""}>
+            ⚡ Apply ${reviewCount} computed daily rate${reviewCount === 1 ? "" : "s"}
+          </button>
+        </div>
+      </div>
+
+      <!-- Health summary tiles -->
+      <div class="kpi-row">
+        <div class="kpi">
+          <div class="kpi-label">REVIEW</div>
+          <div class="kpi-value">${reviewCount}</div>
+          <div class="kpi-sub">daily rates differ from computed</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">SURGING</div>
+          <div class="kpi-value" style="color: var(--crit)">${surgingCount}</div>
+          <div class="kpi-sub">demand up >50% vs baseline</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">DYING</div>
+          <div class="kpi-value" style="color: var(--t3)">${dyingCount}</div>
+          <div class="kpi-sub">demand down >50% vs baseline</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">PARTS WITH HISTORY</div>
+          <div class="kpi-value">${allRows.length}</div>
+          <div class="kpi-sub">have sales in last 180d</div>
+        </div>
+      </div>
+
+      <div class="row gap-md" style="margin-top:14px; align-items: flex-start">
+        <!-- Main table -->
+        <div style="flex: 1; min-width: 0">
+          <div class="panel">
+            <div class="filterbar">
+              <div class="search-input">
+                <input class="input" placeholder="Search part # or description…" value="${esc(SERVICE_USAGE_STATE.search)}" oninput="SERVICE_USAGE_STATE.search = this.value; refresh()">
+              </div>
+              <select class="select" onchange="SERVICE_USAGE_STATE.sortBy = this.value; refresh()">
+                <option value="velocity" ${SERVICE_USAGE_STATE.sortBy==='velocity'?'selected':''}>Sort: biggest velocity shift</option>
+                <option value="diff" ${SERVICE_USAGE_STATE.sortBy==='diff'?'selected':''}>Sort: biggest daily change</option>
+                <option value="units" ${SERVICE_USAGE_STATE.sortBy==='units'?'selected':''}>Sort: most units sold</option>
+                <option value="last" ${SERVICE_USAGE_STATE.sortBy==='last'?'selected':''}>Sort: most recent sale</option>
+              </select>
+              <div class="grow"></div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t2)">
+                <input type="checkbox" class="chk" ${SERVICE_USAGE_STATE.showAll ? "checked" : ""} onchange="SERVICE_USAGE_STATE.showAll = this.checked; refresh()">
+                Show all parts (not just review list)
+              </label>
+            </div>
+            <div class="panel-body flush">
+              ${rows.length === 0 ? `
+                <div class="empty">
+                  <div class="empty-title">${SERVICE_USAGE_STATE.showAll ? "No matches" : "All daily rates current"}</div>
+                  <div class="empty-msg">${SERVICE_USAGE_STATE.showAll ? "Try a different search." : "Every part's daily rate matches its computed value. No review needed."}</div>
+                </div>
+              ` : `
+                <div class="tbl-wrap">
+                  <table class="tbl">
+                    <thead><tr>
+                      <th>Part</th>
+                      <th>Description</th>
+                      <th class="right">30d Units</th>
+                      <th class="right">30d/Day</th>
+                      <th class="right">Baseline/Day</th>
+                      <th class="right">Velocity</th>
+                      <th class="right">Current Daily</th>
+                      <th class="right">Computed Daily</th>
+                      <th class="right">Δ</th>
+                      <th>Last Sale</th>
+                    </tr></thead>
+                    <tbody>
+                      ${rows.slice(0, 500).map(r => _renderRow(r)).join("")}
+                    </tbody>
+                  </table>
+                </div>
+                ${rows.length > 500 ? `<div class="muted center tiny" style="padding:14px">Showing first 500 of ${rows.length}. Use search to narrow.</div>` : ""}
+              `}
+            </div>
+          </div>
+        </div>
+
+        <!-- Anomaly sidebar -->
+        <div style="width: 280px; flex-shrink: 0">
+          ${_renderAnomalyPanel("Surging", surging, "crit")}
+          ${_renderAnomalyPanel("Dying", dying, "muted")}
+          ${_renderAnomalyPanel("New activity", newParts, "info")}
+        </div>
+      </div>
+    </div>`;
+});
+
+function _renderRow(r) {
+  const d = r.demand;
+  const vColor = d.velocity === "surging" || d.velocity === "up" ? "var(--crit)" :
+                 d.velocity === "dying" || d.velocity === "down" ? "var(--t3)" :
+                 "var(--t2)";
+  const vArrow = d.velocity === "surging" ? "▲▲" :
+                 d.velocity === "up" ? "▲" :
+                 d.velocity === "dying" ? "▼▼" :
+                 d.velocity === "down" ? "▼" : "→";
+  const vText = d.velocityPct === 999 ? "NEW" : `${d.velocityPct > 0 ? "+" : ""}${d.velocityPct}%`;
+  const diffSign = r.diff > 0 ? "+" : "";
+  const diffColor = r.diff > 0 ? "var(--crit)" : r.diff < 0 ? "var(--t3)" : "var(--t2)";
+  const lastSale = d.lastOrderDate ? fmtDate(d.lastOrderDate) : "—";
+  const desc = r.part?.desc || "—";
+
+  return `
+    <tr class="clickable" onclick="openServicePartDrawer('${esc(r.pn)}')">
+      <td class="pn">${esc(r.pn)}</td>
+      <td>${esc(desc)}</td>
+      <td class="right num">${fmtNum(d.recentUnits)}</td>
+      <td class="right num">${fmtNum(d.recentRate, 2)}</td>
+      <td class="right num dim">${fmtNum(d.baselineRate, 2)}</td>
+      <td class="right num" style="color:${vColor}">${vArrow} ${vText}</td>
+      <td class="right num dim">${fmtNum(r.storedDaily, 2)}</td>
+      <td class="right num bold">${fmtNum(r.computedDaily, 2)}</td>
+      <td class="right num bold" style="color:${diffColor}">${diffSign}${fmtNum(r.diff, 2)}</td>
+      <td class="dim tiny">${lastSale}</td>
+    </tr>`;
+}
+
+function _renderAnomalyPanel(title, items, tone) {
+  return `
+    <div class="panel" style="margin-bottom:12px">
+      <div class="panel-head">
+        <div class="panel-title">${title}</div>
+        <div class="panel-sub">${items.length === 0 ? "none" : `top ${items.length}`}</div>
+      </div>
+      <div class="panel-body flush">
+        ${items.length === 0 ? `<div class="muted tiny center" style="padding:14px">No parts in this bucket.</div>` :
+          items.map(r => `
+            <div class="clickable" onclick="openServicePartDrawer('${esc(r.pn)}')" style="padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer">
+              <div class="pn" style="font-size:12px">${esc(r.pn)}</div>
+              <div class="dim tiny" style="margin:2px 0">${esc((r.part?.desc || "").slice(0, 40))}</div>
+              <div style="font-size:11px;color:var(--${tone === 'crit' ? 'crit' : tone === 'info' ? 'accent' : 't3'})">
+                ${r.demand.velocityPct === 999 ? "NEW" : (r.demand.velocityPct > 0 ? "+" : "") + r.demand.velocityPct + "%"} ·
+                ${fmtNum(r.demand.recentUnits)}u in 30d
+              </div>
+            </div>
+          `).join("")
+        }
+      </div>
+    </div>`;
+}
+
+function openServicePartDrawer(pn) {
+  const part = DB.parts.find(p => p.pn === pn);
+  const d = computeDemand(pn);
+  const txns = (DB.usage || []).filter(u => u.pn === pn).sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+  const reasoning = d.recentRate > d.baselineRate
+    ? `Recent rate (${d.recentRate.toFixed(2)}/day) > baseline (${d.baselineRate.toFixed(2)}/day) → using recent to catch surge.`
+    : `Recent rate (${d.recentRate.toFixed(2)}/day) ≤ baseline (${d.baselineRate.toFixed(2)}/day) → using 60/40 blend: 0.6×${d.recentRate.toFixed(2)} + 0.4×${d.baselineRate.toFixed(2)} = ${d.appliedDaily.toFixed(2)}.`;
+
+  openDrawer(`
+    <div class="drawer-head">
+      <div class="title-block">
+        <div class="pre">SERVICE PART</div>
+        <div class="title">${esc(pn)}</div>
+        <div class="sub">${esc(part?.desc || "—")} · ${esc(part?.supplier || "")}</div>
+      </div>
+      <button class="drawer-x" data-close>×</button>
+    </div>
+    <div class="drawer-body">
+      <div class="dr-section">Demand math</div>
+      <div class="grid-2">
+        <div class="field"><label>Total units (last 365d)</label><div class="mono">${fmtNum(d.totalUnits365)}</div></div>
+        <div class="field"><label>Last sale</label><div class="mono">${d.lastOrderDate ? fmtDate(d.lastOrderDate) : "—"}</div></div>
+        <div class="field"><label>Last 30 days</label><div class="mono">${fmtNum(d.recentUnits)} units · ${d.recentRate.toFixed(3)}/day</div></div>
+        <div class="field"><label>Last 180 days (baseline)</label><div class="mono">${fmtNum(d.baselineUnits)} units · ${d.baselineRate.toFixed(3)}/day</div></div>
+        <div class="field"><label>Velocity</label><div class="mono">${d.velocity} (${d.velocityPct === 999 ? "NEW" : (d.velocityPct > 0 ? "+" : "") + d.velocityPct + "%"})</div></div>
+        <div class="field"><label>Computed daily</label><div class="mono bold">${d.appliedDaily.toFixed(3)}</div></div>
+      </div>
+      <p class="muted tiny" style="margin:8px 0 16px">${reasoning}</p>
+
+      <div class="dr-section">Apply / Override</div>
+      <div class="grid-2">
+        <div class="field"><label>Current stored daily</label><div class="mono">${(Number(part?.daily) || 0).toFixed(3)}</div></div>
+        <div class="field"><label>New daily (editable)</label><input class="input num" type="number" step="0.001" id="svc-override" value="${d.appliedDaily.toFixed(3)}"></div>
+      </div>
+      <div class="row gap-md" style="margin-top:10px">
+        <button class="btn primary" onclick="applyServicePartDaily('${esc(pn)}')">✓ Apply to part</button>
+        <button class="btn" data-close>Cancel</button>
+      </div>
+
+      <div class="dr-section" style="margin-top:24px">Transaction history (${txns.length})</div>
+      <div class="tbl-wrap" style="max-height:300px;overflow-y:auto">
+        <table class="tbl">
+          <thead><tr><th>Date</th><th class="right">Qty</th><th>Reason</th><th>Notes</th></tr></thead>
+          <tbody>
+            ${txns.slice(0, 200).map(u => `
+              <tr>
+                <td class="tiny">${fmtDate(u.ts)}</td>
+                <td class="right num">${fmtNum(u.qty)}</td>
+                <td class="dim tiny">${esc(u.reason || "—")}</td>
+                <td class="dim tiny">${esc((u.notes || "").slice(0, 40))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+      ${txns.length > 200 ? `<div class="muted tiny center" style="padding:8px">Showing first 200 of ${txns.length}.</div>` : ""}
+    </div>`, { wide: true });
+}
+
+function applyServicePartDaily(pn) {
+  const newDaily = parseFloat($("#svc-override").value) || 0;
+  const part = DB.parts.find(p => p.pn === pn);
+  if (!part) return;
+  const old = Number(part.daily) || 0;
+  part.daily = newDaily;
+  logAudit("daily-override", `${pn}: daily ${old.toFixed(2)} → ${newDaily.toFixed(2)} (Service Usage override)`, { pn, oldDaily: old, newDaily });
+  saveDB();
+  bumpStatusCache();
+  bumpDemandCache();
+  closeDrawer();
+  showToast(`${pn} daily updated to ${newDaily.toFixed(2)}`, "ok");
+  refresh();
+}
+
+function bulkApplyComputedDaily() {
+  const demand = getAllDemand();
+  let updated = 0;
+  const changes = [];
+  for (const part of DB.parts) {
+    const d = demand.get(part.pn);
+    if (!d) continue;
+    if (!_isDailyChanged(part.daily, d.appliedDaily)) continue;
+    const old = Number(part.daily) || 0;
+    part.daily = d.appliedDaily;
+    changes.push({ pn: part.pn, old, new: d.appliedDaily });
+    updated++;
+  }
+  if (updated === 0) {
+    showToast("No changes to apply", "info");
+    return;
+  }
+  logAudit("daily-bulk-apply", `Applied computed daily rates to ${updated} parts from Service Usage`, { count: updated });
+  saveDB();
+  bumpStatusCache();
+  bumpDemandCache();
+  showToast(`Applied new daily rates to ${updated} parts`, "ok", "Bulk update");
+  refresh();
+}
 
 function openLogUsageModal(prefillPn = "") {
   let q = prefillPn;
