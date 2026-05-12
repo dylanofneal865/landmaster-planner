@@ -83,8 +83,8 @@ function refresh() {
    ============================================================ */
 function updateTopBar() {
   const stats = partsWithStatus();
-  const crit = stats.filter(p => p.status === "critical").length;
-  const warn = stats.filter(p => p.status === "warning").length;
+  const crit = stats.filter(p => p.status === "critical" && !p.isKit).length;
+  const warn = stats.filter(p => p.status === "warning" && !p.isKit).length;
   $("#top-stat-date").textContent = TODAY.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }).toUpperCase();
   $("#top-stat-crit").innerHTML = `<span class="dot">●</span> ${crit} CRITICAL`;
   $("#top-stat-warn").innerHTML = `<span class="dot">●</span> ${warn} WARN`;
@@ -101,8 +101,8 @@ function updateNavBadges() {
   const setQueueBadge = (sel, cohort) => {
     const el = $(sel);
     if (!el) return;
-    const needs = cohort.filter(p => p.status === "critical" || p.status === "warning").length;
-    const crit  = cohort.filter(p => p.status === "critical").length;
+    const needs = cohort.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit).length;
+    const crit  = cohort.filter(p => p.status === "critical" && !p.isKit).length;
     el.textContent = needs;
     el.className = "badge " + (needs > 0 ? (crit > 0 ? "crit" : "warn") : "");
   };

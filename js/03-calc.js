@@ -118,6 +118,7 @@ function partsWithStatus() {
   const out = DB.parts.map(p => ({
     ...p,
     onPO: openPOQty(p.pn),
+    isKit: typeof isKit === "function" ? isKit(p.pn) : false,
     ...partStatus(p),
   }));
   _statusCache = out;

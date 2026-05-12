@@ -49,16 +49,46 @@ function renderPartDetail(part) {
   const todayMark = `<line x1="${P}" y1="${P}" x2="${P}" y2="${H-P}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
   const zeroLine = minOH <= 0 ? `<line x1="${P}" y1="${yS(0)}" x2="${W-P}" y2="${yS(0)}" class="spark-zero"/>` : "";
 
+  const partIsKit = typeof isKit === "function" && isKit(part.pn);
+  const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
+
   const html = `
     <div class="drawer-head">
       <div class="title-block">
-        <div class="pre">PART · ${esc(part.partClass||"")}</div>
+        <div class="pre">${partIsKit ? 'KIT' : `PART · ${esc(part.partClass||"")}`}</div>
         <div class="title">${esc(part.pn)}</div>
-        <div class="sub">${esc(part.desc)} · <span class="pill ${status.status==='critical'?'crit':status.status==='warning'?'warn':'ok'}">${status.status.toUpperCase()}</span></div>
+        <div class="sub">${esc(part.desc)} · <span class="pill ${partIsKit ? 'ok' : (status.status==='critical'?'crit':status.status==='warning'?'warn':'ok')}" ${partIsKit ? 'style="background:var(--accent-soft,#eef);color:var(--accent,#36c)"' : ''}>${partIsKit ? 'KIT · ' + kitComponents.length + ' COMPONENTS' : status.status.toUpperCase()}</span></div>
       </div>
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
+      ${partIsKit ? `
+        <div class="dr-section">Kit components</div>
+        <div class="tbl-wrap"><table class="tbl">
+          <thead><tr>
+            <th>Component</th>
+            <th>Description</th>
+            <th class="right">Qty per kit</th>
+            <th class="dim">Type</th>
+          </tr></thead>
+          <tbody>
+            ${kitComponents.map(c => {
+              const compPart = DB.parts.find(pp => pp.pn === c.pn);
+              const inCatalog = !!compPart;
+              const qtyStr = c.qty % 1 === 0 ? fmtNum(c.qty) : fmtNum(c.qty, 2);
+              return `
+                <tr ${inCatalog ? `class="clickable" onclick="openPartDetail('${esc(c.pn)}')"` : ''}>
+                  <td class="pn">${esc(c.pn)}${!inCatalog ? ' <span class="pill warn" title="Not in parts catalog">⚠</span>' : ''}</td>
+                  <td>${esc(compPart?.desc || c.desc || '—')}</td>
+                  <td class="right num bold">${qtyStr}</td>
+                  <td class="dim tiny">${c.isStock ? 'Stock' : 'Non-stock'}</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table></div>
+        <p class="muted tiny" style="margin-top:8px;line-height:1.5">When this kit ships, each component's daily-use is automatically credited based on Qty per kit. Kits never generate purchase suggestions — their components do.</p>
+      ` : ''}
       <div class="stat-strip">
         <div class="stat"><div class="stat-label">On Hand</div><div class="stat-value">${fmtNum(part.onHand)}</div></div>
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
@@ -85,7 +115,7 @@ function renderPartDetail(part) {
       <div class="dr-section">Quick actions</div>
       <div class="row gap-md" style="flex-wrap:wrap">
         <button class="btn primary" onclick="closeDrawer(); openOnHandQuickModal('${esc(part.pn)}')">⚡ Update on-hand</button>
-        ${(status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
+        ${!partIsKit && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
         <button class="btn" onclick="closeDrawer(); navigate('order-queue')">View order queue</button>
       </div>
 
@@ -331,8 +361,8 @@ function partsHeaderValue(p, key) {
   if (key === "pn") value = p.pn || "";
   if (key === "desc") value = p.desc || "";
   if (key === "supplier") value = p.supplier || "";
-  if (key === "cls") value = p.partClass || "";
-  if (key === "status") value = p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK";
+  if (key === "cls") value = p.isKit ? "Kit" : (p.partClass || "");
+  if (key === "status") value = p.isKit ? "Kit" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK";
   return String(value).trim() || "(Blanks)";
 }
 function partsUniqueHeaderValues(rows, key) {
@@ -548,14 +578,14 @@ registerRoute("parts", () => {
                     <td class="pn">${esc(p.pn)}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
-                    <td class="dim mono">${esc(p.partClass||"—")}</td>
+                    <td class="dim mono">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(p.partClass||"—")}</td>
                     <td class="right num">${fmtNum(p.onHand)}</td>
                     <td class="right num dim">${fmtNum(p.onPO)}</td>
                     <td class="right num dim">${fmtNum(p.daily, 2)}</td>
                     <td class="right num dim">${p.ltWeeks || 0}w</td>
                     <td class="right num">${fmtMoneyDec(p.cost)}</td>
                     <td class="right num">${fmtMoney((p.onHand||0)*(p.cost||0))}</td>
-                    <td><span class="pill ${p.status==='critical'?'crit':p.status==='warning'?'warn':'ok'}">${p.status==='critical'?'CRIT':p.status==='warning'?'WARN':'OK'}</span></td>
+                    <td>${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : `<span class="pill ${p.status==='critical'?'crit':p.status==='warning'?'warn':'ok'}">${p.status==='critical'?'CRIT':p.status==='warning'?'WARN':'OK'}</span>`}</td>
                   </tr>
                 `).join("")}
                 ${parts.length > 500 ? `<tr><td colspan="11" class="muted center tiny" style="padding:14px">Showing first 500 of ${parts.length} — use filters to narrow.</td></tr>` : ""}

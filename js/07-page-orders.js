@@ -287,6 +287,7 @@ function renderOrderQueueFor(itemType) {
   const pageTitle = (itemType && titleMap[itemType]) || "Order Queue";
   let stats = partsWithStatus();
   if (itemType) stats = stats.filter(p => p.itemType === itemType);
+  stats = stats.filter(p => !p.isKit);
   const needsOrder = stats.filter(p => p.status === "critical" || p.status === "warning");
   
   // Apply filters

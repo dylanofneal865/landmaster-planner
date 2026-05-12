@@ -8,8 +8,8 @@
    ============================================================ */
 registerRoute("dashboard", () => {
   const stats = partsWithStatus();
-  const crit = stats.filter(p => p.status === "critical");
-  const warn = stats.filter(p => p.status === "warning");
+  const crit = stats.filter(p => p.status === "critical" && !p.isKit);
+  const warn = stats.filter(p => p.status === "warning" && !p.isKit);
   const openPOs = DB.pos.filter(p => p.status === "draft" || p.status === "submitted" || p.status === "in_transit");
   const overduePOs = openPOs.filter(p => p.expectedDate && new Date(p.expectedDate) < TODAY);
   const draftPOs = DB.pos.filter(p => p.status === "draft");
@@ -27,7 +27,7 @@ registerRoute("dashboard", () => {
   }, 0);
 
   // Suggested order $ today
-  const suggestedValue = stats.filter(p => p.status === "critical" || p.status === "warning")
+  const suggestedValue = stats.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit)
     .reduce((s, p) => s + suggestedQty(p) * (p.cost || 0), 0);
 
   // Top critical

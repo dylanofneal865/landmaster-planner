@@ -81,6 +81,10 @@ function updateDraftOrderPill() {
 function quickAddToDraft(pn) {
   const part = DB.parts.find(p => p.pn === pn);
   if (!part) return;
+  if (typeof isKit === "function" && isKit(pn)) {
+    showToast(`${pn} is a kit — order its components instead`, "warn", "Can't add kit to draft");
+    return;
+  }
   const qty = suggestedQty({ ...part, onPO: openPOQty(pn), daily: part.daily });
   draftOrderAdd(pn, qty);
   showToast(`${pn} × ${fmtNum(qty)} added to Draft Order`, "ok", "Added");
