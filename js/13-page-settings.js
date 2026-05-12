@@ -142,7 +142,7 @@ registerRoute("settings", () => {
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">Data</div>
-          <div class="panel-sub">${DB.parts.length} parts · ${DB.pos.length} POs · ${(DB.usage||[]).length} usage txns · ${DB.audit.length} log entries · ${dbSize} KB · source: ${esc(DB.meta.dataSource||"unknown")}${DB.meta.lastImport ? " · imported " + fmtDate(DB.meta.lastImport) : ""}</div>
+          <div class="panel-sub">${DB.parts.length} parts · ${DB.pos.length} POs · ${(DB.usage||[]).length} usage txns · ${Object.keys(DB.kitBoms || {}).length} kit BOMs · ${DB.audit.length} log entries · ${dbSize} KB · source: ${esc(DB.meta.dataSource||"unknown")}${DB.meta.lastImport ? " · imported " + fmtDate(DB.meta.lastImport) : ""}</div>
         </div>
         <div class="panel-body col">
           <div class="row gap-md">
@@ -150,10 +150,9 @@ registerRoute("settings", () => {
             <button class="btn" onclick="exportFullDB()">⇩ Export full database (JSON)</button>
             <button class="btn" onclick="importFullDBPrompt()">⇪ Restore database (JSON)</button>
           </div>
-          <div class="row gap-md" style="margin-top:8px;align-items:center">
-            <button class="btn" onclick="$('#kit-boms-import-input').click()">⇪ Import Kit BOMs</button>
-            <input type="file" id="kit-boms-import-input" accept=".xlsx" style="display:none" onchange="handleKitBomsImportFile(event)">
-            <span class="muted tiny">${Object.keys(DB.kitBoms||{}).length} kit BOMs loaded</span>
+          <div class="row gap-md" style="margin-top:8px">
+            <button class="btn" onclick="$('#kit-bom-file-input').click()">⇪ Import Kit BOMs (Acumatica Excel)</button>
+            <input type="file" id="kit-bom-file-input" accept=".xlsx" style="display:none" onchange="handleKitBomsImportFile(event)">
           </div>
           <div class="row gap-md" style="margin-top:8px">
             <button class="btn" onclick="exportPartsAsCSV()">⇩ Export parts (CSV)</button>
@@ -291,13 +290,8 @@ function handleKitBomsImportFile(event) {
   if (!file) return;
 
   showToast(`Parsing ${file.name}…`, "info");
-  importKitBomsFromExcel(file).then(summary => {
-    logAudit(
-      "kit-boms-import",
-      `Imported ${summary.totalKits} kits with ${summary.totalComponents} components (${summary.skipped} skipped)`,
-      { ...summary, fileName: file.name }
-    );
-    showToast(`Imported ${summary.totalKits} kits · ${summary.totalComponents} components${summary.skipped > 0 ? ` · ${summary.skipped} skipped` : ""}`, "ok", "Kit BOMs");
+  importKitBomsFromExcel(file).then(result => {
+    showToast(`Imported ${result.totalKits} kit BOMs with ${result.totalComponents} component links`, "ok", "Kit BOMs");
     refresh();
   }).catch(err => {
     console.error("Kit BOM import failed:", err);
