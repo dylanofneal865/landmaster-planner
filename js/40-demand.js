@@ -1,28 +1,23 @@
 /* =====================================================
    40-demand.js
-   Service-parts demand engine.
+   Service-parts demand engine — simple 180-day average.
 
    Reads DB.usage (imported sales orders + manual usage)
-   and computes a per-part daily-use rate using an
-   asymmetric blend:
-     - if recent rate > baseline → use recent (catch surges fast)
-     - if recent rate < baseline → 60/40 blend (soft landing on lulls)
+   and computes per-part daily-use rate as:
 
-   This file ONLY computes. It does not modify DB.parts.
-   To apply: call applyDemandToParts() explicitly.
+     daily = units shipped in last 180 days / 180
+
+   No surge detection. No blending. Just average per day.
+   Does NOT modify DB.parts unless applyDemandToParts() called.
    ===================================================== */
 
-const DEMAND_RECENT_DAYS = 30;
-const DEMAND_BASELINE_DAYS = 180;
-const DEMAND_HISTORY_DAYS = 365;
+const DEMAND_WINDOW_DAYS = 180;
 
 function computeDemand(pn) {
   const now = Date.now();
-  const recentCutoff = now - DEMAND_RECENT_DAYS * 86400000;
-  const baselineCutoff = now - DEMAND_BASELINE_DAYS * 86400000;
-  const historyCutoff = now - DEMAND_HISTORY_DAYS * 86400000;
+  const cutoff = now - DEMAND_WINDOW_DAYS * 86400000;
 
-  let recentUnits = 0, baselineUnits = 0, totalUnits365 = 0;
+  let units = 0;
   let lastOrderTs = 0;
 
   if (!Array.isArray(DB.usage)) return _emptyDemand();
@@ -33,55 +28,23 @@ function computeDemand(pn) {
     if (isNaN(t)) continue;
     const qty = Number(u.qty) || 0;
     if (qty <= 0) continue;
-    if (t > historyCutoff) totalUnits365 += qty;
-    if (t > baselineCutoff) baselineUnits += qty;
-    if (t > recentCutoff) recentUnits += qty;
+    if (t > cutoff) units += qty;
     if (t > lastOrderTs) lastOrderTs = t;
   }
 
-  const recentRate = recentUnits / DEMAND_RECENT_DAYS;
-  const baselineRate = baselineUnits / DEMAND_BASELINE_DAYS;
-
-  let appliedDaily;
-  if (recentRate > baselineRate) {
-    appliedDaily = recentRate;
-  } else {
-    appliedDaily = 0.6 * recentRate + 0.4 * baselineRate;
-  }
-
-  const velocityPct = baselineRate > 0
-    ? ((recentRate - baselineRate) / baselineRate) * 100
-    : (recentRate > 0 ? 999 : 0);
-
-  let velocity = "steady";
-  if (velocityPct > 50) velocity = "surging";
-  else if (velocityPct > 15) velocity = "up";
-  else if (velocityPct < -50) velocity = "dying";
-  else if (velocityPct < -15) velocity = "down";
+  const appliedDaily = units / DEMAND_WINDOW_DAYS;
 
   return {
-    recentUnits,
-    recentRate: Math.round(recentRate * 1000) / 1000,
-    baselineUnits,
-    baselineRate: Math.round(baselineRate * 1000) / 1000,
+    units,
     appliedDaily: Math.round(appliedDaily * 1000) / 1000,
-    velocity,
-    velocityPct: Math.round(velocityPct),
     lastOrderDate: lastOrderTs > 0 ? new Date(lastOrderTs).toISOString() : null,
-    totalUnits365,
   };
 }
 
 function _emptyDemand() {
-  return {
-    recentUnits: 0, recentRate: 0,
-    baselineUnits: 0, baselineRate: 0,
-    appliedDaily: 0, velocity: "steady", velocityPct: 0,
-    lastOrderDate: null, totalUnits365: 0,
-  };
+  return { units: 0, appliedDaily: 0, lastOrderDate: null };
 }
 
-// ----- Cached batch computation -----
 let _demandCache = null;
 let _demandCacheKey = null;
 
@@ -111,12 +74,6 @@ function bumpDemandCache() {
   _demandCacheKey = null;
 }
 
-/**
- * Apply computed daily rates onto DB.parts.
- * IMPORTANT: this is NOT called automatically. Only triggered
- * when user explicitly clicks Apply on the Service Usage page.
- * Returns count of parts updated.
- */
 function applyDemandToParts() {
   const demand = getAllDemand();
   let updated = 0;
@@ -133,7 +90,6 @@ function applyDemandToParts() {
   return updated;
 }
 
-// Expose for console use and other modules
 window.computeDemand = computeDemand;
 window.getAllDemand = getAllDemand;
 window.bumpDemandCache = bumpDemandCache;
