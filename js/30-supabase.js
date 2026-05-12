@@ -11,6 +11,7 @@ let _cloudReady = false;
 let _lastCloudPartsHash = null;
 let _lastCloudPosHash = null;
 let _lastCloudDraftHash = null;
+let _lastCloudAuditHash = null;
 
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
@@ -58,6 +59,28 @@ async function _fetchAllPos() {
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] pos page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+async function _fetchAllAudit() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("audit")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] audit page fetch failed:", error);
       return null;
     }
     if (!data || data.length === 0) break;
@@ -143,6 +166,27 @@ async function cloudInit() {
     _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
   }
 
+  // ---- Audit Log ----
+  const cloudAudit = await _fetchAllAudit();
+  if (cloudAudit !== null) {
+    if (cloudAudit.length === 0 && DB.audit && DB.audit.length > 0) {
+      showToast(`Pushing ${DB.audit.length} audit entries to cloud (one-time)…`, "info", "Cloud sync");
+      await _pushAllAudit();
+    } else if (cloudAudit.length > 0) {
+      // Merge: union of local + cloud, deduped by id, sorted by timestamp
+      const merged = new Map();
+      for (const r of cloudAudit) merged.set(r.id, { id: r.id, ...r.data });
+      for (const a of (DB.audit || [])) if (!merged.has(a.id)) merged.set(a.id, a);
+      DB.audit = Array.from(merged.values()).sort((a, b) => {
+        const ta = a.ts || a.time || "";
+        const tb = b.ts || b.time || "";
+        return tb.localeCompare(ta); // newest first
+      });
+      _origSaveDB ? _origSaveDB.call(window) : saveDB();
+    }
+    _lastCloudAuditHash = _hashAudit(DB.audit || []);
+  }
+
   _cloudReady = true;
   _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
@@ -164,6 +208,11 @@ function _hashPos(pos) {
   } catch (e) {
     return pos.length + ":?";
   }
+}
+
+function _hashAudit(audit) {
+  try { return audit.length + ":" + JSON.stringify(audit).length; }
+  catch (e) { return audit.length + ":?"; }
 }
 
 async function _pushAllParts() {
@@ -210,6 +259,28 @@ async function _pushAllPos() {
   return true;
 }
 
+async function _pushAllAudit() {
+  if (!_supa) return false;
+  if (!DB.audit || DB.audit.length === 0) return true;
+
+  const rows = DB.audit.map(a => {
+    const { id, ...rest } = a;
+    return { id, data: rest };
+  });
+
+  const BATCH = 500;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH);
+    const { error } = await _supa.from("audit").upsert(batch);
+    if (error) {
+      console.error("[cloud] audit batch upsert failed:", error);
+      showToast("Cloud push failed: " + error.message, "crit");
+      return false;
+    }
+  }
+  return true;
+}
+
 function _hashDraft(arr) {
   try { return (arr?.length || 0) + ":" + JSON.stringify(arr || []).length; }
   catch (e) { return (arr?.length || 0) + ":?"; }
@@ -248,9 +319,11 @@ function _schedulePush() {
   if (!_cloudReady) return;
   const partsHash = _hashParts(DB.parts);
   const posHash = _hashPos(DB.pos || []);
+  const auditHash = _hashAudit(DB.audit || []);
   const partsChanged = partsHash !== _lastCloudPartsHash;
   const posChanged = posHash !== _lastCloudPosHash;
-  if (!partsChanged && !posChanged) return;
+  const auditChanged = auditHash !== _lastCloudAuditHash;
+  if (!partsChanged && !posChanged && !auditChanged) return;
 
   clearTimeout(_cloudPushTimer);
   _showCloudIndicator(false, "syncing");
@@ -264,6 +337,11 @@ function _schedulePush() {
     if (posChanged) {
       const ok = await _pushAllPos();
       if (ok) _lastCloudPosHash = _hashPos(DB.pos || []);
+      else allOk = false;
+    }
+    if (auditChanged) {
+      const ok = await _pushAllAudit();
+      if (ok) _lastCloudAuditHash = _hashAudit(DB.audit || []);
       else allOk = false;
     }
     _showCloudIndicator(allOk, allOk ? undefined : "error");
@@ -376,6 +454,20 @@ window.cloudForcePullPos = async function () {
   if (typeof refresh === "function") refresh();
   _lastCloudPosHash = _hashPos(DB.pos);
   console.log("Pulled " + DB.pos.length + " POs from cloud");
+};
+
+window.cloudForcePullAudit = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  const data = await _fetchAllAudit();
+  if (data === null) { console.error("Force pull failed"); return; }
+  DB.audit = data.map(r => ({ id: r.id, ...r.data })).sort((a, b) => {
+    const ta = a.ts || a.time || "";
+    const tb = b.ts || b.time || "";
+    return tb.localeCompare(ta);
+  });
+  _origSaveDB ? _origSaveDB.call(window) : saveDB();
+  _lastCloudAuditHash = _hashAudit(DB.audit);
+  console.log("Pulled " + DB.audit.length + " audit entries from cloud");
 };
 
 window.cloudForcePullDraft = async function () {
