@@ -129,6 +129,7 @@ function partsWithStatus() {
    ============================================================ */
 function logAudit(type, msg, detail = {}) {
   DB.audit.unshift({
+    id: "audit_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
     ts: new Date().toISOString(),
     type, msg, detail,
   });

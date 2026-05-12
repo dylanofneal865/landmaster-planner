@@ -263,6 +263,13 @@ async function _pushAllAudit() {
   if (!_supa) return false;
   if (!DB.audit || DB.audit.length === 0) return true;
 
+  // Backfill missing IDs on legacy entries (created before id was added at creation time)
+  for (const a of DB.audit) {
+    if (!a.id) {
+      a.id = "audit_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+    }
+  }
+
   const rows = DB.audit.map(a => {
     const { id, ...rest } = a;
     return { id, data: rest };
