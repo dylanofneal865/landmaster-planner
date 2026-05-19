@@ -65,10 +65,15 @@ function daysUntilStockout(part) {
   if (!part.daily || part.daily <= 0) return Infinity;
   // Project with current PO receipts factored in
   const series = projectOnHand(part, 365);
+  // Find the LAST day on-hand is still positive — accounts for transient dips
+  // that recover when an incoming PO lands.
+  let lastPositive = -1;
   for (let i = 0; i < series.length; i++) {
-    if (series[i].oh <= 0) return i;
+    if (series[i].oh > 0) lastPositive = i;
   }
-  return Infinity;
+  if (lastPositive === -1) return 0;                       // never positive
+  if (lastPositive === series.length - 1) return Infinity; // stays positive through end of window
+  return lastPositive + 1;
 }
 
 // Compute status for a part
