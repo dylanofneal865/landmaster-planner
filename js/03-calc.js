@@ -38,11 +38,18 @@ function projectOnHand(part, days = 365) {
       if (ln.status === "received" || ln.status === "cancelled") continue;
       const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       if (!remaining) continue;
+      let offset;
       const expDate = ln.expectedDate ? new Date(ln.expectedDate) : null;
-      if (!expDate || isNaN(expDate)) continue;
-      expDate.setHours(0,0,0,0);
-      const offset = Math.round((expDate - TODAY) / DAY_MS);
-      if (offset >= 0 && offset <= days) receipts[offset] += remaining;
+      if (!expDate || isNaN(expDate)) {
+        // Missing/invalid date → assume arrival at the part's lead time from today
+        offset = leadTimeDays(part);
+      } else {
+        expDate.setHours(0,0,0,0);
+        offset = Math.round((expDate - TODAY) / DAY_MS);
+        // Past expected date → treat as arriving today (don't drop the receipt)
+        if (offset < 0) offset = 0;
+      }
+      if (offset <= days) receipts[offset] += remaining;
     }
   }
   for (let i = 0; i <= days; i++) {
