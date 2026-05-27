@@ -144,6 +144,7 @@ function previewImport(rows, sheetName, filename) {
       <div class="row gap-md" style="flex-wrap:wrap">
         <label class="row" style="gap:6px"><input type="radio" name="imp-mode" value="merge" checked> <span><strong>Merge</strong> — add new, update existing</span></label>
         <label class="row" style="gap:6px"><input type="radio" name="imp-mode" value="oh-only"> <span>Update <strong>on-hand only</strong> (preserve everything else)</span></label>
+        <label class="row" style="gap:6px"><input type="radio" name="imp-mode" value="cost-only"> <span>Update <strong>cost only</strong> (existing parts; skip unknowns)</span></label>
         <label class="row" style="gap:6px"><input type="radio" name="imp-mode" value="replace"> <span style="color:var(--crit)"><strong>Replace all parts</strong> (deletes existing)</span></label>
       </div>
     </div>
@@ -173,6 +174,29 @@ function applyImport() {
         ohChanged++;
       }
     }
+  } else if (mode === "cost-only") {
+    const map = new Map(DB.parts.map(p => [p.pn, p]));
+    const mapLower = new Map(DB.parts.map(p => [String(p.pn).toLowerCase(), p]));
+    let costChanged = 0, skippedUnknown = 0, skippedNoCost = 0, sameAlready = 0;
+    for (const c of candidates) {
+      let existing = map.get(c.pn);
+      if (!existing) existing = mapLower.get(String(c.pn).toLowerCase());
+      if (!existing) { skippedUnknown++; continue; }
+      const newCost = Number(c.cost);
+      if (!Number.isFinite(newCost) || newCost <= 0) { skippedNoCost++; continue; }
+      if ((existing.cost || 0) === newCost) { sameAlready++; continue; }
+      existing.cost = newCost;
+      costChanged++;
+    }
+    DB.meta.lastImport = new Date().toISOString();
+    DB.meta.dataSource = "imported";
+    logAudit("import", `Cost-only import: ${costChanged} costs updated · ${sameAlready} unchanged · ${skippedUnknown} unknown PNs · ${skippedNoCost} skipped (no cost)`);
+    saveDB();
+    bumpStatusCache();
+    closeModal();
+    showToast(`Cost-only import · ${costChanged} updated · ${sameAlready} unchanged · ${skippedUnknown} unknown · ${skippedNoCost} no cost`, "ok", "Cost update applied");
+    navigate("dashboard");
+    return;
   } else {
     // merge
     const map = new Map(DB.parts.map(p => [p.pn, p]));
