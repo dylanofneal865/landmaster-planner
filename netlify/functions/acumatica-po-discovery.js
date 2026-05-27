@@ -13,7 +13,7 @@
 // Reuses the same env vars as acumatica-sync.js:
 //   ACUMATICA_BASE_URL, ACUMATICA_COMPANY, ACUMATICA_USERNAME, ACUMATICA_PASSWORD
 
-const GI_NAME = "LM Planner PO Line";
+const GI_NAME = "LMInventoryPlannerPOLines";
 
 exports.handler = async () => {
   const log = (msg, data) => console.log(`[acumatica-po-discovery] ${msg}`, data || "");
