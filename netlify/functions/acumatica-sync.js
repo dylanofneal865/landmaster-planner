@@ -17,7 +17,10 @@ const { createClient } = require("@supabase/supabase-js");
 // Shared field extractors for an Acumatica OData Atom-XML <entry>.
 function makeFieldGetters(raw) {
   const get = (field) => {
-    const re = new RegExp(`<d:${field}[^>]*>([\\s\\S]*?)<\\/d:${field}>`, "i");
+    // Exact field-name match: allow attributes (m:type, etc.) but NOT numbered
+    // siblings like <d:CreatedBy_2> — the optional group requires whitespace
+    // after the name, so "_2"/"_3" suffixes can't slip through.
+    const re = new RegExp(`<d:${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/d:${field}>`, "i");
     const m = raw.match(re);
     return m ? m[1].trim() : null;
   };
@@ -273,7 +276,10 @@ async function runPOSync(ctx) {
   log(`PO sync: found ${entries.length} <entry> elements`);
 
   const toNum = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
-  const toIso = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d.toISOString(); };
+  // Acumatica returns date fields as midnight in an unspecified timezone
+  // (e.g. "2026-05-27T00:00:00"). Parsing through JS Date converts to UTC and
+  // shifts US users back a day; slice the calendar portion directly instead.
+  const toDateStr = (v) => (v ? String(v).slice(0, 10) : null);
 
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
@@ -287,13 +293,13 @@ async function runPOSync(ctx) {
 
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
-      headerExpectedByOrder.set(num, toIso(get("ExpectedDate")));
+      headerExpectedByOrder.set(num, toDateStr(get("ExpectedDate")));
     }
     if (!headerBuyerByOrder.has(num)) {
       headerBuyerByOrder.set(num, (get("CreatedBy") || "").trim());
     }
     if (!headerCreatedDateByOrder.has(num)) {
-      headerCreatedDateByOrder.set(num, toIso(get("Date")));
+      headerCreatedDateByOrder.set(num, toDateStr(get("Date")));
     }
 
     const lineNbrRaw = get("LineNbr");
@@ -320,8 +326,8 @@ async function runPOSync(ctx) {
       cost: toNum(get("UnitCost")),         // = UnitCost (app reads `cost`)
       extCost: toNum(get("ExtCost")),
       uom: (get("UOM") || "").trim(),
-      expectedDate: toIso(get("Promised")), // = Promised (app reads `expectedDate`)
-      requestedDate: toIso(get("Requested")),
+      expectedDate: toDateStr(get("Promised")), // = Promised (app reads `expectedDate`)
+      requestedDate: toDateStr(get("Requested")),
       warehouse: (get("Warehouse") || "").trim(),
       vendor: (get("Vendor") || "").trim(),
       vendorName: get("VendorName") || "",
@@ -355,6 +361,7 @@ async function runPOSync(ctx) {
 
   // Build nested PO rows.
   const rows = [];
+  let loggedSample = false;
   for (const [num, lines] of byOrder.entries()) {
     const id = "po_" + num;
     const prev = existingById.get(id) || {};
@@ -391,6 +398,19 @@ async function runPOSync(ctx) {
       lines,
     };
     rows.push({ id, data });
+
+    if (!loggedSample) {
+      // TEMP: verify CreatedBy parses the username field (not _2/_3 siblings).
+      // Remove after confirming in Netlify function logs.
+      log("SAMPLE PO", {
+        num,
+        acumCreatedBy: headerBuyerByOrder.get(num),
+        resolvedBuyer: data.buyer,
+        createdDate: data.createdDate,
+        expectedDate: data.expectedDate,
+      });
+      loggedSample = true;
+    }
   }
 
   // Reconciliation (additive, never delete): a PO previously synced from
