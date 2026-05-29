@@ -246,6 +246,16 @@ function rollupAcumaticaStatus(lines) {
   return best || fallback;
 }
 
+// Placeholder values that crept into `buyer` over time from legacy browser
+// pushes (e.g. "Unassigned") shouldn't block Acumatica's CreatedBy default.
+function isRealBuyer(b) {
+  if (!b) return false;
+  const s = String(b).trim().toLowerCase();
+  if (!s) return false;
+  if (s === "unassigned" || s === "n/a" || s === "na" || s === "—" || s === "-" || s === "?") return false;
+  return true;
+}
+
 // Fetches the LMInventoryPlannerPOLines GI, groups flat lines into nested PO
 // objects (the shape the app already consumes), preserves local buyer/notes,
 // upserts to the `pos` table, and reconciles POs that dropped out of the feed.
@@ -388,7 +398,7 @@ async function runPOSync(ctx) {
       supplier: first.vendorName || "",
       vendor: first.vendor || "",
       source: "acumatica",
-      buyer: prev.buyer || headerBuyerByOrder.get(num) || "",
+      buyer: isRealBuyer(prev.buyer) ? prev.buyer : (headerBuyerByOrder.get(num) || ""),
       createdBy: prev.createdBy || "",
       notes: prev.notes || "",
       createdDate: headerCreatedDateByOrder.get(num) || null,
