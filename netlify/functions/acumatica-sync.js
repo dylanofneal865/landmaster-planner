@@ -277,10 +277,16 @@ async function runPOSync(ctx) {
 
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
+  const headerExpectedByOrder = new Map();
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
+
+    // PO header "Promised On" — same value on every line of a PO; first-wins.
+    if (!headerExpectedByOrder.has(num)) {
+      headerExpectedByOrder.set(num, toIso(get("ExpectedDate")));
+    }
 
     const lineNbrRaw = get("LineNbr");
     const lineNbr = lineNbrRaw == null ? null
@@ -371,7 +377,7 @@ async function runPOSync(ctx) {
       createdBy: prev.createdBy || "",
       notes: prev.notes || "",
       createdDate: prev.createdDate || null,
-      expectedDate: first.expectedDate || null,
+      expectedDate: headerExpectedByOrder.get(num) || first.expectedDate || null,
       status: poStatus,
       acumStatus: rollupAcumaticaStatus(lines),
       lines,
