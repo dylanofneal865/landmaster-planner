@@ -360,23 +360,67 @@ function autoSyncExcel() {
   }, 1200);
 }
 
-function updateSyncIndicator(state) {
+// Header indicator now reflects the freshness of Acumatica → Supabase syncs.
+// The legacy `state` arg from Excel auto-sync callers is intentionally
+// ignored — Excel sync status now lives on the Settings page panel.
+function updateSyncIndicator() {
   const el = $("#top-stat-sync");
   if (!el) return;
-  const linked = FS_KINDS.filter(k => _fileHandles[k]).length;
-  if (state === "syncing") {
-    el.className = "status-pill warn";
-    el.innerHTML = `<span class="dot">●</span> SYNCING…`;
+  const audit = (typeof DB !== "undefined" && DB && Array.isArray(DB.audit)) ? DB.audit : null;
+  if (!audit) {
+    el.className = "status-pill";
+    el.innerHTML = `<span class="dot">○</span> SYNC`;
     return;
   }
-  if (linked === 0) {
-    el.className = "status-pill";
-    el.innerHTML = `<span class="dot">○</span> SYNC OFF`;
-  } else if (linked === FS_KINDS.length) {
-    el.className = "status-pill ok";
-    el.innerHTML = `<span class="dot">●</span> SYNC ON · ${linked}/${FS_KINDS.length}`;
-  } else {
+  // DB.audit is kept newest-first by cloudInit + realtime inserts, so .find
+  // returns the most recent acumatica sync entry.
+  const last = audit.find(a => a && (a.type === "acumatica-sync" || a.type === "acumatica-po-sync"));
+  const ts = last && last.ts ? new Date(last.ts).getTime() : NaN;
+  if (isNaN(ts)) {
+    el.className = "status-pill crit";
+    el.innerHTML = `<span class="dot">●</span> SYNC ERROR`;
+    return;
+  }
+  const ageMin = (Date.now() - ts) / 60000;
+  const rel = _relTimeSince(ts);
+  if (ageMin > 120) {
+    el.className = "status-pill crit";
+    el.innerHTML = `<span class="dot">●</span> SYNC ERROR`;
+  } else if (ageMin > 30) {
     el.className = "status-pill warn";
-    el.innerHTML = `<span class="dot">●</span> SYNC PARTIAL · ${linked}/${FS_KINDS.length}`;
+    el.innerHTML = `<span class="dot">●</span> STALE · ${rel}`;
+  } else {
+    el.className = "status-pill ok";
+    el.innerHTML = `<span class="dot">●</span> SYNCED · ${rel}`;
+  }
+}
+
+function _relTimeSince(ts) {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  return `${Math.floor(h / 24)} d ago`;
+}
+
+// One global 30s timer. Idempotent: re-invoking start clears any existing
+// timer first, so route changes (or anything else that calls start) can
+// never accumulate duplicates.
+let _syncIndicatorTimer = null;
+function startSyncIndicatorTimer() {
+  if (_syncIndicatorTimer) clearInterval(_syncIndicatorTimer);
+  _syncIndicatorTimer = setInterval(updateSyncIndicator, 30000);
+  updateSyncIndicator();
+}
+function stopSyncIndicatorTimer() {
+  if (_syncIndicatorTimer) { clearInterval(_syncIndicatorTimer); _syncIndicatorTimer = null; }
+}
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", startSyncIndicatorTimer);
+  } else {
+    startSyncIndicatorTimer();
   }
 }

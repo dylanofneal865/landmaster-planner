@@ -311,6 +311,7 @@ function _setupRealtimeSubscriptions() {
 }
 
 let _redrawTimer = null;
+let _scrollRestoreRAF = null;
 function _applyAndRefresh() {
   _suppressNextLocalChange = true;
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
@@ -319,11 +320,25 @@ function _applyAndRefresh() {
   // Debounce redraws so a burst of realtime events causes one re-render, not many
   clearTimeout(_redrawTimer);
   _redrawTimer = setTimeout(() => {
+    // Realtime re-renders shouldn't snap the page back to the top. navigate()
+    // intentionally resets main.scrollTop for user-initiated route changes,
+    // so we capture the position around the call and restore it once the new
+    // DOM is laid out. Cancel any prior pending restore so a stale snapshot
+    // from an earlier burst can't clobber the user's current scroll position.
+    if (_scrollRestoreRAF !== null) cancelAnimationFrame(_scrollRestoreRAF);
+    const main = document.getElementById("main");
+    const savedScrollTop = main ? main.scrollTop : 0;
     const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
     if (currentRoute && typeof navigate === "function") {
       navigate(currentRoute);
     } else if (typeof refresh === "function") {
       refresh();
+    }
+    if (main) {
+      _scrollRestoreRAF = requestAnimationFrame(() => {
+        main.scrollTop = savedScrollTop;
+        _scrollRestoreRAF = null;
+      });
     }
   }, 150);
 }

@@ -83,7 +83,6 @@ registerRoute("settings", () => {
             <div class="grow"></div>
             <span class="muted tiny">${lastPoSync ? 'Last sync ' + fmtDate(lastPoSync) : 'Awaiting first sync'}</span>
           </div>
-          <div class="help">The scheduled function pulls POs from the <span class="mono">LMInventoryPlannerPOLines</span> inquiry every 2 minutes and writes them to Supabase; the app receives them live.</div>
         </div>
       </div>
 
@@ -99,7 +98,6 @@ registerRoute("settings", () => {
             <div class="grow"></div>
             <span class="muted tiny">${lastOnHandSync ? 'Last sync ' + fmtDate(lastOnHandSync) : 'Awaiting first sync'}</span>
           </div>
-          <div class="help">The scheduled function pulls on-hand quantities from the <span class="mono">LM Planner Inventory</span> inquiry every 2 minutes and writes them to Supabase; the app receives them live.</div>
         </div>
       </div>
 
