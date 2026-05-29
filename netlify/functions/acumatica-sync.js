@@ -278,14 +278,22 @@ async function runPOSync(ctx) {
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
   const headerExpectedByOrder = new Map();
+  const headerBuyerByOrder = new Map();
+  const headerCreatedDateByOrder = new Map();
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
 
-    // PO header "Promised On" — same value on every line of a PO; first-wins.
+    // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
       headerExpectedByOrder.set(num, toIso(get("ExpectedDate")));
+    }
+    if (!headerBuyerByOrder.has(num)) {
+      headerBuyerByOrder.set(num, (get("CreatedBy") || "").trim());
+    }
+    if (!headerCreatedDateByOrder.has(num)) {
+      headerCreatedDateByOrder.set(num, toIso(get("Date")));
     }
 
     const lineNbrRaw = get("LineNbr");
@@ -373,10 +381,10 @@ async function runPOSync(ctx) {
       supplier: first.vendorName || "",
       vendor: first.vendor || "",
       source: "acumatica",
-      buyer: prev.buyer || "",
+      buyer: prev.buyer || headerBuyerByOrder.get(num) || "",
       createdBy: prev.createdBy || "",
       notes: prev.notes || "",
-      createdDate: prev.createdDate || null,
+      createdDate: headerCreatedDateByOrder.get(num) || null,
       expectedDate: headerExpectedByOrder.get(num) || first.expectedDate || null,
       status: poStatus,
       acumStatus: rollupAcumaticaStatus(lines),
