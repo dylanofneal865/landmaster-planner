@@ -9,6 +9,8 @@
 registerRoute("settings", () => {
   const s = DB.settings;
   const dbSize = ((JSON.stringify(DB).length / 1024)).toFixed(1);
+  const poLineCount = (DB.pos || []).reduce((sum, po) => sum + (po.lines?.length || 0), 0);
+  const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
   $("#main").innerHTML = `
     <div class="page">
       <div class="page-head">
@@ -70,16 +72,32 @@ registerRoute("settings", () => {
 
       <div class="panel">
         <div class="panel-head">
+          <div class="panel-title">Purchase Orders</div>
+          <div class="panel-sub">Sourced live from Acumatica via Supabase — no manual file needed.</div>
+        </div>
+        <div class="panel-body">
+          <div class="row gap-md" style="align-items:center">
+            <span class="pill ok">● Acumatica · live</span>
+            <span class="mono dim" style="font-size:11px">${DB.pos.length} POs · ${poLineCount} lines</span>
+            <div class="grow"></div>
+            <span class="muted tiny">${lastPoSync ? 'Last sync ' + fmtDate(lastPoSync) : 'Awaiting first sync'}</span>
+          </div>
+          <div class="help">The scheduled function pulls POs from the <span class="mono">LMInventoryPlannerPOLines</span> inquiry every 2 minutes and writes them to Supabase; the app receives them live.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
           <div class="panel-title">Live Excel sync</div>
-          <div class="panel-sub">${fsSupported() ? 'PO Lines: read-only from your Acumatica scheduled export (polls every 60s). On-Hand and Usage: outbound writes.' : '<span class="text-warn">Your browser does not support live Excel sync. Use Chrome, Edge, or Brave for this feature.</span>'}</div>
+          <div class="panel-sub">${fsSupported() ? 'On-Hand and Usage workbooks: live two-way Excel sync (outbound writes, pull to read back).' : '<span class="text-warn">Your browser does not support live Excel sync. Use Chrome, Edge, or Brave for this feature.</span>'}</div>
         </div>
         <div class="panel-body">
           ${fsSupported() ? `
             <div class="settings-grid" style="grid-template-columns: 200px 1fr">
-              ${["pos","onhand","usage"].map(k => {
+              ${["onhand","usage"].map(k => {
                 const handle = _fileHandles[k];
                 const linked = !!handle;
-                const labels = {pos:"PO Lines workbook",onhand:"On-Hand workbook",usage:"Usage workbook"};
+                const labels = {onhand:"On-Hand workbook",usage:"Usage workbook"};
                 return `
                   <label>${labels[k]}</label>
                   <div>
@@ -88,14 +106,11 @@ registerRoute("settings", () => {
                         <span class="pill ok">● Linked</span>
                         <span class="mono dim" style="font-size:11px">${esc(handle.name)}</span>
                         <div class="grow"></div>
-                        ${k === 'pos' ? '' : `<button class="btn sm" onclick="syncWorkbookNow('${k}')">↑ Push now</button>`}
-                        ${k === 'pos'
-                          ? `<button class="btn sm" onclick="syncPOsFromAcumatica().then(refresh)">↓ Pull from Acumatica</button>`
-                          : `<button class="btn sm" onclick="pullFromExcel('${k}')">↓ Pull from Excel</button>`}
+                        <button class="btn sm" onclick="syncWorkbookNow('${k}')">↑ Push now</button>
+                        <button class="btn sm" onclick="pullFromExcel('${k}')">↓ Pull from Excel</button>
                         <button class="btn sm ghost" onclick="disconnectFile('${k}').then(refresh)">Unlink</button>
                       </div>
-                      <div class="help">${k === 'pos' ? 'Read-only from your Acumatica export. Polls every 60s; click ↓ to pull immediately.' :
-                                          k === 'onhand' ? 'Auto-writes the full inventory snapshot. Pull reads on-hand counts back from Excel — perfect for warehouse cycle counts.' :
+                      <div class="help">${k === 'onhand' ? 'Auto-writes the full inventory snapshot. Pull reads on-hand counts back from Excel — perfect for warehouse cycle counts.' :
                                           'Auto-writes every usage transaction. Pull merges new rows added in Excel.'}</div>
                     ` : `
                       <div class="row gap-md" style="align-items:center">

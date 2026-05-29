@@ -11,11 +11,11 @@
    ============================================================ */
 const IDB_NAME = "landmaster-fs";
 const IDB_STORE = "handles";
-const FS_KINDS = ["pos", "onhand", "usage"];
-const _fileHandles = { pos: null, onhand: null, usage: null };
-const _lastSync = { pos: null, onhand: null, usage: null };
-let _lastPosModified = null;
-let _posPollTimer = null;
+// POs are sourced from Acumatica → Supabase (see netlify/functions/acumatica-sync.js).
+// Only the On-Hand and Usage workbooks remain as live two-way Excel sync targets.
+const FS_KINDS = ["onhand", "usage"];
+const _fileHandles = { onhand: null, usage: null };
+const _lastSync = { onhand: null, usage: null };
 
 function fsSupported() {
   return typeof window !== "undefined"
@@ -67,7 +67,6 @@ async function loadFileHandles() {
       if (h) _fileHandles[k] = h;
     } catch (e) { /* ignore */ }
   }
-  if (_fileHandles.pos) { await syncPOsFromAcumatica({silent:true}); startPOPolling(); }
 }
 
 async function pickAndLinkFile(kind, mode = "save") {
@@ -81,9 +80,7 @@ async function pickAndLinkFile(kind, mode = "save") {
   };
   let handle;
   try {
-    if (kind === "pos") {
-      [handle] = await window.showOpenFilePicker({ ...opts, multiple: false });
-    } else if (mode === "save") {
+    if (mode === "save") {
       handle = await window.showSaveFilePicker(opts);
     } else {
       [handle] = await window.showOpenFilePicker({ ...opts, multiple: false });
@@ -95,25 +92,15 @@ async function pickAndLinkFile(kind, mode = "save") {
   }
   await idbSet(`fs.${kind}`, handle);
   _fileHandles[kind] = handle;
-  if (kind === "pos") {
-    _lastPosModified = null;
-    await syncPOsFromAcumatica();
-    startPOPolling();
-  } else {
-    // Immediately write fresh data
-    const wb = buildWorkbook(kind);
-    if (wb) await writeWorkbook(kind, wb);
-  }
+  // Immediately write fresh data
+  const wb = buildWorkbook(kind);
+  if (wb) await writeWorkbook(kind, wb);
   showToast(`${kindLabel(kind)} workbook connected: ${handle.name}`, "ok", "Excel linked");
   updateSyncIndicator();
   return handle;
 }
 
 async function disconnectFile(kind) {
-  if (kind === "pos") {
-    stopPOPolling();
-    _lastPosModified = null;
-  }
   await idbDel(`fs.${kind}`);
   _fileHandles[kind] = null;
   showToast(`${kindLabel(kind)} workbook unlinked`, "info");
@@ -281,7 +268,6 @@ async function pullFromExcel(kind) {
     const wb = XLSX.read(buf, { type: "array", cellDates: true });
     if (kind === "onhand") count = readOnHandRows(wb);
     else if (kind === "usage") count = readUsageRows(wb);
-    else if (kind === "pos") count = readPORows(wb);
     saveDB();
     bumpStatusCache();
     showToast(`Pulled ${count} change${count===1?'':'s'} from ${kindLabel(kind)}.xlsx`, count > 0 ? "ok" : "info");
@@ -348,226 +334,6 @@ function readUsageRows(wb) {
   return count;
 }
 
-function readPORows(wb) {
-  // Read PO line edits — qty, qtyReceived, cost, expectedDate, status, notes
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
-  let count = 0;
-  for (const r of rows) {
-    const poNum = String(r["PO #"]||"").trim();
-    const pn    = String(r["Part #"]||"").trim();
-    if (!poNum || !pn) continue;
-    const po = DB.pos.find(p => p.num === poNum);
-    if (!po) continue;
-    const ln = po.lines.find(l => l.pn === pn);
-    if (!ln) continue;
-    let changed = false;
-    const newQty   = parseFloat(String(r["Qty"]||"").replace(/[^0-9.\-]/g, ""));
-    const newRecv  = parseFloat(String(r["Qty Recv"]||"").replace(/[^0-9.\-]/g, ""));
-    const newCost  = parseFloat(String(r["Unit Cost"]||"").replace(/[^0-9.\-]/g, ""));
-    if (!isNaN(newQty)  && Math.abs(newQty  - (ln.qty||0))         > 0.001) { ln.qty = newQty; changed = true; }
-    if (!isNaN(newRecv) && Math.abs(newRecv - (ln.qtyReceived||0)) > 0.001) { ln.qtyReceived = newRecv; changed = true; }
-    if (!isNaN(newCost) && Math.abs(newCost - (ln.cost||0))        > 0.001) { ln.cost = newCost; changed = true; }
-    // Recompute line status
-    if (changed) {
-      const ord = ln.qty||0, recv = ln.qtyReceived||0;
-      if (ln.status !== "cancelled") {
-        if (recv === 0) ln.status = "open";
-        else if (recv < ord) ln.status = "partial";
-        else if (recv >= ord && ord > 0) ln.status = "received";
-      }
-      logAudit("po-pull", `${poNum} / ${pn} updated from Excel`, { poId: po.id, pn });
-      count++;
-    }
-  }
-  return count;
-}
-
-/* ----- ACUMATICA INBOUND (PO Lines, read-only) ----- */
-function normalizeAcumaticaStatus(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return "";
-  const map = [
-    [/^on\s*hold$/i, "On Hold"],
-    [/^pending\s*approval$/i, "Pending Approval"],
-    [/^pending\s*print(ing)?$/i, "Pending Printing"],
-    [/^pending\s*e?-?mail$/i, "Pending Email"],
-    [/^awaiting\s*link$/i, "Awaiting Link"],
-    [/^open$/i, "Open"],
-    [/^completed$/i, "Completed"],
-    [/^rejected$/i, "Rejected"],
-    [/^cancell?ed$/i, "Canceled"],
-  ];
-  for (const [re, canon] of map) if (re.test(s)) return canon;
-  return s;
-}
-const ACUMATICA_STATUS_PRIORITY = ["On Hold", "Pending Approval", "Pending Printing", "Pending Email", "Awaiting Link", "Open", "Completed", "Rejected", "Canceled"];
-function rollupAcumaticaStatus(lines) {
-  let bestPri = Infinity, best = "", fallback = "";
-  for (const l of (lines || [])) {
-    const s = l.acumStatus || "";
-    if (!s) continue;
-    const pri = ACUMATICA_STATUS_PRIORITY.indexOf(s);
-    if (pri >= 0) { if (pri < bestPri) { bestPri = pri; best = s; } }
-    else if (!fallback) fallback = s;
-  }
-  return best || fallback;
-}
-
-function parseAcumaticaPOWorkbook(arrayBuffer) {
-  const wb = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
-  const ws = wb.Sheets["Data"];
-  if (!ws) return [];
-  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
-  let headerRow = -1;
-  for (let i = 0; i < Math.min(8, aoa.length); i++) {
-    if ((aoa[i] || []).some(c => String(c).trim() === "Order Nbr.")) { headerRow = i; break; }
-  }
-  if (headerRow < 0) return [];
-  const headers = aoa[headerRow].map(h => String(h).trim());
-  const rows = [];
-  for (let i = headerRow + 1; i < aoa.length; i++) {
-    const r = aoa[i];
-    if (!r || r.length === 0) continue;
-    const obj = {};
-    headers.forEach((h, j) => {
-      const v = r[j];
-      obj[h] = typeof v === "string" ? v.replace(/\s+$/, "") : v;
-    });
-    rows.push(obj);
-  }
-  const byOrder = new Map();
-  for (const r of rows) {
-    const num = String(r["Order Nbr."] || "").trim();
-    if (!num) continue;
-    if (!byOrder.has(num)) byOrder.set(num, []);
-    byOrder.get(num).push(r);
-  }
-  const toIso = (v) => {
-    if (!v) return null;
-    const d = v instanceof Date ? v : new Date(v);
-    return isNaN(d) ? null : d.toISOString();
-  };
-  const toNum = (v) => {
-    if (typeof v === "number") return v;
-    if (typeof v === "string") return parseFloat(v.trim().replace(/,/g, "")) || 0;
-    return 0;
-  };
-  const pos = [];
-  for (const [num, group] of byOrder) {
-    const first = group[0];
-    const lines = group.map((r) => {
-      const qty = toNum(r["Order Qty."]);
-      const qtyReceived = toNum(r["Qty. On Receipts"]);
-      const acumStatus = normalizeAcumaticaStatus(r["Status"]);
-      let status;
-      if (qty > 0 && qtyReceived >= qty) status = "received";
-      else if (qtyReceived > 0) status = "partial";
-      else if (acumStatus === "Rejected" || acumStatus === "Canceled") status = "cancelled";
-      else if (acumStatus === "Completed") status = "received";
-      else status = "open";
-      return {
-        id: uid("pl"),
-        pn: String(r["Inventory ID"] || "").trim(),
-        qty,
-        qtyReceived,
-        cost: toNum(r["POLine_unitCost"]),
-        expectedDate: toIso(r["Promised"]),
-        status,
-        acumStatus,
-        lineNbr: r["Line Nbr."],
-        notes: ""
-      };
-    });
-    const allTerm = lines.length > 0 && lines.every(l => l.status === "received" || l.status === "cancelled");
-    const anyReceived = lines.some(l => l.status === "received");
-    const anyProgress = lines.some(l => l.status === "partial" || l.status === "received");
-    let poStatus;
-    if (allTerm && anyReceived) poStatus = "received";
-    else if (anyProgress) poStatus = "in_transit";
-    else poStatus = "submitted";
-    pos.push({
-      id: "po_" + num,
-      num,
-      supplier: String(first["Vendor Name"] || "").trim(),
-      source: "acumatica",
-      buyer: "",
-      createdBy: String(first["Created By"] || "").trim(),
-      notes: "",
-      createdDate: toIso(first["Date"]),
-      expectedDate: toIso(first["Promised"]),
-      status: poStatus,
-      acumStatus: rollupAcumaticaStatus(lines),
-      lines
-    });
-  }
-  return pos;
-}
-
-async function syncPOsFromAcumatica({silent=false}={}) {
-  const handle = _fileHandles.pos;
-  if (!handle) return;
-  if (!await ensurePermission(handle, false)) {
-    if (!silent) showToast("Permission needed for PO Lines file", "warn");
-    return;
-  }
-  try {
-    const file = await handle.getFile();
-    if (file.lastModified === _lastPosModified) return;
-    _lastPosModified = file.lastModified;
-    const buf = await file.arrayBuffer();
-    const incoming = parseAcumaticaPOWorkbook(buf);
-    const incomingNums = new Set(incoming.map(p => p.num));
-    const sig = (po) => JSON.stringify({
-      status: po.status,
-      acumStatus: po.acumStatus || "",
-      createdBy: po.createdBy || "",
-      supplier: po.supplier,
-      expectedDate: po.expectedDate,
-      createdDate: po.createdDate,
-      lines: (po.lines || []).slice()
-        .sort((a, b) => String(a.lineNbr ?? a.pn).localeCompare(String(b.lineNbr ?? b.pn)))
-        .map(l => ({ pn: l.pn, qty: l.qty, qtyReceived: l.qtyReceived, cost: l.cost, expectedDate: l.expectedDate, status: l.status, acumStatus: l.acumStatus || "", lineNbr: l.lineNbr })),
-    });
-    let added = 0, changed = 0, removed = 0;
-    for (const inc of incoming) {
-      const existing = DB.pos.find(p => p.num === inc.num);
-      if (existing) {
-        const before = sig(existing);
-        const buyer = existing.buyer;
-        const notes = existing.notes;
-        Object.assign(existing, inc, { buyer, notes });
-        if (sig(existing) !== before) changed++;
-      } else {
-        DB.pos.push(inc);
-        added++;
-      }
-    }
-    for (const po of DB.pos) {
-      if (po.source === "acumatica" && !incomingNums.has(po.num) && po.status !== "received") {
-        po.status = "received";
-        po.acumStatus = "Completed";
-        removed++;
-      }
-    }
-    saveDB();
-    bumpStatusCache();
-    updateNavBadges();
-    updateTopBar();
-    updateSyncIndicator();
-    if (CURRENT_ROUTE && (added > 0 || changed > 0 || removed > 0)) navigate(CURRENT_ROUTE);
-    if (added > 0 || changed > 0 || removed > 0) patchOpenPODrawer();
-  } catch (e) {
-    if (!silent) showToast(`PO sync failed: ${e.message}`, "crit");
-  }
-}
-
-function startPOPolling() {
-  stopPOPolling();
-  _posPollTimer = setInterval(() => { if (_fileHandles.pos) syncPOsFromAcumatica({silent:true}); }, 60000);
-}
-function stopPOPolling() { if (_posPollTimer) { clearInterval(_posPollTimer); _posPollTimer = null; } }
-
 /* ----- AUTO-SYNC (debounced) ----- */
 let _syncDebounce = null;
 let _syncing = false;
@@ -606,11 +372,11 @@ function updateSyncIndicator(state) {
   if (linked === 0) {
     el.className = "status-pill";
     el.innerHTML = `<span class="dot">○</span> SYNC OFF`;
-  } else if (linked === 3) {
+  } else if (linked === FS_KINDS.length) {
     el.className = "status-pill ok";
-    el.innerHTML = `<span class="dot">●</span> SYNC ON · 3/3`;
+    el.innerHTML = `<span class="dot">●</span> SYNC ON · ${linked}/${FS_KINDS.length}`;
   } else {
     el.className = "status-pill warn";
-    el.innerHTML = `<span class="dot">●</span> SYNC PARTIAL · ${linked}/3`;
+    el.innerHTML = `<span class="dot">●</span> SYNC PARTIAL · ${linked}/${FS_KINDS.length}`;
   }
 }
