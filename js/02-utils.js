@@ -23,8 +23,17 @@ const fmtMoneyDec = (n) => {
 };
 const fmtDate = (d) => {
   if (!d) return "—";
-  const dt = (d instanceof Date) ? d : new Date(d);
-  if (isNaN(dt)) return "—";
+  let dt;
+  // Bare "YYYY-MM-DD" strings (from the Acumatica PO sync) must be parsed as
+  // a local calendar date — `new Date("2026-05-27")` treats it as UTC midnight,
+  // which shifts back one day for US users at render time.
+  if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+    const [y, m, day] = d.split("-").map(Number);
+    dt = new Date(y, m - 1, day);
+  } else {
+    dt = (d instanceof Date) ? d : new Date(d);
+  }
+  if (isNaN(dt.getTime())) return "—";
   return dt.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" });
 };
 const fmtDateLong = (d) => {
@@ -45,9 +54,7 @@ const addDays = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); r
 const ucFirst = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
 const round = (n, d=0) => Math.round(n * Math.pow(10,d)) / Math.pow(10,d);
 const clamp = (n, mn, mx) => Math.max(mn, Math.min(mx, n));
-const displayBuyer = (po) => po && po.source === "acumatica"
-  ? (po.createdBy || "")
-  : (po && po.buyer ? po.buyer : "");
+const displayBuyer = (po) => (po && po.buyer) ? po.buyer : "";
 
 function uid(prefix="id") {
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
