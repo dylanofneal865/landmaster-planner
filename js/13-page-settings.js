@@ -11,6 +11,7 @@ registerRoute("settings", () => {
   const dbSize = ((JSON.stringify(DB).length / 1024)).toFixed(1);
   const poLineCount = (DB.pos || []).reduce((sum, po) => sum + (po.lines?.length || 0), 0);
   const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
+  const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
   $("#main").innerHTML = `
     <div class="page">
       <div class="page-head">
@@ -88,13 +89,29 @@ registerRoute("settings", () => {
 
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title">Live Excel sync</div>
-          <div class="panel-sub">${fsSupported() ? 'On-Hand and Usage workbooks: live two-way Excel sync (outbound writes, pull to read back).' : '<span class="text-warn">Your browser does not support live Excel sync. Use Chrome, Edge, or Brave for this feature.</span>'}</div>
+          <div class="panel-title">On-Hand</div>
+          <div class="panel-sub">Sourced live from Acumatica via Supabase — no manual file needed.</div>
+        </div>
+        <div class="panel-body">
+          <div class="row gap-md" style="align-items:center">
+            <span class="pill ok">● Acumatica · live</span>
+            <span class="mono dim" style="font-size:11px">${DB.parts.length} parts</span>
+            <div class="grow"></div>
+            <span class="muted tiny">${lastOnHandSync ? 'Last sync ' + fmtDate(lastOnHandSync) : 'Awaiting first sync'}</span>
+          </div>
+          <div class="help">The scheduled function pulls on-hand quantities from the <span class="mono">LM Planner Inventory</span> inquiry every 2 minutes and writes them to Supabase; the app receives them live.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">Usage Excel sync</div>
+          <div class="panel-sub">${fsSupported() ? 'Usage workbook: live two-way Excel sync (outbound writes, pull to read back).' : '<span class="text-warn">Your browser does not support live Excel sync. Use Chrome, Edge, or Brave for this feature.</span>'}</div>
         </div>
         <div class="panel-body">
           ${fsSupported() ? `
             <div class="settings-grid" style="grid-template-columns: 200px 1fr">
-              ${["onhand","usage"].map(k => {
+              ${["usage"].map(k => {
                 const handle = _fileHandles[k];
                 const linked = !!handle;
                 const labels = {onhand:"On-Hand workbook",usage:"Usage workbook"};
