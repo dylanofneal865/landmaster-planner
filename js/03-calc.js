@@ -89,8 +89,8 @@ function partStatus(part) {
   if (stockoutDay === Infinity) {
     status = "ok";
     urgency = 9999;
-  } else if (stockoutDay <= lt) {
-    // We will stockout before any new order could arrive
+  } else if (stockoutDay <= reorderBy) {
+    // Cover doesn't reach lead time + safety buffer — order today to keep the cushion.
     status = "critical";
     urgency = stockoutDay; // smaller = more urgent
   } else if (stockoutDay <= reorderBy + warnDays) {
