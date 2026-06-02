@@ -150,8 +150,6 @@ async function cloudInit() {
   // ---- POs ----
   const cloudPos = await _fetchAllPos();
   if (cloudPos !== null) {
-    // TEMP: verify pos boot fetch — remove once confirmed
-    console.log(`[cloud] cloud has ${cloudPos.length} pos, local has ${DB.pos?.length || 0}`);
     if (cloudPos.length === 0 && DB.pos && DB.pos.length > 0) {
       showToast(`Pushing ${DB.pos.length} POs to cloud (one-time)…`, "info", "Cloud sync");
       await _pushAllPos();
@@ -305,8 +303,6 @@ function _setupRealtimeSubscriptions() {
     })
     .subscribe((status) => {
       console.log("[cloud] realtime status:", status);
-      // TEMP: pos shares this channel — log explicitly so we can confirm wiring
-      console.log("[cloud] pos realtime status:", status);
     });
 }
 

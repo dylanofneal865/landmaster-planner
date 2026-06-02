@@ -371,7 +371,6 @@ async function runPOSync(ctx) {
 
   // Build nested PO rows.
   const rows = [];
-  let loggedSample = false;
   for (const [num, lines] of byOrder.entries()) {
     const id = "po_" + num;
     const prev = existingById.get(id) || {};
@@ -408,19 +407,6 @@ async function runPOSync(ctx) {
       lines,
     };
     rows.push({ id, data });
-
-    if (!loggedSample) {
-      // TEMP: verify CreatedBy parses the username field (not _2/_3 siblings).
-      // Remove after confirming in Netlify function logs.
-      log("SAMPLE PO", {
-        num,
-        acumCreatedBy: headerBuyerByOrder.get(num),
-        resolvedBuyer: data.buyer,
-        createdDate: data.createdDate,
-        expectedDate: data.expectedDate,
-      });
-      loggedSample = true;
-    }
   }
 
   // Reconciliation (additive, never delete): a PO previously synced from
