@@ -409,6 +409,34 @@ function bbuOpenImportModal() {
   `);
 }
 
+// Header normalizer: lowercase, strip all non-alphanumeric.
+// "Part #" → "part", "Monthly Rate" → "monthlyrate".
+const _bbuNormHeader = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+const _BBU_PN_HEADERS = new Set([
+  "partnumber", "partno", "part", "pn", "sku", "item", "itemnumber", "material",
+]);
+const _BBU_RATE_HEADERS = new Set([
+  "monthlyrate", "dailyrate", "rate",
+  "monthlyaverage", "averagemonthlydemand",
+  "monthlydemand", "monthlyusage",
+  "averagemonthly", "daily", "monthly",
+]);
+
+function bbuDetectPnColumn(sampleRow) {
+  for (const k of Object.keys(sampleRow)) {
+    if (_BBU_PN_HEADERS.has(_bbuNormHeader(k))) return k;
+  }
+  return null;
+}
+
+function bbuDetectRateColumn(sampleRow) {
+  for (const k of Object.keys(sampleRow)) {
+    if (_BBU_RATE_HEADERS.has(_bbuNormHeader(k))) return k;
+  }
+  return null;
+}
+
 function bbuApplyImport() {
   const fileInput = $("#bbu-import-file");
   const file = fileInput?.files?.[0];
@@ -423,35 +451,47 @@ function bbuApplyImport() {
       const ws = wb.Sheets[wb.SheetNames[0]];
       const sheetRows = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
       if (!sheetRows.length) { showToast("Sheet is empty", "warn"); return; }
-      const cols = detectColumns(sheetRows[0]);
-      if (!cols.pn || !cols.daily) {
-        showToast(`Couldn't detect ${!cols.pn ? 'PN' : 'rate'} column. Headers: ${Object.keys(sheetRows[0]).join(", ")}`, "crit");
+
+      const pnCol = bbuDetectPnColumn(sheetRows[0]);
+      const rateCol = bbuDetectRateColumn(sheetRows[0]);
+      if (!pnCol || !rateCol) {
+        showToast(`Couldn't detect ${!pnCol ? 'PN' : 'rate'} column. Headers: ${Object.keys(sheetRows[0]).join(", ")}`, "crit", "Import failed", 8000);
         return;
       }
-      const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p.pn)).map(p => p.pn));
-      let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0;
+
+      // Bucket every row by what we'll do with it.
+      const buckets = {
+        newlyClassified: [],   // null/empty itemType → set base_bom + write daily
+        reRated: [],           // already base_bom → write daily only
+        skippedOtherType: [],  // service / options / do_not_order / kit → skip
+        notInCatalog: [],      // pn not in DB.parts
+        invalidRate: [],       // unparseable / negative rate
+      };
+
       for (const row of sheetRows) {
-        const pn = String(row[cols.pn] || "").trim();
-        if (!pn || !baseBomPns.has(pn)) { if (pn) skippedNotBaseBom++; continue; }
-        const raw = parseFloat(String(row[cols.daily] || "").replace(/[^0-9.\-]/g, ""));
-        if (!isFinite(raw) || raw < 0) { skippedInvalid++; continue; }
+        const pn = String(row[pnCol] || "").trim();
+        if (!pn) continue;
+        const rawCell = row[rateCol];
+        const raw = parseFloat(String(rawCell || "").replace(/[^0-9.\-]/g, ""));
+        if (!isFinite(raw) || raw < 0) {
+          buckets.invalidRate.push({ pn, raw: rawCell });
+          continue;
+        }
         const newDaily = raw / divisor;
         const part = DB.parts.find(p => p.pn === pn);
-        const old = Number(part.daily) || 0;
-        if (Math.abs(newDaily - old) < 0.0001) { unchanged++; continue; }
-        part.daily = newDaily;
-        updated++;
+        if (!part) { buckets.notInCatalog.push({ pn }); continue; }
+        if (isKit(pn)) { buckets.skippedOtherType.push({ pn, part, itemType: "kit" }); continue; }
+        const itemType = part.itemType;
+        if (itemType === "base_bom") {
+          buckets.reRated.push({ pn, part, oldDaily: Number(part.daily) || 0, newDaily });
+        } else if (!itemType) {
+          buckets.newlyClassified.push({ pn, part, oldDaily: Number(part.daily) || 0, newDaily });
+        } else {
+          buckets.skippedOtherType.push({ pn, part, itemType });
+        }
       }
-      logAudit("daily-bulk-edit", `Base BOM rates imported from ${file.name}: ${updated} updated, ${unchanged} unchanged, ${skippedNotBaseBom} not base_bom, ${skippedInvalid} invalid`, { source: file.name, mode });
-      saveDB();
-      bumpStatusCache();
-      closeModal();
-      const tail = [];
-      if (unchanged) tail.push(`${unchanged} unchanged`);
-      if (skippedNotBaseBom) tail.push(`${skippedNotBaseBom} not base_bom`);
-      if (skippedInvalid) tail.push(`${skippedInvalid} invalid`);
-      showToast(`Updated ${updated} rate${updated === 1 ? '' : 's'}${tail.length ? ' · ' + tail.join(' · ') : ''}`, updated > 0 ? "ok" : "warn");
-      refresh();
+
+      bbuShowImportPreview(buckets, mode, file.name, sheetRows.length, pnCol, rateCol);
     } catch (err) {
       console.error("BBU import failed:", err);
       showToast("Import failed: " + err.message, "crit");
@@ -459,6 +499,127 @@ function bbuApplyImport() {
   };
   reader.onerror = () => showToast("Failed to read file", "crit");
   reader.readAsArrayBuffer(file);
+}
+
+function bbuShowImportPreview(buckets, mode, filename, totalRows, pnCol, rateCol) {
+  // Stash so the Apply button can commit without re-parsing.
+  window._bbuPendingImport = { buckets, mode, filename };
+
+  const SAMPLE = 20;
+  const skippedTypeList = buckets.skippedOtherType.slice(0, SAMPLE);
+  const notInCatList = buckets.notInCatalog.slice(0, SAMPLE);
+  const willApply = buckets.newlyClassified.length + buckets.reRated.length;
+
+  openModal(`
+    <div class="modal-head">
+      <div style="font-size:13px;font-weight:600">Import preview · ${esc(filename)}</div>
+      <div class="muted tiny" style="margin-top:4px">${totalRows} file row${totalRows === 1 ? '' : 's'} · PN col: <span class="mono">${esc(pnCol)}</span> · rate col: <span class="mono">${esc(rateCol)}</span> · mode: <strong>${esc(mode)}</strong>${mode === 'monthly' ? ' (÷30)' : ''}</div>
+    </div>
+    <div class="modal-body">
+      <div class="stat-strip" style="margin-bottom:14px">
+        <div class="stat"><div class="stat-label">Newly classified</div><div class="stat-value ok">${buckets.newlyClassified.length}</div></div>
+        <div class="stat"><div class="stat-label">Re-rated</div><div class="stat-value">${buckets.reRated.length}</div></div>
+        <div class="stat"><div class="stat-label">Different type</div><div class="stat-value ${buckets.skippedOtherType.length > 0 ? 'warn' : ''}">${buckets.skippedOtherType.length}</div></div>
+        <div class="stat"><div class="stat-label">Not in catalog</div><div class="stat-value ${buckets.notInCatalog.length > 0 ? 'warn' : ''}">${buckets.notInCatalog.length}</div></div>
+      </div>
+
+      <p class="muted tiny" style="margin:0 0 14px">
+        Apply will: set <strong>itemType = base_bom</strong> AND write daily on ${buckets.newlyClassified.length} part${buckets.newlyClassified.length === 1 ? '' : 's'},
+        and update daily on ${buckets.reRated.length} existing base_bom part${buckets.reRated.length === 1 ? '' : 's'}.
+        Other buckets are left untouched.
+      </p>
+
+      ${buckets.skippedOtherType.length > 0 ? `
+        <div class="dr-section">Skipped — already classified (${buckets.skippedOtherType.length})</div>
+        <div class="tbl-wrap" style="max-height:200px;overflow-y:auto;margin-bottom:10px">
+          <table class="tbl">
+            <thead><tr><th>Part</th><th>Description</th><th>Current Type</th></tr></thead>
+            <tbody>
+              ${skippedTypeList.map(b => `
+                <tr><td class="pn">${esc(b.pn)}</td><td>${esc(b.part?.desc || '—')}</td><td class="dim">${esc(b.itemType)}</td></tr>
+              `).join("")}
+              ${buckets.skippedOtherType.length > SAMPLE ? `<tr><td colspan="3" class="muted center tiny" style="padding:6px">…and ${buckets.skippedOtherType.length - SAMPLE} more</td></tr>` : ""}
+            </tbody>
+          </table>
+        </div>
+        <p class="muted tiny" style="margin:0 0 14px">These parts already have an item type set. Change them manually via the part detail drawer if you want them on Base BOM.</p>
+      ` : ""}
+
+      ${buckets.notInCatalog.length > 0 ? `
+        <div class="dr-section">Skipped — not in catalog (${buckets.notInCatalog.length})</div>
+        <div class="tag-row" style="margin-bottom:10px">
+          ${notInCatList.map(b => `<span class="tag">${esc(b.pn)}</span>`).join("")}
+          ${buckets.notInCatalog.length > SAMPLE ? `<span class="muted tiny" style="margin-left:8px">…and ${buckets.notInCatalog.length - SAMPLE} more</span>` : ""}
+        </div>
+        <p class="muted tiny" style="margin:0 0 14px">These PNs aren't in the catalog. Add them via Parts Catalog → + Add part if you want them rated.</p>
+      ` : ""}
+
+      ${buckets.invalidRate.length > 0 ? `
+        <div class="dr-section">Skipped — invalid rate (${buckets.invalidRate.length})</div>
+        <p class="muted tiny" style="margin:0 0 14px">${buckets.invalidRate.length} row${buckets.invalidRate.length === 1 ? '' : 's'} had an unparseable or negative rate value.</p>
+      ` : ""}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" onclick="bbuCommitImport()" ${willApply === 0 ? 'disabled' : ''}>
+        Apply ${willApply} row${willApply === 1 ? '' : 's'}
+      </button>
+    </div>
+  `);
+}
+
+function bbuCommitImport() {
+  const pending = window._bbuPendingImport;
+  if (!pending) { showToast("Nothing to apply", "warn"); return; }
+  const { buckets, mode, filename } = pending;
+
+  let newlyClassifiedApplied = 0;
+  let reRatedApplied = 0;
+  let reRatedUnchanged = 0;
+
+  for (const b of buckets.newlyClassified) {
+    const part = b.part;
+    if (!part) continue;
+    part.itemType = "base_bom";
+    part.daily = b.newDaily;
+    newlyClassifiedApplied++;
+  }
+  for (const b of buckets.reRated) {
+    const part = b.part;
+    if (!part) continue;
+    const old = Number(part.daily) || 0;
+    if (Math.abs(b.newDaily - old) < 0.0001) { reRatedUnchanged++; continue; }
+    part.daily = b.newDaily;
+    reRatedApplied++;
+  }
+
+  logAudit(
+    "daily-bulk-edit",
+    `Base BOM rate import (${filename}): ${newlyClassifiedApplied} newly classified as base_bom + rated, ${reRatedApplied} re-rated, ${reRatedUnchanged} unchanged, ${buckets.skippedOtherType.length} skipped (other type), ${buckets.notInCatalog.length} skipped (not in catalog), ${buckets.invalidRate.length} invalid`,
+    {
+      source: filename, mode,
+      newlyClassified: newlyClassifiedApplied,
+      reRated: reRatedApplied,
+      unchanged: reRatedUnchanged,
+      skippedOtherType: buckets.skippedOtherType.length,
+      notInCatalog: buckets.notInCatalog.length,
+      invalidRate: buckets.invalidRate.length,
+    }
+  );
+  saveDB();
+  bumpStatusCache();
+  closeModal();
+  window._bbuPendingImport = null;
+
+  const tail = [];
+  if (reRatedUnchanged) tail.push(`${reRatedUnchanged} unchanged`);
+  if (buckets.skippedOtherType.length) tail.push(`${buckets.skippedOtherType.length} other type`);
+  if (buckets.notInCatalog.length) tail.push(`${buckets.notInCatalog.length} not in catalog`);
+  if (buckets.invalidRate.length) tail.push(`${buckets.invalidRate.length} invalid`);
+
+  const totalApplied = newlyClassifiedApplied + reRatedApplied;
+  showToast(`Applied: ${newlyClassifiedApplied} classified, ${reRatedApplied} re-rated${tail.length ? ' · ' + tail.join(' · ') : ''}`, totalApplied > 0 ? "ok" : "warn");
+  refresh();
 }
 
 function bbuOpenPasteModal() {
