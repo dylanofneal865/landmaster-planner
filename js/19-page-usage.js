@@ -177,8 +177,362 @@ function renderUsageFor(itemType) {
     </div>`;
 }
 registerRoute("usage",          () => renderUsageFor(null));
-registerRoute("base-bom-usage", () => renderUsageFor("base_bom"));
+registerRoute("base-bom-usage", renderBaseBomUsage);
 registerRoute("options-usage",  () => renderUsageFor("options"));
+
+/* ============================================================
+   BASE BOM USAGE — rate-management surface (not a transaction tracker)
+   Edits part.daily on base_bom parts only; feeds the Base BOM Queue.
+   ============================================================ */
+let BBU_STATE = {
+  search: "",
+  supplier: "",
+  sortBy: "missing",       // missing | mostUsed | leastUsed | alpha
+  displayMode: "daily",    // daily | monthly
+};
+
+function bbuBaseBomParts() {
+  return partsWithStatus().filter(p => p.itemType === "base_bom" && !p.isKit);
+}
+
+function renderBaseBomUsage() {
+  const parts = bbuBaseBomParts();
+
+  // Filter
+  let rows = parts.slice();
+  if (BBU_STATE.search) {
+    const q = BBU_STATE.search.toLowerCase();
+    rows = rows.filter(p => p.pn.toLowerCase().includes(q) || (p.desc || "").toLowerCase().includes(q));
+  }
+  if (BBU_STATE.supplier) rows = rows.filter(p => p.supplier === BBU_STATE.supplier);
+
+  // Sort
+  rows.sort((a, b) => {
+    const aDaily = Number(a.daily) || 0;
+    const bDaily = Number(b.daily) || 0;
+    switch (BBU_STATE.sortBy) {
+      case "missing": {
+        const aHas = aDaily > 0 ? 1 : 0;
+        const bHas = bDaily > 0 ? 1 : 0;
+        if (aHas !== bHas) return aHas - bHas;   // missing (0) sorts first
+        return String(a.pn).localeCompare(String(b.pn));
+      }
+      case "mostUsed":  return bDaily - aDaily;
+      case "leastUsed": return aDaily - bDaily;
+      case "alpha":
+      default:          return String(a.pn).localeCompare(String(b.pn));
+    }
+  });
+
+  // Stats over the unfiltered base_bom set
+  const total = parts.length;
+  const rated = parts.filter(p => (Number(p.daily) || 0) > 0);
+  const withRate = rated.length;
+  const withoutRate = total - withRate;
+  const avgDaily = withRate > 0 ? rated.reduce((s, p) => s + (Number(p.daily) || 0), 0) / withRate : 0;
+
+  const suppliers = [...new Set(parts.map(p => p.supplier).filter(Boolean))].sort();
+  const isMonthly = BBU_STATE.displayMode === "monthly";
+
+  $("#main").innerHTML = `
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <div class="page-title">Base BOM Usage</div>
+          <div class="page-sub mono">DAILY-USE RATES FOR BASE BOM PARTS · FEEDS THE BASE BOM QUEUE AND STOCKOUT PROJECTIONS</div>
+        </div>
+        <div class="page-actions">
+          <button class="btn" onclick="bbuOpenImportModal()">📥 Import rates</button>
+          <button class="btn" onclick="bbuOpenPasteModal()">📋 Paste rates</button>
+          <button class="btn" onclick="bbuExportRates()">📤 Export current rates</button>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <div class="kpi">
+          <div class="kpi-label">Total Base BOM Parts</div>
+          <div class="kpi-value">${total}</div>
+          <div class="kpi-foot">in catalog</div>
+        </div>
+        <div class="kpi ${withRate > 0 ? 'ok' : ''}">
+          <div class="kpi-label">With Rate</div>
+          <div class="kpi-value">${withRate}</div>
+          <div class="kpi-foot">daily &gt; 0</div>
+        </div>
+        <div class="kpi ${withoutRate > 0 ? 'warn' : ''}">
+          <div class="kpi-label">Without Rate</div>
+          <div class="kpi-value">${withoutRate}</div>
+          <div class="kpi-foot">need seeding</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Avg Daily</div>
+          <div class="kpi-value">${fmtNum(avgDaily, 2)}</div>
+          <div class="kpi-foot">across rated parts</div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div>
+          <div class="panel">
+            <div class="filterbar">
+              <div class="search-input">
+                <input class="input" placeholder="Search part # or description…" value="${esc(BBU_STATE.search)}"
+                  onchange="BBU_STATE.search = this.value; refresh()"
+                  onkeydown="if(event.key === 'Enter'){ BBU_STATE.search = this.value; refresh(); }">
+              </div>
+              <select class="select" onchange="BBU_STATE.supplier = this.value; refresh()">
+                <option value="">All suppliers</option>
+                ${suppliers.map(s => `<option value="${esc(s)}" ${BBU_STATE.supplier === s ? 'selected' : ''}>${esc(s)}</option>`).join("")}
+              </select>
+              <select class="select" onchange="BBU_STATE.sortBy = this.value; refresh()">
+                <option value="missing"   ${BBU_STATE.sortBy === 'missing'   ? 'selected' : ''}>No-rate first</option>
+                <option value="mostUsed"  ${BBU_STATE.sortBy === 'mostUsed'  ? 'selected' : ''}>Most-used</option>
+                <option value="leastUsed" ${BBU_STATE.sortBy === 'leastUsed' ? 'selected' : ''}>Least-used</option>
+                <option value="alpha"     ${BBU_STATE.sortBy === 'alpha'     ? 'selected' : ''}>Alphabetical</option>
+              </select>
+              <div class="grow"></div>
+              <span class="muted tiny">Show as:</span>
+              <select class="select" onchange="BBU_STATE.displayMode = this.value; refresh()">
+                <option value="daily"   ${!isMonthly ? 'selected' : ''}>Daily</option>
+                <option value="monthly" ${isMonthly  ? 'selected' : ''}>Monthly (×30)</option>
+              </select>
+            </div>
+            <div class="panel-body flush">
+              ${rows.length === 0 ? `
+                <div class="empty">
+                  <div class="empty-title">${total === 0 ? 'No base BOM parts in catalog' : 'No matches'}</div>
+                  <div class="empty-msg">${total === 0
+                    ? 'Set <strong>Item Type = Base BOM</strong> on a part via the part detail drawer to populate this page.'
+                    : 'Adjust search, supplier filter, or sort to see rows.'}</div>
+                </div>
+              ` : `
+                <div class="tbl-wrap">
+                  <table class="tbl">
+                    <thead><tr>
+                      <th>Part</th>
+                      <th>Description</th>
+                      <th>Supplier</th>
+                      <th class="right">On Hand</th>
+                      <th class="right">${isMonthly ? 'Monthly Rate' : 'Daily Rate'}</th>
+                      <th></th>
+                    </tr></thead>
+                    <tbody>
+                      ${rows.slice(0, 500).map(p => {
+                        const d = Number(p.daily) || 0;
+                        const missing = d <= 0;
+                        const shown = isMonthly ? d * 30 : d;
+                        return `
+                          <tr>
+                            <td class="pn clickable" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}</td>
+                            <td class="clickable" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc || '')}</td>
+                            <td class="dim clickable" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier || '')}</td>
+                            <td class="right num clickable" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onHand)}</td>
+                            <td class="right">
+                              <input class="input num" type="number" min="0" step="0.01"
+                                value="${missing ? '' : shown}"
+                                placeholder="—"
+                                onclick="event.stopPropagation()"
+                                onblur="bbuApplyRateFromInput('${esc(p.pn)}', this.value)"
+                                onkeydown="if(event.key==='Enter'){this.blur()}"
+                                style="width:100px;text-align:right">
+                            </td>
+                            <td>${missing ? '<span class="pill warn">MISSING RATE</span>' : ''}</td>
+                          </tr>
+                        `;
+                      }).join("")}
+                    </tbody>
+                  </table>
+                  ${rows.length > 500 ? `<div class="muted center tiny" style="padding:14px">Showing first 500 of ${rows.length}. Use search to narrow.</div>` : ""}
+                </div>
+              `}
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">How rates work</div></div>
+            <div class="panel-body" style="font-size:12px;color:var(--t2);line-height:1.6">
+              <p>Daily-use rates here feed the <strong>Base BOM Queue</strong>'s stockout projections.</p>
+              <p>Set rates by <strong>importing a sheet</strong>, <strong>pasting rows</strong>, or <strong>editing inline</strong>. Each change saves immediately and syncs to Supabase.</p>
+              <p>Rows flagged <span class="pill warn">MISSING RATE</span> contribute nothing to demand and won't be flagged for reorder.</p>
+              <p>Service usage is tracked separately and isn't affected by changes here.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function bbuApplyRateFromInput(pn, raw) {
+  const part = DB.parts.find(p => p.pn === pn);
+  if (!part) return;
+  const value = String(raw).trim();
+  let newDaily;
+  if (value === "") {
+    newDaily = 0;
+  } else {
+    const num = parseFloat(value);
+    if (!isFinite(num) || num < 0) { showToast(`Invalid rate for ${pn}`, "warn"); return; }
+    newDaily = BBU_STATE.displayMode === "monthly" ? num / 30 : num;
+  }
+  const old = Number(part.daily) || 0;
+  if (Math.abs(newDaily - old) < 0.0001) return; // no-op — avoids spurious audit/sync
+  part.daily = newDaily;
+  logAudit("daily-edit", `${pn}: daily ${old.toFixed(3)} → ${newDaily.toFixed(3)} (Base BOM Usage)`, { pn, oldDaily: old, newDaily });
+  saveDB();
+  bumpStatusCache();
+  // No refresh() — keeps focus available for rapid multi-row entry.
+  // Stats and MISSING pills update on the next manual refresh / navigation.
+}
+
+function bbuOpenImportModal() {
+  openModal(`
+    <div class="modal-head">
+      <div style="font-size:13px;font-weight:600">Import base BOM rates</div>
+      <div class="muted tiny" style="margin-top:4px">CSV or XLSX with a PN column and a daily-rate (or monthly-rate) column. Only updates existing base_bom parts; no new parts created.</div>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>File</label>
+        <input type="file" id="bbu-import-file" accept=".csv,.xlsx,.xls">
+      </div>
+      <div style="margin-top:10px">
+        <label class="row" style="gap:6px;margin-bottom:6px"><input type="radio" name="bbu-imp-mode" value="daily" checked> <span>Rate column is <strong>daily</strong> (units / day)</span></label>
+        <label class="row" style="gap:6px"><input type="radio" name="bbu-imp-mode" value="monthly"> <span>Rate column is <strong>monthly</strong> (will divide by 30)</span></label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" onclick="bbuApplyImport()">Read file</button>
+    </div>
+  `);
+}
+
+function bbuApplyImport() {
+  const fileInput = $("#bbu-import-file");
+  const file = fileInput?.files?.[0];
+  if (!file) { showToast("Pick a file first", "warn"); return; }
+  const mode = document.querySelector('input[name="bbu-imp-mode"]:checked')?.value || "daily";
+  const divisor = mode === "monthly" ? 30 : 1;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: "array", cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const sheetRows = XLSX.utils.sheet_to_json(ws, { defval: "", raw: false });
+      if (!sheetRows.length) { showToast("Sheet is empty", "warn"); return; }
+      const cols = detectColumns(sheetRows[0]);
+      if (!cols.pn || !cols.daily) {
+        showToast(`Couldn't detect ${!cols.pn ? 'PN' : 'rate'} column. Headers: ${Object.keys(sheetRows[0]).join(", ")}`, "crit");
+        return;
+      }
+      const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p.pn)).map(p => p.pn));
+      let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0;
+      for (const row of sheetRows) {
+        const pn = String(row[cols.pn] || "").trim();
+        if (!pn || !baseBomPns.has(pn)) { if (pn) skippedNotBaseBom++; continue; }
+        const raw = parseFloat(String(row[cols.daily] || "").replace(/[^0-9.\-]/g, ""));
+        if (!isFinite(raw) || raw < 0) { skippedInvalid++; continue; }
+        const newDaily = raw / divisor;
+        const part = DB.parts.find(p => p.pn === pn);
+        const old = Number(part.daily) || 0;
+        if (Math.abs(newDaily - old) < 0.0001) { unchanged++; continue; }
+        part.daily = newDaily;
+        updated++;
+      }
+      logAudit("daily-bulk-edit", `Base BOM rates imported from ${file.name}: ${updated} updated, ${unchanged} unchanged, ${skippedNotBaseBom} not base_bom, ${skippedInvalid} invalid`, { source: file.name, mode });
+      saveDB();
+      bumpStatusCache();
+      closeModal();
+      const tail = [];
+      if (unchanged) tail.push(`${unchanged} unchanged`);
+      if (skippedNotBaseBom) tail.push(`${skippedNotBaseBom} not base_bom`);
+      if (skippedInvalid) tail.push(`${skippedInvalid} invalid`);
+      showToast(`Updated ${updated} rate${updated === 1 ? '' : 's'}${tail.length ? ' · ' + tail.join(' · ') : ''}`, updated > 0 ? "ok" : "warn");
+      refresh();
+    } catch (err) {
+      console.error("BBU import failed:", err);
+      showToast("Import failed: " + err.message, "crit");
+    }
+  };
+  reader.onerror = () => showToast("Failed to read file", "crit");
+  reader.readAsArrayBuffer(file);
+}
+
+function bbuOpenPasteModal() {
+  openModal(`
+    <div class="modal-head">
+      <div style="font-size:13px;font-weight:600">Paste base BOM rates</div>
+      <div class="muted tiny" style="margin-top:4px">One row per line: <span class="mono">PART_NUMBER &lt;TAB&gt; RATE</span> (comma also accepted). Only updates existing base_bom parts.</div>
+    </div>
+    <div class="modal-body">
+      <div style="margin-bottom:10px">
+        <label class="row" style="gap:6px;margin-bottom:6px"><input type="radio" name="bbu-paste-mode" value="daily" checked> <span>Rate is <strong>daily</strong></span></label>
+        <label class="row" style="gap:6px"><input type="radio" name="bbu-paste-mode" value="monthly"> <span>Rate is <strong>monthly</strong> (will divide by 30)</span></label>
+      </div>
+      <div class="field"><label>Paste rows</label>
+        <textarea class="paste-area" id="bbu-paste-area" autofocus placeholder="LM-FR-1000\t0.5&#10;LM-FR-1001\t1.2"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" onclick="bbuApplyPaste()">Apply</button>
+    </div>
+  `);
+}
+
+function bbuApplyPaste() {
+  const txt = $("#bbu-paste-area")?.value || "";
+  if (!txt.trim()) { showToast("Paste some rows first", "warn"); return; }
+  const mode = document.querySelector('input[name="bbu-paste-mode"]:checked')?.value || "daily";
+  const divisor = mode === "monthly" ? 30 : 1;
+  const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p.pn)).map(p => p.pn));
+  const lines = txt.split(/\r?\n/);
+  let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const cells = line.split(/\t|,/).map(s => s.trim());
+    if (cells.length < 2) continue;
+    const pn = cells[0];
+    if (!pn || !baseBomPns.has(pn)) { if (pn) skippedNotBaseBom++; continue; }
+    const raw = parseFloat(cells[1].replace(/[^0-9.\-]/g, ""));
+    if (!isFinite(raw) || raw < 0) { skippedInvalid++; continue; }
+    const newDaily = raw / divisor;
+    const part = DB.parts.find(p => p.pn === pn);
+    const old = Number(part.daily) || 0;
+    if (Math.abs(newDaily - old) < 0.0001) { unchanged++; continue; }
+    part.daily = newDaily;
+    updated++;
+  }
+  logAudit("daily-bulk-edit", `Base BOM rates pasted: ${updated} updated, ${unchanged} unchanged, ${skippedNotBaseBom} not base_bom, ${skippedInvalid} invalid`, { mode });
+  saveDB();
+  bumpStatusCache();
+  closeModal();
+  const tail = [];
+  if (unchanged) tail.push(`${unchanged} unchanged`);
+  if (skippedNotBaseBom) tail.push(`${skippedNotBaseBom} not base_bom`);
+  if (skippedInvalid) tail.push(`${skippedInvalid} invalid`);
+  showToast(`Updated ${updated} rate${updated === 1 ? '' : 's'}${tail.length ? ' · ' + tail.join(' · ') : ''}`, updated > 0 ? "ok" : "warn");
+  refresh();
+}
+
+function bbuExportRates() {
+  const parts = bbuBaseBomParts();
+  const headers = ["Part #", "Description", "Supplier", "On Hand", "Daily Rate", "Monthly Rate"];
+  const out = [headers];
+  for (const p of parts) {
+    const d = Number(p.daily) || 0;
+    out.push([p.pn, p.desc || "", p.supplier || "", p.onHand || 0, d, d * 30]);
+  }
+  const csv = out.map(r => r.map(c => {
+    const s = String(c ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(",")).join("\n");
+  downloadFile(csv, `base-bom-rates-${isoDate(TODAY)}.csv`, "text/csv");
+  showToast(`Exported ${parts.length} base BOM part${parts.length === 1 ? '' : 's'}`, "ok");
+}
 let SERVICE_USAGE_STATE = {
   search: "",
   sortBy: "units",  // units | daily | diff | last
