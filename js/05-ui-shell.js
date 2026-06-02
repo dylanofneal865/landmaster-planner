@@ -83,8 +83,8 @@ function refresh() {
    ============================================================ */
 function updateTopBar() {
   const stats = partsWithStatus();
-  const crit = stats.filter(p => p.status === "critical" && !p.isKit).length;
-  const warn = stats.filter(p => p.status === "warning" && !p.isKit).length;
+  const crit = stats.filter(p => p.status === "critical" && !p.isKit && p.itemType !== "do_not_order").length;
+  const warn = stats.filter(p => p.status === "warning" && !p.isKit && p.itemType !== "do_not_order").length;
   $("#top-stat-date").textContent = TODAY.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }).toUpperCase();
   $("#top-stat-crit").innerHTML = `<span class="dot">●</span> ${crit} CRITICAL`;
   $("#top-stat-warn").innerHTML = `<span class="dot">●</span> ${warn} WARN`;
@@ -110,5 +110,5 @@ function updateNavBadges() {
   setQueueBadge("#badge-options-queue",  stats.filter(p => p.itemType === "options"));
   setQueueBadge("#badge-service-queue",  stats.filter(p => p.itemType === "service"));
   // Backup — legacy badge for the unlinked order-queue route, if anything ever re-adds it.
-  setQueueBadge("#badge-orderqueue", stats);
+  setQueueBadge("#badge-orderqueue", stats.filter(p => p.itemType !== "do_not_order"));
 }

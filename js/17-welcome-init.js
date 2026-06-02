@@ -8,8 +8,8 @@
    ============================================================ */
 function showCriticalNotification() {
   const stats = partsWithStatus();
-  const crit = stats.filter(p => p.status === "critical").length;
-  const warn = stats.filter(p => p.status === "warning").length;
+  const crit = stats.filter(p => p.status === "critical" && p.itemType !== "do_not_order").length;
+  const warn = stats.filter(p => p.status === "warning" && p.itemType !== "do_not_order").length;
   if (crit > 0) {
     showToast(`${crit} part${crit===1?'':'s'} will run out before reorder arrives — check the Order Queue.`, "crit", "⚠ Action required");
   }

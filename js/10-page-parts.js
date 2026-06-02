@@ -173,10 +173,11 @@ function renderPartDetail(part) {
         </div>
         <div class="field"><label>Item Type</label>
           <select class="select" id="pd-itemtype">
-            <option value=""         ${!part.itemType               ? "selected" : ""}>—</option>
-            <option value="base_bom" ${part.itemType === "base_bom" ? "selected" : ""}>Base BOM</option>
-            <option value="options"  ${part.itemType === "options"  ? "selected" : ""}>Options</option>
-            <option value="service"  ${part.itemType === "service"  ? "selected" : ""}>Service</option>
+            <option value=""             ${!part.itemType                   ? "selected" : ""}>—</option>
+            <option value="base_bom"     ${part.itemType === "base_bom"     ? "selected" : ""}>Base BOM</option>
+            <option value="options"      ${part.itemType === "options"      ? "selected" : ""}>Options</option>
+            <option value="service"      ${part.itemType === "service"      ? "selected" : ""}>Service</option>
+            <option value="do_not_order" ${part.itemType === "do_not_order" ? "selected" : ""}>Do Not Order</option>
           </select>
         </div>
       </div>
@@ -392,7 +393,7 @@ function partsHeaderValue(p, key) {
   if (key === "desc") value = p.desc || "";
   if (key === "supplier") value = p.supplier || "";
   if (key === "cls") value = p.isKit ? "Kit" : (p.partClass || "");
-  if (key === "status") value = p.isKit ? "Kit" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK";
+  if (key === "status") value = p.isKit ? "Kit" : p.itemType === "do_not_order" ? "Do Not Order" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK";
   return String(value).trim() || "(Blanks)";
 }
 function partsUniqueHeaderValues(rows, key) {
@@ -405,7 +406,7 @@ function partsApplyHeaderFilters(rows) {
     const desc = String(p.desc || "").toLowerCase();
     const supplier = String(p.supplier || "").toLowerCase();
     const cls = String(p.partClass || "").toLowerCase();
-    const statusLabel = (p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK").toLowerCase();
+    const statusLabel = (p.itemType === "do_not_order" ? "Do Not Order" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK").toLowerCase();
     const hidden = PARTS_STATE.hiddenFilters || { pn: [], desc: [], supplier: [], cls: [], status: [] };
 
     const textMatch =
@@ -615,7 +616,7 @@ registerRoute("parts", () => {
                     <td class="right num dim">${p.ltWeeks || 0}w</td>
                     <td class="right num">${fmtMoneyDec(p.cost)}</td>
                     <td class="right num">${fmtMoney((p.onHand||0)*(p.cost||0))}</td>
-                    <td>${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : `<span class="pill ${p.status==='critical'?'crit':p.status==='warning'?'warn':'ok'}">${p.status==='critical'?'CRIT':p.status==='warning'?'WARN':'OK'}</span>`}</td>
+                    <td>${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : p.itemType === 'do_not_order' ? '<span class="pill muted">DNO</span>' : `<span class="pill ${p.status==='critical'?'crit':p.status==='warning'?'warn':'ok'}">${p.status==='critical'?'CRIT':p.status==='warning'?'WARN':'OK'}</span>`}</td>
                   </tr>
                 `).join("")}
                 ${parts.length > 500 ? `<tr><td colspan="11" class="muted center tiny" style="padding:14px">Showing first 500 of ${parts.length} — use filters to narrow.</td></tr>` : ""}

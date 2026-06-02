@@ -183,8 +183,10 @@ registerRoute("suppliers", () => {
     });
     const a = map.get(key);
     a.parts++;
-    if (p.status === "critical") a.critical++;
-    if (p.status === "warning") a.warning++;
+    if (p.itemType !== "do_not_order") {
+      if (p.status === "critical") a.critical++;
+      if (p.status === "warning") a.warning++;
+    }
     a.ohValue += (p.onHand || 0) * (p.cost || 0);
     if (p.ltWeeks) { a.ltSum += p.ltWeeks; a.ltCount++; }
     a.partsList.push(p);
@@ -280,8 +282,8 @@ function openSupplierDetail(name) {
   const parts = stats.filter(p => p.supplier === name);
   const pos = DB.pos.filter(p => p.supplier === name).sort((a,b) => new Date(b.createdDate) - new Date(a.createdDate));
   const ohValue = parts.reduce((s,p) => s + (p.onHand||0)*(p.cost||0), 0);
-  const crit = parts.filter(p => p.status === "critical").length;
-  const warn = parts.filter(p => p.status === "warning").length;
+  const crit = parts.filter(p => p.status === "critical" && p.itemType !== "do_not_order").length;
+  const warn = parts.filter(p => p.status === "warning" && p.itemType !== "do_not_order").length;
   const avgLT = parts.length > 0 ? round(parts.reduce((s,p) => s + (p.ltWeeks||0), 0) / parts.length, 1) : 0;
   const buyers = [...new Set(parts.map(p => p.buyer).filter(Boolean))];
 
