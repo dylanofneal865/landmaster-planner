@@ -322,13 +322,24 @@ function partsToggleHeaderValue(key, value, checked) {
   if (checked) hidden = hidden.filter(v => v !== value);
   else if (!hidden.includes(value)) hidden.push(value);
   PARTS_STATE.hiddenFilters[key] = hidden;
-  partsReapplyHeaderFiltersInPlace();
+  partsRerenderPreservingScroll();
 }
 function partsToggleAllHeaderValues(key, checked) {
   const values = PARTS_STATE.headerOptions[key] || [];
   PARTS_STATE.hiddenFilters[key] = checked ? [] : [...values];
-  document.querySelectorAll(`[data-parts-option="${key}"] input[type="checkbox"]`).forEach(cb => { cb.checked = checked; });
-  partsReapplyHeaderFiltersInPlace();
+  partsRerenderPreservingScroll();
+}
+
+// Re-run the parts route handler in place so header-dropdown changes flow
+// through partsApplyHeaderFilters BEFORE the 500-row slice, then restore the
+// main viewport's scroll so the user doesn't jump to top. We bypass refresh()
+// /navigate() because those reset scrollTop and rebuild the top bar etc. —
+// none of which we need for a header-filter toggle.
+function partsRerenderPreservingScroll() {
+  const main = document.getElementById("main");
+  const savedScrollTop = main ? main.scrollTop : 0;
+  if (typeof ROUTES !== "undefined" && ROUTES.parts) ROUTES.parts();
+  if (main) requestAnimationFrame(() => { main.scrollTop = savedScrollTop; });
 }
 function partsReapplyHeaderFiltersInPlace() {
   const hidden = PARTS_STATE.hiddenFilters || { pn: [], desc: [], supplier: [], cls: [], status: [] };
@@ -506,9 +517,13 @@ registerRoute("parts", () => {
   if (PARTS_STATE.category) parts = parts.filter(p => p.category === PARTS_STATE.category);
   if (PARTS_STATE.partClass) parts = parts.filter(p => p.partClass === PARTS_STATE.partClass);
 
-  // Render every toolbar-filter row; the header hidden filter is applied
-  // in-place via display:none so the dropdown survives checkbox clicks.
+  // Dropdown option list is built from the post-toolbar, pre-header set so
+  // unchecked values stay visible (and re-checkable) in the dropdown.
   const headerFilterRows = parts;
+  // Header-dropdown filters must apply BEFORE the render-time 500-row slice,
+  // otherwise the dropdown could only filter within the first 500 of 1625
+  // parts (rest never reach the DOM).
+  parts = partsApplyHeaderFilters(parts);
 
   const dir = PARTS_STATE.sortDir === "desc" ? -1 : 1;
   parts.sort((a, b) => {
