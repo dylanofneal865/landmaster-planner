@@ -282,6 +282,17 @@ function oqHeaderDropdown(key, label, rows) {
     </th>
   `;
 }
+// Re-run the current queue route handler in place so a +Add click can flip
+// the row's button to "IN DRAFT" immediately, without losing scroll position
+// (refresh()/navigate() would reset main.scrollTop).
+function oqRerenderPreservingScroll() {
+  const main = document.getElementById("main");
+  const savedScrollTop = main ? main.scrollTop : 0;
+  const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
+  if (currentRoute && typeof ROUTES !== "undefined" && ROUTES[currentRoute]) ROUTES[currentRoute]();
+  if (main) requestAnimationFrame(() => { main.scrollTop = savedScrollTop; });
+}
+
 function renderOrderQueueFor(itemType) {
   const titleMap = { "base_bom": "Base BOM Queue", "options": "Options Queue", "service": "Service Queue" };
   const pageTitle = (itemType && titleMap[itemType]) || "Order Queue";
@@ -436,7 +447,9 @@ function renderOrderQueueFor(itemType) {
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.daily,2)}</td>
                       <td class="right num bold text-accent" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(sq)}</td>
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtMoney(sq * (p.cost||0))}</td>
-                      <td><button class="btn sm primary" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}')">+ Add</button></td>
+                      <td>${draftOrderHas(p.pn)
+                        ? `<span class="btn sm" aria-disabled="true" style="min-width:72px;justify-content:center;cursor:default;color:var(--t2);font-weight:500;pointer-events:none">IN DRAFT</span>`
+                        : `<button class="btn sm primary" style="min-width:72px;justify-content:center" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}'); oqRerenderPreservingScroll();">+ Add</button>`}</td>
                     </tr>`;
                   }).join("")}
                 </tbody>
