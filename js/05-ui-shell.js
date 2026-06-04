@@ -75,7 +75,13 @@ function refresh() {
   updateTopBar();
   updateNavBadges();
   updateDraftOrderPill();
+  // navigate() always resets main.scrollTop=0 (correct for real route changes),
+  // but refresh() is an in-place re-render — capture scroll around it so edits
+  // like savePartFromDetail don't jump the underlying list to the top.
+  const main = document.getElementById("main");
+  const savedScrollTop = main ? main.scrollTop : 0;
   navigate(CURRENT_ROUTE || "dashboard");
+  if (main && savedScrollTop > 0) requestAnimationFrame(() => { main.scrollTop = savedScrollTop; });
 }
 
 /* ============================================================

@@ -840,22 +840,17 @@ function _showCloudIndicator(ready, state) {
   if (!el) {
     el = document.createElement("div");
     el.id = "cloud-indicator";
-    el.style.cssText = "position:fixed;bottom:8px;right:12px;z-index:9999;font:11px ui-monospace,monospace;padding:4px 8px;border-radius:4px;background:rgba(0,0,0,0.7);color:#fff;pointer-events:none";
+    el.style.cssText = "position:fixed;bottom:10px;left:12px;z-index:9999;width:10px;height:10px;border-radius:50%;transition:background .2s,box-shadow .2s;cursor:default";
     document.body.appendChild(el);
   }
-  if (state === "syncing") {
-    el.textContent = "☁ syncing…";
-    el.style.background = "rgba(80,80,40,0.85)";
-  } else if (state === "error") {
-    el.textContent = "☁ sync error";
-    el.style.background = "rgba(140,40,40,0.85)";
-  } else if (ready) {
-    el.textContent = "☁ cloud OK";
-    el.style.background = "rgba(40,80,40,0.85)";
-  } else {
-    el.textContent = "☁ connecting…";
-    el.style.background = "rgba(60,60,60,0.85)";
-  }
+  let color, label;
+  if (state === "syncing")    { color = "#e6c84f"; label = "Cloud: syncing…"; }
+  else if (state === "error") { color = "#e25555"; label = "Cloud: sync error"; }
+  else if (ready)             { color = "var(--accent)"; label = "Cloud: connected"; }
+  else                        { color = "#777"; label = "Cloud: connecting…"; }
+  el.style.background = color;
+  el.style.boxShadow = "0 0 6px " + color;
+  el.title = label;
 }
 
 window.cloudForcePush = async function () {
