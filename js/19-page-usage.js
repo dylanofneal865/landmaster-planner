@@ -176,9 +176,84 @@ function renderUsageFor(itemType) {
       </div>
     </div>`;
 }
+/* ============================================================
+   USAGE PASSWORD GATE — casual gate on the three Usage routes.
+   Per-tab unlock via sessionStorage; closing the tab re-locks.
+   ============================================================ */
+const _USAGE_PASSWORD = "4616";
+
+function _isUsageUnlocked() {
+  try { return sessionStorage.getItem("usage_unlocked") === "1"; }
+  catch (e) { return false; }
+}
+
+// Returns true if the route handler should continue rendering. If false, a
+// "Locked" placeholder is shown in #main and the password modal is opened;
+// on correct password the routeName is re-navigated so the original handler
+// runs cleanly with the gate now open.
+function _usageGate(routeName) {
+  if (_isUsageUnlocked()) return true;
+  $("#main").innerHTML = `
+    <div class="page">
+      <div class="empty">
+        <div class="empty-title">Locked</div>
+        <div class="empty-msg">Enter the password to view this page.</div>
+      </div>
+    </div>`;
+  _openUsagePasswordModal(routeName);
+  return false;
+}
+
+function _openUsagePasswordModal(routeName) {
+  window._pendingUsageRoute = routeName;
+  openModal(`
+    <div class="modal-head">
+      <div style="font-size:13px;font-weight:600">Enter password</div>
+    </div>
+    <div class="modal-body">
+      <p class="muted tiny" style="margin-bottom:10px">These pages are restricted. Please enter the password to continue.</p>
+      <input class="input lg" type="password" id="usage-pw-input"
+        onkeydown="if(event.key==='Enter'){event.preventDefault();_submitUsagePassword();}">
+      <div id="usage-pw-error" class="text-crit tiny" style="margin-top:8px;display:none">Incorrect.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="_cancelUsagePassword()">Cancel</button>
+      <button class="btn primary" onclick="_submitUsagePassword()">Unlock</button>
+    </div>
+  `);
+  // Override backdrop click — dismissing must navigate away, otherwise the
+  // user sits on the "Locked" placeholder with no obvious next step.
+  const bd = document.getElementById("modal-bd");
+  if (bd) bd.onclick = (e) => { if (e.target === bd) _cancelUsagePassword(); };
+  setTimeout(() => { const i = document.getElementById("usage-pw-input"); if (i) i.focus(); }, 30);
+}
+
+function _submitUsagePassword() {
+  const inp = document.getElementById("usage-pw-input");
+  if (!inp) return;
+  if (inp.value === _USAGE_PASSWORD) {
+    try { sessionStorage.setItem("usage_unlocked", "1"); } catch (e) {}
+    const route = window._pendingUsageRoute;
+    window._pendingUsageRoute = null;
+    closeModal();
+    if (route) navigate(route);
+  } else {
+    const err = document.getElementById("usage-pw-error");
+    if (err) err.style.display = "";
+    inp.value = "";
+    inp.focus();
+  }
+}
+
+function _cancelUsagePassword() {
+  window._pendingUsageRoute = null;
+  closeModal();
+  navigate("dashboard");
+}
+
 registerRoute("usage",          () => renderUsageFor(null));
-registerRoute("base-bom-usage", renderBaseBomUsage);
-registerRoute("options-usage",  () => renderUsageFor("options"));
+registerRoute("base-bom-usage", () => { if (!_usageGate("base-bom-usage")) return; renderBaseBomUsage(); });
+registerRoute("options-usage",  () => { if (!_usageGate("options-usage")) return; renderUsageFor("options"); });
 
 /* ============================================================
    BASE BOM USAGE — rate-management surface (not a transaction tracker)
@@ -715,6 +790,7 @@ function _svcUsageSearchInput(value) {
 }
 
 registerRoute("service-usage", () => {
+  if (!_usageGate("service-usage")) return;
   const demand = getAllDemand();
   const txCount = (DB.usage || []).length;
 
