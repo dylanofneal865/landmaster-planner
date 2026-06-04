@@ -161,6 +161,32 @@ let _statusCache = null;
 let _statusCacheVer = 0;
 function bumpStatusCache() { _statusCacheVer++; _statusCache = null; }
 
+// Supplier mute — independent from itemType="do_not_order". A muted
+// supplier's parts keep their TRUE computed status in _rawStatus, but their
+// public-facing status is forced to "ok" so they fall out of every alert
+// filter (header counts, dashboard tiles, queues, suggested-order $).
+// Supplier-facing surfaces should read (p._rawStatus || p.status) instead.
+function isSupplierMuted(name) {
+  if (!name) return false;
+  const list = (DB.settings && DB.settings.mutedSuppliers) || [];
+  const n = name.toLowerCase();
+  return list.some(s => (s || "").toLowerCase() === n);
+}
+
+function toggleSupplierMute(name) {
+  if (!name) return;
+  if (!Array.isArray(DB.settings.mutedSuppliers)) DB.settings.mutedSuppliers = [];
+  const list = DB.settings.mutedSuppliers;
+  const i = list.findIndex(s => (s || "").toLowerCase() === name.toLowerCase());
+  const wasMuted = i >= 0;
+  if (wasMuted) list.splice(i, 1); else list.push(name);
+  saveDB();
+  bumpStatusCache();
+  logAudit("settings", `${wasMuted ? "Unmuted" : "Muted"} supplier alerts: ${name}`, { supplier: name });
+  openSupplierDetail(name); // re-render drawer in new state
+  refresh();                // re-render underlying page
+}
+
 function partsWithStatus() {
   if (_statusCache) return _statusCache;
   // Build the per-PN open-PO-line index ONCE and reuse it so we don't
@@ -171,11 +197,13 @@ function partsWithStatus() {
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
     const isKitVal = typeof isKit === "function" ? isKit(p.pn) : false;
     const status = partStatus(p, lines);
+    const muted = isSupplierMuted(p.supplier);
     return {
       ...p,
       onPO,
       isKit: isKitVal,
       ...status,
+      ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
       _suggestedQty: suggestedQty(p, onPO),
     };
   });

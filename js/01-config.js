@@ -23,6 +23,7 @@ const DEFAULTS = {
     poNumStart: 47120,
     autoSyncExcel: true,     // auto-write linked Excel files on every change
     usageWindowDays: 120,    // how many days of usage history to compute daily-avg from (4 months covers our YTD data)
+    mutedSuppliers: [],      // supplier names whose parts are excluded from alert/queue surfaces
   },
   parts: [],
   pos: [],

@@ -184,8 +184,13 @@ registerRoute("suppliers", () => {
     const a = map.get(key);
     a.parts++;
     if (p.itemType !== "do_not_order") {
-      if (p.status === "critical") a.critical++;
-      if (p.status === "warning") a.warning++;
+      // Count off the TRUE status so muted suppliers still show real
+      // crit/warn tallies in their own row. The "muted" override in
+      // partsWithStatus flips p.status to "ok" for header/queue/dashboard
+      // surfaces; supplier-facing surfaces consult _rawStatus instead.
+      const real = p._rawStatus || p.status;
+      if (real === "critical") a.critical++;
+      if (real === "warning")  a.warning++;
     }
     a.ohValue += (p.onHand || 0) * (p.cost || 0);
     if (p.ltWeeks) { a.ltSum += p.ltWeeks; a.ltCount++; }
@@ -254,7 +259,7 @@ registerRoute("suppliers", () => {
                   const avgLT = a.ltCount > 0 ? round(a.ltSum / a.ltCount, 1) : 0;
                   return `
                     <tr class="clickable" data-sup-row data-su-name="${esc(supHeaderValue(a, "name"))}" onclick="openSupplierDetail('${esc(a.name)}')">
-                      <td class="bold">${esc(a.name)}</td>
+                      <td class="bold">${esc(a.name)}${isSupplierMuted(a.name) ? ' <span class="pill warn">MUTED</span>' : ''}</td>
                       <td class="right num">${fmtNum(a.parts)}</td>
                       <td class="right">${a.critical > 0 ? `<span class="pill crit">${a.critical}</span>` : '<span class="dim">0</span>'}</td>
                       <td class="right">${a.warning > 0 ? `<span class="pill warn">${a.warning}</span>` : '<span class="dim">0</span>'}</td>
@@ -282,17 +287,20 @@ function openSupplierDetail(name) {
   const parts = stats.filter(p => p.supplier === name);
   const pos = DB.pos.filter(p => p.supplier === name).sort((a,b) => new Date(b.createdDate) - new Date(a.createdDate));
   const ohValue = parts.reduce((s,p) => s + (p.onHand||0)*(p.cost||0), 0);
-  const crit = parts.filter(p => p.status === "critical" && p.itemType !== "do_not_order").length;
-  const warn = parts.filter(p => p.status === "warning" && p.itemType !== "do_not_order").length;
+  // Drawer always shows the TRUE status; muted parts have p.status forced to
+  // "ok" but keep their original in p._rawStatus.
+  const crit = parts.filter(p => (p._rawStatus || p.status) === "critical" && p.itemType !== "do_not_order").length;
+  const warn = parts.filter(p => (p._rawStatus || p.status) === "warning"  && p.itemType !== "do_not_order").length;
   const avgLT = parts.length > 0 ? round(parts.reduce((s,p) => s + (p.ltWeeks||0), 0) / parts.length, 1) : 0;
   const buyers = [...new Set(parts.map(p => p.buyer).filter(Boolean))];
+  const muted = isSupplierMuted(name);
 
   const html = `
     <div class="drawer-head">
       <div class="title-block">
         <div class="pre">SUPPLIER</div>
         <div class="title">${esc(name)}</div>
-        <div class="sub">${parts.length} parts · ${pos.length} total POs · avg lead ${avgLT}w</div>
+        <div class="sub">${parts.length} parts · ${pos.length} total POs · avg lead ${avgLT}w${muted ? ' · <span class="pill warn">MUTED</span>' : ''}</div>
       </div>
       <button class="drawer-x" data-close>×</button>
     </div>
@@ -310,17 +318,19 @@ function openSupplierDetail(name) {
       <div class="tbl-wrap" style="max-height:380px;overflow-y:auto"><table class="tbl">
         <thead><tr><th>Part</th><th>Description</th><th class="right">On Hand</th><th class="right">Days Cover</th><th></th></tr></thead>
         <tbody>
-          ${parts.sort((a,b) => a.urgency - b.urgency).slice(0, 100).map(p => `
+          ${parts.sort((a,b) => a.urgency - b.urgency).slice(0, 100).map(p => {
+            const real = p._rawStatus || p.status;
+            return `
             <tr class="clickable" onclick="closeDrawer(); setTimeout(() => openPartDetail('${esc(p.pn)}'), 200)">
               <td class="pn">${esc(p.pn)}</td>
               <td>${esc(p.desc)}</td>
               <td class="right num">${fmtNum(p.onHand)}</td>
               <td class="right">
-                <span class="num bold ${p.status==='critical'?'text-crit':p.status==='warning'?'text-warn':''}">${p.daysOfCover === Infinity ? '∞' : p.daysOfCover + 'd'}</span>
+                <span class="num bold ${real==='critical'?'text-crit':real==='warning'?'text-warn':''}">${p.daysOfCover === Infinity ? '∞' : p.daysOfCover + 'd'}</span>
               </td>
-              <td><span class="pill ${p.status==='critical'?'crit':p.status==='warning'?'warn':'ok'}">${p.status==='critical'?'CRIT':p.status==='warning'?'WARN':'OK'}</span></td>
+              <td><span class="pill ${real==='critical'?'crit':real==='warning'?'warn':'ok'}">${real==='critical'?'CRIT':real==='warning'?'WARN':'OK'}</span></td>
             </tr>
-          `).join("")}
+          `;}).join("")}
         </tbody>
       </table></div>
 
@@ -348,6 +358,7 @@ function openSupplierDetail(name) {
      </div>
 
   <div class="drawer-foot">
+    <button class="btn ${muted ? 'warn' : 'ghost'}" onclick="toggleSupplierMute(decodeURIComponent('${encodeURIComponent(name)}'))">${muted ? 'Unmute alerts' : 'Mute alerts'}</button>
     <button class="btn danger" onclick="deleteSupplierByName(decodeURIComponent('${encodeURIComponent(name)}'))">Delete Supplier</button>
     <button class="btn" data-close>Close</button>
   </div>
