@@ -31,7 +31,7 @@ registerRoute("dashboard", () => {
 
   // Suggested order $ today
   const suggestedValue = orderable.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit)
-    .reduce((s, p) => s + suggestedQty(p) * (p.cost || 0), 0);
+    .reduce((s, p) => s + p._suggestedQty * (p.cost || 0), 0);
 
   // Top critical
   const topCrit = crit.sort((a,b) => a.urgency - b.urgency).slice(0, 8);
@@ -129,7 +129,7 @@ registerRoute("dashboard", () => {
                           <td class="right num dim">${p.leadDays}d</td>
                           <td class="right num">${fmtNum(p.onHand)}</td>
                           <td class="right num dim">${fmtNum(p.onPO)}</td>
-                          <td class="right num bold text-accent">${fmtNum(suggestedQty(p))}</td>
+                          <td class="right num bold text-accent">${fmtNum(p._suggestedQty)}</td>
                           <td><button class="btn sm primary" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}')">+ Order</button></td>
                         </tr>
                       `).join("")}

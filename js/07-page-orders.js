@@ -341,11 +341,11 @@ function renderOrderQueueFor(itemType) {
         break;
 
       case "qty":
-        cmp = suggestedQty(a) - suggestedQty(b);
+        cmp = a._suggestedQty - b._suggestedQty;
         break;
 
       case "value":
-        cmp = suggestedQty(a) * (a.cost || 0) - suggestedQty(b) * (b.cost || 0);
+        cmp = a._suggestedQty * (a.cost || 0) - b._suggestedQty * (b.cost || 0);
         break;
 
       case "urgency":
@@ -429,7 +429,7 @@ function renderOrderQueueFor(itemType) {
                     No parts match the current filters. Adjust the column dropdowns or toolbar above.
                   </td></tr>
                   ${filtered.map(p => {
-                    const sq = suggestedQty(p);
+                    const sq = p._suggestedQty;
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
                       <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}</td>

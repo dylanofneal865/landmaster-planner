@@ -11,10 +11,37 @@ function leadTimeDays(part) {
   return Math.round((part.ltWeeks || 0) * 7);
 }
 
-// Total open PO qty for a part across all open POs
-function openPOQty(pn) {
+// Build a per-PN index of open PO lines. Each entry: { ln, remaining }.
+// Built once at the top of partsWithStatus so projectOnHand/openPOQty don't
+// rescan DB.pos for every part. External callers don't need this — the public
+// fns below accept an optional precomputed lines array and fall back to a
+// full scan when called without it.
+function _buildOpenPOLineIndex() {
+  const map = new Map();
+  for (const po of (DB.pos || [])) {
+    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
+    for (const ln of po.lines) {
+      if (ln.status === "received" || ln.status === "cancelled") continue;
+      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (!remaining) continue;
+      let arr = map.get(ln.pn);
+      if (!arr) { arr = []; map.set(ln.pn, arr); }
+      arr.push({ ln, remaining });
+    }
+  }
+  return map;
+}
+
+// Total open PO qty for a part across all open POs.
+// `lines` is the optional precomputed index entry for this PN.
+function openPOQty(pn, lines) {
+  if (lines) {
+    let total = 0;
+    for (const e of lines) total += e.remaining;
+    return total;
+  }
   let total = 0;
-  for (const po of DB.pos) {
+  for (const po of (DB.pos || [])) {
     if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
     for (const ln of po.lines) {
       if (ln.pn === pn && ln.status !== "received" && ln.status !== "cancelled") {
@@ -26,30 +53,37 @@ function openPOQty(pn) {
 }
 
 // Project on-hand over the next N days, treating PO lines as receipts on their expected dates.
-function projectOnHand(part, days = 365) {
+// `lines` is the optional precomputed index entry for this part.
+function projectOnHand(part, days = 365, lines) {
   const series = [];
   let oh = part.onHand || 0;
-  // Build receipts map by date offset
   const receipts = new Array(days + 1).fill(0);
-  for (const po of DB.pos) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
-    for (const ln of po.lines) {
-      if (ln.pn !== part.pn) continue;
-      if (ln.status === "received" || ln.status === "cancelled") continue;
-      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
-      if (!remaining) continue;
-      let offset;
-      const expDate = ln.expectedDate ? new Date(ln.expectedDate) : null;
-      if (!expDate || isNaN(expDate)) {
-        // Missing/invalid date → assume arrival at the part's lead time from today
-        offset = leadTimeDays(part);
-      } else {
-        expDate.setHours(0,0,0,0);
-        offset = Math.round((expDate - TODAY) / DAY_MS);
-        // Past expected date → treat as arriving today (don't drop the receipt)
-        if (offset < 0) offset = 0;
+  const accumReceipt = (ln, remaining) => {
+    let offset;
+    const expDate = ln.expectedDate ? new Date(ln.expectedDate) : null;
+    if (!expDate || isNaN(expDate)) {
+      // Missing/invalid date → assume arrival at the part's lead time from today
+      offset = leadTimeDays(part);
+    } else {
+      expDate.setHours(0,0,0,0);
+      offset = Math.round((expDate - TODAY) / DAY_MS);
+      // Past expected date → treat as arriving today (don't drop the receipt)
+      if (offset < 0) offset = 0;
+    }
+    if (offset <= days) receipts[offset] += remaining;
+  };
+  if (lines) {
+    for (const e of lines) accumReceipt(e.ln, e.remaining);
+  } else {
+    for (const po of (DB.pos || [])) {
+      if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
+      for (const ln of po.lines) {
+        if (ln.pn !== part.pn) continue;
+        if (ln.status === "received" || ln.status === "cancelled") continue;
+        const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+        if (!remaining) continue;
+        accumReceipt(ln, remaining);
       }
-      if (offset <= days) receipts[offset] += remaining;
     }
   }
   for (let i = 0; i <= days; i++) {
@@ -60,11 +94,11 @@ function projectOnHand(part, days = 365) {
   return series;
 }
 
-// Days until stockout (without any new orders)
-function daysUntilStockout(part) {
+// Days until stockout (without any new orders). Optional precomputed lines.
+function daysUntilStockout(part, lines) {
   if (!part.daily || part.daily <= 0) return Infinity;
   // Project with current PO receipts factored in
-  const series = projectOnHand(part, 365);
+  const series = projectOnHand(part, 365, lines);
   // Find the LAST day on-hand is still positive — accounts for transient dips
   // that recover when an incoming PO lands.
   let lastPositive = -1;
@@ -76,12 +110,12 @@ function daysUntilStockout(part) {
   return lastPositive + 1;
 }
 
-// Compute status for a part
-function partStatus(part) {
+// Compute status for a part. Optional precomputed lines.
+function partStatus(part, lines) {
   const lt = leadTimeDays(part);
   const safety = DB.settings.safetyDays || 0;
   const warnDays = DB.settings.alertWarning ?? 14;
-  const stockoutDay = daysUntilStockout(part);
+  const stockoutDay = daysUntilStockout(part, lines);
   const reorderBy = lt + safety; // we should have stock for at least lead time + safety days
   let status = "ok";
   let urgency = 9999;
@@ -104,14 +138,16 @@ function partStatus(part) {
   return { status, urgency, stockoutDay, leadDays: lt, reorderBy, daysOfCover: stockoutDay };
 }
 
-// Suggested order qty: cover lead time + safety + a target horizon (e.g., 30 days more)
-function suggestedQty(part) {
+// Suggested order qty: cover lead time + safety + a target horizon (e.g., 30 days more).
+// `onPO` is the optional precomputed open-PO qty — saves an openPOQty scan.
+function suggestedQty(part, onPO) {
   const lt = leadTimeDays(part);
   const safety = DB.settings.safetyDays || 0;
   const horizon = 30; // beyond reorder, target 30 days of stock after arrival
   const target = (lt + safety + horizon) * (part.daily || 0);
   // Minus what's already on order + on hand
-  const have = (part.onHand || 0) + openPOQty(part.pn);
+  const onPOQty = (typeof onPO === "number") ? onPO : openPOQty(part.pn);
+  const have = (part.onHand || 0) + onPOQty;
   let qty = Math.max(0, Math.ceil(target - have));
   if (part.moq && qty > 0) qty = Math.max(qty, part.moq);
   if (part.packSize && qty > 0) {
@@ -127,12 +163,22 @@ function bumpStatusCache() { _statusCacheVer++; _statusCache = null; }
 
 function partsWithStatus() {
   if (_statusCache) return _statusCache;
-  const out = DB.parts.map(p => ({
-    ...p,
-    onPO: openPOQty(p.pn),
-    isKit: typeof isKit === "function" ? isKit(p.pn) : false,
-    ...partStatus(p),
-  }));
+  // Build the per-PN open-PO-line index ONCE and reuse it so we don't
+  // rescan DB.pos for every part during the .map below.
+  const lineIndex = _buildOpenPOLineIndex();
+  const out = DB.parts.map(p => {
+    const lines = lineIndex.get(p.pn);
+    const onPO = lines ? openPOQty(p.pn, lines) : 0;
+    const isKitVal = typeof isKit === "function" ? isKit(p.pn) : false;
+    const status = partStatus(p, lines);
+    return {
+      ...p,
+      onPO,
+      isKit: isKitVal,
+      ...status,
+      _suggestedQty: suggestedQty(p, onPO),
+    };
+  });
   _statusCache = out;
   return out;
 }
