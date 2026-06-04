@@ -399,12 +399,27 @@ function partsSortHeader(key, dir) {
   refresh();
 }
 
+// Repurposes the "cls" column to show ITEM TYPE while keeping the header-filter
+// plumbing keyed on "cls" so data attributes and hidden-value matching keep
+// working unchanged. The toolbar "All classes" dropdown and the part-detail
+// drawer's Class field still use partClass.
+function partItemTypeLabel(p) {
+  if (p.isKit) return "Kit";
+  switch (p.itemType) {
+    case "base_bom":     return "Base BOM";
+    case "options":      return "Options";
+    case "service":      return "Service";
+    case "do_not_order": return "Do Not Order";
+    default:             return "Untagged";
+  }
+}
+
 function partsHeaderValue(p, key) {
   let value = "";
   if (key === "pn") value = p.pn || "";
   if (key === "desc") value = p.desc || "";
   if (key === "supplier") value = p.supplier || "";
-  if (key === "cls") value = p.isKit ? "Kit" : (p.partClass || "");
+  if (key === "cls") value = partItemTypeLabel(p);
   if (key === "status") value = p.isKit ? "Kit" : p.itemType === "do_not_order" ? "Do Not Order" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK";
   return String(value).trim() || "(Blanks)";
 }
@@ -417,7 +432,7 @@ function partsApplyHeaderFilters(rows) {
     const pn = String(p.pn || "").toLowerCase();
     const desc = String(p.desc || "").toLowerCase();
     const supplier = String(p.supplier || "").toLowerCase();
-    const cls = String(p.partClass || "").toLowerCase();
+    const cls = partItemTypeLabel(p).toLowerCase();
     const statusLabel = (p.itemType === "do_not_order" ? "Do Not Order" : p.status === "critical" ? "Critical" : p.status === "warning" ? "Warning" : "OK").toLowerCase();
     const hidden = PARTS_STATE.hiddenFilters || { pn: [], desc: [], supplier: [], cls: [], status: [] };
 
@@ -535,7 +550,7 @@ registerRoute("parts", () => {
       case "supplier":
         cmp = (a.supplier || "").localeCompare(b.supplier || ""); break;
       case "cls":
-        cmp = (a.partClass || "").localeCompare(b.partClass || ""); break;
+        cmp = partItemTypeLabel(a).localeCompare(partItemTypeLabel(b)); break;
       case "status":
         cmp = partsHeaderValue(a, "status").localeCompare(partsHeaderValue(b, "status")); break;
       case "onhand":
@@ -607,7 +622,7 @@ registerRoute("parts", () => {
                 ${partsHeaderDropdown("pn", "Part", headerFilterRows)}
                 ${partsHeaderDropdown("desc", "Description", headerFilterRows)}
                 ${partsHeaderDropdown("supplier", "Supplier", headerFilterRows)}
-                ${partsHeaderDropdown("cls", "Cls", headerFilterRows)}
+                ${partsHeaderDropdown("cls", "Type", headerFilterRows)}
                 <th class="right">On Hand</th>
                 <th class="right">On PO</th>
                 <th class="right">Daily</th>
@@ -625,7 +640,7 @@ registerRoute("parts", () => {
                     <td class="pn">${esc(p.pn)}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
-                    <td class="dim mono">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(p.partClass||"—")}</td>
+                    <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>
                     <td class="right num">${fmtNum(p.onHand)}</td>
                     <td class="right num dim">${fmtNum(p.onPO)}</td>
                     <td class="right num dim">${fmtNum(p.daily, 2)}</td>
