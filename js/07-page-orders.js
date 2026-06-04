@@ -439,6 +439,7 @@ function renderOrderQueueFor(itemType) {
                         <span class="meter">
                           <span class="meter-bar ${p.status==='critical'?'crit':'warn'}"><i style="width:${clamp((p.daysOfCover/Math.max(p.leadDays+30,30))*100,5,100)}%"></i></span>
                           <span class="num bold ${p.status==='critical'?'text-crit':'text-warn'}">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
+                          ${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? `<span class="dim tiny mono" style="margin-left:6px">· ${s}</span>` : ''; })()}
                         </span>
                       </td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${p.leadDays}d</td>

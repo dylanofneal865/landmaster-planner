@@ -46,6 +46,22 @@ const fmtTime = (d) => {
   const dt = (d instanceof Date) ? d : new Date(d);
   return dt.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 };
+// Projected stockout date string for a parts-with-status daysOfCover value.
+// Returns M/D/YY in local time, or a phrase for edge cases:
+//   Infinity         → ""             (caller decides whether to render)
+//   0                → "STOCKED OUT"
+//   > 365 (finite)   → ">1yr"
+//   NaN / negative   → "?"
+// Date is built via addDays(TODAY, ...) so it never goes through ISO/UTC —
+// no off-by-one shift at the day boundary.
+const stockoutDateStr = (daysOfCover) => {
+  if (daysOfCover === Infinity) return "";
+  if (typeof daysOfCover !== "number" || isNaN(daysOfCover) || daysOfCover < 0) return "?";
+  if (daysOfCover === 0) return "STOCKED OUT";
+  if (daysOfCover > 365) return ">1yr";
+  const d = addDays(TODAY, daysOfCover);
+  return `${d.getMonth() + 1}/${d.getDate()}/${String(d.getFullYear()).slice(-2)}`;
+};
 const isoDate = (d) => {
   const dt = (d instanceof Date) ? d : new Date(d);
   return dt.toISOString().slice(0,10);

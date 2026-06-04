@@ -124,6 +124,7 @@ registerRoute("dashboard", () => {
                             <span class="meter">
                               <span class="meter-bar crit"><i style="width:${clamp(p.daysOfCover/30*100,5,100)}%"></i></span>
                               <span class="num text-crit bold">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
+                              ${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? `<span class="dim tiny mono" style="margin-left:6px">· ${s}</span>` : ''; })()}
                             </span>
                           </td>
                           <td class="right num dim">${p.leadDays}d</td>
