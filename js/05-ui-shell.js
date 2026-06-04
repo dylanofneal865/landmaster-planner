@@ -98,17 +98,38 @@ function updateNavBadges() {
   const poBadge = $("#badge-pos");
   if (poBadge) poBadge.textContent = openPOs;
 
-  const setQueueBadge = (sel, cohort) => {
+  // Single-pass tally of needs/crit per itemType bucket, plus an aggregate
+  // (excluding DNO) for the legacy generic order-queue badge.
+  const tally = {
+    base_bom: { needs: 0, crit: 0 },
+    options:  { needs: 0, crit: 0 },
+    service:  { needs: 0, crit: 0 },
+    _agg:     { needs: 0, crit: 0 },
+  };
+  for (const p of stats) {
+    if (p.isKit) continue;
+    const isCrit = p.status === "critical";
+    const isNeeds = isCrit || p.status === "warning";
+    if (!isNeeds) continue;
+    if (p.itemType !== "do_not_order") {
+      tally._agg.needs++;
+      if (isCrit) tally._agg.crit++;
+    }
+    const bucket = tally[p.itemType];
+    if (bucket) {
+      bucket.needs++;
+      if (isCrit) bucket.crit++;
+    }
+  }
+  const applyBadge = (sel, b) => {
     const el = $(sel);
     if (!el) return;
-    const needs = cohort.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit).length;
-    const crit  = cohort.filter(p => p.status === "critical" && !p.isKit).length;
-    el.textContent = needs;
-    el.className = "badge " + (needs > 0 ? (crit > 0 ? "crit" : "warn") : "");
+    el.textContent = b.needs;
+    el.className = "badge " + (b.needs > 0 ? (b.crit > 0 ? "crit" : "warn") : "");
   };
-  setQueueBadge("#badge-base-bom-queue", stats.filter(p => p.itemType === "base_bom"));
-  setQueueBadge("#badge-options-queue",  stats.filter(p => p.itemType === "options"));
-  setQueueBadge("#badge-service-queue",  stats.filter(p => p.itemType === "service"));
+  applyBadge("#badge-base-bom-queue", tally.base_bom);
+  applyBadge("#badge-options-queue",  tally.options);
+  applyBadge("#badge-service-queue",  tally.service);
   // Backup — legacy badge for the unlinked order-queue route, if anything ever re-adds it.
-  setQueueBadge("#badge-orderqueue", stats.filter(p => p.itemType !== "do_not_order"));
+  applyBadge("#badge-orderqueue",     tally._agg);
 }

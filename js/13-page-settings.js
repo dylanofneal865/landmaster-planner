@@ -8,7 +8,6 @@
    ============================================================ */
 registerRoute("settings", () => {
   const s = DB.settings;
-  const dbSize = ((JSON.stringify(DB).length / 1024)).toFixed(1);
   const poLineCount = (DB.pos || []).reduce((sum, po) => sum + (po.lines?.length || 0), 0);
   const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
   const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
@@ -172,7 +171,7 @@ registerRoute("settings", () => {
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">Data</div>
-          <div class="panel-sub">${DB.parts.length} parts · ${DB.pos.length} POs · ${(DB.usage||[]).length} usage txns · ${Object.keys(DB.kitBoms || {}).length} kit BOMs · ${DB.audit.length} log entries · ${dbSize} KB · source: ${esc(DB.meta.dataSource||"unknown")}${DB.meta.lastImport ? " · imported " + fmtDate(DB.meta.lastImport) : ""}</div>
+          <div class="panel-sub">${DB.parts.length} parts · ${DB.pos.length} POs · ${(DB.usage||[]).length} usage txns · ${Object.keys(DB.kitBoms || {}).length} kit BOMs · ${DB.audit.length} log entries · source: ${esc(DB.meta.dataSource||"unknown")}${DB.meta.lastImport ? " · imported " + fmtDate(DB.meta.lastImport) : ""}</div>
         </div>
         <div class="panel-body col">
           <div class="row gap-md">

@@ -8,12 +8,8 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 
 let _supa = null;
 let _cloudReady = false;
-let _lastCloudPartsHash = null;
-let _lastCloudPosHash = null;
 let _lastCloudDraftHash = null;
-let _lastCloudAuditHash = null;
 let _lastCloudSettingsHash = null;
-let _lastCloudUsageHash = null;
 let _lastCloudKitBomsHash = null;
 
 // Delta tracking — only push records that actually changed
@@ -161,7 +157,6 @@ async function cloudInit() {
       if (typeof refresh === "function") refresh();
       showToast(`Synced ${cloudPos.length} POs from cloud`, "ok");
     }
-    _lastCloudPosHash = _hashPos(DB.pos || []);
   }
 
   // ---- Draft Order ----
@@ -199,7 +194,6 @@ async function cloudInit() {
       });
       _origSaveDB ? _origSaveDB.call(window) : saveDB();
     }
-    _lastCloudAuditHash = _hashAudit(DB.audit || []);
   }
 
   // ---- Settings ----
@@ -232,7 +226,6 @@ async function cloudInit() {
         showToast(`Synced ${cloudUsage.length} usage entries from cloud`, "ok");
       }
     }
-    _lastCloudUsageHash = _hashUsage(DB.usage || []);
   }
 
   // ---- Kit BOMs ----
@@ -264,7 +257,6 @@ async function cloudInit() {
   for (const u of (DB.usage || [])) if (u.id) _usageSnapshot.set(u.id, JSON.stringify(u));
   for (const [kit_pn, kit] of Object.entries(DB.kitBoms || {})) _kitBomsSnapshot.set(kit_pn, JSON.stringify(kit));
   _partsSnapshot.set("__settings__", JSON.stringify(DB.settings || {}));
-  _lastCloudPartsHash = _hashParts(DB.parts);
   _hookSaveDB();
   _hookDraftSave();
   _showCloudIndicator(true);
@@ -350,7 +342,6 @@ function _handleRealtimePart(payload) {
     if (i >= 0) DB.parts[i] = merged;
     else DB.parts.push(merged);
   }
-  _lastCloudPartsHash = _hashParts(DB.parts);
   _applyAndRefresh();
 }
 
@@ -365,7 +356,6 @@ function _handleRealtimePO(payload) {
     if (i >= 0) DB.pos[i] = merged;
     else DB.pos.push(merged);
   }
-  _lastCloudPosHash = _hashPos(DB.pos || []);
   _applyAndRefresh();
 }
 
@@ -396,7 +386,6 @@ function _handleRealtimeAudit(payload) {
     if (i >= 0) DB.audit[i] = merged;
     else DB.audit.unshift(merged); // newest first
   }
-  _lastCloudAuditHash = _hashAudit(DB.audit || []);
   _applyAndRefresh();
 }
 
@@ -421,7 +410,6 @@ function _handleRealtimeUsage(payload) {
     if (i >= 0) DB.usage[i] = merged;
     else DB.usage.push(merged);
   }
-  _lastCloudUsageHash = _hashUsage(DB.usage || []);
   _applyAndRefresh();
 }
 
@@ -435,27 +423,6 @@ function _handleRealtimeKitBoms(payload) {
   }
   _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
   _applyAndRefresh();
-}
-
-function _hashParts(parts) {
-  try {
-    return parts.length + ":" + JSON.stringify(parts).length;
-  } catch (e) {
-    return parts.length + ":?";
-  }
-}
-
-function _hashPos(pos) {
-  try {
-    return pos.length + ":" + JSON.stringify(pos).length;
-  } catch (e) {
-    return pos.length + ":?";
-  }
-}
-
-function _hashAudit(audit) {
-  try { return audit.length + ":" + JSON.stringify(audit).length; }
-  catch (e) { return audit.length + ":?"; }
 }
 
 async function _pushAllParts() {
@@ -587,9 +554,10 @@ async function _pushAllUsage() {
 
 async function _pushDirtyParts() {
   if (_dirtyParts.size === 0) return true;
+  const byPn = new Map(DB.parts.map(p => [p.pn, p]));
   const rows = [];
   for (const pn of _dirtyParts) {
-    const p = DB.parts.find(x => x.pn === pn);
+    const p = byPn.get(pn);
     if (p) {
       const { pn: _, ...rest } = p;
       rows.push({ pn, data: rest });
@@ -604,9 +572,10 @@ async function _pushDirtyParts() {
 
 async function _pushDirtyPos() {
   if (_dirtyPos.size === 0) return true;
+  const byId = new Map((DB.pos || []).map(p => [p.id, p]));
   const rows = [];
   for (const id of _dirtyPos) {
-    const po = DB.pos.find(x => x.id === id);
+    const po = byId.get(id);
     if (po) {
       const { id: _, ...rest } = po;
       rows.push({ id, data: rest });
@@ -621,9 +590,10 @@ async function _pushDirtyPos() {
 
 async function _pushDirtyAudit() {
   if (_dirtyAudit.size === 0) return true;
+  const byId = new Map((DB.audit || []).map(a => [a.id, a]));
   const rows = [];
   for (const id of _dirtyAudit) {
-    const a = DB.audit.find(x => x.id === id);
+    const a = byId.get(id);
     if (a) {
       const { id: _, ...rest } = a;
       rows.push({ id, data: rest });
@@ -638,9 +608,10 @@ async function _pushDirtyAudit() {
 
 async function _pushDirtyUsage() {
   if (_dirtyUsage.size === 0) return true;
+  const byId = new Map((DB.usage || []).map(u => [u.id, u]));
   const rows = [];
   for (const id of _dirtyUsage) {
-    const u = DB.usage.find(x => x.id === id);
+    const u = byId.get(id);
     if (u) {
       const { id: _, ...rest } = u;
       rows.push({ id, data: rest });
@@ -655,9 +626,6 @@ async function _pushDirtyUsage() {
 
 function _hashSettings(s) {
   try { return JSON.stringify(s || {}).length; } catch (e) { return 0; }
-}
-function _hashUsage(u) {
-  try { return (u?.length || 0) + ":" + JSON.stringify(u || []).length; } catch (e) { return (u?.length || 0) + ":?"; }
 }
 function _hashKitBoms(k) {
   try { return Object.keys(k || {}).length + ":" + JSON.stringify(k || {}).length; } catch (e) { return "?"; }
@@ -895,7 +863,6 @@ window.cloudForcePush = async function () {
   _showCloudIndicator(false, "syncing");
   const ok = await _pushAllParts();
   if (ok) {
-    _lastCloudPartsHash = _hashParts(DB.parts);
     _showCloudIndicator(true);
     console.log("Force-pushed " + DB.parts.length + " parts");
   }
@@ -909,7 +876,6 @@ window.cloudForcePull = async function () {
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   if (typeof bumpStatusCache === "function") bumpStatusCache();
   if (typeof refresh === "function") refresh();
-  _lastCloudPartsHash = _hashParts(DB.parts);
   console.log("Pulled " + DB.parts.length + " parts from cloud");
 };
 
@@ -918,7 +884,6 @@ window.cloudForcePushPos = async function () {
   _showCloudIndicator(false, "syncing");
   const ok = await _pushAllPos();
   if (ok) {
-    _lastCloudPosHash = _hashPos(DB.pos || []);
     _showCloudIndicator(true);
     console.log("Force-pushed " + (DB.pos?.length || 0) + " POs");
   }
@@ -932,7 +897,6 @@ window.cloudForcePullPos = async function () {
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   if (typeof bumpStatusCache === "function") bumpStatusCache();
   if (typeof refresh === "function") refresh();
-  _lastCloudPosHash = _hashPos(DB.pos);
   console.log("Pulled " + DB.pos.length + " POs from cloud");
 };
 
@@ -946,7 +910,6 @@ window.cloudForcePullAudit = async function () {
     return tb.localeCompare(ta);
   });
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
-  _lastCloudAuditHash = _hashAudit(DB.audit);
   console.log("Pulled " + DB.audit.length + " audit entries from cloud");
 };
 
