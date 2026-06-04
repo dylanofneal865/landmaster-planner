@@ -185,6 +185,20 @@ function draftOrderUpdateQty(pn, value) {
 function draftOrderRemoveLine(pn) {
   draftOrderRemove(pn);
   openDraftOrderDrawer();
+  // Drawer is an overlay — the queue page beneath it doesn't know a line was
+  // just removed, so its IN DRAFT pill would stay stuck. Flip it back to +Add
+  // by re-running the queue renderer (scroll-preserving). No-op off-queue.
+  _refreshQueueIfActive();
+}
+
+// Re-run the current queue route handler with scroll preservation, but only
+// if the active route is actually one of the order queues. Mirrors the +Add
+// path that flips +Add → IN DRAFT instantly; this is the inverse half.
+function _refreshQueueIfActive() {
+  const route = document.querySelector(".nav-item.active")?.dataset?.route;
+  if (route !== "base-bom-queue" && route !== "options-queue"
+      && route !== "service-queue" && route !== "order-queue") return;
+  if (typeof oqRerenderPreservingScroll === "function") oqRerenderPreservingScroll();
 }
 
 function draftOrderClearConfirm() {
@@ -204,6 +218,7 @@ function draftOrderClearAndClose() {
   draftOrderClear();
   closeModal();
   openDraftOrderDrawer();
+  _refreshQueueIfActive();
 }
 
 /* =====================================================
