@@ -72,6 +72,19 @@ const round = (n, d=0) => Math.round(n * Math.pow(10,d)) / Math.pow(10,d);
 const clamp = (n, mn, mx) => Math.max(mn, Math.min(mx, n));
 const displayBuyer = (po) => (po && po.buyer) ? po.buyer : "";
 
+// Shared gate for all destructive actions (delete part / delete PO / remove
+// PO line / delete usage / clear audit log / reset DB / delete supplier),
+// plus the page-access gate on the Usage screens. Single password, one
+// helper — change DELETE_PIN to rotate.
+const DELETE_PIN = "4616";
+function gateDelete() {
+  const v = prompt("Enter delete password:");
+  if (v === null) return false;
+  if (v === DELETE_PIN) return true;
+  showToast("Incorrect password", "warn");
+  return false;
+}
+
 function uid(prefix="id") {
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 }

@@ -359,17 +359,9 @@ openDrawer(html, { wide: true });
 
 
 
-const DELETE_SUPPLIER_PASSWORD = "4616"; // change this password
-
 function deleteSupplierByName(supplierName) {
   if (!supplierName) return;
-
-  const password = prompt(`Enter password to delete supplier:\n\n${supplierName}`);
-
-  if (password !== DELETE_SUPPLIER_PASSWORD) {
-    showToast("Incorrect password. Supplier was not deleted.", "warn");
-    return;
-  }
+  if (!gateDelete()) return;
 
   const confirmed = confirm(
     `Are you sure you want to delete this supplier?\n\n${supplierName}\n\nThis will remove the supplier from the supplier list and unassign it from all related parts. This cannot be undone.`

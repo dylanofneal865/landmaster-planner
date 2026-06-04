@@ -89,7 +89,7 @@ function confirmClearAudit() {
     </div>
     <div class="modal-foot">
       <button class="btn" data-close>Cancel</button>
-      <button class="btn danger" onclick="DB.audit = []; saveDB(); closeModal(); showToast('Audit log cleared', 'warn'); refresh();">Clear log</button>
+      <button class="btn danger" onclick="if(!gateDelete())return; DB.audit = []; saveDB(); closeModal(); showToast('Audit log cleared', 'warn'); refresh();">Clear log</button>
     </div>
   `);
 }

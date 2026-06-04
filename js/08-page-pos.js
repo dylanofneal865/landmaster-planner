@@ -664,6 +664,7 @@ function addPOLine(poId) {
 }
 
 function removePOLine(poId, lineId) {
+  if (!gateDelete()) return;
   const po = DB.pos.find(p => p.id === poId); if (!po) return;
   const ln = po.lines.find(l => l.id === lineId); if (!ln) return;
   if (!confirm(`Remove line ${ln.pn} from ${po.num}?`)) return;
@@ -795,6 +796,7 @@ function duplicatePO(poId) {
 }
 
 function confirmDeletePO(poId) {
+  if (!gateDelete()) return;
   const po = DB.pos.find(p => p.id === poId); if (!po) return;
   if (!confirm(`Delete ${po.num}? This cannot be undone.`)) return;
   DB.pos = DB.pos.filter(p => p.id !== poId);

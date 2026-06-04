@@ -264,6 +264,7 @@ function savePartFromDetail(originalPn) {
 }
 
 function confirmDeletePart(pn) {
+  if (!gateDelete()) return;
   openModal(`
     <div class="modal-head"><div style="font-size:13px;font-weight:600">Delete part?</div></div>
     <div class="modal-body">

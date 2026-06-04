@@ -1069,6 +1069,7 @@ function openLogUsageModal(prefillPn = "") {
 }
 
 function confirmDeleteUsage(id) {
+  if (!gateDelete()) return;
   const u = DB.usage.find(x => x.id === id);
   if (!u) return;
   openModal(`

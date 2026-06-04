@@ -299,6 +299,7 @@ function doImportFullDB() {
 }
 
 function confirmReset() {
+  if (!gateDelete()) return;
   openModal(`
     <div class="modal-head"><div style="font-size:13px;font-weight:600">Reset all data?</div></div>
     <div class="modal-body">
