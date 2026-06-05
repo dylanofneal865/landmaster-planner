@@ -54,7 +54,9 @@ function renderPartDetail(part) {
   //   (early-stockout) H=220, PB=76 — stockout AND lead both land in the
   //   left ~25% of the plot, so all four labels stack BELOW the baseline
   //   in a single left-anchored column to avoid piling on TODAY + y-axis.
-  const W = 720, PL = 56, PR = 80, PT = 24;
+  // PL=90 gives the y-axis its own column so the peak/0 numbers, the today
+  // line, the today label, and the overdue dot don't pile in the same gutter.
+  const W = 720, PL = 90, PR = 80, PT = 24;
   const hasGap = Number.isFinite(coverDays) && leadDays > coverDays;
   const _denom = Math.max(1, series.length - 1);
   const stockoutInLeftZone = stockoutIdx >= 0 && stockoutIdx / _denom < 0.25;
@@ -72,20 +74,37 @@ function renderPartDetail(part) {
   const todayMark = `<line x1="${xS(0)}" y1="${PT}" x2="${xS(0)}" y2="${H-PB}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
   const zeroLine = `<line x1="${PL}" y1="${yS(0)}" x2="${W-PR}" y2="${yS(0)}" class="spark-zero"/>`;
 
-  // PO receipt dots + labels, with crowding suppression (~20px in x).
-  let _lastRecvLabelX = -Infinity;
-  const recvMarkers = series.map((s, i) => {
-    if (!s.recv || s.recv <= 0) return "";
-    const cx = xS(i);
-    const cy = yS(Math.max(0, s.oh));
-    const dot = `<circle cx="${cx}" cy="${cy}" r="3" fill="#4aa3f2"/>`;
-    let label = "";
-    if (cx - _lastRecvLabelX > 20) {
-      label = `<text x="${cx}" y="${cy - 7}" text-anchor="middle" fill="#4aa3f2" font-size="9" font-family="var(--f-mono)">+${fmtNum(s.recv)}</text>`;
-      _lastRecvLabelX = cx;
+  // PO receipt dots + labels. Two crowding rules:
+  //   (a) if a dot is within 55px of the left gutter, anchor the label start
+  //       at dot.x+6 so it can't land on the y-axis numbers or today line;
+  //   (b) if two dots are within 45px of each other, label only the LATER
+  //       one with the COMBINED "+N" (sum across the cluster). All dots are
+  //       drawn — only labels are merged.
+  const _recvHits = [];
+  series.forEach((s, i) => {
+    if (!s.recv || s.recv <= 0) return;
+    _recvHits.push({ cx: xS(i), cy: yS(Math.max(0, s.oh)), recv: s.recv });
+  });
+  const _recvLabels = [];
+  for (const h of _recvHits) {
+    const last = _recvLabels.length > 0 ? _recvLabels[_recvLabels.length - 1] : null;
+    if (last && h.cx - last.cx < 45) {
+      last.cx = h.cx;
+      last.cy = h.cy;
+      last.recv += h.recv;
+    } else {
+      _recvLabels.push({ cx: h.cx, cy: h.cy, recv: h.recv });
     }
-    return dot + label;
-  }).join("");
+  }
+  const recvMarkers = [
+    _recvHits.map(h => `<circle cx="${h.cx}" cy="${h.cy}" r="3" fill="#4aa3f2"/>`).join(""),
+    _recvLabels.map(h => {
+      const closeToLeft = h.cx - PL < 55;
+      const lx = closeToLeft ? h.cx + 6 : h.cx;
+      const anchor = closeToLeft ? "start" : "middle";
+      return `<text x="${lx}" y="${h.cy - 8}" text-anchor="${anchor}" fill="#4aa3f2" font-size="9" font-family="var(--f-mono)">+${fmtNum(h.recv)}</text>`;
+    }).join(""),
+  ].join("");
 
   // Thin gap strip on the baseline — drawn above the area fill, below the
   // line stroke. The "N-day gap" caption is dropped here; in early-stockout
@@ -95,21 +114,26 @@ function renderPartDetail(part) {
     <rect x="${xS(coverDays)}" y="${yS(0) - 3}" width="${xS(leadDays) - xS(coverDays)}" height="6" fill="var(--crit)" opacity="0.5"/>
   ` : "";
 
-  // Y-axis labels (right-aligned in left pad). With scale clamped to
-  // 0..peak the baseline label is always "0".
+  // Y-axis: exactly two right-anchored labels in the left gutter — peak and 0.
   const yAxis = `
-    <text x="${PL - 6}" y="${yS(maxOH) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtNum(maxOH)}</text>
-    <text x="${PL - 6}" y="${yS(0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">0</text>
+    <text x="${PL - 8}" y="${yS(maxOH) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtNum(maxOH)}</text>
+    <text x="${PL - 8}" y="${yS(0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">0</text>
   `;
 
-  // X-axis month tick labels — drop a "Mon" abbrev each day the month changes.
+  // X-axis month tick labels — drop a "Mon" abbrev each day the month
+  // changes. On horizons longer than ~6 months, label every other change so
+  // the row doesn't smear into one continuous block of text.
   const _monAbbrev = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const _labelEveryOther = horizon > 180;
   let _prevMonth = series[0]?.d ? series[0].d.getMonth() : -1;
+  let _monthChangeCount = 0;
   const xAxis = series.map((s, i) => {
-    if (i === 0) return ""; // skip i=0 to avoid colliding with the TODAY label
+    if (i === 0) return ""; // skip i=0 to avoid colliding with the today label
     const m = s.d.getMonth();
     if (m === _prevMonth) return "";
     _prevMonth = m;
+    _monthChangeCount++;
+    if (_labelEveryOther && (_monthChangeCount % 2 === 0)) return "";
     return `<text x="${xS(i)}" y="${H - 8}" text-anchor="middle" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${_monAbbrev[m]}</text>`;
   }).join("");
 
@@ -163,14 +187,12 @@ function renderPartDetail(part) {
           <text x="${sTx}" y="${sy-24}"${sAnchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
         `;
       } else {
-        // (c) Normal: label by the line, end-anchor flip + right-edge clamp.
-        const LEAD_LABEL_WIDTH = 160;
-        const leadWouldOverflow = lx + 4 + LEAD_LABEL_WIDTH > W - 6;
-        const ltx = leadWouldOverflow ? Math.min(W - 6, lx - 4) : Math.max(PL + 2, lx + 4);
-        const leadAnchor = leadWouldOverflow ? ` text-anchor="end"` : "";
+        // (c) Normal: end-anchored to the LEFT of the lead line, clamped so
+        // the label end can never push past the right inner edge.
+        const ltx = Math.min(lx - 6, W - PR - 4);
         leadLine = `
           ${leadVerticalLine}
-          <text x="${ltx}" y="${PT+10}"${leadAnchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+          <text x="${ltx}" y="${PT+10}" text-anchor="end" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
         `;
       }
     }
@@ -186,9 +208,6 @@ function renderPartDetail(part) {
     runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--warn);font-weight:500">Runs out in ${coverDays}d (${stockoutDateStr(coverDays)}). Reorder by day ${Math.max(0, coverDays - leadDays)} to stay covered.</div>`;
   }
 
-  // TODAY / +horizonD label y. Slightly lower in early-stockout mode so
-  // they sit clear of the y-axis numbers when the stack is in play.
-  const todayLabelY = earlyStockoutMode ? PT - 4 : PT - 8;
 
   // Overdue advisory — projection still treats past-due lines as arrived
   // today (math unchanged), but surface the assumption so the runway
@@ -199,9 +218,10 @@ function renderPartDetail(part) {
   const overdueBanner = overdueUnits > 0 ? `
     <div class="tiny" style="margin-bottom:8px;color:var(--warn)">${overdueLines.length} PO line${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes they've arrived. Confirm with supplier.</div>
   ` : "";
+  // Overdue cue is the hollow amber circle ONLY — the detail lives in the
+  // banner row above the chart, so no in-plot text label is needed.
   const overdueMarker = overdueUnits > 0 ? `
     <circle cx="${xS(0)}" cy="${yS(0)}" r="4" stroke="var(--warn)" stroke-width="1.5" fill="none"/>
-    <text x="${PL}" y="${todayLabelY + 10}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">overdue inbound</text>
   ` : "";
 
   const partIsKit = typeof isKit === "function" && isKit(part.pn);
@@ -299,8 +319,8 @@ function renderPartDetail(part) {
           ${overdueMarker}
           ${yAxis}
           ${xAxis}
-          <text x="${PL}" y="${todayLabelY}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
-          <text x="${W-6}" y="${todayLabelY}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
+          <text x="${PL}" y="${PT - 6}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">today</text>
+          <text x="${W-6}" y="${PT - 6}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
         </svg>
       </div>
 
