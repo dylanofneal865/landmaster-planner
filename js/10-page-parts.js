@@ -17,8 +17,15 @@ function renderPartDetail(part) {
   const status = partStatus(part);
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
-  // Build projection
-  const series = projectOnHand(part, 90);
+  // Build projection with dynamic horizon — extend enough to show both the
+  // stockout day and the lead-time landing day, capped at 365 so slow movers
+  // don't flatten the chart.
+  const coverDays = daysUntilStockout(part);
+  const leadDays = leadTimeDays(part);
+  const finiteCover = Number.isFinite(coverDays) ? coverDays : 0;
+  let horizon = Math.max(90, finiteCover + 14, leadDays + 14);
+  horizon = Math.min(horizon, 365);
+  const series = projectOnHand(part, horizon);
   const minOH = Math.min(...series.map(s => s.oh), 0);
   const maxOH = Math.max(...series.map(s => s.oh), part.onHand || 0, 1);
 
@@ -37,17 +44,77 @@ function renderPartDetail(part) {
   // Recent transactions involving this part
   const txns = DB.audit.filter(a => a.detail && a.detail.pn === part.pn).slice(0, 8);
 
-  // Sparkline SVG (90 days projection)
-  const W = 660, H = 140, P = 24;
-  const xS = i => P + (i / (series.length - 1)) * (W - 2*P);
-  const yS = v => H - P - ((v - minOH) / Math.max(1, maxOH - minOH)) * (H - 2*P);
+  // Inventory runway SVG — fixed canvas size; viewBox scales the content.
+  // Wider left pad for y-axis labels; extra bottom pad for month ticks.
+  const W = 720, H = 180, PL = 56, PR = 24, PT = 24, PB = 28;
+  const xS = i => PL + (i / Math.max(1, series.length - 1)) * (W - PL - PR);
+  const yS = v => H - PB - ((v - minOH) / Math.max(1, maxOH - minOH)) * (H - PT - PB);
   const linePath = series.map((s,i) => `${i===0?'M':'L'}${xS(i)},${yS(s.oh)}`).join(" ");
-  const areaPath = `${linePath} L${xS(series.length-1)},${H-P} L${xS(0)},${H-P} Z`;
-  // Mark stockout
+  const areaPath = `${linePath} L${xS(series.length-1)},${H-PB} L${xS(0)},${H-PB} Z`;
   const stockoutIdx = series.findIndex(s => s.oh <= 0);
-  // Mark today
-  const todayMark = `<line x1="${P}" y1="${P}" x2="${P}" y2="${H-P}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
-  const zeroLine = minOH <= 0 ? `<line x1="${P}" y1="${yS(0)}" x2="${W-P}" y2="${yS(0)}" class="spark-zero"/>` : "";
+  const todayMark = `<line x1="${xS(0)}" y1="${PT}" x2="${xS(0)}" y2="${H-PB}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
+  const zeroLine = minOH <= 0 ? `<line x1="${PL}" y1="${yS(0)}" x2="${W-PR}" y2="${yS(0)}" class="spark-zero"/>` : "";
+
+  // PO receipt dots + labels, with crowding suppression (~20px in x).
+  let _lastRecvLabelX = -Infinity;
+  const recvMarkers = series.map((s, i) => {
+    if (!s.recv || s.recv <= 0) return "";
+    const cx = xS(i);
+    const cy = yS(s.oh);
+    const dot = `<circle cx="${cx}" cy="${cy}" r="3" fill="#4aa3f2"/>`;
+    let label = "";
+    if (cx - _lastRecvLabelX > 20) {
+      label = `<text x="${cx}" y="${cy - 7}" text-anchor="middle" fill="#4aa3f2" font-size="9" font-family="var(--f-mono)">+${fmtNum(s.recv)}</text>`;
+      _lastRecvLabelX = cx;
+    }
+    return dot + label;
+  }).join("");
+
+  // Lead-time landing line (only if it lands inside the visible horizon).
+  const leadLine = (leadDays > 0 && leadDays <= horizon) ? `
+    <line x1="${xS(leadDays)}" y1="${PT}" x2="${xS(leadDays)}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>
+    <text x="${xS(leadDays)+4}" y="${PT+10}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+  ` : "";
+
+  // Overdue gap band — only when the reorder window has been missed.
+  const gapBand = (Number.isFinite(coverDays) && leadDays > coverDays) ? `
+    <rect x="${xS(coverDays)}" y="${PT}" width="${xS(leadDays) - xS(coverDays)}" height="${H - PT - PB}" fill="var(--crit)" opacity="0.12"/>
+    <text x="${(xS(coverDays) + xS(leadDays)) / 2}" y="${PT + 18}" text-anchor="middle" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">${leadDays - coverDays}-day gap</text>
+  ` : "";
+
+  // Y-axis labels (right-aligned in left pad).
+  const yAxis = `
+    <text x="${PL - 6}" y="${yS(part.onHand || 0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtNum(part.onHand || 0)}</text>
+    ${minOH <= 0 ? `<text x="${PL - 6}" y="${yS(0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">0</text>` : ""}
+  `;
+
+  // X-axis month tick labels — drop a "Mon" abbrev each day the month changes.
+  const _monAbbrev = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  let _prevMonth = series[0]?.d ? series[0].d.getMonth() : -1;
+  const xAxis = series.map((s, i) => {
+    if (i === 0) return ""; // skip i=0 to avoid colliding with the TODAY label
+    const m = s.d.getMonth();
+    if (m === _prevMonth) return "";
+    _prevMonth = m;
+    return `<text x="${xS(i)}" y="${H - 8}" text-anchor="middle" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${_monAbbrev[m]}</text>`;
+  }).join("");
+
+  // Stockout marker — first day at or below zero, two stacked labels.
+  const stockoutMarker = stockoutIdx >= 0 ? `
+    <circle cx="${xS(stockoutIdx)}" cy="${yS(0)}" r="4" fill="var(--crit)"/>
+    <text x="${xS(stockoutIdx)+6}" y="${yS(0)-12}" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
+    <text x="${xS(stockoutIdx)+6}" y="${yS(0)-2}" fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
+  ` : "";
+
+  // Status banner — plain-language summary placed above the chart.
+  let runwayBanner;
+  if (!Number.isFinite(coverDays)) {
+    runwayBanner = `<div class="dim tiny" style="margin-bottom:8px">No projected stockout at current demand.</div>`;
+  } else if (leadDays > coverDays) {
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--crit);font-weight:600">Runs out in ${coverDays}d (${stockoutDateStr(coverDays)}). Resupply takes ${leadDays}d — reorder overdue by ${leadDays - coverDays}d.</div>`;
+  } else {
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--warn);font-weight:500">Runs out in ${coverDays}d (${stockoutDateStr(coverDays)}). Reorder by day ${Math.max(0, coverDays - leadDays)} to stay covered.</div>`;
+  }
 
   const partIsKit = typeof isKit === "function" && isKit(part.pn);
   const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
@@ -128,17 +195,22 @@ function renderPartDetail(part) {
         <div class="stat"><div class="stat-label">Unit Cost</div><div class="stat-value">${fmtMoneyDec(part.cost)}</div></div>
       </div>
 
-      <div class="dr-section">90-day projection</div>
+      <div class="dr-section">Inventory runway</div>
+      ${runwayBanner}
       <div class="spark-wrap">
         <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;display:block">
+          ${gapBand}
           ${zeroLine}
           ${todayMark}
+          ${leadLine}
           <path d="${areaPath}" class="spark-area"/>
           <path d="${linePath}" class="spark-line"/>
-          ${stockoutIdx >= 0 ? `<circle cx="${xS(stockoutIdx)}" cy="${yS(0)}" r="3.5" fill="var(--crit)"/>` : ""}
-          <text x="${P}" y="${P-6}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
-          <text x="${W-P}" y="${P-6}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+90D</text>
-          ${stockoutIdx >= 0 ? `<text x="${xS(stockoutIdx)+6}" y="${yS(0)-6}" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">STOCKOUT D+${stockoutIdx}</text>` : ""}
+          ${recvMarkers}
+          ${stockoutMarker}
+          ${yAxis}
+          ${xAxis}
+          <text x="${PL}" y="${PT-8}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
+          <text x="${W-PR}" y="${PT-8}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
         </svg>
       </div>
 
