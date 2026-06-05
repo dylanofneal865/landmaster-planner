@@ -46,7 +46,9 @@ function renderPartDetail(part) {
 
   // Inventory runway SVG — fixed canvas size; viewBox scales the content.
   // Wider left pad for y-axis labels; extra bottom pad for month ticks.
-  const W = 720, H = 180, PL = 56, PR = 24, PT = 24, PB = 28;
+  // PR is generous so labels anchored near the horizon (stockout, lead-time
+  // landing, +horizonD) don't run off the right edge of the SVG viewBox.
+  const W = 720, H = 180, PL = 56, PR = 80, PT = 24, PB = 28;
   const xS = i => PL + (i / Math.max(1, series.length - 1)) * (W - PL - PR);
   const yS = v => H - PB - ((v - minOH) / Math.max(1, maxOH - minOH)) * (H - PT - PB);
   const linePath = series.map((s,i) => `${i===0?'M':'L'}${xS(i)},${yS(s.oh)}`).join(" ");
@@ -71,10 +73,21 @@ function renderPartDetail(part) {
   }).join("");
 
   // Lead-time landing line (only if it lands inside the visible horizon).
-  const leadLine = (leadDays > 0 && leadDays <= horizon) ? `
-    <line x1="${xS(leadDays)}" y1="${PT}" x2="${xS(leadDays)}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>
-    <text x="${xS(leadDays)+4}" y="${PT+10}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
-  ` : "";
+  // The "order today → arrives day N" label flips to end-anchor at the right
+  // inner edge when the line is too close to the horizon to fit a start-
+  // anchored label without clipping.
+  let leadLine = "";
+  if (leadDays > 0 && leadDays <= horizon) {
+    const lx = xS(leadDays);
+    const LEAD_LABEL_WIDTH = 160; // ≈ "order today → arrives day NNN" at font-size 9
+    const wouldOverflow = lx + 4 + LEAD_LABEL_WIDTH > W - 6;
+    const tx = wouldOverflow ? Math.min(W - 6, lx - 4) : Math.max(PL + 2, lx + 4);
+    const anchor = wouldOverflow ? ` text-anchor="end"` : "";
+    leadLine = `
+      <line x1="${lx}" y1="${PT}" x2="${lx}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>
+      <text x="${tx}" y="${PT+10}"${anchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+    `;
+  }
 
   // Overdue gap band — only when the reorder window has been missed.
   const gapBand = (Number.isFinite(coverDays) && leadDays > coverDays) ? `
@@ -100,11 +113,22 @@ function renderPartDetail(part) {
   }).join("");
 
   // Stockout marker — first day at or below zero, two stacked labels.
-  const stockoutMarker = stockoutIdx >= 0 ? `
-    <circle cx="${xS(stockoutIdx)}" cy="${yS(0)}" r="4" fill="var(--crit)"/>
-    <text x="${xS(stockoutIdx)+6}" y="${yS(0)-12}" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
-    <text x="${xS(stockoutIdx)+6}" y="${yS(0)-2}" fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
-  ` : "";
+  // When the marker is close to the right edge, anchor the labels at the
+  // right inner edge so the longer "day NNN · M/D/YY" line can't clip.
+  let stockoutMarker = "";
+  if (stockoutIdx >= 0) {
+    const sx = xS(stockoutIdx);
+    const sy = yS(0);
+    const STOCKOUT_LABEL_WIDTH = 110; // ≈ "day NNN · M/D/YY" at font-size 9
+    const wouldOverflow = sx + 6 + STOCKOUT_LABEL_WIDTH > W - 6;
+    const tx = wouldOverflow ? Math.min(W - 6, sx - 6) : Math.max(PL + 2, sx + 6);
+    const anchor = wouldOverflow ? ` text-anchor="end"` : "";
+    stockoutMarker = `
+      <circle cx="${sx}" cy="${sy}" r="4" fill="var(--crit)"/>
+      <text x="${tx}" y="${sy-12}"${anchor} fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
+      <text x="${tx}" y="${sy-2}"${anchor} fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
+    `;
+  }
 
   // Status banner — plain-language summary placed above the chart.
   let runwayBanner;
@@ -210,7 +234,7 @@ function renderPartDetail(part) {
           ${yAxis}
           ${xAxis}
           <text x="${PL}" y="${PT-8}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
-          <text x="${W-PR}" y="${PT-8}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
+          <text x="${W-6}" y="${PT-8}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
         </svg>
       </div>
 
