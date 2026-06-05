@@ -26,8 +26,13 @@ function renderPartDetail(part) {
   let horizon = Math.max(90, finiteCover + 14, leadDays + 14);
   horizon = Math.min(horizon, 365);
   const series = projectOnHand(part, horizon);
-  const minOH = Math.min(...series.map(s => s.oh), 0);
+  // Clamp the visual scale to 0..peak so long horizons of deeply negative
+  // on-hand don't crush the meaningful band into a sliver. The stockout
+  // index is still found on the unclamped series; only the drawn path is
+  // capped at the baseline.
+  const minOH = 0;
   const maxOH = Math.max(...series.map(s => s.oh), part.onHand || 0, 1);
+  const stockoutIdx = series.findIndex(s => s.oh <= 0);
 
   // Open POs containing this part
   const linesForPart = [];
@@ -44,25 +49,35 @@ function renderPartDetail(part) {
   // Recent transactions involving this part
   const txns = DB.audit.filter(a => a.detail && a.detail.pn === part.pn).slice(0, 8);
 
-  // Inventory runway SVG — fixed canvas size; viewBox scales the content.
-  // Wider left pad for y-axis labels; extra bottom pad for month ticks.
-  // PR is generous so labels anchored near the horizon (stockout, lead-time
-  // landing, +horizonD) don't run off the right edge of the SVG viewBox.
-  const W = 720, H = 180, PL = 56, PR = 80, PT = 24, PB = 28;
-  const xS = i => PL + (i / Math.max(1, series.length - 1)) * (W - PL - PR);
+  // Inventory runway SVG. Three layouts share this geometry:
+  //   (normal)    H=180, PB=28 — labels sit above the line near their markers
+  //   (early-stockout) H=220, PB=76 — stockout AND lead both land in the
+  //   left ~25% of the plot, so all four labels stack BELOW the baseline
+  //   in a single left-anchored column to avoid piling on TODAY + y-axis.
+  const W = 720, PL = 56, PR = 80, PT = 24;
+  const hasGap = Number.isFinite(coverDays) && leadDays > coverDays;
+  const _denom = Math.max(1, series.length - 1);
+  const stockoutInLeftZone = stockoutIdx >= 0 && stockoutIdx / _denom < 0.25;
+  const leadInLeftZone = leadDays > 0 && leadDays / _denom < 0.25;
+  const earlyStockoutMode = stockoutInLeftZone && leadInLeftZone && hasGap;
+  const PB = earlyStockoutMode ? 76 : 28;
+  const H = earlyStockoutMode ? 220 : 180;
+  const xS = i => PL + (i / _denom) * (W - PL - PR);
   const yS = v => H - PB - ((v - minOH) / Math.max(1, maxOH - minOH)) * (H - PT - PB);
-  const linePath = series.map((s,i) => `${i===0?'M':'L'}${xS(i)},${yS(s.oh)}`).join(" ");
+
+  // Drawn path clamps each point's oh to >= 0 so the curve flatlines on
+  // the baseline once stock crosses zero, rather than diving negative.
+  const linePath = series.map((s,i) => `${i===0?'M':'L'}${xS(i)},${yS(Math.max(0, s.oh))}`).join(" ");
   const areaPath = `${linePath} L${xS(series.length-1)},${H-PB} L${xS(0)},${H-PB} Z`;
-  const stockoutIdx = series.findIndex(s => s.oh <= 0);
   const todayMark = `<line x1="${xS(0)}" y1="${PT}" x2="${xS(0)}" y2="${H-PB}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
-  const zeroLine = minOH <= 0 ? `<line x1="${PL}" y1="${yS(0)}" x2="${W-PR}" y2="${yS(0)}" class="spark-zero"/>` : "";
+  const zeroLine = `<line x1="${PL}" y1="${yS(0)}" x2="${W-PR}" y2="${yS(0)}" class="spark-zero"/>`;
 
   // PO receipt dots + labels, with crowding suppression (~20px in x).
   let _lastRecvLabelX = -Infinity;
   const recvMarkers = series.map((s, i) => {
     if (!s.recv || s.recv <= 0) return "";
     const cx = xS(i);
-    const cy = yS(s.oh);
+    const cy = yS(Math.max(0, s.oh));
     const dot = `<circle cx="${cx}" cy="${cy}" r="3" fill="#4aa3f2"/>`;
     let label = "";
     if (cx - _lastRecvLabelX > 20) {
@@ -72,33 +87,19 @@ function renderPartDetail(part) {
     return dot + label;
   }).join("");
 
-  // Lead-time landing line (only if it lands inside the visible horizon).
-  // The "order today → arrives day N" label flips to end-anchor at the right
-  // inner edge when the line is too close to the horizon to fit a start-
-  // anchored label without clipping.
-  let leadLine = "";
-  if (leadDays > 0 && leadDays <= horizon) {
-    const lx = xS(leadDays);
-    const LEAD_LABEL_WIDTH = 160; // ≈ "order today → arrives day NNN" at font-size 9
-    const wouldOverflow = lx + 4 + LEAD_LABEL_WIDTH > W - 6;
-    const tx = wouldOverflow ? Math.min(W - 6, lx - 4) : Math.max(PL + 2, lx + 4);
-    const anchor = wouldOverflow ? ` text-anchor="end"` : "";
-    leadLine = `
-      <line x1="${lx}" y1="${PT}" x2="${lx}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>
-      <text x="${tx}" y="${PT+10}"${anchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
-    `;
-  }
-
-  // Overdue gap band — only when the reorder window has been missed.
-  const gapBand = (Number.isFinite(coverDays) && leadDays > coverDays) ? `
-    <rect x="${xS(coverDays)}" y="${PT}" width="${xS(leadDays) - xS(coverDays)}" height="${H - PT - PB}" fill="var(--crit)" opacity="0.12"/>
-    <text x="${(xS(coverDays) + xS(leadDays)) / 2}" y="${PT + 18}" text-anchor="middle" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">${leadDays - coverDays}-day gap</text>
+  // Thin gap strip on the baseline — drawn above the area fill, below the
+  // line stroke. The "N-day gap" caption is dropped here; in early-stockout
+  // mode it appears in the label stack, in normal mode the strip + lead /
+  // stockout markers carry the meaning.
+  const gapBand = hasGap ? `
+    <rect x="${xS(coverDays)}" y="${yS(0) - 3}" width="${xS(leadDays) - xS(coverDays)}" height="6" fill="var(--crit)" opacity="0.5"/>
   ` : "";
 
-  // Y-axis labels (right-aligned in left pad).
+  // Y-axis labels (right-aligned in left pad). With scale clamped to
+  // 0..peak the baseline label is always "0".
   const yAxis = `
-    <text x="${PL - 6}" y="${yS(part.onHand || 0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtNum(part.onHand || 0)}</text>
-    ${minOH <= 0 ? `<text x="${PL - 6}" y="${yS(0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">0</text>` : ""}
+    <text x="${PL - 6}" y="${yS(maxOH) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtNum(maxOH)}</text>
+    <text x="${PL - 6}" y="${yS(0) + 3}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">0</text>
   `;
 
   // X-axis month tick labels — drop a "Mon" abbrev each day the month changes.
@@ -112,22 +113,67 @@ function renderPartDetail(part) {
     return `<text x="${xS(i)}" y="${H - 8}" text-anchor="middle" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${_monAbbrev[m]}</text>`;
   }).join("");
 
-  // Stockout marker — first day at or below zero, two stacked labels.
-  // When the marker is close to the right edge, anchor the labels at the
-  // right inner edge so the longer "day NNN · M/D/YY" line can't clip.
+  // Stockout marker + lead-line label. Three layouts:
+  //   (a) early-stockout: all four labels stacked below the baseline
+  //   (b) collision sub-case of normal: stockout + lead within ~120px →
+  //       co-locate lead one line above the stockout group
+  //   (c) normal: stockout above its dot, lead by its line (with the
+  //       right-edge end-anchor flip + clamp from the prior pass).
+  let leadLine = "";
   let stockoutMarker = "";
-  if (stockoutIdx >= 0) {
+  if (earlyStockoutMode) {
+    if (leadDays > 0 && leadDays <= horizon) {
+      leadLine = `<line x1="${xS(leadDays)}" y1="${PT}" x2="${xS(leadDays)}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>`;
+    }
     const sx = xS(stockoutIdx);
     const sy = yS(0);
-    const STOCKOUT_LABEL_WIDTH = 110; // ≈ "day NNN · M/D/YY" at font-size 9
-    const wouldOverflow = sx + 6 + STOCKOUT_LABEL_WIDTH > W - 6;
-    const tx = wouldOverflow ? Math.min(W - 6, sx - 6) : Math.max(PL + 2, sx + 6);
-    const anchor = wouldOverflow ? ` text-anchor="end"` : "";
+    const stackX = Math.max(PL + 4, Math.min(W - 6, sx + 8));
     stockoutMarker = `
       <circle cx="${sx}" cy="${sy}" r="4" fill="var(--crit)"/>
-      <text x="${tx}" y="${sy-12}"${anchor} fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
-      <text x="${tx}" y="${sy-2}"${anchor} fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
+      <text x="${stackX}" y="${sy + 14}" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
+      <text x="${stackX}" y="${sy + 26}" fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
+      <text x="${stackX}" y="${sy + 40}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+      <text x="${stackX}" y="${sy + 52}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">${leadDays - coverDays}-day gap</text>
     `;
+  } else {
+    // Compute stockout label anchor first so the lead label can co-locate.
+    let sTx = 0;
+    let sAnchor = "";
+    const sy = yS(0);
+    if (stockoutIdx >= 0) {
+      const sx = xS(stockoutIdx);
+      const STOCKOUT_LABEL_WIDTH = 110; // ≈ "day NNN · M/D/YY"
+      const wouldOverflow = sx + 6 + STOCKOUT_LABEL_WIDTH > W - 6;
+      sTx = wouldOverflow ? Math.min(W - 6, sx - 6) : Math.max(PL + 2, sx + 6);
+      sAnchor = wouldOverflow ? ` text-anchor="end"` : "";
+      stockoutMarker = `
+        <circle cx="${sx}" cy="${sy}" r="4" fill="var(--crit)"/>
+        <text x="${sTx}" y="${sy-12}"${sAnchor} fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
+        <text x="${sTx}" y="${sy-2}"${sAnchor} fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
+      `;
+    }
+    if (leadDays > 0 && leadDays <= horizon) {
+      const lx = xS(leadDays);
+      const leadVerticalLine = `<line x1="${lx}" y1="${PT}" x2="${lx}" y2="${H-PB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3" opacity="0.85"/>`;
+      const closeToStockout = stockoutIdx >= 0 && Math.abs(xS(stockoutIdx) - lx) < 120;
+      if (closeToStockout) {
+        // (b) Stack lead one line above the stockout group at same x/anchor.
+        leadLine = `
+          ${leadVerticalLine}
+          <text x="${sTx}" y="${sy-24}"${sAnchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+        `;
+      } else {
+        // (c) Normal: label by the line, end-anchor flip + right-edge clamp.
+        const LEAD_LABEL_WIDTH = 160;
+        const leadWouldOverflow = lx + 4 + LEAD_LABEL_WIDTH > W - 6;
+        const ltx = leadWouldOverflow ? Math.min(W - 6, lx - 4) : Math.max(PL + 2, lx + 4);
+        const leadAnchor = leadWouldOverflow ? ` text-anchor="end"` : "";
+        leadLine = `
+          ${leadVerticalLine}
+          <text x="${ltx}" y="${PT+10}"${leadAnchor} fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
+        `;
+      }
+    }
   }
 
   // Status banner — plain-language summary placed above the chart.
@@ -139,6 +185,10 @@ function renderPartDetail(part) {
   } else {
     runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--warn);font-weight:500">Runs out in ${coverDays}d (${stockoutDateStr(coverDays)}). Reorder by day ${Math.max(0, coverDays - leadDays)} to stay covered.</div>`;
   }
+
+  // TODAY / +horizonD label y. Slightly lower in early-stockout mode so
+  // they sit clear of the y-axis numbers when the stack is in play.
+  const todayLabelY = earlyStockoutMode ? PT - 4 : PT - 8;
 
   const partIsKit = typeof isKit === "function" && isKit(part.pn);
   const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
@@ -223,18 +273,18 @@ function renderPartDetail(part) {
       ${runwayBanner}
       <div class="spark-wrap">
         <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;display:block">
-          ${gapBand}
           ${zeroLine}
           ${todayMark}
           ${leadLine}
-          <path d="${areaPath}" class="spark-area"/>
+          <path d="${areaPath}" class="spark-area" style="fill-opacity:0.08"/>
+          ${gapBand}
           <path d="${linePath}" class="spark-line"/>
           ${recvMarkers}
           ${stockoutMarker}
           ${yAxis}
           ${xAxis}
-          <text x="${PL}" y="${PT-8}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
-          <text x="${W-6}" y="${PT-8}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
+          <text x="${PL}" y="${todayLabelY}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
+          <text x="${W-6}" y="${todayLabelY}" text-anchor="end" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">+${horizon}D</text>
         </svg>
       </div>
 
