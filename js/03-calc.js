@@ -11,11 +11,12 @@ function leadTimeDays(part) {
   return Math.round((part.ltWeeks || 0) * 7);
 }
 
-// Build a per-PN index of open PO lines. Each entry: { ln, remaining }.
+// Build a per-PN index of open PO lines. Each entry: { ln, remaining, po }.
 // Built once at the top of partsWithStatus so projectOnHand/openPOQty don't
 // rescan DB.pos for every part. External callers don't need this — the public
 // fns below accept an optional precomputed lines array and fall back to a
-// full scan when called without it.
+// full scan when called without it. The `po` reference is carried so
+// projectOnHand can attribute overdue receipts to a PO number.
 function _buildOpenPOLineIndex() {
   const map = new Map();
   for (const po of (DB.pos || [])) {
@@ -26,7 +27,7 @@ function _buildOpenPOLineIndex() {
       if (!remaining) continue;
       let arr = map.get(ln.pn);
       if (!arr) { arr = []; map.set(ln.pn, arr); }
-      arr.push({ ln, remaining });
+      arr.push({ ln, remaining, po });
     }
   }
   return map;
@@ -54,26 +55,46 @@ function openPOQty(pn, lines) {
 
 // Project on-hand over the next N days, treating PO lines as receipts on their expected dates.
 // `lines` is the optional precomputed index entry for this part.
+// Past-due lines (genuine expected date < today) are still clamped to offset
+// 0 — they continue to prop up the projection — but the units and source
+// lines are surfaced via series.overdueUnits / series.overdueLines so the
+// UI can flag the assumption without changing any math.
 function projectOnHand(part, days = 365, lines) {
   const series = [];
   let oh = part.onHand || 0;
   const receipts = new Array(days + 1).fill(0);
-  const accumReceipt = (ln, remaining) => {
+  let overdueAtZero = 0;
+  const overdueLines = [];
+  const accumReceipt = (ln, remaining, po) => {
     let offset;
+    let isOverdue = false;
     const expDate = ln.expectedDate ? new Date(ln.expectedDate) : null;
     if (!expDate || isNaN(expDate)) {
-      // Missing/invalid date → assume arrival at the part's lead time from today
+      // Missing/invalid date → assume arrival at the part's lead time from
+      // today. NOT treated as overdue — we have no signal that it's late.
       offset = leadTimeDays(part);
     } else {
       expDate.setHours(0,0,0,0);
       offset = Math.round((expDate - TODAY) / DAY_MS);
       // Past expected date → treat as arriving today (don't drop the receipt)
-      if (offset < 0) offset = 0;
+      if (offset < 0) {
+        isOverdue = true;
+        offset = 0;
+      }
     }
     if (offset <= days) receipts[offset] += remaining;
+    if (isOverdue) {
+      overdueAtZero += remaining;
+      overdueLines.push({
+        pn: ln.pn,
+        qty: remaining,
+        expected: ln.expectedDate,
+        po: po ? (po.num || null) : null,
+      });
+    }
   };
   if (lines) {
-    for (const e of lines) accumReceipt(e.ln, e.remaining);
+    for (const e of lines) accumReceipt(e.ln, e.remaining, e.po);
   } else {
     for (const po of (DB.pos || [])) {
       if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
@@ -82,7 +103,7 @@ function projectOnHand(part, days = 365, lines) {
         if (ln.status === "received" || ln.status === "cancelled") continue;
         const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
         if (!remaining) continue;
-        accumReceipt(ln, remaining);
+        accumReceipt(ln, remaining, po);
       }
     }
   }
@@ -91,6 +112,10 @@ function projectOnHand(part, days = 365, lines) {
     oh += receipts[i];
     series.push({ d: addDays(TODAY, i), oh: oh, recv: receipts[i] });
   }
+  // Attach the overdue summary as plain properties on the array. Existing
+  // callers (.map / .length / indexing / .findIndex) are unaffected.
+  series.overdueUnits = overdueAtZero;
+  series.overdueLines = overdueLines;
   return series;
 }
 

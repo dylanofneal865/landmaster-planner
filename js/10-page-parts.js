@@ -190,6 +190,20 @@ function renderPartDetail(part) {
   // they sit clear of the y-axis numbers when the stack is in play.
   const todayLabelY = earlyStockoutMode ? PT - 4 : PT - 8;
 
+  // Overdue advisory — projection still treats past-due lines as arrived
+  // today (math unchanged), but surface the assumption so the runway
+  // doesn't silently bake in late inbound. series.overdueUnits/Lines are
+  // populated by projectOnHand.
+  const overdueUnits = series.overdueUnits || 0;
+  const overdueLines = series.overdueLines || [];
+  const overdueBanner = overdueUnits > 0 ? `
+    <div class="tiny" style="margin-bottom:8px;color:var(--warn)">${overdueLines.length} PO line${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes they've arrived. Confirm with supplier.</div>
+  ` : "";
+  const overdueMarker = overdueUnits > 0 ? `
+    <circle cx="${xS(0)}" cy="${yS(0)}" r="4" stroke="var(--warn)" stroke-width="1.5" fill="none"/>
+    <text x="${PL}" y="${todayLabelY + 10}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">overdue inbound</text>
+  ` : "";
+
   const partIsKit = typeof isKit === "function" && isKit(part.pn);
   const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
 
@@ -271,6 +285,7 @@ function renderPartDetail(part) {
 
       <div class="dr-section">Inventory runway</div>
       ${runwayBanner}
+      ${overdueBanner}
       <div class="spark-wrap">
         <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px;display:block">
           ${zeroLine}
@@ -281,6 +296,7 @@ function renderPartDetail(part) {
           <path d="${linePath}" class="spark-line"/>
           ${recvMarkers}
           ${stockoutMarker}
+          ${overdueMarker}
           ${yAxis}
           ${xAxis}
           <text x="${PL}" y="${todayLabelY}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">TODAY</text>
@@ -336,14 +352,24 @@ function renderPartDetail(part) {
         <div class="tbl-wrap"><table class="tbl">
           <thead><tr><th>PO</th><th>Status</th><th class="right">Open Qty</th><th>Expected</th></tr></thead>
           <tbody>
-            ${linesForPart.map(({po, ln, remaining}) => `
+            ${linesForPart.map(({po, ln, remaining}) => {
+              const expRaw = ln.expectedDate || po.expectedDate;
+              let isPastDue = false;
+              if (expRaw) {
+                const exp = new Date(expRaw);
+                if (!isNaN(exp)) {
+                  exp.setHours(0, 0, 0, 0);
+                  isPastDue = exp.getTime() < TODAY.getTime();
+                }
+              }
+              return `
               <tr class="clickable" onclick="openPODetail('${esc(po.id)}')">
                 <td class="pn">${esc(po.num)}</td>
                 <td><span class="pill ${poStatusClass(po.status)}">${poStatusLabel(po.status)}</span></td>
                 <td class="right num">${fmtNum(remaining)}</td>
-                <td class="num dim">${fmtDate(ln.expectedDate || po.expectedDate)}</td>
+                <td class="num ${isPastDue ? 'text-warn bold' : 'dim'}">${fmtDate(expRaw)}${isPastDue ? ' <span class="pill warn" style="margin-left:4px">PAST DUE</span>' : ''}</td>
               </tr>
-            `).join("")}
+            `;}).join("")}
           </tbody>
         </table></div>
       ` : ""}
