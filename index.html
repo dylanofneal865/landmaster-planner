@@ -72,10 +72,21 @@
     </button>
 
     <div class="nav-section">USAGE</div>
-    <button class="nav-item" data-route="base-bom-usage">
-      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13L5 9L8 11L13 4"/><path d="M10 4h3v3"/></svg>
-      Base BOM
-    </button>
+    <div class="nav-row" data-nav-group="bb">
+      <button class="nav-item" data-route="base-bom-usage">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13L5 9L8 11L13 4"/><path d="M10 4h3v3"/></svg>
+        Base BOM
+      </button>
+      <button class="nav-caret" id="nav-caret-bb" onclick="toggleNavGroup('bb')" aria-label="Toggle Base BOM children" aria-expanded="false" title="Show / hide BOM views">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l4 4 4-4"/></svg>
+      </button>
+    </div>
+    <div class="nav-children" id="nav-children-bb" hidden>
+      <button class="nav-item nav-child" data-route="multi-level-bom">
+        <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 2v3M8 5L4 8M8 5l4 3M4 8v2M12 8v2M8 11v2"/><circle cx="8" cy="2" r="1.2"/><circle cx="4" cy="11" r="1.2"/><circle cx="12" cy="11" r="1.2"/><circle cx="8" cy="13.5" r="1.2"/></svg>
+        Multi Level BOM
+      </button>
+    </div>
     <button class="nav-item" data-route="options-usage">
       <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13L5 9L8 11L13 4"/><path d="M10 4h3v3"/></svg>
       Options

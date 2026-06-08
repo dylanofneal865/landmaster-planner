@@ -255,6 +255,44 @@ registerRoute("usage",          () => renderUsageFor(null));
 registerRoute("base-bom-usage", () => { if (!_usageGate("base-bom-usage")) return; renderBaseBomUsage(); });
 registerRoute("options-usage",  () => { if (!_usageGate("options-usage")) return; renderUsageFor("options"); });
 
+// Multi Level BOM — empty-state stub. Reserves the route + sidebar slot for
+// the upcoming finished-goods bills of material; intentionally UN-GATED while
+// it carries no real data (we'll add _usageGate once BOMs sync in).
+registerRoute("multi-level-bom", () => renderMultiLevelBomStub());
+
+function renderMultiLevelBomStub() {
+  $("#main").innerHTML = `
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <div class="page-title">Multi Level BOM</div>
+          <div class="page-sub mono">FINISHED-GOODS BILLS OF MATERIAL · EACH UTV'S EXPLODED COMPONENT LIST WILL DRIVE BASE-BOM DEMAND</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-body">
+          <div class="empty">
+            <div class="empty-title">No BOMs loaded yet</div>
+            <div class="empty-msg">Finished-goods BOMs will sync from Acumatica and appear here.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="opacity:0.55;pointer-events:none">
+        <div class="panel-head">
+          <div class="panel-title">Finished goods</div>
+          <div class="panel-sub">placeholder</div>
+        </div>
+        <div class="panel-body">
+          <div class="muted tiny center" style="padding:28px 0;font-style:italic">
+            81 finished goods will list here — select one to see its exploded multi-level parts.
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 /* ============================================================
    BASE BOM USAGE — rate-management surface (not a transaction tracker)
    Edits part.daily on base_bom parts only; feeds the Base BOM Queue.

@@ -289,6 +289,46 @@ body {
 }
 .nav-item .badge.crit { background: var(--crit-soft); color: var(--crit); }
 .nav-item .badge.warn { background: var(--warn-soft); color: var(--warn); }
+
+/* Expandable nav group: parent row hosts the nav-item + a disclosure caret */
+.nav-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.nav-row .nav-item { flex: 1; min-width: 0; }
+.nav-caret {
+  flex: 0 0 auto;
+  width: 24px; height: 24px;
+  border: 0;
+  background: transparent;
+  color: var(--t3);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.nav-caret:hover { background: var(--bg-hover); color: var(--t1); }
+.nav-caret svg { width: 12px; height: 12px; display: block; transition: transform 0.15s ease; }
+.nav-row.expanded .nav-caret svg { transform: rotate(180deg); }
+.nav-children {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0 2px;
+}
+.nav-children[hidden] { display: none; }
+.nav-item.nav-child {
+  padding-left: 30px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--t3);
+}
+.nav-item.nav-child .ico { width: 13px; height: 13px; opacity: 0.7; }
+.nav-item.nav-child:hover { color: var(--t1); }
+.nav-item.nav-child.active { color: var(--t1); }
+
 .sidebar .grow { flex: 1; }
 .sidebar-foot {
   padding: 10px 10px 12px;

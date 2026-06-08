@@ -85,6 +85,39 @@ function refresh() {
 }
 
 /* ============================================================
+   SIDEBAR NAV GROUPS — expand/collapse persistence
+   Single source of truth for nestable nav rows. Each key maps to the
+   localStorage flag that persists its expanded state across reloads.
+   ============================================================ */
+const NAV_GROUP_KEYS = {
+  bb: "landmaster.nav.bbExpanded",
+};
+
+function applyNavGroupState(key, expanded) {
+  const row = document.querySelector(`.nav-row[data-nav-group="${key}"]`);
+  const children = document.getElementById(`nav-children-${key}`);
+  const caret = document.getElementById(`nav-caret-${key}`);
+  if (row) row.classList.toggle("expanded", !!expanded);
+  if (children) children.hidden = !expanded;
+  if (caret) caret.setAttribute("aria-expanded", expanded ? "true" : "false");
+}
+
+function toggleNavGroup(key) {
+  const storageKey = NAV_GROUP_KEYS[key];
+  if (!storageKey) return;
+  const next = !(localStorage.getItem(storageKey) === "1");
+  try { localStorage.setItem(storageKey, next ? "1" : "0"); } catch (e) {}
+  applyNavGroupState(key, next);
+}
+
+function initNavGroups() {
+  for (const [key, storageKey] of Object.entries(NAV_GROUP_KEYS)) {
+    const expanded = localStorage.getItem(storageKey) === "1";
+    applyNavGroupState(key, expanded);
+  }
+}
+
+/* ============================================================
    TOP BAR / NAV BADGES
    ============================================================ */
 function updateTopBar() {

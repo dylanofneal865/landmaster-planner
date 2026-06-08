@@ -37,6 +37,9 @@ async function initApp() {
     n.onclick = () => navigate(n.dataset.route);
   });
 
+  // Restore expand/collapse state for nestable sidebar groups
+  initNavGroups();
+
   // Wire top-bar Draft Order button
   $("#btn-draft-order").onclick = openDraftOrderDrawer;
 
