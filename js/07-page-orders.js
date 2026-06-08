@@ -345,7 +345,7 @@ function renderOrderQueueFor(itemType) {
         break;
 
       case "value":
-        cmp = a._suggestedQty * (a.cost || 0) - b._suggestedQty * (b.cost || 0);
+        cmp = a._suggestedQty * orderUnitCost(a) - b._suggestedQty * orderUnitCost(b);
         break;
 
       case "urgency":
@@ -432,7 +432,7 @@ function renderOrderQueueFor(itemType) {
                     const sq = p._suggestedQty;
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}</td>
                       <td onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')">
@@ -447,7 +447,7 @@ function renderOrderQueueFor(itemType) {
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onPO)}</td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.daily,2)}</td>
                       <td class="right num bold text-accent" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(sq)}</td>
-                      <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtMoney(sq * (p.cost||0))}</td>
+                      <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtMoney(sq * orderUnitCost(p))}</td>
                       <td>${draftOrderHas(p.pn)
                         ? `<span class="btn sm" aria-disabled="true" style="min-width:72px;justify-content:center;cursor:default;color:var(--t2);font-weight:500;pointer-events:none">IN DRAFT</span>`
                         : `<button class="btn sm primary" style="min-width:72px;justify-content:center" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}'); oqRerenderPreservingScroll();">+ Add</button>`}</td>

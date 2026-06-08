@@ -29,9 +29,12 @@ registerRoute("dashboard", () => {
     }, 0);
   }, 0);
 
-  // Suggested order $ today
-  const suggestedValue = orderable.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit)
-    .reduce((s, p) => s + p._suggestedQty * (p.cost || 0), 0);
+  // Suggested order $ today. Uses orderUnitCost (last PO price → stored
+  // cost fallback). Skip parts with no usable purchase price (no PO history
+  // AND no stored cost — typically built kits/FG) so they can't dilute the
+  // total with implicit $0 contributions.
+  const suggestedValue = orderable.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit && !hasNoOrderCost(p))
+    .reduce((s, p) => s + p._suggestedQty * orderUnitCost(p), 0);
 
   // Top critical
   const topCrit = crit.sort((a,b) => a.urgency - b.urgency).slice(0, 8);

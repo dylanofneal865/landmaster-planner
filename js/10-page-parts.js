@@ -17,6 +17,21 @@ function renderPartDetail(part) {
   const status = partStatus(part);
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
+  // Pricing provenance for the Unit Cost tile + NO COST flag. Suggested-
+  // order $ uses orderUnitCost (last PO price → stored cost fallback); the
+  // stored part.cost stays editable and authoritative as the on-hand /
+  // inventory-value baseline.
+  const lastPO = lastPOPrice(part.pn);
+  const noOrderCost = hasNoOrderCost(part);
+  let costMeta;
+  if (lastPO && lastPO.cost > 0) {
+    costMeta = `<div class="dim tiny mono" style="margin-top:2px">last PO: ${fmtMoneyDec(lastPO.cost)} × ${fmtNum(lastPO.qty)} on ${fmtDate(lastPO.date)} (${esc(lastPO.poNum || "")})</div>`;
+  } else if ((part.cost || 0) > 0) {
+    costMeta = `<div class="dim tiny" style="margin-top:2px">no PO history — using standard cost</div>`;
+  } else {
+    costMeta = `<div class="tiny" style="margin-top:2px"><span class="pill warn">NO COST</span></div>`;
+  }
+
   // Build projection with dynamic horizon — extend enough to show both the
   // stockout day and the lead-time landing day, capped at 365 so slow movers
   // don't flatten the chart.
@@ -300,7 +315,7 @@ function renderPartDetail(part) {
         <div class="stat"><div class="stat-label">Daily Use</div><div class="stat-value">${fmtNum(part.daily, 2)}</div></div>
         <div class="stat"><div class="stat-label">Days Cover</div><div class="stat-value ${status.status==='critical'?'crit':status.status==='warning'?'warn':'ok'}">${status.daysOfCover === Infinity ? '∞' : status.daysOfCover + 'd'}</div>${(() => { const s = stockoutDateStr(status.daysOfCover); return s ? `<div class="dim tiny mono" style="margin-top:2px">${s}</div>` : ''; })()}</div>
         <div class="stat"><div class="stat-label">Lead Time</div><div class="stat-value">${part.ltWeeks||0}w</div></div>
-        <div class="stat"><div class="stat-label">Unit Cost</div><div class="stat-value">${fmtMoneyDec(part.cost)}</div></div>
+        <div class="stat"><div class="stat-label">Unit Cost</div><div class="stat-value">${fmtMoneyDec(part.cost)}</div>${costMeta}</div>
       </div>
 
       <div class="dr-section">Inventory runway</div>

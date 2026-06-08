@@ -181,6 +181,42 @@ function suggestedQty(part, onPO) {
   return qty;
 }
 
+// Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
+// NOT in the future (guards the known future-dated createdDate typos); if all
+// candidates are future/invalid, fall back to newest regardless.
+function lastPOPrice(pn) {
+  if (!pn || !Array.isArray(DB.pos)) return null;
+  const cands = [];
+  for (const po of DB.pos) {
+    for (const ln of (po.lines || [])) {
+      if (ln.pn !== pn) continue;
+      const d = po.createdDate ? new Date(po.createdDate) : null;
+      cands.push({ cost: ln.cost || 0, qty: ln.qty || 0, date: d, poNum: po.num || po.id });
+    }
+  }
+  if (!cands.length) return null;
+  const notFuture = cands.filter(c => c.date && !isNaN(c.date) && c.date <= TODAY);
+  const pool = notFuture.length ? notFuture : cands;
+  pool.sort((a, b) => (b.date ? b.date.getTime() : 0) - (a.date ? a.date.getTime() : 0));
+  return pool[0]; // { cost, qty, date, poNum }
+}
+
+// Unit cost for SUGGESTED-ORDER pricing: last PO price if known, else stored
+// cost. On-hand inventory valuation and the inventory-value KPI still use
+// part.cost (the stored standard cost) — only the suggested-order math
+// reaches for actual recent purchase price.
+function orderUnitCost(part) {
+  const lp = lastPOPrice(part.pn);
+  return (lp && lp.cost > 0) ? lp.cost : (part.cost || 0);
+}
+
+// True when there's no usable purchase price (no PO history AND no stored
+// cost). Mostly kit/FG SKUs that are built, not bought. Used to keep these
+// out of suggested-value rollups and to flag them visually.
+function hasNoOrderCost(part) {
+  return orderUnitCost(part) <= 0;
+}
+
 // Snapshot all parts with computed status — heavy compute, cache?
 let _statusCache = null;
 let _statusCacheVer = 0;
