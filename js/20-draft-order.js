@@ -351,7 +351,7 @@ async function generateDraftOrderPDF() {
 }
 
 async function _buildDraftOrderPDF() {
-  const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
+  const { itemCount, supplierGroups } = draftOrderTotals();
   if (itemCount === 0) return;
 
   const { jsPDF } = window.jspdf;
@@ -367,8 +367,29 @@ async function _buildDraftOrderPDF() {
   const dateStr = today.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
   const pad = n => String(n).padStart(2, "0");
   const isoStr = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`;
+  const refNum = `DRAFT-${today.getFullYear()}${pad(today.getMonth() + 1)}${pad(today.getDate())}-${pad(today.getHours())}${pad(today.getMinutes())}`;
   const buyer = (DB.settings && DB.settings.defaultBuyer) || "Landmaster Purchasing";
-  const supplierKeys = Object.keys(supplierGroups).sort();
+
+  // Recompute supplier subtotals and grand total using orderUnitCost (last
+  // PO price → stored cost fallback) so the approval document reflects the
+  // actual recent purchase price, not the static standard cost. Parts with
+  // no usable purchase price ("no cost") contribute 0 and render "—" in
+  // the table.
+  const supplierData = {};
+  let pdfGrandTotal = 0;
+  for (const supplier of Object.keys(supplierGroups).sort()) {
+    const grp = supplierGroups[supplier];
+    const lines = grp.lines.map(({ part, qty }) => {
+      const noCost = hasNoOrderCost(part);
+      const unit = noCost ? 0 : orderUnitCost(part);
+      const lineTotal = qty * unit;
+      pdfGrandTotal += lineTotal;
+      return { part, qty, unit, lineTotal, noCost };
+    });
+    const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
+    supplierData[supplier] = { lines, subtotal };
+  }
+  const supplierKeys = Object.keys(supplierData);
 
   // ---- TITLE BLOCK (page 1) ----
   const titleY = BANNER_H + 30; // 77
@@ -383,131 +404,218 @@ async function _buildDraftOrderPDF() {
   doc.setLineWidth(2);
   doc.line(M, titleY + 6, M + 64, titleY + 6);
 
-  // Subtitle
+  // Subtitle line + draft reference number
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
   doc.setTextColor(...PDF_COLORS.muted);
   doc.text(`Generated ${dateStr}   ·   Prepared by ${buyer}`, M, titleY + 22);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(9);
+  doc.setTextColor(...PDF_COLORS.accentDark);
+  doc.text(refNum, M, titleY + 38);
 
   // ---- STAT STRIP (right side, page 1) ----
-  // Three label/value pairs, right-aligned
   const statY = titleY - 14;
   const statSpacing = 96;
   const statRight = pageW - M;
-  // Render right-to-left to keep alignment clean
-  _pdfStat(doc, statRight - 60, statY, "TOTAL", fmtMoney(grandTotal), true);
+  _pdfStat(doc, statRight - 60, statY, "TOTAL", fmtMoney(pdfGrandTotal), true);
   _pdfStat(doc, statRight - 60 - statSpacing, statY, "SUPPLIERS", String(supplierKeys.length), false);
   _pdfStat(doc, statRight - 60 - statSpacing * 2, statY, "ITEMS", String(itemCount), false);
 
-  // ---- FLAT TABLE: one row per part, supplier as column ----
-  // Flatten all rows, sorted by supplier (alpha), and keep status meta in parallel
-  const allRows = [];
-  const rowStatuses = [];
+  // ---- PER-SUPPLIER GROUPS ----
+  // Each supplier renders as: header band → 8-col autoTable → subtotal row.
+  // startY chains off the previous table's finalY so groups stack cleanly,
+  // with a page-break guard before each band.
+  let cursorY = titleY + 56;
+
   for (const supplier of supplierKeys) {
-    const grp = supplierGroups[supplier];
-    for (const { part, qty, lineTotal } of grp.lines) {
+    const { lines, subtotal } = supplierData[supplier];
+    const BAND_H = 22;
+    const PRE_BAND_BREAK = BAND_H + 60; // band + first row + subtotal allowance
+    if (cursorY + PRE_BAND_BREAK > pageH - FOOTER_H) {
+      doc.addPage();
+      cursorY = CONT_TOP;
+    }
+
+    // Supplier header band
+    doc.setFillColor(...PDF_COLORS.alt);
+    doc.rect(M, cursorY, pageW - 2 * M, BAND_H, "F");
+    doc.setFillColor(...PDF_COLORS.accent);
+    doc.rect(M, cursorY, 4, BAND_H, "F");
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(...PDF_COLORS.accentDark);
+    doc.text(supplier, M + 12, cursorY + 14);
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(...PDF_COLORS.muted);
+    const itemsLabel = `${lines.length} item${lines.length === 1 ? '' : 's'}  ·  ${fmtMoney(subtotal)}`;
+    doc.text(itemsLabel, pageW - M - 8, cursorY + 14, { align: "right" });
+
+    cursorY += BAND_H + 2;
+
+    // Build table rows + parallel status array for Days-Cover coloring
+    const rows = [];
+    const statuses = [];
+    for (const line of lines) {
+      const part = line.part;
       const stat = partStatus(part);
       const cover = stat.daysOfCover === Infinity ? "—" : `${stat.daysOfCover}d`;
-      allRows.push([
-        supplier,
+      const unitCell = line.noCost ? "—" : fmtMoneyDec(line.unit);
+      const totalCell = line.noCost ? "(no cost)" : fmtMoney(line.lineTotal);
+      rows.push([
         part.pn || "",
         part.desc || "",
         fmtNum(part.onHand || 0),
-        fmtNum(part.daily || 0, 2),
         cover,
         `${part.ltWeeks || 0}w`,
-        fmtNum(qty),
-        fmtMoneyDec(part.cost),
-        fmtMoney(lineTotal),
+        fmtNum(line.qty),
+        unitCell,
+        totalCell,
       ]);
-      rowStatuses.push(stat.status);
+      statuses.push(stat.status);
     }
+
+    doc.autoTable({
+      head: [["Part #", "Description", "On Hand", "Days Cover", "Lead", "Qty", "Unit Cost", "Line Total"]],
+      body: rows,
+      startY: cursorY,
+      margin: { left: M, right: M, top: CONT_TOP, bottom: FOOTER_H + 10 },
+      theme: "plain",
+      styles: {
+        fontSize: 9,
+        cellPadding: 6,
+        textColor: PDF_COLORS.ink,
+        lineColor: PDF_COLORS.line,
+        lineWidth: 0.3,
+        overflow: "linebreak",
+        valign: "middle",
+      },
+      headStyles: {
+        fillColor: PDF_COLORS.white,
+        textColor: PDF_COLORS.inkSoft,
+        fontStyle: "bold",
+        fontSize: 8,
+        lineWidth: 0,
+        cellPadding: { top: 6, right: 7, bottom: 8, left: 7 },
+      },
+      alternateRowStyles: { fillColor: PDF_COLORS.alt },
+      columnStyles: {
+        0: { fontStyle: "bold", cellWidth: 80 },
+        1: { cellWidth: "auto" },
+        2: { halign: "right", textColor: PDF_COLORS.muted, cellWidth: 56 },
+        3: { halign: "right", textColor: PDF_COLORS.muted, cellWidth: 64 },
+        4: { halign: "right", textColor: PDF_COLORS.muted, cellWidth: 42 },
+        5: { halign: "right", cellWidth: 50, fontStyle: "bold" },
+        6: { halign: "right", cellWidth: 68 },
+        7: { halign: "right", cellWidth: 76, fontStyle: "bold" },
+      },
+      didParseCell: (data) => {
+        // Days-Cover column is now index 3; re-apply status coloring there.
+        if (data.section === "body" && data.column.index === 3) {
+          const s = statuses[data.row.index];
+          if (s === "critical") {
+            data.cell.styles.textColor = PDF_COLORS.crit;
+            data.cell.styles.fontStyle = "bold";
+          } else if (s === "warning") {
+            data.cell.styles.textColor = PDF_COLORS.warn;
+          }
+        }
+      },
+      didDrawCell: (data) => {
+        if (data.section === "head") {
+          const { x, y, height, width } = data.cell;
+          doc.setDrawColor(...PDF_COLORS.accent);
+          doc.setLineWidth(1.6);
+          doc.line(x, y + height, x + width, y + height);
+        }
+      },
+    });
+
+    cursorY = doc.lastAutoTable.finalY + 6;
+
+    // Per-supplier subtotal row (right-aligned under the table)
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(...PDF_COLORS.muted);
+    doc.text(`${supplier} subtotal`, pageW - M - 100, cursorY + 10, { align: "right" });
+    doc.setFontSize(11);
+    doc.setTextColor(...PDF_COLORS.accentDark);
+    doc.text(fmtMoney(subtotal), pageW - M, cursorY + 10, { align: "right" });
+
+    cursorY += 26; // table finalY → next group origin
   }
 
-  const tableStartY = titleY + 38;
-
-  doc.autoTable({
-    head: [["Supplier", "Part #", "Description", "On Hand", "Daily", "Days Cover", "Lead", "Qty", "Unit Cost", "Line Total"]],
-    body: allRows,
-    startY: tableStartY,
-    margin: { left: M, right: M, top: CONT_TOP, bottom: FOOTER_H + 10 },
-    theme: "plain",
-    styles: {
-      fontSize: 9,
-      cellPadding: 7,
-      textColor: PDF_COLORS.ink,
-      lineColor: PDF_COLORS.line,
-      lineWidth: 0.3,
-      overflow: "linebreak",
-      valign: "middle",
-    },
-    headStyles: {
-      fillColor: PDF_COLORS.white,
-      textColor: PDF_COLORS.inkSoft,
-      fontStyle: "bold",
-      fontSize: 8,
-      lineWidth: 0,
-      cellPadding: { top: 6, right: 7, bottom: 8, left: 7 },
-    },
-    alternateRowStyles: { fillColor: PDF_COLORS.alt },
-    columnStyles: {
-      0: { fontStyle: "bold", textColor: PDF_COLORS.accentDark, cellWidth: 130 },
-      1: { fontStyle: "bold", cellWidth: 70 },
-      2: { cellWidth: "auto" },
-      3: { halign: "right", cellWidth: 50 },
-      4: { halign: "right", cellWidth: 44 },
-      5: { halign: "right", cellWidth: 58 },
-      6: { halign: "right", cellWidth: 38 },
-      7: { halign: "right", cellWidth: 46, fontStyle: "bold" },
-      8: { halign: "right", cellWidth: 60 },
-      9: { halign: "right", cellWidth: 66, fontStyle: "bold" },
-    },
-    didParseCell: (data) => {
-      if (data.section === "body" && data.column.index === 5) {
-        const s = rowStatuses[data.row.index];
-        if (s === "critical") {
-          data.cell.styles.textColor = PDF_COLORS.crit;
-          data.cell.styles.fontStyle = "bold";
-        } else if (s === "warning") {
-          data.cell.styles.textColor = PDF_COLORS.warn;
-        }
-      }
-    },
-    didDrawCell: (data) => {
-      // Draw 2pt accent underline beneath every header cell (forms a continuous line)
-      if (data.section === "head") {
-        const { x, y, height, width } = data.cell;
-        doc.setDrawColor(...PDF_COLORS.accent);
-        doc.setLineWidth(1.6);
-        doc.line(x, y + height, x + width, y + height);
-      }
-    },
-  });
-
-  let cursorY = doc.lastAutoTable.finalY + 18;
-
-  // ---- TOTAL ROW ----
-  // Page-break guard
-  if (cursorY + 36 > pageH - FOOTER_H) {
+  // ---- GRAND TOTAL + APPROVAL BLOCK ----
+  // Keep these together. If they won't fit above the footer, push to a new page.
+  const APPROVAL_H = 110;
+  const TOTAL_H = 38;
+  if (cursorY + TOTAL_H + 14 + APPROVAL_H > pageH - FOOTER_H) {
     doc.addPage();
     cursorY = CONT_TOP;
   }
 
-  // Strong accent line above total
+  // Grand total — large, accentDark, with a 2pt accent line above
   doc.setDrawColor(...PDF_COLORS.accent);
   doc.setLineWidth(2);
-  doc.line(pageW - M - 240, cursorY, pageW - M, cursorY);
-  cursorY += 18;
+  doc.line(pageW - M - 260, cursorY, pageW - M, cursorY);
+  cursorY += 20;
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(9);
   doc.setTextColor(...PDF_COLORS.muted);
-  doc.text("TOTAL", pageW - M - 240, cursorY);
+  doc.text("GRAND TOTAL", pageW - M - 260, cursorY);
 
   doc.setFont("helvetica", "bold");
-  doc.setFontSize(18);
-  doc.setTextColor(...PDF_COLORS.ink);
-  doc.text(fmtMoney(grandTotal), pageW - M, cursorY, { align: "right" });
+  doc.setFontSize(20);
+  doc.setTextColor(...PDF_COLORS.accentDark);
+  doc.text(fmtMoney(pdfGrandTotal), pageW - M, cursorY, { align: "right" });
+
+  cursorY += 22;
+
+  // Approval block
+  const APPROVAL_W = pageW - 2 * M;
+  const APPROVAL_PAD = 14;
+  const approvalY = cursorY;
+
+  doc.setDrawColor(...PDF_COLORS.line);
+  doc.setLineWidth(0.5);
+  doc.rect(M, approvalY, APPROVAL_W, APPROVAL_H);
+
+  // Title
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(10);
+  doc.setTextColor(...PDF_COLORS.accentDark);
+  doc.text("Approval", M + APPROVAL_PAD, approvalY + 20);
+
+  // Notes line: "Notes:" label + underlined writing area
+  const notesY = approvalY + 42;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(8.5);
+  doc.setTextColor(...PDF_COLORS.muted);
+  doc.text("Notes:", M + APPROVAL_PAD, notesY);
+  doc.setDrawColor(...PDF_COLORS.line);
+  doc.setLineWidth(0.5);
+  doc.line(M + APPROVAL_PAD + 38, notesY + 3, M + APPROVAL_W - APPROVAL_PAD, notesY + 3);
+
+  // Three signature lines laid out horizontally
+  const sigLineY = approvalY + APPROVAL_H - 24;
+  const sigLabelY = sigLineY + 12;
+  const sigLabels = ["Approved by", "Signature", "Date"];
+  const sigColWidth = (APPROVAL_W - 2 * APPROVAL_PAD) / 3;
+  for (let i = 0; i < 3; i++) {
+    const sx = M + APPROVAL_PAD + i * sigColWidth;
+    const lineWidth = sigColWidth - 24;
+    doc.setDrawColor(...PDF_COLORS.line);
+    doc.setLineWidth(0.5);
+    doc.line(sx, sigLineY, sx + lineWidth, sigLineY);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(...PDF_COLORS.muted);
+    doc.text(sigLabels[i], sx, sigLabelY);
+  }
 
   // ---- BANNER + FOOTER ON EVERY PAGE ----
   const pageCount = doc.internal.getNumberOfPages();
