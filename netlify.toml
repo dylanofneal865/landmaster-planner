@@ -9,3 +9,8 @@
 # Schedule the Acumatica sync to run every 2 minutes
 [functions."acumatica-sync"]
   schedule = "*/2 * * * *"
+
+# Daily BOM sync — runs once at 06:00 UTC. Reconciles bom_links from the
+# "LM Planner BOM" GI; slow-moving reference data, separate cadence.
+[functions."acumatica-bom-sync"]
+  schedule = "0 6 * * *"
