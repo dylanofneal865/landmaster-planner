@@ -52,6 +52,9 @@ function draftOrderClear() {
 }
 
 function draftOrderTotals() {
+  // Pricing source: orderUnitCost(part) — last PO price → stored cost fallback.
+  // Parts with no usable purchase price contribute 0 to subtotals/grand total
+  // (they render as "—" in the drawer and PDF rather than a misleading $0).
   const groups = {};
   let itemCount = 0;
   let grandTotal = 0;
@@ -60,10 +63,14 @@ function draftOrderTotals() {
     if (!part) continue;
     const supplier = part.supplier || "(No supplier)";
     if (!groups[supplier]) groups[supplier] = { lines: [], subtotal: 0 };
-    const lineTotal = (item.qty || 0) * (part.cost || 0);
-    groups[supplier].lines.push({ part, qty: item.qty, lineTotal });
-    groups[supplier].subtotal += lineTotal;
-    grandTotal += lineTotal;
+    const noCost = hasNoOrderCost(part);
+    const unit = noCost ? 0 : orderUnitCost(part);
+    const lineTotal = (item.qty || 0) * unit;
+    groups[supplier].lines.push({ part, qty: item.qty, unit, lineTotal, noCost });
+    if (!noCost) {
+      groups[supplier].subtotal += lineTotal;
+      grandTotal += lineTotal;
+    }
     itemCount++;
   }
   return { itemCount, grandTotal, supplierGroups: groups };
@@ -125,7 +132,7 @@ function openDraftOrderDrawer() {
               <th></th>
             </tr></thead>
             <tbody>
-              ${grp.lines.map(({ part, qty, lineTotal }) => `
+              ${grp.lines.map(({ part, qty, unit, lineTotal, noCost }) => `
                 <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}">
                   <td>
                     <div class="pn">${esc(part.pn)}</div>
@@ -134,8 +141,8 @@ function openDraftOrderDrawer() {
                   <td class="right" style="width:90px">
                     <input class="input num" type="number" min="0" value="${qty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
                   </td>
-                  <td class="right num">${fmtMoneyDec(part.cost)}</td>
-                  <td class="right num bold" data-draft-line-total>${fmtMoney(lineTotal)}</td>
+                  <td class="right num">${noCost ? '—' : fmtMoneyDec(unit)}</td>
+                  <td class="right num bold" data-draft-line-total>${noCost ? '—' : fmtMoney(lineTotal)}</td>
                   <td><button class="btn sm ghost" onclick="draftOrderRemoveLine('${esc(part.pn)}')" title="Remove">×</button></td>
                 </tr>
               `).join("")}
@@ -163,11 +170,13 @@ function draftOrderUpdateQty(pn, value) {
 
   // Patch DOM in place so the input keeps focus.
   const part = DB.parts.find(p => p.pn === pn);
-  const lineTotal = qty * (part?.cost || 0);
+  const noCost = part ? hasNoOrderCost(part) : true;
+  const unit = (part && !noCost) ? orderUnitCost(part) : 0;
+  const lineTotal = qty * unit;
   const row = $(`tr[data-draft-pn="${pn}"]`);
   if (row) {
     const cell = row.querySelector("[data-draft-line-total]");
-    if (cell) cell.textContent = fmtMoney(lineTotal);
+    if (cell) cell.textContent = noCost ? '—' : fmtMoney(lineTotal);
   }
   const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
   const supplier = row?.dataset.draftSupplier;
@@ -394,9 +403,12 @@ async function _buildDraftOrderPDF() {
   const rowStatuses = [];
   for (const supplier of supplierKeys) {
     const grp = supplierGroups[supplier];
-    for (const { part, qty, lineTotal } of grp.lines) {
+    for (const { part, qty, unit, lineTotal, noCost } of grp.lines) {
       const stat = partStatus(part);
       const cover = stat.daysOfCover === Infinity ? "—" : `${stat.daysOfCover}d`;
+      // Pricing source: orderUnitCost (last PO → stored cost fallback), pulled
+      // from draftOrderTotals so the PDF and drawer can't drift apart. No-
+      // cost rows render "—" rather than a misleading $0.
       allRows.push([
         supplier,
         part.pn || "",
@@ -405,8 +417,8 @@ async function _buildDraftOrderPDF() {
         cover,
         `${part.ltWeeks || 0}w`,
         fmtNum(qty),
-        fmtMoneyDec(part.cost),
-        fmtMoney(lineTotal),
+        noCost ? "—" : fmtMoneyDec(unit),
+        noCost ? "—" : fmtMoney(lineTotal),
       ]);
       rowStatuses.push(stat.status);
     }
