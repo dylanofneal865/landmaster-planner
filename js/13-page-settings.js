@@ -332,7 +332,7 @@ function handleKitBomsImportFile(event) {
 async function doReset() {
   resetDB();
   await bootstrapSample();
-  DB = loadDB();
+  DB = await loadDB();
   bumpStatusCache();
   closeModal();
   showToast("Reset to embedded Landmaster snapshot", "ok");

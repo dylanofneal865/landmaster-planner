@@ -8,6 +8,22 @@
    ============================================================ */
 const STORAGE_KEY = "landmaster.inv.v3";  // v3 — data now includes 4-month usage history
 const LEGACY_KEYS = ["landmaster.inv.v2", "landmaster.inv.v1", "helix.inv.v1"];
+// The boot-cache moved off localStorage (5 MB ceiling) onto IndexedDB. The
+// blob is stored as a JSON STRING under this key in its own DB/store so this
+// module is load-order-independent of 18-excel-sync.js. Supabase remains the
+// source of truth — this is only the local hydration cache.
+const IDB_DB_KEY = "db.v3";
+function _cacheOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("landmaster-cache", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("kv");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function _cacheGet(k){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readonly");const r=t.objectStore("kv").get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);})); }
+function _cacheSet(k,v){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readwrite");t.objectStore("kv").put(v,k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error);})); }
+function _cacheDel(k){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readwrite");t.objectStore("kv").delete(k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error);})); }
 const TODAY = new Date(); TODAY.setHours(0,0,0,0);
 const DAY_MS = 86400000;
 
@@ -36,7 +52,7 @@ const DEFAULTS = {
 
 let DB = null;
 
-function loadDB() {
+async function loadDB() {
   try {
     // Clean up legacy keys — we don't migrate; want a fresh bootstrap with embedded data
     for (const k of LEGACY_KEYS) {
@@ -45,7 +61,18 @@ function loadDB() {
         console.log("Cleared legacy storage:", k);
       }
     }
-    const raw = localStorage.getItem(STORAGE_KEY);
+    // Prefer IDB. On the first run after this change, migrate any existing
+    // localStorage blob into IDB and free the 5 MB localStorage slot.
+    let raw = null;
+    try { raw = await _cacheGet(IDB_DB_KEY); } catch (e) { console.warn("IDB read failed", e); }
+    if (!raw) {
+      const ls = localStorage.getItem(STORAGE_KEY);
+      if (ls) {
+        raw = ls;
+        try { await _cacheSet(IDB_DB_KEY, ls); console.log("Migrated DB cache from localStorage → IndexedDB"); } catch (e) { /* fall through */ }
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+      }
+    }
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     // Stale-sample sanity check
@@ -56,7 +83,8 @@ function loadDB() {
        parsed.parts.every(p => typeof p.pn === "string" && /^LM-[A-Z]{2}-\d+$/.test(p.pn)));
     if (looksLikeOldSample) {
       console.log("Stale sample data detected — clearing for fresh bootstrap");
-      localStorage.removeItem(STORAGE_KEY);
+      try { await _cacheDel(IDB_DB_KEY); } catch (e) { /* ignore */ }
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
       return null;
     }
     return { ...DEFAULTS, ...parsed,
@@ -90,14 +118,32 @@ function ensureIds() {
   }
 }
 
+// IDB writes are async and serializing a 1600-part DB isn't cheap — debounce
+// so a burst of edits coalesces into a single write. Falls back to
+// localStorage only if IDB is unreachable (private browsing, etc).
+let _cacheTimer = null;
+let _cachePending = false;
 function saveDB() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); }
-  catch (e) { showToast("Storage full or blocked: " + e.message, "crit", "Save Failed"); }
+  _cachePending = true;
+  if (!_cacheTimer) {
+    _cacheTimer = setTimeout(async () => {
+      _cacheTimer = null;
+      if (!_cachePending) return;
+      _cachePending = false;
+      try {
+        await _cacheSet(IDB_DB_KEY, JSON.stringify(DB));
+      } catch (e) {
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(DB)); }
+        catch (e2) { showToast("Local cache error: " + e2.message, "warn", "Cache"); }
+      }
+    }, 250);
+  }
   // Auto-mirror to linked Excel files (debounced internally)
   try { autoSyncExcel(); } catch (e) { /* don't break save */ }
 }
 
 function resetDB() {
   localStorage.removeItem(STORAGE_KEY);
+  try { _cacheDel(IDB_DB_KEY); } catch (e) { /* ignore */ }
   DB = null;
 }

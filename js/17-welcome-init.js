@@ -25,10 +25,10 @@ function showCriticalNotification() {
    ============================================================ */
 async function initApp() {
   // Boot DB
-  DB = loadDB();
+  DB = await loadDB();
   if (!DB) {
     await bootstrapSample();
-    DB = loadDB();
+    DB = await loadDB();
   }
   ensureIds();
 
