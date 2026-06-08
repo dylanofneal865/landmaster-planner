@@ -279,17 +279,6 @@ function _pdfBanner(doc, pageW) {
   doc.setTextColor(...PDF_COLORS.white);
   doc.text("LANDMASTER", 36, 28);
 
-  // Accent tick separator
-  doc.setDrawColor(...PDF_COLORS.accent);
-  doc.setLineWidth(1.4);
-  doc.line(160, 16, 160, 34);
-
-  // Subtitle
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(8.5);
-  doc.setTextColor(205, 205, 205);
-  doc.text("PURCHASING DEPARTMENT", 170, 28);
-
   // Accent stripe under banner
   doc.setFillColor(...PDF_COLORS.accent);
   doc.rect(0, 44, pageW, 3, "F");
