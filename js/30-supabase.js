@@ -80,6 +80,31 @@ async function _fetchAllPos() {
   return all;
 }
 
+// BOM links — read-only from the browser's perspective. Server-side
+// netlify/functions/acumatica-bom-sync.js owns writes (daily). One paged
+// fetch on boot is enough; no realtime subscription, no push hooks.
+async function _fetchAllBomLinks() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("bom_links")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] bom_links page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
 async function _fetchAllAudit() {
   if (!_supa) return [];
   const all = [];
@@ -247,6 +272,26 @@ async function cloudInit() {
       }
     }
     _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
+  }
+
+  // ---- BOM Links (read-only) ----
+  // Slow-moving reference data; we pull once on boot and never push from the
+  // browser. Stored as a flat array of { bomId, parent, child, qty, uom }.
+  // NOT persisted via saveDB — re-fetched from cloud each session — and NOT
+  // included in the realtime subscription set below.
+  const cloudBomLinks = await _fetchAllBomLinks();
+  if (cloudBomLinks !== null) {
+    DB.bomLinks = cloudBomLinks.map(r => ({ id: r.id, ...r.data }));
+    console.log(`[cloud] loaded ${DB.bomLinks.length} bom_links rows`);
+    if (DB.bomLinks.length === 0) {
+      console.warn("[cloud] bom_links is EMPTY — multi-level BOM explosion will return no leaves. Check Supabase table or daily Acumatica BOM sync.");
+    }
+    if (typeof refresh === "function") refresh();
+  } else {
+    // Fetch failed entirely — keep whatever's already on DB (likely undefined)
+    // and warn so the page can surface it.
+    console.warn("[cloud] bom_links fetch failed; DB.bomLinks may be unset");
+    if (!Array.isArray(DB.bomLinks)) DB.bomLinks = [];
   }
 
   _cloudReady = true;
@@ -920,6 +965,15 @@ window.cloudForcePullDraft = async function () {
     _lastCloudDraftHash = _hashDraft(DRAFT_ORDER);
     console.log("Pulled " + items.length + " draft items from cloud");
   }
+};
+
+window.cloudForcePullBomLinks = async function () {
+  if (!_supa) { console.log("Not connected"); return; }
+  const data = await _fetchAllBomLinks();
+  if (data === null) { console.error("Force pull failed"); return; }
+  DB.bomLinks = data.map(r => ({ id: r.id, ...r.data }));
+  if (typeof refresh === "function") refresh();
+  console.log("Pulled " + DB.bomLinks.length + " bom_links from cloud");
 };
 
 window.cloudForcePullKitBoms = async function () {

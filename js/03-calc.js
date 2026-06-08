@@ -1,7 +1,117 @@
 /* =====================================================
    03-calc.js
-   Sections: COMPUTATION ENGINE — alerts, days of cover, etc., AUDIT
+   Sections: FINISHED GOODS + BOM EXPLOSION, COMPUTATION ENGINE — alerts, days of cover, etc., AUDIT
    ===================================================== */
+
+/* ============================================================
+   FINISHED GOODS — the SKUs whose multi-level BOMs we explode to
+   derive base-BOM demand. Edit this list directly to add/remove FGs.
+   ============================================================ */
+const FINISHED_GOODS = ["CA00135","CA00136","CA00138","CA00140","CA00141","CA00144","CA00145","CA00146","CA00147","CA00148","CA00149","CA00150","CA00151","CA00152","CA00190","CA00191","CA00197","CA00198","CA00200","CA00201","CA00202","CA00203","CA00205","CA00206","CA00207","CA00208","CA00210","CA00211","CA00212","CA00213","CA00214","CA00219","CA00415","CA00416","CA00417","CA00418","CA00419","CA25135","CA25136","CA25151","CA25180","CA25201","CA25205","CA25211","CA25219","CA25220","JA26001","JA26002","JA26003","JA26004","JA26005","JA26006","JA26007","JA26008","JA26009","JA26017","JA26018","JA26019","JA26020","JA26021","JA26022","JA26023","JA26024","JA26025","JA26026","JA26027","JA26028","JA26029","JA26030","JA26031","JA26032","JA26033","JA26034","JA26035","JA26036","JA26037","JA26038","JA26039","JA26040","JA26041","JA26042","JA27001","JA27002","JA27003","JA27004","JA27005","JA27006","JA27007","CA00137","CA00139","CA00142","CA00204","CA00215","CA00216","CA00217","CA00218","CA25217","CA25250","JA26010","JA26011","JA26012","JA26013","JA26014","JA26015","JA26016","CA00143"];
+
+/* ============================================================
+   BOM EXPLOSION ENGINE — walks DB.bomLinks from a finished-good
+   SKU down through every sub-assembly to the rolled-up buyable
+   leaf parts (multiplying qty through each level). Single-pass
+   cycle guard, memoized parent→children index.
+   ============================================================ */
+
+// Memoized parent→children index built from DB.bomLinks. Rebuilds only when
+// the underlying array reference changes (e.g. after cloud sync replaces it),
+// so 16k+ links don't get re-grouped on every explodeBOM call.
+let _bomIndex = null;
+let _bomIndexSource = null;
+function getBomChildrenIndex() {
+  const src = (typeof DB !== "undefined" && Array.isArray(DB.bomLinks)) ? DB.bomLinks : [];
+  if (_bomIndex && _bomIndexSource === src) return _bomIndex;
+  const map = new Map();
+  for (const ln of src) {
+    if (!ln || !ln.parent || !ln.child) continue;
+    let arr = map.get(ln.parent);
+    if (!arr) { arr = []; map.set(ln.parent, arr); }
+    arr.push({ child: ln.child, qty: Number(ln.qty) || 0, uom: ln.uom || "" });
+  }
+  _bomIndex = map;
+  _bomIndexSource = src;
+  return map;
+}
+
+// True iff `pn` appears as a parent in any BOM link (it's an assembly that
+// explodes further). Anything else is treated as a buyable leaf — including
+// PNs not in the catalog at all (they still get rolled up; the page flags
+// them so engineering can decide whether they belong in DB.parts).
+function isSubAssembly(pn) {
+  return getBomChildrenIndex().has(pn);
+}
+
+// Walk the BOM tree from `fgSku` and return the rolled-up leaf list.
+// Result shape:
+//   {
+//     leaves: [{ pn, qtyPerUnit, uom }] sorted by pn,
+//     distinctLeafCount,
+//     totalPieces,
+//     warnings: [string],   // cycles or depth blow-outs
+//   }
+// Quantities multiply through every level: if FG → SubA (qty 2) → Leaf (qty 3),
+// the leaf contributes 6 per FG unit. A leaf reached via multiple branches has
+// its qtys summed in the final rollup.
+function explodeBOM(fgSku) {
+  const index = getBomChildrenIndex();
+  if (!index.has(fgSku)) {
+    return {
+      leaves: [],
+      distinctLeafCount: 0,
+      totalPieces: 0,
+      warnings: [`No BOM defined for ${fgSku} in bom_links`],
+    };
+  }
+
+  const leafTotals = new Map();    // pn -> { qty, uom }
+  const warnings = [];
+  const MAX_DEPTH = 64;            // belt-and-suspenders on top of cycle detection
+
+  function visit(parent, parentMultiplier, ancestors, depth) {
+    if (depth > MAX_DEPTH) {
+      warnings.push(`Max depth ${MAX_DEPTH} exceeded under ${fgSku} (at ${parent})`);
+      return;
+    }
+    if (ancestors.has(parent)) {
+      warnings.push(`Cycle detected: ${parent} appears in its own ancestry under ${fgSku}`);
+      console.warn(`[bom] cycle under ${fgSku}: ${parent}`);
+      return;
+    }
+    const children = index.get(parent);
+    if (!children) return;
+    ancestors.add(parent);
+    for (const c of children) {
+      const m = parentMultiplier * (Number(c.qty) || 0);
+      if (index.has(c.child)) {
+        visit(c.child, m, ancestors, depth + 1);
+      } else {
+        const prev = leafTotals.get(c.child);
+        if (prev) {
+          prev.qty += m;
+          if (!prev.uom && c.uom) prev.uom = c.uom;
+        } else {
+          leafTotals.set(c.child, { qty: m, uom: c.uom || "" });
+        }
+      }
+    }
+    ancestors.delete(parent);
+  }
+
+  visit(fgSku, 1, new Set(), 0);
+
+  const leaves = [];
+  let totalPieces = 0;
+  for (const [pn, { qty, uom }] of leafTotals.entries()) {
+    leaves.push({ pn, qtyPerUnit: qty, uom });
+    totalPieces += qty;
+  }
+  leaves.sort((a, b) => String(a.pn).localeCompare(String(b.pn)));
+
+  return { leaves, distinctLeafCount: leaves.length, totalPieces, warnings };
+}
 
 /* ============================================================
    COMPUTATION ENGINE — alerts, days of cover, etc.

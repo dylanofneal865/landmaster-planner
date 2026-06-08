@@ -255,42 +255,238 @@ registerRoute("usage",          () => renderUsageFor(null));
 registerRoute("base-bom-usage", () => { if (!_usageGate("base-bom-usage")) return; renderBaseBomUsage(); });
 registerRoute("options-usage",  () => { if (!_usageGate("options-usage")) return; renderUsageFor("options"); });
 
-// Multi Level BOM — empty-state stub. Reserves the route + sidebar slot for
-// the upcoming finished-goods bills of material; intentionally UN-GATED while
-// it carries no real data (we'll add _usageGate once BOMs sync in).
-registerRoute("multi-level-bom", () => renderMultiLevelBomStub());
+// Multi Level BOM — read-only explorer over DB.bomLinks. Left rail lists
+// FINISHED_GOODS (search-filterable); right pane shows the picked FG's
+// rolled-up leaf-parts list via explodeBOM(). UN-GATED for now (will gate
+// once we wire this into demand math).
+registerRoute("multi-level-bom", () => renderMultiLevelBom());
 
-function renderMultiLevelBomStub() {
+let MLB_STATE = {
+  search: "",
+  selectedFg: null,
+};
+
+function mlbSelectFg(pn) {
+  MLB_STATE.selectedFg = pn;
+  refresh();
+}
+
+function mlbSetSearch(q) {
+  MLB_STATE.search = q || "";
+  refresh();
+}
+
+function renderMultiLevelBom() {
+  const partByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const fgRows = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS) ? FINISHED_GOODS : []).map(pn => {
+    const cat = partByPn.get(pn);
+    return { pn, desc: cat?.desc || "", inCatalog: !!cat };
+  });
+
+  const q = MLB_STATE.search.trim().toLowerCase();
+  const filteredFgs = q
+    ? fgRows.filter(r => r.pn.toLowerCase().includes(q) || (r.desc || "").toLowerCase().includes(q))
+    : fgRows;
+
+  const bomLinksLoaded = Array.isArray(DB.bomLinks);
+  const linkCount = bomLinksLoaded ? DB.bomLinks.length : 0;
+  const parentCount = bomLinksLoaded
+    ? (typeof getBomChildrenIndex === "function" ? getBomChildrenIndex().size : 0)
+    : 0;
+
+  // If we have zero links loaded, the entire engine is dead — surface that
+  // up front rather than letting users click finished goods to empty tables.
+  if (bomLinksLoaded && linkCount === 0) {
+    $("#main").innerHTML = `
+      <div class="page">
+        ${_mlbPageHead(fgRows.length, linkCount, parentCount)}
+        <div class="panel">
+          <div class="panel-body">
+            <div class="empty">
+              <div class="empty-title">No BOM links loaded</div>
+              <div class="empty-msg">
+                The <code>bom_links</code> table is empty or the cloud fetch returned no rows.
+                Wait for the next daily Acumatica BOM sync (06:00 UTC) or run the
+                <code>acumatica-bom-sync</code> function manually from the Netlify dashboard.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // Loading state — DB.bomLinks is undefined until cloudInit finishes its
+  // paged fetch. Cloud sync calls refresh() after the load completes.
+  if (!bomLinksLoaded) {
+    $("#main").innerHTML = `
+      <div class="page">
+        ${_mlbPageHead(fgRows.length, 0, 0)}
+        <div class="panel">
+          <div class="panel-body">
+            <div class="empty">
+              <div class="empty-title">Loading BOM data…</div>
+              <div class="empty-msg">Fetching <code>bom_links</code> from Supabase. This page will populate automatically.</div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const sel = MLB_STATE.selectedFg && FINISHED_GOODS.includes(MLB_STATE.selectedFg) ? MLB_STATE.selectedFg : null;
+  const expl = sel ? explodeBOM(sel) : null;
+
   $("#main").innerHTML = `
     <div class="page">
-      <div class="page-head">
-        <div>
-          <div class="page-title">Multi Level BOM</div>
-          <div class="page-sub mono">FINISHED-GOODS BILLS OF MATERIAL · EACH UTV'S EXPLODED COMPONENT LIST WILL DRIVE BASE-BOM DEMAND</div>
-        </div>
-      </div>
+      ${_mlbPageHead(fgRows.length, linkCount, parentCount)}
 
-      <div class="panel">
-        <div class="panel-body">
-          <div class="empty">
-            <div class="empty-title">No BOMs loaded yet</div>
-            <div class="empty-msg">Finished-goods BOMs will sync from Acumatica and appear here.</div>
+      <div style="display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:flex-start">
+        <!-- ===== FG selector ===== -->
+        <div class="panel">
+          <div class="panel-head">
+            <div class="panel-title">Finished goods</div>
+            <div class="panel-sub">${filteredFgs.length} of ${fgRows.length}</div>
+          </div>
+          <div class="filterbar" style="padding:8px 12px">
+            <div class="search-input" style="flex:1">
+              <input class="input" placeholder="Search PN or description…" value="${esc(MLB_STATE.search)}"
+                oninput="mlbSetSearch(this.value)">
+            </div>
+          </div>
+          <div class="panel-body flush" style="max-height:70vh;overflow-y:auto">
+            ${filteredFgs.length === 0 ? `
+              <div class="empty">
+                <div class="empty-msg">No finished goods match the search.</div>
+              </div>
+            ` : `
+              <div class="tbl-wrap">
+                <table class="tbl">
+                  <tbody>
+                    ${filteredFgs.map(fg => {
+                      const isSel = fg.pn === sel;
+                      const noCat = !fg.inCatalog;
+                      return `
+                        <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
+                            style="${isSel ? 'background:var(--bg-3);' : ''}">
+                          <td>
+                            <div class="pn">${esc(fg.pn)}</div>
+                            <div class="muted tiny">${noCat ? '<em>not in catalog</em>' : esc(fg.desc || '—')}</div>
+                          </td>
+                        </tr>
+                      `;
+                    }).join("")}
+                  </tbody>
+                </table>
+              </div>
+            `}
           </div>
         </div>
-      </div>
 
-      <div class="panel" style="opacity:0.55;pointer-events:none">
-        <div class="panel-head">
-          <div class="panel-title">Finished goods</div>
-          <div class="panel-sub">placeholder</div>
-        </div>
-        <div class="panel-body">
-          <div class="muted tiny center" style="padding:28px 0;font-style:italic">
-            81 finished goods will list here — select one to see its exploded multi-level parts.
-          </div>
+        <!-- ===== Exploded leaves ===== -->
+        <div class="panel">
+          ${sel ? _mlbExplodedPanel(sel, expl, partByPn) : `
+            <div class="panel-head">
+              <div class="panel-title">Exploded BOM</div>
+              <div class="panel-sub">pick a finished good</div>
+            </div>
+            <div class="panel-body">
+              <div class="empty">
+                <div class="empty-title">Select a finished good</div>
+                <div class="empty-msg">Pick an SKU from the list to see its exploded buyable-parts list.</div>
+              </div>
+            </div>
+          `}
         </div>
       </div>
     </div>`;
+}
+
+function _mlbPageHead(fgCount, linkCount, parentCount) {
+  const subParts = [`${fgCount} FINISHED GOODS`];
+  if (linkCount > 0) subParts.push(`${fmtNum(linkCount)} BOM LINKS`);
+  if (parentCount > 0) subParts.push(`${fmtNum(parentCount)} PARENT ASSEMBLIES`);
+  return `
+    <div class="page-head">
+      <div>
+        <div class="page-title">Multi Level BOM</div>
+        <div class="page-sub mono">${subParts.join(" · ")} · EACH UTV'S EXPLODED COMPONENT LIST WILL DRIVE BASE-BOM DEMAND</div>
+      </div>
+    </div>
+  `;
+}
+
+function _mlbExplodedPanel(fgPn, expl, partByPn) {
+  const { leaves, distinctLeafCount, totalPieces, warnings } = expl;
+  const fgPart = partByPn.get(fgPn);
+  const fgDesc = fgPart?.desc || "";
+
+  if (!leaves.length) {
+    return `
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">${esc(fgPn)}${fgDesc ? ` — ${esc(fgDesc)}` : ''}</div>
+          <div class="panel-sub">no rolled-up leaves</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="empty">
+          <div class="empty-title">No BOM data for ${esc(fgPn)}</div>
+          <div class="empty-msg">
+            ${warnings.length ? esc(warnings[0]) : `This finished good isn't a parent in any bom_links row. Either the BOM hasn't been published in Acumatica, or the GI didn't include it.`}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  const totalPiecesNum = Number.isInteger(totalPieces) ? totalPieces : Math.round(totalPieces * 1000) / 1000;
+  const headerLine = `${esc(fgPn)}${fgDesc ? ` — ${esc(fgDesc)}` : ''} · ${distinctLeafCount} distinct parts, ${fmtNum(totalPiecesNum)} total pieces per unit`;
+
+  return `
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">${headerLine}</div>
+        <div class="panel-sub">multiplied through every sub-assembly</div>
+      </div>
+    </div>
+    ${warnings.length ? `
+      <div class="filterbar" style="padding:8px 12px;background:var(--warn-soft);color:var(--warn)">
+        ⚠ ${esc(warnings.join(" · "))}
+      </div>
+    ` : ""}
+    <div class="panel-body flush">
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th>Part</th>
+            <th>Description</th>
+            <th>Supplier</th>
+            <th class="right">Qty per Unit</th>
+            <th>UOM</th>
+          </tr></thead>
+          <tbody>
+            ${leaves.map(l => {
+              const cat = partByPn.get(l.pn);
+              const desc = cat?.desc || "";
+              const supplier = cat?.supplier || "";
+              const noCat = !cat;
+              const qtyDisplay = Number.isInteger(l.qtyPerUnit) ? fmtNum(l.qtyPerUnit) : fmtNum(l.qtyPerUnit, 3);
+              return `
+                <tr ${cat ? `class="clickable" onclick="openPartDetail('${esc(l.pn)}')"` : ''}>
+                  <td class="pn">${esc(l.pn)}${noCat ? ' <span class="pill warn" style="margin-left:6px">NOT IN CATALOG</span>' : ''}</td>
+                  <td>${esc(desc)}</td>
+                  <td class="dim">${esc(supplier)}</td>
+                  <td class="right num bold">${qtyDisplay}</td>
+                  <td class="dim">${esc(l.uom || "")}</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
 }
 
 /* ============================================================
