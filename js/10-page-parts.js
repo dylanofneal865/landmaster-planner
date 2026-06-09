@@ -242,42 +242,88 @@ function renderPartDetail(part) {
   const partIsKit = typeof isKit === "function" && isKit(part.pn);
   const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
 
+  // Per-component buildable: floor(onHand / qtyPerKit) for each component.
+  // `builds: null` means qtyPerKit <= 0 — excluded from the kit-wide minimum
+  // as a divide-by-zero guard. A component missing from DB.parts contributes
+  // onHand=0 and stays in the calc, so it surfaces as a bottleneck rather
+  // than being silently dropped. Snapshot-on-render; no caching.
+  const kitBuildRows = partIsKit ? kitComponents.map(c => {
+    const compPart = DB.parts.find(pp => pp.pn === c.pn);
+    const inCatalog = !!compPart;
+    const onHand = inCatalog ? (Number(compPart.onHand) || 0) : 0;
+    const qtyPerKit = Number(c.qty) || 0;
+    const builds = qtyPerKit > 0 ? Math.floor(onHand / qtyPerKit) : null;
+    return { c, compPart, inCatalog, onHand, qtyPerKit, builds };
+  }) : [];
+  const kitLimitingRows = kitBuildRows.filter(r => r.builds !== null);
+  const kitBuildable = partIsKit
+    ? (kitLimitingRows.length === 0 ? 0 : Math.min(...kitLimitingRows.map(r => r.builds)))
+    : 0;
+  const kitBottleneckCount = partIsKit
+    ? kitBuildRows.filter(r => r.builds !== null && r.builds === kitBuildable).length
+    : 0;
+
   const html = `
     <div class="drawer-head">
       <div class="title-block">
         <div class="pre">${partIsKit ? 'KIT' : `PART · ${esc(part.partClass||"")}`}</div>
         <div class="title">${esc(part.pn)}</div>
-        <div class="sub">${esc(part.desc)} · <span class="pill ${partIsKit ? 'ok' : (status.status==='critical'?'crit':status.status==='warning'?'warn':'ok')}" ${partIsKit ? 'style="background:var(--accent-soft,#eef);color:var(--accent,#36c)"' : ''}>${partIsKit ? 'KIT · ' + kitComponents.length + ' COMPONENTS' : status.status.toUpperCase()}</span></div>
+        <div class="sub">${esc(part.desc)} · <span class="pill ${partIsKit ? 'ok' : (status.status==='critical'?'crit':status.status==='warning'?'warn':'ok')}" ${partIsKit ? 'style="background:var(--accent-soft,#eef);color:var(--accent,#36c)"' : ''}>${partIsKit ? 'KIT · ' + kitComponents.length + ' COMPONENTS' : status.status.toUpperCase()}</span>${partIsKit ? ` · <span class="pill ${kitBuildable === 0 ? 'crit' : 'ok'}" style="font-weight:700;letter-spacing:0.04em">CAN BUILD: ${fmtNum(kitBuildable)}</span>` : ''}</div>
       </div>
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
       ${partIsKit ? `
+        <div class="stat-strip" style="margin-bottom:14px">
+          <div class="stat">
+            <div class="stat-label">Can Build</div>
+            <div class="stat-value ${kitBuildable === 0 ? 'crit' : ''}" style="font-size:30px;line-height:1.1">${fmtNum(kitBuildable)}</div>
+            <div class="dim tiny">complete kit${kitBuildable === 1 ? '' : 's'} from on-hand</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Components</div>
+            <div class="stat-value">${kitComponents.length}</div>
+            <div class="dim tiny">in this kit BOM</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Bottleneck</div>
+            <div class="stat-value ${kitBuildable === 0 ? 'crit' : 'warn'}">${kitBottleneckCount}</div>
+            <div class="dim tiny">part${kitBottleneckCount === 1 ? '' : 's'} at min</div>
+          </div>
+        </div>
         <div class="dr-section">Kit components</div>
         <div class="tbl-wrap"><table class="tbl">
           <thead><tr>
             <th>Component</th>
             <th>Description</th>
-            <th class="right">Qty per kit</th>
+            <th class="right">Qty per Kit</th>
+            <th class="right">On Hand</th>
+            <th class="right">Builds</th>
             <th class="dim">Type</th>
           </tr></thead>
           <tbody>
-            ${kitComponents.map(c => {
-              const compPart = DB.parts.find(pp => pp.pn === c.pn);
-              const inCatalog = !!compPart;
-              const qtyStr = c.qty % 1 === 0 ? fmtNum(c.qty) : fmtNum(c.qty, 2);
+            ${kitBuildRows.map(({ c, compPart, inCatalog, onHand, qtyPerKit, builds }) => {
+              const qtyStr = qtyPerKit % 1 === 0 ? fmtNum(qtyPerKit) : fmtNum(qtyPerKit, 2);
+              const isBottleneck = (builds !== null && builds === kitBuildable);
+              const rowStyle = isBottleneck ? 'background:var(--crit-soft)' : '';
+              const buildsCell = builds === null ? '—' : fmtNum(builds);
+              const onHandCell = inCatalog
+                ? fmtNum(onHand)
+                : `<span class="dim">—</span> <span class="pill warn" title="Not in parts catalog" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">not in catalog</span>`;
               return `
-                <tr ${inCatalog ? `class="clickable" onclick="openPartDetail('${esc(c.pn)}')"` : ''}>
-                  <td class="pn">${esc(c.pn)}${!inCatalog ? ' <span class="pill warn" title="Not in parts catalog">⚠</span>' : ''}</td>
+                <tr ${inCatalog ? `class="clickable" onclick="openPartDetail('${esc(c.pn)}')"` : ''} style="${rowStyle}">
+                  <td class="pn">${esc(c.pn)}</td>
                   <td>${esc(compPart?.desc || c.desc || '—')}</td>
                   <td class="right num bold">${qtyStr}</td>
+                  <td class="right num">${onHandCell}</td>
+                  <td class="right num bold ${isBottleneck ? 'text-crit' : ''}">${buildsCell}</td>
                   <td class="dim tiny">${c.isStock ? 'Stock' : 'Non-stock'}</td>
                 </tr>
               `;
             }).join("")}
           </tbody>
         </table></div>
-        <p class="muted tiny" style="margin-top:8px;line-height:1.5">When this kit ships, each component's daily-use is automatically credited based on Qty per kit. Kits never generate purchase suggestions — their components do.</p>
+        <p class="muted tiny" style="margin-top:8px;line-height:1.5">When this kit ships, each component's daily-use is automatically credited based on Qty per kit. Kits never generate purchase suggestions — their components do.${kitBuildable === 0 ? ` <strong class="text-crit">Can't build this kit right now</strong> — highlighted rows are blocking it.` : kitBottleneckCount > 0 ? ` Highlighted row${kitBottleneckCount === 1 ? '' : 's'} cap the build at ${fmtNum(kitBuildable)} — order more to lift it.` : ''}</p>
       ` : ''}
       ${(() => {
         const parentKits = typeof getKitsForComponent === "function" ? getKitsForComponent(part.pn) : [];
