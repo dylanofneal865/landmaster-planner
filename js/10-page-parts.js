@@ -17,17 +17,19 @@ function renderPartDetail(part) {
   const status = partStatus(part);
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
-  // Pricing provenance for the Unit Cost tile + NO COST flag. Suggested-
-  // order $ uses orderUnitCost (last PO price → stored cost fallback); the
-  // stored part.cost stays editable and authoritative as the on-hand /
-  // inventory-value baseline.
-  const lastPO = lastPOPrice(part.pn);
-  const noOrderCost = hasNoOrderCost(part);
+  // Pricing provenance for the Unit Cost tile. Source resolution lives in
+  // orderUnitCostSource() (js/03-calc.js) — newer of (manual cost edit date,
+  // last PO date) wins. We just narrate which side won so the user can see
+  // why a draft is priced the way it is.
+  const costSrc = orderUnitCostSource(part);
+  const noOrderCost = costSrc.cost <= 0;
   let costMeta;
-  if (lastPO && lastPO.cost > 0) {
-    costMeta = `<div class="dim tiny mono" style="margin-top:2px">last PO: ${fmtMoneyDec(lastPO.cost)} × ${fmtNum(lastPO.qty)} on ${fmtDate(lastPO.date)} (${esc(lastPO.poNum || "")})</div>`;
-  } else if ((part.cost || 0) > 0) {
-    costMeta = `<div class="dim tiny" style="margin-top:2px">no PO history — using standard cost</div>`;
+  if (costSrc.source === "manual") {
+    const dateLabel = costSrc.date ? ` (updated ${fmtDate(costSrc.date)})` : "";
+    costMeta = `<div class="dim tiny" style="margin-top:2px">using manual cost${dateLabel}</div>`;
+  } else if (costSrc.source === "po") {
+    const dateLabel = costSrc.date ? fmtDate(costSrc.date) : "—";
+    costMeta = `<div class="dim tiny mono" style="margin-top:2px">using last PO ${fmtMoneyDec(costSrc.cost)} (${dateLabel}${costSrc.poNum ? `, ${esc(costSrc.poNum)}` : ""})</div>`;
   } else {
     costMeta = `<div class="tiny" style="margin-top:2px"><span class="pill warn">NO COST</span></div>`;
   }
@@ -492,7 +494,15 @@ function savePartFromDetail(originalPn) {
   part.buyer = $("#pd-buyer").value.trim();
   part.onHand = Math.max(0, Math.round(parseFloat($("#pd-oh").value) || 0));
   part.daily = Math.max(0, parseFloat($("#pd-daily").value) || 0);
-  part.cost = Math.max(0, parseFloat($("#pd-cost").value) || 0);
+  // Stamp costUpdatedAt only when the cost actually changes — this is what
+  // lets orderUnitCostSource() decide "newer wins" against the last PO date.
+  // Bumping on every save would defeat the comparison.
+  const newCost = Math.max(0, parseFloat($("#pd-cost").value) || 0);
+  const oldCost = Number(part.cost) || 0;
+  if (newCost !== oldCost) {
+    part.costUpdatedAt = new Date().toISOString();
+  }
+  part.cost = newCost;
   part.ltWeeks = Math.max(0, parseFloat($("#pd-lt").value) || 0);
   part.moq = Math.max(0, parseInt($("#pd-moq").value) || 0);
   part.packSize = Math.max(1, parseInt($("#pd-pack").value) || 1);

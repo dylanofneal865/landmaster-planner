@@ -311,13 +311,53 @@ function lastPOPrice(pn) {
   return pool[0]; // { cost, qty, date, poNum }
 }
 
-// Unit cost for SUGGESTED-ORDER pricing: last PO price if known, else stored
-// cost. On-hand inventory valuation and the inventory-value KPI still use
-// part.cost (the stored standard cost) — only the suggested-order math
-// reaches for actual recent purchase price.
+// Unit cost decision for SUGGESTED-ORDER pricing. Returns a full provenance
+// record so the part drawer can show *which* side won and why. Two pricing
+// sources compete:
+//   • the manual cost in part.cost, stamped at edit time as part.costUpdatedAt
+//   • the last PO line's unit cost (lastPOPrice(pn)), dated by PO createdDate
+//
+// Rule: NEWER WINS. Tie → manual (the user edited it just now, give them the
+// benefit). If manual lacks a costUpdatedAt (legacy / never edited since this
+// feature shipped), fall back to the prior behavior — last PO wins — so old
+// parts keep pricing from purchase history until someone re-saves them.
+//
+// Returns { cost, source, date, poNum }:
+//   source = "manual" | "po" | "none"
+//   date   = Date | null   (the winning side's stamp, for the UI tag line)
+//   poNum  = string | null (only populated when source === "po")
+//
+// On-hand inventory valuation and the inventory-value KPI still read raw
+// part.cost — only the suggested-order math reaches through this.
+function orderUnitCostSource(part) {
+  const manualCost = Number(part?.cost) || 0;
+  const manualDateRaw = part?.costUpdatedAt || null;
+  const manualDate = manualDateRaw ? new Date(manualDateRaw) : null;
+  const manualValid = !!manualDate && !isNaN(manualDate);
+
+  const lp = lastPOPrice(part?.pn);
+  const poCost = (lp && lp.cost > 0) ? lp.cost : 0;
+  const poDate = (lp && lp.date && !isNaN(lp.date)) ? lp.date : null;
+
+  // Both sides usable AND we have a manual edit date → compare recency.
+  if (poCost > 0 && manualCost > 0 && manualValid && poDate) {
+    if (manualDate.getTime() >= poDate.getTime()) {
+      return { cost: manualCost, source: "manual", date: manualDate, poNum: null };
+    }
+    return { cost: poCost, source: "po", date: poDate, poNum: lp.poNum || null };
+  }
+  // Either no manual edit date or one side is zero — last-PO-wins fallback.
+  if (poCost > 0) {
+    return { cost: poCost, source: "po", date: poDate, poNum: lp.poNum || null };
+  }
+  if (manualCost > 0) {
+    return { cost: manualCost, source: "manual", date: manualValid ? manualDate : null, poNum: null };
+  }
+  return { cost: 0, source: "none", date: null, poNum: null };
+}
+
 function orderUnitCost(part) {
-  const lp = lastPOPrice(part.pn);
-  return (lp && lp.cost > 0) ? lp.cost : (part.cost || 0);
+  return orderUnitCostSource(part).cost;
 }
 
 // True when there's no usable purchase price (no PO history AND no stored
