@@ -14,7 +14,20 @@ function openPartDetail(pn) {
 
 function renderPartDetail(part) {
   const onPO = openPOQty(part.pn);
-  const status = partStatus(part);
+
+  // Phase 2: when this part is the final hop of an actively-transitioning
+  // chain, feed an effective view (combined chain on-hand, anchor's daily
+  // rate) into partStatus / daysUntilStockout / projectOnHand so days-cover,
+  // status color, and the runway chart all reflect the chain's true
+  // burn-down. The original `part` is still used for editable fields, the
+  // On Hand and Daily Use stat cells (we annotate those instead), and PN
+  // lookups against PO history.
+  const chainBoost = (typeof _supersessionDemandBoost === "function") ? _supersessionDemandBoost(part) : null;
+  const effectivePart = chainBoost
+    ? { ...part, onHand: chainBoost.combinedOnHand, daily: Math.max(Number(part.daily) || 0, chainBoost.dailyRate) }
+    : part;
+
+  const status = partStatus(effectivePart);
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
   // Pricing provenance for the Unit Cost tile. Source resolution lives in
@@ -37,12 +50,12 @@ function renderPartDetail(part) {
   // Build projection with dynamic horizon — extend enough to show both the
   // stockout day and the lead-time landing day, capped at 365 so slow movers
   // don't flatten the chart.
-  const coverDays = daysUntilStockout(part);
+  const coverDays = daysUntilStockout(effectivePart);
   const leadDays = leadTimeDays(part);
   const finiteCover = Number.isFinite(coverDays) ? coverDays : 0;
   let horizon = Math.max(90, finiteCover + 14, leadDays + 14);
   horizon = Math.min(horizon, 365);
-  const series = projectOnHand(part, horizon);
+  const series = projectOnHand(effectivePart, horizon);
   // Clamp the visual scale to 0..peak so long horizons of deeply negative
   // on-hand don't crush the meaningful band into a sliver. The stockout
   // index is still found on the unclamped series; only the drawn path is
@@ -390,9 +403,17 @@ function renderPartDetail(part) {
         ` ;
       })()}
       <div class="stat-strip">
-        <div class="stat"><div class="stat-label">On Hand</div><div class="stat-value">${fmtNum(part.onHand)}</div></div>
+        <div class="stat">
+          <div class="stat-label">On Hand</div>
+          <div class="stat-value">${fmtNum(part.onHand)}</div>
+          ${chainBoost && (chainBoost.combinedOnHand - (Number(part.onHand) || 0)) > 0 ? `<div class="dim tiny" style="margin-top:2px">+ ${fmtNum(chainBoost.combinedOnHand - (Number(part.onHand) || 0))} in chain (burning down)</div>` : ''}
+        </div>
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
-        <div class="stat"><div class="stat-label">Daily Use</div><div class="stat-value">${fmtNum(part.daily, 2)}</div></div>
+        <div class="stat">
+          <div class="stat-label">Daily Use</div>
+          <div class="stat-value">${fmtNum(part.daily, 2)}</div>
+          ${chainBoost ? `<div class="dim tiny" style="margin-top:2px">demand from chain anchor ${esc(chainBoost.anchorPn)} (${fmtNum(chainBoost.dailyRate, 2)}/day)</div>` : ''}
+        </div>
         <div class="stat"><div class="stat-label">Days Cover</div><div class="stat-value ${status.status==='critical'?'crit':status.status==='warning'?'warn':'ok'}">${status.daysOfCover === Infinity ? '∞' : status.daysOfCover + 'd'}</div>${(() => { const s = stockoutDateStr(status.daysOfCover); return s ? `<div class="dim tiny mono" style="margin-top:2px">${s}</div>` : ''; })()}</div>
         <div class="stat"><div class="stat-label">Lead Time</div><div class="stat-value">${part.ltWeeks||0}w</div></div>
         <div class="stat"><div class="stat-label">Unit Cost</div><div class="stat-value">${fmtMoneyDec(part.cost)}</div>${costMeta}</div>
@@ -425,6 +446,7 @@ function renderPartDetail(part) {
         ${!partIsKit && !part.phasingOut && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
         <button class="btn" onclick="closeDrawer(); navigate('order-queue')">View order queue</button>
       </div>
+      ${chainBoost ? `<p class="muted tiny" style="margin-top:8px;line-height:1.5">Suggested qty sized against the chain's combined on-hand (${fmtNum(chainBoost.combinedOnHand)} total${(chainBoost.combinedOnHand - (Number(part.onHand) || 0)) > 0 ? ` — incl. ${fmtNum(chainBoost.combinedOnHand - (Number(part.onHand) || 0))} on-hand from predecessors being burned down` : ''}) at ${fmtNum(chainBoost.dailyRate, 2)}/day from anchor ${esc(chainBoost.anchorPn)}.</p>` : ''}
 
       <div class="dr-section">Edit part</div>
       <div class="grid-2">

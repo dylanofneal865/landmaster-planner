@@ -279,17 +279,40 @@ function partStatus(part, lines) {
 // PHASE-OUT short-circuit: parts marked part.phasingOut return 0 — they're
 // being retired and we burn down existing stock. Everything else about the
 // part (on-hand, days-of-cover, status color) stays real so the drawer can
-// still show it depleting. Phase 2 will route their demand to the successor;
-// Phase 1 just zeros the reorder.
+// still show it depleting.
+//
+// PHASE 2 — CHAIN DEMAND ROUTING: when this part is the final hop of an
+// actively-transitioning supersession chain, _supersessionDemandBoost gives
+// us the anchor's daily rate and the chain's combined on-hand. We size the
+// order against that combined supply so we don't reorder while a phased-out
+// predecessor still has stock to burn down. See _supersessionDemandBoost.
 function suggestedQty(part, onPO) {
   if (part && part.phasingOut) return 0;
+
+  const boost = _supersessionDemandBoost(part);
+
   const lt = leadTimeDays(part);
   const safety = DB.settings.safetyDays || 0;
   const horizon = 30; // beyond reorder, target 30 days of stock after arrival
-  const target = (lt + safety + horizon) * (part.daily || 0);
-  // Minus what's already on order + on hand
+
+  // Daily rate. Edge case: if the final part already has its own non-zero
+  // usage (real shipments on the new PN already), use the GREATER of
+  // (its own daily, the anchor's copied daily) so we never under-order
+  // during the cutover window.
+  const dailyRate = boost
+    ? Math.max(Number(part.daily) || 0, boost.dailyRate)
+    : (part.daily || 0);
+  const target = (lt + safety + horizon) * dailyRate;
+
+  // Effective supply. When boosted, every predecessor's on-hand counts as
+  // stock we'll consume first — only the final part has open POs that we
+  // count (predecessor POs are excluded per spec; in practice they're
+  // cancelled when a part phases out).
   const onPOQty = (typeof onPO === "number") ? onPO : openPOQty(part.pn);
-  const have = (part.onHand || 0) + onPOQty;
+  const have = boost
+    ? boost.combinedOnHand + onPOQty
+    : (part.onHand || 0) + onPOQty;
+
   let qty = Math.max(0, Math.ceil(target - have));
   if (part.moq && qty > 0) qty = Math.max(qty, part.moq);
   if (part.packSize && qty > 0) {
@@ -361,6 +384,47 @@ function supersessionLineage(pn) {
   }
   const forward = supersessionChain(start); // [start, ...successors]
   return [...back, ...forward];
+}
+
+// Phase 2: chain-demand routing inputs. Returns null when no routing applies;
+// otherwise returns { dailyRate, combinedOnHand, anchorPn, anchor, predecessors }
+// describing the chain's pooled supply and the anchor's daily-use rate.
+//
+// Routing kicks in only when:
+//   1. `part` is the FINAL hop of a supersession chain (lineage.length >= 2), AND
+//   2. At least one non-final part in the chain has phasingOut === true
+//      (the chain is "actively transitioning" — otherwise we leave the
+//      successor priced/sized normally).
+//
+// Anchor = the FIRST part in the lineage (the one with real usage history,
+// e.g. 19830 in 19830 → CP00751 → JP00021). dailyRate is copied (not moved)
+// from the anchor, so the anchor's burn-down display stays accurate using
+// its own daily.
+function _supersessionDemandBoost(part) {
+  if (!part || !part.pn) return null;
+  const lineage = supersessionLineage(part.pn);
+  if (lineage.length < 2) return null;
+
+  const finalPn = lineage[lineage.length - 1];
+  if (part.pn !== finalPn) return null;
+
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const predecessors = lineage.slice(0, -1)
+    .map(pn => partsByPn.get(pn))
+    .filter(Boolean);
+
+  const transitioning = predecessors.some(p => p.phasingOut);
+  if (!transitioning) return null;
+
+  const anchorPn = lineage[0];
+  const anchor = partsByPn.get(anchorPn) || null;
+  const dailyRate = anchor ? (Number(anchor.daily) || 0) : 0;
+
+  // Combined on-hand across the whole chain (predecessors + this final part).
+  let combinedOnHand = Number(part.onHand) || 0;
+  for (const p of predecessors) combinedOnHand += Number(p.onHand) || 0;
+
+  return { dailyRate, combinedOnHand, anchorPn, anchor, predecessors };
 }
 
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
@@ -479,7 +543,17 @@ function partsWithStatus() {
     const lines = lineIndex.get(p.pn);
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
     const isKitVal = typeof isKit === "function" ? isKit(p.pn) : false;
-    const status = partStatus(p, lines);
+
+    // Phase 2: chain-final parts get an effective view (combined on-hand +
+    // anchor's daily) before status / days-of-cover is computed, so the
+    // runway reflects the chain's true burn-down rather than the new PN's
+    // isolated zero-daily / zero-on-hand view.
+    const boost = _supersessionDemandBoost(p);
+    const effectiveForStatus = boost
+      ? { ...p, onHand: boost.combinedOnHand, daily: Math.max(Number(p.daily) || 0, boost.dailyRate) }
+      : p;
+    const status = partStatus(effectiveForStatus, lines);
+
     const muted = isSupplierMuted(p.supplier);
     return {
       ...p,
@@ -488,6 +562,7 @@ function partsWithStatus() {
       ...status,
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
       _suggestedQty: suggestedQty(p, onPO),
+      ...(boost ? { _chainBoost: boost } : {}),
     };
   });
   _statusCache = out;
