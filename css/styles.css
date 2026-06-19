@@ -613,6 +613,22 @@ body {
 .tbl td.dim { color: var(--t3); }
 .tbl td.pn { font-family: var(--f-mono); font-weight: 500; color: var(--t1); }
 
+/* Queue rows: the Part cell can hold multiple pills (NO COST, phasing out,
+   TRANSITION RISK). Let those wrap WITHIN the cell instead of stretching the
+   column wider — otherwise Est $ / + Add get pushed off the right edge.
+   Scoped via the [data-oq-row] attribute so other tables keep their
+   global `white-space: nowrap` behavior. */
+.tbl tr[data-oq-row] > td.pn {
+  white-space: normal;
+  max-width: 200px;
+  line-height: 1.35;
+}
+.tbl tr[data-oq-row] > td.pn .pill {
+  display: inline-block;
+  vertical-align: middle;
+  margin-top: 2px;
+}
+
 /* Status pills */
 .pill {
   display: inline-flex;
