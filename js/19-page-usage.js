@@ -520,10 +520,24 @@ function renderBaseBomUsage() {
   }
   if (BBU_STATE.supplier) rows = rows.filter(p => p.supplier === BBU_STATE.supplier);
 
+  // Effective-daily resolver. Sort, KPIs, displayed cell value, and the
+  // MISSING RATE flag all read from this so they can never disagree —
+  // chain successors with stored 0 but an inherited anchor rate (e.g.
+  // CP00558 → 3.81) get the inherited rate everywhere on the page, not
+  // a blank cell paired with a MISSING flag. Falls back to part.daily
+  // when chainDisplayDaily isn't defined (defensive — same module, but
+  // belt-and-braces in case of load-order quirks).
+  const _bbuEffDaily = (p) => {
+    if (typeof chainDisplayDaily === "function") {
+      return Number(chainDisplayDaily(p)) || 0;
+    }
+    return Number(p?.daily) || 0;
+  };
+
   // Sort
   rows.sort((a, b) => {
-    const aDaily = Number(a.daily) || 0;
-    const bDaily = Number(b.daily) || 0;
+    const aDaily = _bbuEffDaily(a);
+    const bDaily = _bbuEffDaily(b);
     switch (BBU_STATE.sortBy) {
       case "missing": {
         const aHas = aDaily > 0 ? 1 : 0;
@@ -538,12 +552,14 @@ function renderBaseBomUsage() {
     }
   });
 
-  // Stats over the unfiltered base_bom set
+  // Stats over the unfiltered base_bom set — same effective-rate basis as
+  // the row-level MISSING flag so With/Without/Avg KPIs match the visible
+  // pill counts.
   const total = parts.length;
-  const rated = parts.filter(p => (Number(p.daily) || 0) > 0);
+  const rated = parts.filter(p => _bbuEffDaily(p) > 0);
   const withRate = rated.length;
   const withoutRate = total - withRate;
-  const avgDaily = withRate > 0 ? rated.reduce((s, p) => s + (Number(p.daily) || 0), 0) / withRate : 0;
+  const avgDaily = withRate > 0 ? rated.reduce((s, p) => s + _bbuEffDaily(p), 0) / withRate : 0;
 
   const suppliers = [...new Set(parts.map(p => p.supplier).filter(Boolean))].sort();
   const isMonthly = BBU_STATE.displayMode === "monthly";
@@ -632,7 +648,16 @@ function renderBaseBomUsage() {
                     </tr></thead>
                     <tbody>
                       ${rows.slice(0, 500).map(p => {
-                        const d = Number(p.daily) || 0;
+                        // Resolve effective rate via chainDisplayDailySource so
+                        // chain successors (e.g. CP00558) show their inherited
+                        // anchor rate AND don't flag as MISSING. Display value,
+                        // MISSING pill, sort, and KPIs all agree because they
+                        // pull from the same effective source.
+                        const dailySrc = (typeof chainDisplayDailySource === "function")
+                          ? chainDisplayDailySource(p)
+                          : { daily: Number(p.daily) || 0, anchorPn: null, transitioning: false, isAnchor: false };
+                        const dailyInherited = dailySrc.transitioning && !dailySrc.isAnchor;
+                        const d = Number(dailySrc.daily) || 0;
                         const missing = d <= 0;
                         const shown = isMonthly ? d * 30 : d;
                         return `
@@ -646,9 +671,10 @@ function renderBaseBomUsage() {
                                 value="${missing ? '' : shown}"
                                 placeholder="—"
                                 onclick="event.stopPropagation()"
-                                onblur="bbuApplyRateFromInput('${esc(p.pn)}', this.value)"
-                                onkeydown="if(event.key==='Enter'){this.blur()}"
-                                style="width:100px;text-align:right">
+                                ${dailyInherited
+                                  ? `disabled title="Inherited from chain anchor ${esc(dailySrc.anchorPn || '')} — edit there"`
+                                  : `onblur="bbuApplyRateFromInput('${esc(p.pn)}', this.value)" onkeydown="if(event.key==='Enter'){this.blur()}"`}
+                                style="width:100px;text-align:right${dailyInherited ? ';opacity:0.55;cursor:not-allowed' : ''}">
                             </td>
                             <td>${missing ? '<span class="pill warn">MISSING RATE</span>' : ''}</td>
                           </tr>
