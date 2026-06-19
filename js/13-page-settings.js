@@ -35,6 +35,7 @@ registerRoute("settings", () => {
             <label>Safety buffer (days)</label>
             <div>
               <input class="input" type="number" min="0" id="set-safety" value="${s.safetyDays}">
+              <div class="help">Extra buffer beyond lead time</div>
             </div>
             <label>Warning threshold (days)</label>
             <div>
