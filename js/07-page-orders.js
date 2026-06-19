@@ -383,7 +383,14 @@ function renderOrderQueueFor(itemType) {
   if (itemType) stats = stats.filter(p => p.itemType === itemType);
   else stats = stats.filter(p => p.itemType !== "do_not_order");
   stats = stats.filter(p => !p.isKit);
-  const needsOrder = stats.filter(p => p.status === "critical" || p.status === "warning");
+  // Phasing-out parts stay visible in the Parts Catalog but disappear from
+  // every queue — there's no order to place for them. The chain's FINAL
+  // successor (which isn't phasingOut) still appears, and gets a TRANSITION
+  // AT RISK tag below if the chain will dry up before the replacement order
+  // can land.
+  const needsOrder = stats
+    .filter(p => p.status === "critical" || p.status === "warning")
+    .filter(p => !p.phasingOut);
   
   // Apply filters
   let filtered = needsOrder;
@@ -531,9 +538,14 @@ function renderOrderQueueFor(itemType) {
                   </td></tr>
                   ${filtered.map(p => {
                     const sq = p._suggestedQty;
+                    // Chain-final parts get a TRANSITION AT RISK tag when no
+                    // covering PO arrives before the chain runs dry. Computed
+                    // off the row's cached partsWithStatus state — non-final
+                    // / non-chain parts get falsy here (zero cost).
+                    const risk = (typeof chainTransitionRisk === "function") ? chainTransitionRisk(p) : false;
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Chain runs dry in ${risk.runoutDays}d — order not yet placed">TRANSITION AT RISK</span>` : ''}</td>
                       <td onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')">

@@ -147,6 +147,10 @@ function updateNavBadges() {
   };
   for (const p of stats) {
     if (p.isKit) continue;
+    // Phasing-out parts are hidden from queues — keep badges consistent with
+    // the queue lists so the count never overpromises rows that aren't there.
+    // (The final part of the chain isn't phasingOut, so it still tallies.)
+    if (p.phasingOut) continue;
     const isCrit = p.status === "critical";
     const isNeeds = isCrit || p.status === "warning";
     if (!isNeeds) continue;

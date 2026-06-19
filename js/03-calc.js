@@ -477,6 +477,57 @@ function _supersessionDemandBoost(part) {
   };
 }
 
+// Chain-safety check for the FINAL part of an actively-transitioning chain.
+// Returns false (or null) when no risk flag is warranted, or an object
+// { runoutDays } when the chain will run dry before a replacement order
+// arrives.
+//
+// Decision:
+//   1. Only the FINAL part is eligible (rest of chain is phasing out → not in
+//      the queue anyway after this commit).
+//   2. Chain runs dry from today at chainRate, starting from the clamped
+//      cumulative supply through the final part. runoutDays = supply/rate.
+//   3. If an open PO line for the final part is expected to arrive on/before
+//      that runout date, the chain is COVERED → no risk.
+//   4. If suggestedQty is already 0 (math says we have what we need), no risk.
+//   5. Otherwise AT RISK — the order hasn't been placed (or won't arrive in
+//      time) and the predecessor stock will exhaust first.
+//
+// Reads open POs the same way the rest of the app does (status filter, line
+// status filter, line.expectedDate falling back to po.expectedDate).
+function chainTransitionRisk(part) {
+  const view = chainSequentialView(part);
+  if (!view || !view.isFinal) return false;
+  if (view.chainRate <= 0) return false;
+
+  const runoutDays = view.cumulativeStockThroughThis / view.chainRate;
+  const today = new Date(TODAY); today.setHours(0, 0, 0, 0);
+  const runoutMs = today.getTime() + runoutDays * DAY_MS;
+
+  // Look for any covering PO line on the final part.
+  for (const po of (DB.pos || [])) {
+    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
+    for (const ln of (po.lines || [])) {
+      if (ln.pn !== part.pn) continue;
+      if (ln.status === "received" || ln.status === "cancelled") continue;
+      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (remaining <= 0) continue;
+      const expRaw = ln.expectedDate || po.expectedDate;
+      if (!expRaw) continue;
+      const exp = new Date(expRaw);
+      if (isNaN(exp)) continue;
+      exp.setHours(0, 0, 0, 0);
+      if (exp.getTime() <= runoutMs) return false; // covered
+    }
+  }
+
+  // No covering PO. Risk only if an order is also actually needed.
+  const sq = (typeof part._suggestedQty === "number") ? part._suggestedQty : suggestedQty(part);
+  if (sq <= 0) return false;
+
+  return { runoutDays: Math.ceil(runoutDays) };
+}
+
 // Phase 2 display helper. Returns the daily rate every chain member should
 // SHOW in UI surfaces (drawer stat cell, parts catalog row, order queue row)
 // so users see the same consumption rate on every link of the chain. The
