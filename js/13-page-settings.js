@@ -11,6 +11,13 @@ registerRoute("settings", () => {
   const poLineCount = (DB.pos || []).reduce((sum, po) => sum + (po.lines?.length || 0), 0);
   const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
   const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
+  const lastBomSync = (DB.audit || []).find(a => a.type === "acumatica-bom-sync")?.ts || null;
+  // BOM links load asynchronously after first paint; distinguish "not yet
+  // arrived" (undefined) from "loaded but empty" (0) so the card doesn't
+  // misleadingly show "0 links" during the brief boot window.
+  const bomLinksLoaded = Array.isArray(DB.bomLinks);
+  const bomLinksCount = bomLinksLoaded ? DB.bomLinks.length : null;
+  const fgCount = (typeof FINISHED_GOODS !== "undefined" && Array.isArray(FINISHED_GOODS)) ? FINISHED_GOODS.length : 0;
   $("#main").innerHTML = `
     <div class="page">
       <div class="page-head">
@@ -96,6 +103,21 @@ registerRoute("settings", () => {
             <span class="mono dim" style="font-size:11px">${DB.parts.length} parts</span>
             <div class="grow"></div>
             <span class="muted tiny">${lastOnHandSync ? 'Last sync ' + fmtDate(lastOnHandSync) : 'Awaiting first sync'}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">Multi Level BOM</div>
+          <div class="panel-sub">Finished-goods BOM structure, synced nightly from Acumatica.</div>
+        </div>
+        <div class="panel-body">
+          <div class="row gap-md" style="align-items:center">
+            <span class="pill ok">● Acumatica · live</span>
+            <span class="mono dim" style="font-size:11px">${bomLinksLoaded ? `${fmtNum(bomLinksCount)} links · ${fgCount} finished goods` : 'loading…'}</span>
+            <div class="grow"></div>
+            <span class="muted tiny">Syncs daily 6:00 AM${lastBomSync ? ' · last ' + fmtDate(lastBomSync) : ''}</span>
           </div>
         </div>
       </div>

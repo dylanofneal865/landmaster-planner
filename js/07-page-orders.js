@@ -14,6 +14,11 @@ let OQ_STATE = {
   sortBy: "urgency",    // urgency | pn | supplier | qty | value | desc | lead
   sortDir: "asc",
 
+  // Days Cover column-header filter. Single-select; stacks with the toolbar
+  // urgency filter and the supplier / buyer / search filters via AND.
+  // Values: all | critical | critWarn | under30 | under60
+  coverFilter: "all",
+
  headerFilters: {
     pn: "",
     desc: "",
@@ -48,6 +53,68 @@ function oqClearHeaderFilter(key) {
   OQ_STATE.hiddenFilters[key] = [];
   OQ_STATE.openHeaderMenu = "";
   refresh();
+}
+
+// Days Cover dropdown selection. Single-select; "all" clears.
+function oqSetCoverFilter(value) {
+  OQ_STATE.coverFilter = String(value || "all");
+  OQ_STATE.openHeaderMenu = "";
+  refresh();
+}
+
+// Days Cover header dropdown. Same visual shell as oqHeaderDropdown
+// (.excel-th / .excel-menu / .excel-check-row) so the row of column headers
+// reads consistently, but the body is a radio group over fixed options
+// rather than a search + value-list — matching the spec's filter semantics.
+// "Critical only" / "Critical + Warning" rely on p.status, which already
+// reflects supplier-mute overrides (isSupplierMuted forces status to "ok"),
+// so muted parts never show as critical here — same as the row coloring.
+function oqCoverDropdown() {
+  const open = OQ_STATE.openHeaderMenu === "cover";
+  const active = OQ_STATE.coverFilter && OQ_STATE.coverFilter !== "all" ? "active" : "";
+  const options = [
+    { key: "all",      label: "All" },
+    { key: "critical", label: "Critical only" },
+    { key: "critWarn", label: "Critical + Warning" },
+    { key: "under30",  label: "Under 30 days" },
+    { key: "under60",  label: "Under 60 days" },
+  ];
+  return `
+    <th class="right">
+      <div class="excel-th">
+        <span>Days Cover</span>
+        <button class="excel-drop ${active}" onclick="event.stopPropagation(); oqToggleHeaderMenu('cover')">▾</button>
+        ${open ? `
+          <div class="excel-menu" onclick="event.stopPropagation()">
+            <button class="excel-menu-btn" onclick="oqSortHeader('urgency', 'asc')">Sort most urgent first</button>
+            <button class="excel-menu-btn" onclick="oqSortHeader('urgency', 'desc')">Sort least urgent first</button>
+
+            <div class="excel-menu-line"></div>
+
+            <button class="excel-menu-btn ${active ? '' : 'disabled'}" onclick="oqSetCoverFilter('all')">
+              Clear Filter from 'Days Cover'
+            </button>
+
+            <div class="excel-menu-line"></div>
+
+            <div class="excel-values">
+              ${options.map(o => `
+                <label class="excel-check-row">
+                  <input
+                    type="radio"
+                    name="oq-cover-filter"
+                    ${OQ_STATE.coverFilter === o.key ? 'checked' : ''}
+                    onchange="oqSetCoverFilter('${o.key}')"
+                  >
+                  <span>${esc(o.label)}</span>
+                </label>
+              `).join("")}
+            </div>
+          </div>
+        ` : ""}
+      </div>
+    </th>
+  `;
 }
 
 function oqToggleHeaderValue(key, value, checked) {
@@ -137,6 +204,22 @@ function oqSortHeader(key, dir) {
   OQ_STATE.sortDir = dir;
   OQ_STATE.openHeaderMenu = "";
   refresh();
+}
+
+// Urgency margin used by the "Most urgent" sort. Margin = daysOfCover -
+// reorderBy, where reorderBy = leadDays + safetyDays (already computed by
+// partStatus). More negative = more urgent: a part with 40-day cover and
+// 182-day lead (margin -142) ranks above a part with 25-day cover and 7-day
+// lead (margin +18), since the long-lead part is the one that genuinely
+// runs dry before resupply lands. Critical parts always have margin <= 0
+// by definition (status === "critical" iff stockoutDay <= reorderBy), so
+// they naturally cluster at the top under ascending sort.
+// Missing cover/reorderBy → +Infinity → sorts to the bottom.
+function oqUrgencyMargin(p) {
+  const cover = Number(p?.daysOfCover);
+  const reorderBy = Number(p?.reorderBy);
+  if (!Number.isFinite(cover) || !Number.isFinite(reorderBy)) return Infinity;
+  return cover - reorderBy;
 }
 
 function oqHeaderValue(p, key) {
@@ -310,9 +393,23 @@ function renderOrderQueueFor(itemType) {
   if (OQ_STATE.buyer) filtered = filtered.filter(p => p.buyer === OQ_STATE.buyer);
   if (OQ_STATE.search) {
     const q = OQ_STATE.search.toLowerCase();
-    filtered = filtered.filter(p => 
+    filtered = filtered.filter(p =>
       p.pn.toLowerCase().includes(q) || (p.desc||"").toLowerCase().includes(q)
     );
+  }
+  // Days Cover column-header filter. Status-based options use p.status, which
+  // already reflects supplier-mute overrides — muted parts stay out of the
+  // "Critical only" / "Critical + Warning" buckets the same way they're not
+  // colored red in the row treatment. The day cutoffs are a straight numeric
+  // compare on p.daysOfCover (Infinity correctly fails both <30 and <60).
+  if (OQ_STATE.coverFilter === "critical") {
+    filtered = filtered.filter(p => p.status === "critical");
+  } else if (OQ_STATE.coverFilter === "critWarn") {
+    filtered = filtered.filter(p => p.status === "critical" || p.status === "warning");
+  } else if (OQ_STATE.coverFilter === "under30") {
+    filtered = filtered.filter(p => Number(p.daysOfCover) < 30);
+  } else if (OQ_STATE.coverFilter === "under60") {
+    filtered = filtered.filter(p => Number(p.daysOfCover) < 60);
   }
 
   // Render every toolbar-filter row; the header hidden filter is applied
@@ -350,7 +447,11 @@ function renderOrderQueueFor(itemType) {
 
       case "urgency":
       default:
-        cmp = a.urgency - b.urgency;
+        // Rank by urgency margin (cover - reorderBy), not raw daysOfCover.
+        // Keeps the sort consistent with row colors: long-lead parts whose
+        // cover doesn't reach lead+safety surface above short-lead parts
+        // with smaller raw cover but a comfortable margin.
+        cmp = oqUrgencyMargin(a) - oqUrgencyMargin(b);
         break;
     }
 
@@ -412,7 +513,7 @@ function renderOrderQueueFor(itemType) {
     ${oqHeaderDropdown("desc", "Description", headerFilterRows)}
     ${oqHeaderDropdown("supplier", "Supplier", headerFilterRows)}
 
-    <th class="right">Days Cover</th>
+    ${oqCoverDropdown()}
 
     ${oqHeaderDropdown("lead", "Lead", headerFilterRows)}
 
@@ -432,7 +533,7 @@ function renderOrderQueueFor(itemType) {
                     const sq = p._suggestedQty;
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
                       <td onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')">
