@@ -399,7 +399,7 @@ registerRoute("pos", () => {
                 No POs match the current filters. Adjust the column dropdowns or tabs above.
               </td></tr>
               ${pos.map(po => {
-                const open = po.lines.filter(l => l.status !== "received" && l.status !== "cancelled");
+                const open = (po.lines || []).filter(l => isLineOpen(po, l));
                 const totalQty = po.lines.reduce((s,l) => s + (l.qty||0), 0);
                 const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY && po.status !== "received" && po.status !== "closed";
                 return `
@@ -457,8 +457,8 @@ function poTotalValue(po) {
   }, 0);
 }
 function poRemainingValue(po) {
-  return po.lines.reduce((s, l) => {
-    if (l.status === "received" || l.status === "cancelled") return s;
+  return (po.lines || []).reduce((s, l) => {
+    if (!isLineOpen(po, l)) return s;
     const rem = Math.max(0, (l.qty||0) - (l.qtyReceived||0));
     return s + rem * (l.cost || 0);
   }, 0);

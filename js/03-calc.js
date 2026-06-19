@@ -121,6 +121,54 @@ function leadTimeDays(part) {
   return Math.round((part.ltWeeks || 0) * 7);
 }
 
+// ----- Shared "is this PO line actually open?" gate -------------------------
+//
+// The PO Lines GI was changed to also feed back received / closed lines so
+// the planner can show receipts. As a side effect, "Completed" / "Closed"
+// Acumatica POs can land in DB.pos carrying straggler lines that look open
+// at the line level (qty > 0, qtyReceived < qty, ln.status === "open")
+// because Acumatica never reconciled them — and our po-level rollup picks
+// "Open" priority over "Completed", so po.acumStatus is "Open" too.
+//
+// `isLineOpen(po, ln)` is the single chokepoint for deciding whether a line
+// should count toward open-PO supply math, transition-risk PO coverage, the
+// supplier follow-up list, the dashboard's $ open PO KPI, the suppliers-page
+// totals, and the part-drawer open-PO list. Be liberal — when ANY of these
+// signals say it's done, treat as NOT open. Better to miss a follow-up than
+// to chase a vendor about a PO they already shipped.
+//
+// A line is NOT open if:
+//   - po.status is received / closed / cancelled / completed (case-insens.)
+//   - po.acumStatus is Completed / Closed / Canceled / Cancelled / Rejected
+//   - ln.status is received / closed / cancelled / completed
+//   - ln.acumStatus is Completed / Closed / Canceled / Cancelled / Rejected
+//   - ln.openQty is defined and <= 0
+//   - qty is 0 (degenerate line)
+//   - qtyReceived (or ln.recv) >= qty (fully received)
+const _CLOSED_LINE_STATUSES = new Set([
+  "received", "closed", "cancelled", "canceled", "completed",
+]);
+const _CLOSED_ACUM_STATUSES = new Set([
+  "completed", "closed", "canceled", "cancelled", "rejected",
+]);
+function isLineOpen(po, ln) {
+  if (!po || !ln) return false;
+  const poStatus = String(po.status || "").toLowerCase().trim();
+  if (_CLOSED_LINE_STATUSES.has(poStatus)) return false;
+  const poAcum = String(po.acumStatus || "").toLowerCase().trim();
+  if (poAcum && _CLOSED_ACUM_STATUSES.has(poAcum)) return false;
+  const lnStatus = String(ln.status || "").toLowerCase().trim();
+  if (_CLOSED_LINE_STATUSES.has(lnStatus)) return false;
+  const lnAcum = String(ln.acumStatus || "").toLowerCase().trim();
+  if (lnAcum && _CLOSED_ACUM_STATUSES.has(lnAcum)) return false;
+  if (ln.openQty !== undefined && ln.openQty !== null && Number(ln.openQty) <= 0) return false;
+  const qty = Number(ln.qty || 0);
+  if (qty <= 0) return false;
+  const recv = Number(ln.qtyReceived != null ? ln.qtyReceived : (ln.recv != null ? ln.recv : 0));
+  if (recv >= qty) return false;
+  return true;
+}
+
 // Build a per-PN index of open PO lines. Each entry: { ln, remaining, po }.
 // Built once at the top of partsWithStatus so projectOnHand/openPOQty don't
 // rescan DB.pos for every part. External callers don't need this — the public
@@ -130,9 +178,8 @@ function leadTimeDays(part) {
 function _buildOpenPOLineIndex() {
   const map = new Map();
   for (const po of (DB.pos || [])) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
-    for (const ln of po.lines) {
-      if (ln.status === "received" || ln.status === "cancelled") continue;
+    for (const ln of (po.lines || [])) {
+      if (!isLineOpen(po, ln)) continue;
       const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       if (!remaining) continue;
       let arr = map.get(ln.pn);
@@ -153,11 +200,10 @@ function openPOQty(pn, lines) {
   }
   let total = 0;
   for (const po of (DB.pos || [])) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
-    for (const ln of po.lines) {
-      if (ln.pn === pn && ln.status !== "received" && ln.status !== "cancelled") {
-        total += Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
-      }
+    for (const ln of (po.lines || [])) {
+      if (ln.pn !== pn) continue;
+      if (!isLineOpen(po, ln)) continue;
+      total += Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
     }
   }
   return total;
@@ -207,10 +253,9 @@ function projectOnHand(part, days = 365, lines) {
     for (const e of lines) accumReceipt(e.ln, e.remaining, e.po);
   } else {
     for (const po of (DB.pos || [])) {
-      if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
-      for (const ln of po.lines) {
+      for (const ln of (po.lines || [])) {
         if (ln.pn !== part.pn) continue;
-        if (ln.status === "received" || ln.status === "cancelled") continue;
+        if (!isLineOpen(po, ln)) continue;
         const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
         if (!remaining) continue;
         accumReceipt(ln, remaining, po);
@@ -504,12 +549,13 @@ function chainTransitionRisk(part) {
   const today = new Date(TODAY); today.setHours(0, 0, 0, 0);
   const runoutMs = today.getTime() + runoutDays * DAY_MS;
 
-  // Look for any covering PO line on the final part.
+  // Look for any covering PO line on the final part. Goes through the
+  // same isLineOpen gate as the rest of the supply math so a "Completed"
+  // PO from the Acumatica feed can't masquerade as a covering order.
   for (const po of (DB.pos || [])) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
     for (const ln of (po.lines || [])) {
       if (ln.pn !== part.pn) continue;
-      if (ln.status === "received" || ln.status === "cancelled") continue;
+      if (!isLineOpen(po, ln)) continue;
       const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       if (remaining <= 0) continue;
       const expRaw = ln.expectedDate || po.expectedDate;

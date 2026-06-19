@@ -196,14 +196,15 @@ registerRoute("suppliers", () => {
     if (p.ltWeeks) { a.ltSum += p.ltWeeks; a.ltCount++; }
     a.partsList.push(p);
   }
-  // Add PO data
+  // Add PO data. Route through isLineOpen so completed/closed POs from the
+  // Acumatica feed don't inflate per-supplier open-PO counts or value.
   for (const po of DB.pos) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
+    const openLines = (po.lines || []).filter(ln => isLineOpen(po, ln));
+    if (openLines.length === 0) continue;
     const a = map.get(po.supplier);
     if (!a) continue;
     a.openPOs++;
-    for (const ln of po.lines) {
-      if (ln.status === "received" || ln.status === "cancelled") continue;
+    for (const ln of openLines) {
       const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
       a.openPOValue += remaining * (ln.cost || 0);
     }

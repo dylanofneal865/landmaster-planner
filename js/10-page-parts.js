@@ -73,15 +73,16 @@ function renderPartDetail(part) {
   const maxOH = Math.max(...series.map(s => s.oh), part.onHand || 0, 1);
   const stockoutIdx = series.findIndex(s => s.oh <= 0);
 
-  // Open POs containing this part
+  // Open POs containing this part. Same isLineOpen gate as the rest of
+  // the open-supply math so a leaked Completed PO doesn't pad the drawer's
+  // PO list with lines the supplier already shipped.
   const linesForPart = [];
   for (const po of DB.pos) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
-    for (const ln of po.lines) {
-      if (ln.pn === part.pn && ln.status !== "received" && ln.status !== "cancelled") {
-        const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
-        if (remaining > 0) linesForPart.push({ po, ln, remaining });
-      }
+    for (const ln of (po.lines || [])) {
+      if (ln.pn !== part.pn) continue;
+      if (!isLineOpen(po, ln)) continue;
+      const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
+      if (remaining > 0) linesForPart.push({ po, ln, remaining });
     }
   }
 

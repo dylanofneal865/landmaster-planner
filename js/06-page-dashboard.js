@@ -18,17 +18,21 @@ registerRoute("dashboard", () => {
   const orderable = stats.filter(p => p.itemType !== "do_not_order");
   const crit = orderable.filter(p => p.status === "critical" && !p.isKit);
   const warn = orderable.filter(p => p.status === "warning" && !p.isKit);
-  const openPOs = DB.pos.filter(p => p.status === "draft" || p.status === "submitted" || p.status === "in_transit");
+  // A PO is "open" iff it has at least one line that passes isLineOpen — the
+  // shared chokepoint that excludes Completed/Closed Acumatica POs even when
+  // po.status is still "submitted"/"in_transit" because some straggler lines
+  // never got reconciled in the source system.
+  const openPOs = DB.pos.filter(po => (po.lines || []).some(ln => isLineOpen(po, ln)));
   const overduePOs = openPOs.filter(p => p.expectedDate && new Date(p.expectedDate) < TODAY);
   const draftPOs = DB.pos.filter(p => p.status === "draft");
 
   // Total inventory value
   const invValue = stats.reduce((s, p) => s + (p.onHand || 0) * (p.cost || 0), 0);
-  // Total open PO value
+  // Total open PO value — sum remaining qty * cost across genuinely-open
+  // lines only, so a leaked Completed PO can't inflate the KPI.
   const poValue = DB.pos.reduce((s, po) => {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") return s;
-    return s + po.lines.reduce((ls, ln) => {
-      if (ln.status === "received" || ln.status === "cancelled") return ls;
+    return s + (po.lines || []).reduce((ls, ln) => {
+      if (!isLineOpen(po, ln)) return ls;
       const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       return ls + remaining * (ln.cost || 0);
     }, 0);
@@ -50,16 +54,16 @@ registerRoute("dashboard", () => {
   // Supplier Follow-Ups: every open PO line whose expected date is more
   // than FOLLOWUP_DAYS in the past. Uses ln.expectedDate first, falls
   // back to po.expectedDate — same convention as chainTransitionRisk and
-  // the part-drawer open-PO list. Same retired-line statuses (received /
-  // cancelled) excluded as everywhere else. YYYY-MM-DD strings (from the
-  // Acumatica sync) are parsed as local dates to avoid the off-by-one
-  // shift `new Date("2026-05-27")` would introduce.
+  // the part-drawer open-PO list. Open-ness is decided by isLineOpen so
+  // Completed/Closed POs leaking through the Acumatica feed never appear
+  // as follow-ups. YYYY-MM-DD strings (from the Acumatica sync) are
+  // parsed as local dates to avoid the off-by-one shift
+  // `new Date("2026-05-27")` would introduce.
   const statsByPn = new Map(stats.map(p => [p.pn, p]));
   const followUps = [];
   for (const po of (DB.pos || [])) {
-    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
     for (const ln of (po.lines || [])) {
-      if (ln.status === "received" || ln.status === "cancelled") continue;
+      if (!isLineOpen(po, ln)) continue;
       const openQty = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       if (openQty <= 0) continue;
       const expRaw = ln.expectedDate || po.expectedDate;
@@ -218,7 +222,7 @@ registerRoute("dashboard", () => {
                   <thead><tr><th>PO #</th><th>Supplier</th><th>Status</th><th class="right">Lines</th><th class="right">Value</th><th>Expected</th><th></th></tr></thead>
                   <tbody>
                     ${openPOs.slice(0,6).map(po => {
-                      const open = po.lines.filter(l => l.status !== "received" && l.status !== "cancelled");
+                      const open = (po.lines || []).filter(l => isLineOpen(po, l));
                       const val = open.reduce((s,l) => s + Math.max(0,(l.qty||0)-(l.qtyReceived||0)) * (l.cost||0), 0);
                       const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY;
                       return `
