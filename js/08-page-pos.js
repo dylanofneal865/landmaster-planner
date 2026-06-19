@@ -171,23 +171,25 @@ function patchOpenPODrawer() {
 }
 
 function posMatchesTab(po, tab) {
+  // Active / Overdue / Closed all gate on the same isActivePO chokepoint
+  // (js/03-calc.js) so the tabs partition cleanly and the counts match
+  // both the Purchase Orders nav badge and the Dashboard "Open POs" KPI.
+  // The remaining Acumatica-lifecycle sub-tabs (Open / On Hold / Pending)
+  // narrow within Active using po.acumStatus and a small fallback that
+  // mirrors the previous semantics — they still appear inside Active for
+  // users who want a finer-grained view.
   const a = po.acumStatus || "";
-  const isAcumActive   = a === "Open" || a === "On Hold" || a === "Pending Approval" || a === "Pending Printing" || a === "Pending Email" || a === "Awaiting Link";
-  const isAcumPending  = a === "Pending Approval" || a === "Pending Printing" || a === "Pending Email" || a === "Awaiting Link";
-  const isAcumTerminal = a === "Completed" || a === "Rejected" || a === "Canceled";
-  const fbActive    = !a && (po.status === "submitted" || po.status === "in_transit");
-  const fbCompleted = !a && po.status === "received";
-  const fbCancelled = !a && po.status === "cancelled";
+  const isAcumPending = a === "Pending Approval" || a === "Pending Printing" || a === "Pending Email" || a === "Awaiting Link";
+  const fbActive = !a && (po.status === "submitted" || po.status === "in_transit");
   switch (tab) {
-    case "active":    return isAcumActive || fbActive;
-    case "open":      return a === "Open" || fbActive;
-    case "onhold":    return a === "On Hold";
-    case "pending":   return isAcumPending;
-    case "overdue":   return !!po.expectedDate && new Date(po.expectedDate) < TODAY && !isAcumTerminal && !fbCompleted && !fbCancelled;
-    case "completed": return a === "Completed" || fbCompleted;
-    case "cancelled": return a === "Rejected" || a === "Canceled" || fbCancelled;
-    case "all":       return true;
-    default:          return true;
+    case "active":  return isActivePO(po);
+    case "open":    return isActivePO(po) && (a === "Open" || fbActive);
+    case "onhold":  return isActivePO(po) && a === "On Hold";
+    case "pending": return isActivePO(po) && isAcumPending;
+    case "overdue": return isActivePO(po) && !!po.expectedDate && new Date(po.expectedDate) < TODAY;
+    case "closed":  return !isActivePO(po);
+    case "all":     return true;
+    default:        return true;
   }
 }
 function posUniqueHeaderValues(rows, key) {
@@ -328,14 +330,13 @@ registerRoute("pos", () => {
   });
 
   const counts = {
-    active:    DB.pos.filter(p => posMatchesTab(p, "active")).length,
-    open:      DB.pos.filter(p => posMatchesTab(p, "open")).length,
-    onhold:    DB.pos.filter(p => posMatchesTab(p, "onhold")).length,
-    pending:   DB.pos.filter(p => posMatchesTab(p, "pending")).length,
-    overdue:   DB.pos.filter(p => posMatchesTab(p, "overdue")).length,
-    completed: DB.pos.filter(p => posMatchesTab(p, "completed")).length,
-    cancelled: DB.pos.filter(p => posMatchesTab(p, "cancelled")).length,
-    all:       DB.pos.length,
+    active:  DB.pos.filter(p => posMatchesTab(p, "active")).length,
+    open:    DB.pos.filter(p => posMatchesTab(p, "open")).length,
+    onhold:  DB.pos.filter(p => posMatchesTab(p, "onhold")).length,
+    pending: DB.pos.filter(p => posMatchesTab(p, "pending")).length,
+    overdue: DB.pos.filter(p => posMatchesTab(p, "overdue")).length,
+    closed:  DB.pos.filter(p => posMatchesTab(p, "closed")).length,
+    all:     DB.pos.length,
   };
 
   $("#main").innerHTML = `
@@ -372,8 +373,7 @@ registerRoute("pos", () => {
             ["onhold","On Hold",counts.onhold],
             ["pending","Pending",counts.pending],
             ["overdue","Overdue",counts.overdue],
-            ["completed","Completed",counts.completed],
-            ["cancelled","Cancelled",counts.cancelled],
+            ["closed","Closed",counts.closed],
             ["all","All",counts.all],
           ].map(([k,l,c]) => `
             <button class="btn sm ${POS_STATE.filter===k?'primary':''}" onclick="POS_STATE.filter='${k}'; refresh()">${l} <span style="opacity:0.7;font-family:var(--f-mono)">${c}</span></button>

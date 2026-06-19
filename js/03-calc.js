@@ -151,12 +151,28 @@ const _CLOSED_LINE_STATUSES = new Set([
 const _CLOSED_ACUM_STATUSES = new Set([
   "completed", "closed", "canceled", "cancelled", "rejected",
 ]);
-function isLineOpen(po, ln) {
-  if (!po || !ln) return false;
+
+// PO-level "is this PO still live?" gate. Exclude-list approach so any
+// tenant's custom in-progress statuses (draft / submitted / in_transit /
+// partial / etc.) all default to active — only the explicitly-terminal
+// po.status and po.acumStatus values are filtered out. Used by:
+//   - Purchase Orders nav badge count
+//   - Dashboard "Open POs" KPI
+//   - PO list "Active" / "Overdue" / "Closed" filter tabs
+//   - isLineOpen (as the PO-level pre-check before the line-level rules)
+// One definition, reused everywhere; no parallel filter chains.
+function isActivePO(po) {
+  if (!po) return false;
   const poStatus = String(po.status || "").toLowerCase().trim();
   if (_CLOSED_LINE_STATUSES.has(poStatus)) return false;
   const poAcum = String(po.acumStatus || "").toLowerCase().trim();
   if (poAcum && _CLOSED_ACUM_STATUSES.has(poAcum)) return false;
+  return true;
+}
+
+function isLineOpen(po, ln) {
+  if (!isActivePO(po)) return false;
+  if (!ln) return false;
   const lnStatus = String(ln.status || "").toLowerCase().trim();
   if (_CLOSED_LINE_STATUSES.has(lnStatus)) return false;
   const lnAcum = String(ln.acumStatus || "").toLowerCase().trim();
@@ -759,10 +775,21 @@ function partsWithStatus() {
 
 /* ============================================================
    QUEUE ELIGIBILITY — single source of truth for "what parts
-   show up in an order queue today". Used by the queue page AND
-   the dashboard's Critical/Order Today count so the two can
-   never drift apart again.
+   show up in an order queue today". Used by the queue page, the
+   topbar, the dashboard KPIs, and the nav badges so they can
+   never drift apart.
    ============================================================ */
+
+// True iff `part.itemType` is one of the three queue itemTypes
+// (base_bom / options / service). Parts with a blank/undefined
+// itemType — OR itemType === "do_not_order" — are NOT queue-eligible
+// and don't get counted anywhere visible. The dashboard surfaces
+// any critical parts that fall outside this set as "(+N untagged)"
+// so they don't silently disappear.
+const _QUEUE_ITEM_TYPES = new Set(["base_bom", "options", "service"]);
+function isQueueEligible(part) {
+  return !!(part && _QUEUE_ITEM_TYPES.has(part.itemType));
+}
 
 // Returns the parts that would appear in an order queue before any
 // toolbar/header filters are applied. Callers can narrow further
@@ -772,7 +799,7 @@ function partsWithStatus() {
 // Rules — kept in lock-step with renderOrderQueueFor's needsOrder:
 //   - itemType:
 //       passed value  → exact match for that queue (base_bom/options/service)
-//       null/undef    → union of all three real queues (anything NOT do_not_order)
+//       null/undef    → union of all three real queues (isQueueEligible)
 //   - !isKit              (kits are tracked separately; can't be ordered)
 //   - !phasingOut         (no order to place for a phasing-out part;
 //                          the chain's final successor still appears
@@ -781,10 +808,13 @@ function partsWithStatus() {
 //   - status here is the effective status from partsWithStatus, which
 //     already forces muted-supplier parts to "ok" — so muted parts
 //     naturally drop out without an extra check.
+//
+// queueParts() (no arg) === union of queueParts("base_bom"), queueParts("options"),
+// queueParts("service") — same predicate, no untagged leakage.
 function queueParts(itemType) {
   let stats = partsWithStatus();
   if (itemType) stats = stats.filter(p => p.itemType === itemType);
-  else stats = stats.filter(p => p.itemType !== "do_not_order");
+  else stats = stats.filter(p => isQueueEligible(p));
   stats = stats.filter(p => !p.isKit);
   return stats.filter(p =>
     (p.status === "critical" || p.status === "warning") &&

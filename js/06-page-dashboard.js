@@ -13,22 +13,42 @@ const FOLLOWUP_DAYS = 10;
    ============================================================ */
 registerRoute("dashboard", () => {
   const stats = partsWithStatus();
-  // Parts that should feed purchasing signals — excludes the "Do Not Order"
-  // item type. DNO parts still appear in `stats` for on-hand value totals.
-  const orderable = stats.filter(p => p.itemType !== "do_not_order");
-  // Critical & warning counts must EQUAL the totals shown across the
-  // three order queues. queueParts() (no arg = combined Base BOM +
-  // Options + Service) is the single source of truth shared with
-  // renderOrderQueueFor — same predicate, same exclusions
-  // (kits, phasing-out, muted suppliers, do_not_order). See js/03-calc.js.
+  // Critical & warning counts must EQUAL the topbar and the sum of
+  // visible rows across the three order queues. queueParts() is the
+  // single source of truth shared with renderOrderQueueFor and
+  // updateTopBar — same isQueueEligible predicate, same exclusions
+  // (kits, phasing-out, muted suppliers, untagged itemType, DNO).
+  // See js/03-calc.js.
   const queueEligible = queueParts();
   const crit = queueEligible.filter(p => p.status === "critical");
   const warn = queueEligible.filter(p => p.status === "warning");
-  // A PO is "open" iff it has at least one line that passes isLineOpen — the
-  // shared chokepoint that excludes Completed/Closed Acumatica POs even when
-  // po.status is still "submitted"/"in_transit" because some straggler lines
-  // never got reconciled in the source system.
-  const openPOs = DB.pos.filter(po => (po.lines || []).some(ln => isLineOpen(po, ln)));
+
+  // Safety net: critical parts that don't have a queue itemType won't
+  // appear in any queue and aren't counted in crit/warn above. Surface
+  // them (a) in the console so the user can fix the itemType, and
+  // (b) as a "(+N untagged)" suffix on the Will Stockout kpi-foot so
+  // they aren't silently invisible. Excludes kits, DNO, and phasing-out
+  // parts (those are intentionally not orderable).
+  const untaggedCritical = stats.filter(p =>
+    p.status === "critical" &&
+    !isQueueEligible(p) &&
+    !p.isKit &&
+    p.itemType !== "do_not_order" &&
+    !p.phasingOut
+  );
+  if (untaggedCritical.length > 0) {
+    console.warn(`[Landmaster] ${untaggedCritical.length} critical part(s) have no queue itemType — they won't appear in Base BOM / Options / Service queues. Set itemType via the part drawer to surface them:`);
+    for (const p of untaggedCritical) {
+      console.warn(`  ${p.pn} — ${p.desc || "(no description)"}`);
+    }
+  }
+  // Open POs KPI uses isActivePO — same predicate as the Purchase Orders
+  // nav badge and the PO list "Active" tab, so all three numbers reconcile.
+  // Excludes only received/closed/cancelled (po.status) and the Acumatica
+  // Completed/Rejected/Canceled rollups (po.acumStatus); every other status
+  // counts as active. overduePOs inherits the same base so a closed-but-
+  // past-its-date PO never inflates the overdue subcount.
+  const openPOs = DB.pos.filter(isActivePO);
   const overduePOs = openPOs.filter(p => p.expectedDate && new Date(p.expectedDate) < TODAY);
   const draftPOs = DB.pos.filter(p => p.status === "draft");
 
@@ -45,10 +65,12 @@ registerRoute("dashboard", () => {
   }, 0);
 
   // Suggested order $ today. Uses orderUnitCost (last PO price → stored
-  // cost fallback). Skip parts with no usable purchase price (no PO history
-  // AND no stored cost — typically built kits/FG) so they can't dilute the
-  // total with implicit $0 contributions.
-  const suggestedValue = orderable.filter(p => (p.status === "critical" || p.status === "warning") && !p.isKit && !hasNoOrderCost(p))
+  // cost fallback). Same queueParts() base as the crit/warn counts above
+  // so the $ figure and the "${crit.length + warn.length} parts" footer
+  // describe the same set. Drop parts with no usable purchase price (no
+  // PO history AND no stored cost — typically built kits/FG) so they
+  // can't dilute the total with implicit $0 contributions.
+  const suggestedValue = queueEligible.filter(p => !hasNoOrderCost(p))
     .reduce((s, p) => s + p._suggestedQty * orderUnitCost(p), 0);
 
   // Top critical
@@ -126,7 +148,7 @@ registerRoute("dashboard", () => {
         <div class="kpi ${crit.length ? 'crit' : 'ok'}" style="cursor:pointer" onclick="navigate('order-queue')" title="Open the combined order queue">
           <div class="kpi-label">⚠ Will Stockout</div>
           <div class="kpi-value">${crit.length}</div>
-          <div class="kpi-foot">parts · before reorder arrives</div>
+          <div class="kpi-foot">parts · before reorder arrives${untaggedCritical.length > 0 ? ` <span class="text-warn" title="These critical parts have no queue itemType — set itemType via the part drawer to surface them in Base BOM / Options / Service. See console for the list.">(+${untaggedCritical.length} untagged)</span>` : ''}</div>
         </div>
         <div class="kpi ${warn.length ? 'warn' : ''}" style="cursor:pointer" onclick="navigate('order-queue')" title="Open the combined order queue">
           <div class="kpi-label">↗ Approaching Threshold</div>

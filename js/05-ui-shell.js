@@ -121,9 +121,16 @@ function initNavGroups() {
    TOP BAR / NAV BADGES
    ============================================================ */
 function updateTopBar() {
-  const stats = partsWithStatus();
-  const crit = stats.filter(p => p.status === "critical" && !p.isKit && p.itemType !== "do_not_order").length;
-  const warn = stats.filter(p => p.status === "warning" && !p.isKit && p.itemType !== "do_not_order").length;
+  // Topbar must equal the dashboard "Will Stockout" / "Approaching Threshold"
+  // KPIs and the sum of critical/warning rows across the three queues.
+  // queueParts() is the single source of truth: queue-eligible itemType +
+  // !isKit + !phasingOut + status in {critical, warning}.
+  const eligible = queueParts();
+  let crit = 0, warn = 0;
+  for (const p of eligible) {
+    if (p.status === "critical") crit++;
+    else if (p.status === "warning") warn++;
+  }
   $("#top-stat-date").textContent = TODAY.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" }).toUpperCase();
   $("#top-stat-crit").innerHTML = `<span class="dot">●</span> ${crit} CRITICAL`;
   $("#top-stat-warn").innerHTML = `<span class="dot">●</span> ${warn} WARN`;
@@ -133,7 +140,12 @@ function updateTopBar() {
 
 function updateNavBadges() {
   const stats = partsWithStatus();
-  const openPOs = DB.pos.filter(p => p.status === "draft" || p.status === "submitted" || p.status === "in_transit").length;
+  // Purchase Orders nav badge — uses isActivePO so it equals the Dashboard
+  // "Open POs" KPI and the PO list "Active" filter tab count. Exclude
+  // received/closed/cancelled (plus the Acumatica-side Completed/Rejected/
+  // Canceled rollups) rather than whitelisting, so draft/submitted/
+  // in_transit/partial/etc. all count without being enumerated.
+  const openPOs = DB.pos.filter(isActivePO).length;
   const poBadge = $("#badge-pos");
   if (poBadge) poBadge.textContent = openPOs;
 
