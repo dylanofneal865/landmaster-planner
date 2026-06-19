@@ -16,8 +16,14 @@ registerRoute("dashboard", () => {
   // Parts that should feed purchasing signals — excludes the "Do Not Order"
   // item type. DNO parts still appear in `stats` for on-hand value totals.
   const orderable = stats.filter(p => p.itemType !== "do_not_order");
-  const crit = orderable.filter(p => p.status === "critical" && !p.isKit);
-  const warn = orderable.filter(p => p.status === "warning" && !p.isKit);
+  // Critical & warning counts must EQUAL the totals shown across the
+  // three order queues. queueParts() (no arg = combined Base BOM +
+  // Options + Service) is the single source of truth shared with
+  // renderOrderQueueFor — same predicate, same exclusions
+  // (kits, phasing-out, muted suppliers, do_not_order). See js/03-calc.js.
+  const queueEligible = queueParts();
+  const crit = queueEligible.filter(p => p.status === "critical");
+  const warn = queueEligible.filter(p => p.status === "warning");
   // A PO is "open" iff it has at least one line that passes isLineOpen — the
   // shared chokepoint that excludes Completed/Closed Acumatica POs even when
   // po.status is still "submitted"/"in_transit" because some straggler lines
@@ -117,12 +123,12 @@ registerRoute("dashboard", () => {
       </div>
 
       <div class="kpi-grid">
-        <div class="kpi ${crit.length ? 'crit' : 'ok'}">
+        <div class="kpi ${crit.length ? 'crit' : 'ok'}" style="cursor:pointer" onclick="navigate('order-queue')" title="Open the combined order queue">
           <div class="kpi-label">⚠ Will Stockout</div>
           <div class="kpi-value">${crit.length}</div>
           <div class="kpi-foot">parts · before reorder arrives</div>
         </div>
-        <div class="kpi ${warn.length ? 'warn' : ''}">
+        <div class="kpi ${warn.length ? 'warn' : ''}" style="cursor:pointer" onclick="navigate('order-queue')" title="Open the combined order queue">
           <div class="kpi-label">↗ Approaching Threshold</div>
           <div class="kpi-value">${warn.length}</div>
           <div class="kpi-foot">parts · order soon</div>

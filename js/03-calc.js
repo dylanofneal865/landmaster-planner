@@ -758,6 +758,41 @@ function partsWithStatus() {
 }
 
 /* ============================================================
+   QUEUE ELIGIBILITY — single source of truth for "what parts
+   show up in an order queue today". Used by the queue page AND
+   the dashboard's Critical/Order Today count so the two can
+   never drift apart again.
+   ============================================================ */
+
+// Returns the parts that would appear in an order queue before any
+// toolbar/header filters are applied. Callers can narrow further
+// (e.g. dashboard wants critical-only; queue applies search/supplier/
+// buyer/days-cover filters on top of this).
+//
+// Rules — kept in lock-step with renderOrderQueueFor's needsOrder:
+//   - itemType:
+//       passed value  → exact match for that queue (base_bom/options/service)
+//       null/undef    → union of all three real queues (anything NOT do_not_order)
+//   - !isKit              (kits are tracked separately; can't be ordered)
+//   - !phasingOut         (no order to place for a phasing-out part;
+//                          the chain's final successor still appears
+//                          under its own itemType)
+//   - status in { critical, warning }
+//   - status here is the effective status from partsWithStatus, which
+//     already forces muted-supplier parts to "ok" — so muted parts
+//     naturally drop out without an extra check.
+function queueParts(itemType) {
+  let stats = partsWithStatus();
+  if (itemType) stats = stats.filter(p => p.itemType === itemType);
+  else stats = stats.filter(p => p.itemType !== "do_not_order");
+  stats = stats.filter(p => !p.isKit);
+  return stats.filter(p =>
+    (p.status === "critical" || p.status === "warning") &&
+    !p.phasingOut
+  );
+}
+
+/* ============================================================
    AUDIT
    ============================================================ */
 function logAudit(type, msg, detail = {}) {

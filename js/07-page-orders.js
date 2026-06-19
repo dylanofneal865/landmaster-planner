@@ -379,18 +379,17 @@ function oqRerenderPreservingScroll() {
 function renderOrderQueueFor(itemType) {
   const titleMap = { "base_bom": "Base BOM Queue", "options": "Options Queue", "service": "Service Queue" };
   const pageTitle = (itemType && titleMap[itemType]) || "Order Queue";
+  // `stats` is the broader post-itemType, post-!isKit set used only for
+  // the headline-count line below ("X of Y · N CRITICAL · M WARNING").
+  // `needsOrder` is the actual queue list — same shape, but additionally
+  // filtered to critical-or-warning and !phasingOut. queueParts() is the
+  // shared chokepoint (js/03-calc.js) so the dashboard's
+  // Critical/Order Today count can't drift from what renders here.
   let stats = partsWithStatus();
   if (itemType) stats = stats.filter(p => p.itemType === itemType);
   else stats = stats.filter(p => p.itemType !== "do_not_order");
   stats = stats.filter(p => !p.isKit);
-  // Phasing-out parts stay visible in the Parts Catalog but disappear from
-  // every queue — there's no order to place for them. The chain's FINAL
-  // successor (which isn't phasingOut) still appears, and gets a TRANSITION
-  // AT RISK tag below if the chain will dry up before the replacement order
-  // can land.
-  const needsOrder = stats
-    .filter(p => p.status === "critical" || p.status === "warning")
-    .filter(p => !p.phasingOut);
+  const needsOrder = queueParts(itemType);
   
   // Apply filters
   let filtered = needsOrder;
