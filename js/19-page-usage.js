@@ -257,9 +257,14 @@ registerRoute("options-usage",  () => { if (!_usageGate("options-usage")) return
 
 // Multi Level BOM — read-only explorer over DB.bomLinks. Left rail lists
 // FINISHED_GOODS (search-filterable); right pane shows the picked FG's
-// rolled-up leaf-parts list via explodeBOM(). UN-GATED for now (will gate
-// once we wire this into demand math).
-registerRoute("multi-level-bom", () => renderMultiLevelBom());
+// rolled-up leaf-parts list via explodeBOM(). Page-locked behind the same
+// _usageGate as the three sibling usage pages — once any of them is
+// unlocked for the session, all four are accessible (shared
+// sessionStorage "usage_unlocked" flag).
+registerRoute("multi-level-bom", () => {
+  if (!_usageGate("multi-level-bom")) return;
+  renderMultiLevelBom();
+});
 
 let MLB_STATE = {
   search: "",
@@ -687,6 +692,8 @@ function bbuApplyRateFromInput(pn, raw) {
   }
   const old = Number(part.daily) || 0;
   if (Math.abs(newDaily - old) < 0.0001) return; // no-op — avoids spurious audit/sync
+  // Daily-use edit gate. Same 4616 / same prompt as delete actions.
+  if (!gateEdit()) return;
   part.daily = newDaily;
   logAudit("daily-edit", `${pn}: daily ${old.toFixed(3)} → ${newDaily.toFixed(3)} (Base BOM Usage)`, { pn, oldDaily: old, newDaily });
   saveDB();
@@ -880,6 +887,8 @@ function bbuShowImportPreview(buckets, mode, filename, totalRows, pnCol, rateCol
 function bbuCommitImport() {
   const pending = window._bbuPendingImport;
   if (!pending) { showToast("Nothing to apply", "warn"); return; }
+  // Bulk daily-use writes — gate once before applying the whole batch.
+  if (!gateEdit()) return;
   const { buckets, mode, filename } = pending;
 
   let newlyClassifiedApplied = 0;
@@ -956,6 +965,8 @@ function bbuOpenPasteModal() {
 function bbuApplyPaste() {
   const txt = $("#bbu-paste-area")?.value || "";
   if (!txt.trim()) { showToast("Paste some rows first", "warn"); return; }
+  // Bulk daily-use writes — gate once before applying the whole paste batch.
+  if (!gateEdit()) return;
   const mode = document.querySelector('input[name="bbu-paste-mode"]:checked')?.value || "daily";
   const divisor = mode === "monthly" ? 30 : 1;
   const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p.pn)).map(p => p.pn));
@@ -1128,6 +1139,10 @@ registerRoute("service-usage", () => {
 function applyServicePartDaily(pn, newDaily) {
   const part = DB.parts.find(p => p.pn === pn);
   if (!part) return;
+  // Per-row Apply Computed Daily — gated by the same 4616 prompt as
+  // delete actions. Still callable from the console after the UI was
+  // hidden; the gate stays in front regardless of caller.
+  if (!gateEdit()) return;
   const old = Number(part.daily) || 0;
   part.daily = newDaily;
   logAudit("daily-override", `${pn}: daily ${old.toFixed(3)} → ${newDaily.toFixed(3)} (Service Usage)`, { pn, oldDaily: old, newDaily });
@@ -1139,6 +1154,9 @@ function applyServicePartDaily(pn, newDaily) {
 }
 
 function bulkApplyComputedDaily() {
+  // Bulk Apply Computed Daily across every part — gate once before the
+  // batch write. Still callable from the console after the UI was hidden.
+  if (!gateEdit()) return;
   const demand = getAllDemand();
   let updated = 0;
   for (const part of DB.parts) {
@@ -1441,6 +1459,10 @@ function recomputeDailyFromUsage() {
     showToast("No usage history to recalc from. Log some usage first.", "warn");
     return;
   }
+  // Bulk daily-use write triggered by the "⟲ Recalc daily-use rates"
+  // button on the generic Usage page — same 4616 gate as the other
+  // bulk-apply paths. Prompt fires once before the batch.
+  if (!gateEdit()) return;
   const days = DB.settings.usageWindowDays || 120;
   const cutoff = addDays(TODAY, -days);
   // Calendar daily rate — matches the projection logic which decrements daily per calendar day

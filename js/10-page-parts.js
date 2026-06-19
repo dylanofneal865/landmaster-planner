@@ -569,6 +569,17 @@ function savePartFromDetail(originalPn) {
   if (newPN !== originalPn && DB.parts.some(p => p.pn === newPN)) {
     showToast("Part # already exists", "warn"); return;
   }
+  // Daily-use edits are gated by the same 4616 password as delete actions.
+  // Check up-front (before any field mutation lands on `part`) so a cancel
+  // or wrong password leaves the persisted record exactly as it was.
+  // Chain-inheriting parts skip the gate — their #pd-daily input is rendered
+  // disabled because the anchor is the single source of truth.
+  const dailyInput = document.getElementById("pd-daily");
+  if (dailyInput && !dailyInput.disabled) {
+    const proposedDaily = Math.max(0, parseFloat(dailyInput.value) || 0);
+    const oldDaily = Number(part.daily) || 0;
+    if (proposedDaily !== oldDaily && !gateEdit()) return;
+  }
   const oldOh = part.onHand || 0;
   part.pn = newPN;
   part.desc = $("#pd-desc").value.trim();
@@ -578,7 +589,7 @@ function savePartFromDetail(originalPn) {
   // Chain-inheriting parts render the Daily Use field disabled (anchor is the
   // single source of truth). Skip the write so the displayed anchor rate
   // never gets copied into this part's stored daily — derivation only.
-  const dailyInput = document.getElementById("pd-daily");
+  // `dailyInput` is already in scope from the gate-check block above.
   if (dailyInput && !dailyInput.disabled) {
     part.daily = Math.max(0, parseFloat(dailyInput.value) || 0);
   }

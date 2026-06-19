@@ -85,6 +85,14 @@ function gateDelete() {
   return false;
 }
 
+// Edit-action gate (daily-use edits, inline rate edits, bulk-apply paths).
+// Same 4616, same per-action prompt-each-time behavior as gateDelete — just
+// named for the read-side at call sites. Single source of truth: this is a
+// thin alias, never a parallel mechanism. Rotate DELETE_PIN to rotate both.
+function gateEdit() {
+  return gateDelete();
+}
+
 function uid(prefix="id") {
   return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
 }
