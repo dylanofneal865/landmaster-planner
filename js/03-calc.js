@@ -427,6 +427,45 @@ function _supersessionDemandBoost(part) {
   return { dailyRate, combinedOnHand, anchorPn, anchor, predecessors };
 }
 
+// Phase 2 display helper. Returns the daily rate every chain member should
+// SHOW in UI surfaces (drawer stat cell, parts catalog row, order queue row)
+// so users see the same consumption rate on every link of the chain. The
+// rate is the anchor's daily, copied (not stored) — the anchor remains the
+// single source of truth and 19830's saved daily is never overwritten on
+// CP00751 or JP00021.
+//
+// Same gating as _supersessionDemandBoost so the two stay consistent:
+//   - lineage.length >= 2 (part is in a chain), AND
+//   - at least one member of the chain is phasingOut (actively transitioning).
+// Otherwise we return the part's own stored daily — normal parts unchanged.
+//
+// IMPORTANT: this is purely for display. suggestedQty / partStatus continue
+// to read raw part.daily and apply their own max(part.daily, anchor.daily)
+// where relevant — we don't double-apply here.
+function chainDisplayDailySource(part) {
+  const own = { daily: Number(part?.daily) || 0, anchorPn: null, transitioning: false, isAnchor: false };
+  if (!part || !part.pn) return own;
+  const lineage = supersessionLineage(part.pn);
+  if (lineage.length < 2) return own;
+
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const transitioning = lineage.some(pn => {
+    const p = partsByPn.get(pn);
+    return !!(p && p.phasingOut);
+  });
+  const anchorPn = lineage[0];
+  const isAnchor = (anchorPn === part.pn);
+  if (!transitioning) return { ...own, anchorPn, isAnchor };
+
+  const anchor = partsByPn.get(anchorPn);
+  const daily = anchor ? (Number(anchor.daily) || 0) : (Number(part.daily) || 0);
+  return { daily, anchorPn, transitioning: true, isAnchor };
+}
+
+function chainDisplayDaily(part) {
+  return chainDisplayDailySource(part).daily;
+}
+
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
 // candidates are future/invalid, fall back to newest regardless.

@@ -546,7 +546,7 @@ function renderOrderQueueFor(itemType) {
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${p.leadDays}d</td>
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onHand)}</td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onPO)}</td>
-                      <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.daily,2)}</td>
+                      <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(chainDisplayDaily(p),2)}</td>
                       <td class="right num bold text-accent" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(sq)}</td>
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtMoney(sq * orderUnitCost(p))}</td>
                       <td>${draftOrderHas(p.pn)
