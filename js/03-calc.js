@@ -275,7 +275,14 @@ function partStatus(part, lines) {
 
 // Suggested order qty: cover lead time + safety + a target horizon (e.g., 30 days more).
 // `onPO` is the optional precomputed open-PO qty — saves an openPOQty scan.
+//
+// PHASE-OUT short-circuit: parts marked part.phasingOut return 0 — they're
+// being retired and we burn down existing stock. Everything else about the
+// part (on-hand, days-of-cover, status color) stays real so the drawer can
+// still show it depleting. Phase 2 will route their demand to the successor;
+// Phase 1 just zeros the reorder.
 function suggestedQty(part, onPO) {
+  if (part && part.phasingOut) return 0;
   const lt = leadTimeDays(part);
   const safety = DB.settings.safetyDays || 0;
   const horizon = 30; // beyond reorder, target 30 days of stock after arrival
@@ -289,6 +296,71 @@ function suggestedQty(part, onPO) {
     qty = Math.ceil(qty / part.packSize) * part.packSize;
   }
   return qty;
+}
+
+/* ============================================================
+   PART SUPERSESSION — old part → new part chains (multi-hop).
+   Phase 1: data model + chain helpers + phase-out zeroing. Phase 2
+   will route phased-part demand to the successor; not done here.
+   ============================================================ */
+
+// Forward walk from `pn` following part.supersededBy. Returns the ordered
+// chain starting at `pn` (inclusive). Example: 19722.supersededBy = "CP00668",
+// CP00668.supersededBy = "CP00945" → supersessionChain("19722") returns
+// ["19722", "CP00668", "CP00945"]. Cycles are detected via a visited set —
+// we stop, console.warn, and return the chain so far.
+function supersessionChain(pn) {
+  const start = pn ? String(pn).trim() : "";
+  if (!start) return [];
+  const chain = [start];
+  const visited = new Set([start]);
+  let cur = start;
+  while (true) {
+    const p = (DB.parts || []).find(x => x.pn === cur);
+    const next = (p && p.supersededBy) ? String(p.supersededBy).trim() : "";
+    if (!next) break;
+    if (visited.has(next)) {
+      console.warn(`[supersession] cycle detected at ${next} in chain starting ${start}`);
+      break;
+    }
+    chain.push(next);
+    visited.add(next);
+    cur = next;
+  }
+  return chain;
+}
+
+// Terminal/live part for a supersession chain (the last hop). For
+// 19722→CP00668→CP00945 this returns "CP00945" regardless of which PN you
+// hand it. If `pn` itself has no successor, returns `pn`.
+function currentPartOf(pn) {
+  const chain = supersessionChain(pn);
+  return chain.length ? chain[chain.length - 1] : (pn || "");
+}
+
+// Full lineage including predecessors — walks BACKWARD from `pn` (any part
+// whose supersededBy points at me, transitively) then FORWARD via
+// supersessionChain. Used by the drawer so viewing the latest part still
+// shows the whole history. Same cycle guard via visited sets.
+function supersessionLineage(pn) {
+  const start = pn ? String(pn).trim() : "";
+  if (!start) return [];
+  const back = [];
+  const seen = new Set([start]);
+  let cur = start;
+  while (true) {
+    const pred = (DB.parts || []).find(x => x.supersededBy && String(x.supersededBy).trim() === cur);
+    if (!pred) break;
+    if (seen.has(pred.pn)) {
+      console.warn(`[supersession] backward cycle hitting ${pred.pn} from ${start}`);
+      break;
+    }
+    back.unshift(pred.pn);
+    seen.add(pred.pn);
+    cur = pred.pn;
+  }
+  const forward = supersessionChain(start); // [start, ...successors]
+  return [...back, ...forward];
 }
 
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is

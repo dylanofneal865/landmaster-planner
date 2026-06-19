@@ -265,6 +265,14 @@ function renderPartDetail(part) {
     ? kitBuildRows.filter(r => r.builds !== null && r.builds === kitBuildable).length
     : 0;
 
+  // Supersession lineage including predecessors (so viewing the live part
+  // still shows the full history). hasChain == true iff the open part sits
+  // anywhere in a multi-hop chain.
+  const lineage = typeof supersessionLineage === "function" ? supersessionLineage(part.pn) : [part.pn];
+  const hasChain = lineage.length > 1;
+  const partCatalogPns = new Set(DB.parts.map(p => p.pn));
+  const successorMissing = part.supersededBy && !partCatalogPns.has(String(part.supersededBy).trim());
+
   const html = `
     <div class="drawer-head">
       <div class="title-block">
@@ -275,6 +283,30 @@ function renderPartDetail(part) {
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
+      ${(hasChain || part.phasingOut) ? `
+        <div style="padding:10px 0 12px;border-bottom:1px solid var(--line);margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          ${hasChain ? `
+            <span class="muted tiny">Supersession:</span>
+            <span style="font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">
+              ${lineage.map((pn, i) => {
+                const isCurrent = pn === part.pn;
+                const inCat = partCatalogPns.has(pn);
+                const linkable = inCat && !isCurrent;
+                const sepBefore = i > 0 ? '<span class="dim" style="font-size:14px">→</span>' : '';
+                const baseStyle = isCurrent
+                  ? 'background:var(--bg-3);padding:2px 8px;border-radius:3px;font-weight:700'
+                  : (linkable ? 'cursor:pointer;text-decoration:underline' : '');
+                const click = linkable ? `onclick="event.stopPropagation(); openPartDetail('${esc(pn)}')"` : '';
+                const notInCat = !inCat ? ' <span class="pill warn" style="font-size:9px;padding:1px 4px;text-transform:none;letter-spacing:0">not in catalog</span>' : '';
+                return `${sepBefore}<span class="pn" ${click} style="${baseStyle}">${esc(pn)}${notInCat}</span>`;
+              }).join("")}
+            </span>
+          ` : ''}
+          ${part.phasingOut ? `
+            <span class="pill warn" style="font-weight:700;letter-spacing:0.04em">PHASING OUT — not reordering</span>
+          ` : ''}
+        </div>
+      ` : ''}
       ${partIsKit ? `
         <div class="stat-strip" style="margin-bottom:14px">
           <div class="stat">
@@ -390,7 +422,7 @@ function renderPartDetail(part) {
       <div class="dr-section">Quick actions</div>
       <div class="row gap-md" style="flex-wrap:wrap">
         <button class="btn primary" onclick="closeDrawer(); openOnHandQuickModal('${esc(part.pn)}')">⚡ Update on-hand</button>
-        ${!partIsKit && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
+        ${!partIsKit && !part.phasingOut && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
         <button class="btn" onclick="closeDrawer(); navigate('order-queue')">View order queue</button>
       </div>
 
@@ -424,6 +456,18 @@ function renderPartDetail(part) {
             <option value="service"      ${part.itemType === "service"      ? "selected" : ""}>Service</option>
             <option value="do_not_order" ${part.itemType === "do_not_order" ? "selected" : ""}>Do Not Order</option>
           </select>
+        </div>
+        <div class="field">
+          <label>Superseded by</label>
+          <input class="input" id="pd-superseded" value="${esc(part.supersededBy||"")}" placeholder="e.g. CP00668">
+          ${successorMissing ? `<div class="text-warn tiny" style="margin-top:4px">⚠ successor not in catalog</div>` : ''}
+        </div>
+        <div class="field">
+          <label>Phasing out</label>
+          <label class="row" style="gap:8px;cursor:pointer;align-items:center;padding:6px 0">
+            <input type="checkbox" class="chk" id="pd-phasing" ${part.phasingOut ? 'checked' : ''}>
+            <span class="muted tiny">Stop reordering — burn down existing stock</span>
+          </label>
         </div>
       </div>
       <div class="field" style="margin-top:12px"><label>Notes</label>
@@ -509,6 +553,13 @@ function savePartFromDetail(originalPn) {
   part.partClass = $("#pd-class").value;
   part.category = $("#pd-cat").value.trim();
   part.itemType = $("#pd-itemtype").value || null;
+  // Supersession (Phase 1): forward-link only, plus a "phasing out" flag that
+  // zeros suggestedQty in js/03-calc.js. Successor demand-routing comes in
+  // Phase 2 — this just records the link and silences reorders.
+  const supEl = document.getElementById("pd-superseded");
+  const phaseEl = document.getElementById("pd-phasing");
+  if (supEl) part.supersededBy = supEl.value.trim() || "";
+  if (phaseEl) part.phasingOut = !!phaseEl.checked;
   part.notes = $("#pd-notes").value.trim();
   // If PN changed, update PO line refs
   if (newPN !== originalPn) {
@@ -900,7 +951,7 @@ registerRoute("parts", () => {
                 </td></tr>
                 ${parts.slice(0, 500).map(p => `
                   <tr class="clickable" data-parts-row data-pt-pn="${esc(partsHeaderValue(p, "pn"))}" data-pt-desc="${esc(partsHeaderValue(p, "desc"))}" data-pt-supplier="${esc(partsHeaderValue(p, "supplier"))}" data-pt-cls="${esc(partsHeaderValue(p, "cls"))}" data-pt-status="${esc(partsHeaderValue(p, "status"))}" onclick="openPartDetail('${esc(p.pn)}')">
-                    <td class="pn">${esc(p.pn)}</td>
+                    <td class="pn">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
                     <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>
