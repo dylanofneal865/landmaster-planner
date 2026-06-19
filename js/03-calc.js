@@ -386,45 +386,95 @@ function supersessionLineage(pn) {
   return [...back, ...forward];
 }
 
-// Phase 2: chain-demand routing inputs. Returns null when no routing applies;
-// otherwise returns { dailyRate, combinedOnHand, anchorPn, anchor, predecessors }
-// describing the chain's pooled supply and the anchor's daily-use rate.
+// Phase 2: sequential view of an actively-transitioning supersession chain
+// for ANY member (anchor, intermediate, or final). Models the chain as parts
+// consumed strictly in order at the anchor's daily rate: each part only
+// begins depleting once the part before it hits zero. Returns null when the
+// part isn't in such a chain, otherwise:
+//   {
+//     lineage,                       // ordered PN list from anchor → final
+//     chainRate,                     // anchor's daily (copied, never stored)
+//     anchorPn, anchor,
+//     position,                      // index in lineage (0 = anchor)
+//     isAnchor, isFinal,
+//     predecessors, successors,      // ordered part objects either side of me
+//     predecessorStockClamped,       // sum of max(0, p.onHand) for predecessors
+//     ownClamped,                    // max(0, this part's onHand)
+//     cumulativeStockThroughThis,    // predecessorStockClamped + ownClamped
+//     totalChainStockClamped,        // sum of clamped on-hand across the whole chain
+//   }
 //
 // Routing kicks in only when:
-//   1. `part` is the FINAL hop of a supersession chain (lineage.length >= 2), AND
-//   2. At least one non-final part in the chain has phasingOut === true
-//      (the chain is "actively transitioning" — otherwise we leave the
-//      successor priced/sized normally).
+//   1. lineage.length >= 2 (part is in a chain), AND
+//   2. At least one chain member has phasingOut === true (the chain is
+//      "actively transitioning" — otherwise we leave every member alone).
 //
-// Anchor = the FIRST part in the lineage (the one with real usage history,
-// e.g. 19830 in 19830 → CP00751 → JP00021). dailyRate is copied (not moved)
-// from the anchor, so the anchor's burn-down display stays accurate using
-// its own daily.
-function _supersessionDemandBoost(part) {
+// "Clamped" means a stocked-out predecessor (negative on-hand from a count
+// error) contributes 0 to chain supply, not negative — the predecessor is
+// gone, not somehow worsening the successor's runway.
+function chainSequentialView(part) {
   if (!part || !part.pn) return null;
   const lineage = supersessionLineage(part.pn);
   if (lineage.length < 2) return null;
 
-  const finalPn = lineage[lineage.length - 1];
-  if (part.pn !== finalPn) return null;
-
   const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
-  const predecessors = lineage.slice(0, -1)
-    .map(pn => partsByPn.get(pn))
-    .filter(Boolean);
+  const members = lineage.map(pn => partsByPn.get(pn)).filter(Boolean);
+  if (members.length < 2) return null;
 
-  const transitioning = predecessors.some(p => p.phasingOut);
+  const transitioning = members.some(m => m.phasingOut);
   if (!transitioning) return null;
 
   const anchorPn = lineage[0];
   const anchor = partsByPn.get(anchorPn) || null;
-  const dailyRate = anchor ? (Number(anchor.daily) || 0) : 0;
+  const chainRate = anchor ? (Number(anchor.daily) || 0) : 0;
 
-  // Combined on-hand across the whole chain (predecessors + this final part).
-  let combinedOnHand = Number(part.onHand) || 0;
-  for (const p of predecessors) combinedOnHand += Number(p.onHand) || 0;
+  const position = lineage.indexOf(part.pn);
+  if (position < 0) return null;
+  const isAnchor = position === 0;
+  const isFinal = position === lineage.length - 1;
 
-  return { dailyRate, combinedOnHand, anchorPn, anchor, predecessors };
+  const predecessors = members.slice(0, position);
+  const successors = members.slice(position + 1);
+
+  let predecessorStockClamped = 0;
+  for (const p of predecessors) predecessorStockClamped += Math.max(0, Number(p.onHand) || 0);
+  const ownClamped = Math.max(0, Number(part.onHand) || 0);
+  const cumulativeStockThroughThis = predecessorStockClamped + ownClamped;
+
+  let totalChainStockClamped = cumulativeStockThroughThis;
+  for (const p of successors) totalChainStockClamped += Math.max(0, Number(p.onHand) || 0);
+
+  return {
+    lineage,
+    chainRate,
+    anchorPn,
+    anchor,
+    position,
+    isAnchor,
+    isFinal,
+    predecessors,
+    successors,
+    predecessorStockClamped,
+    ownClamped,
+    cumulativeStockThroughThis,
+    totalChainStockClamped,
+  };
+}
+
+// Phase 2 demand-routing input for the FINAL part of an actively-transitioning
+// chain. Thin wrapper over chainSequentialView so the existing suggestedQty
+// shape stays stable. `combinedOnHand` is now the CLAMPED total (predecessors
+// at max(0, onHand) + own clamped). Returns null for any non-final position.
+function _supersessionDemandBoost(part) {
+  const view = chainSequentialView(part);
+  if (!view || !view.isFinal) return null;
+  return {
+    dailyRate: view.chainRate,
+    combinedOnHand: view.totalChainStockClamped,
+    anchorPn: view.anchorPn,
+    anchor: view.anchor,
+    predecessors: view.predecessors,
+  };
 }
 
 // Phase 2 display helper. Returns the daily rate every chain member should
@@ -583,13 +633,15 @@ function partsWithStatus() {
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
     const isKitVal = typeof isKit === "function" ? isKit(p.pn) : false;
 
-    // Phase 2: chain-final parts get an effective view (combined on-hand +
-    // anchor's daily) before status / days-of-cover is computed, so the
-    // runway reflects the chain's true burn-down rather than the new PN's
-    // isolated zero-daily / zero-on-hand view.
-    const boost = _supersessionDemandBoost(p);
-    const effectiveForStatus = boost
-      ? { ...p, onHand: boost.combinedOnHand, daily: Math.max(Number(p.daily) || 0, boost.dailyRate) }
+    // Phase 2: every member of an actively-transitioning chain gets an
+    // effective view fed to partStatus, so the sequential burn-down shows up
+    // in days-of-cover / status / runway for ALL of them — not just the
+    // final part. cumulativeStockThroughThis is "everything ahead of me in
+    // line plus what I have", so the anchor depletes first (0 if stocked
+    // out), then each successor in order. Anchor's daily is the chain rate.
+    const view = chainSequentialView(p);
+    const effectiveForStatus = view
+      ? { ...p, onHand: view.cumulativeStockThroughThis, daily: Math.max(Number(p.daily) || 0, view.chainRate) }
       : p;
     const status = partStatus(effectiveForStatus, lines);
 
@@ -601,7 +653,7 @@ function partsWithStatus() {
       ...status,
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
       _suggestedQty: suggestedQty(p, onPO),
-      ...(boost ? { _chainBoost: boost } : {}),
+      ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
   });
   _statusCache = out;

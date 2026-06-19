@@ -15,16 +15,16 @@ function openPartDetail(pn) {
 function renderPartDetail(part) {
   const onPO = openPOQty(part.pn);
 
-  // Phase 2: when this part is the final hop of an actively-transitioning
-  // chain, feed an effective view (combined chain on-hand, anchor's daily
-  // rate) into partStatus / daysUntilStockout / projectOnHand so days-cover,
-  // status color, and the runway chart all reflect the chain's true
-  // burn-down. The original `part` is still used for editable fields, the
-  // On Hand and Daily Use stat cells (we annotate those instead), and PN
-  // lookups against PO history.
+  // Phase 2: every member of an actively-transitioning chain gets an
+  // effective view (cumulativeStockThroughThis, chainRate) fed into
+  // partStatus / daysUntilStockout / projectOnHand. Models sequential
+  // burn-down — each part only depletes after the parts ahead of it run
+  // dry. chainBoost (final-part only) is still useful for the Quick-actions
+  // paragraph that explains the suggested-qty sizing.
+  const chainView = (typeof chainSequentialView === "function") ? chainSequentialView(part) : null;
   const chainBoost = (typeof _supersessionDemandBoost === "function") ? _supersessionDemandBoost(part) : null;
-  const effectivePart = chainBoost
-    ? { ...part, onHand: chainBoost.combinedOnHand, daily: Math.max(Number(part.daily) || 0, chainBoost.dailyRate) }
+  const effectivePart = chainView
+    ? { ...part, onHand: chainView.cumulativeStockThroughThis, daily: Math.max(Number(part.daily) || 0, chainView.chainRate) }
     : part;
 
   // Chain-aware daily for the stat cell AND the edit form. Non-anchor members
