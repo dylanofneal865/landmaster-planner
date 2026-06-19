@@ -1099,8 +1099,7 @@ registerRoute("service-usage", () => {
                 <thead><tr>
                   <th>Part</th>
                   <th>Description</th>
-                  <th class="right">180d Units</th>
-                  <th class="right">Computed Daily</th>
+                  <th style="text-align:right">Computed Daily</th>
                   <th>Last Sale</th>
                 </tr></thead>
                 <tbody>
@@ -1111,7 +1110,6 @@ registerRoute("service-usage", () => {
                       <tr>
                         <td class="pn">${esc(r.pn)}</td>
                         <td>${esc(desc)}</td>
-                        <td class="right num">${fmtNum(r.demand.units)}</td>
                         <td class="right num bold">${fmtNum(r.computedDaily, 3)}</td>
                         <td class="dim tiny">${lastSale}</td>
                       </tr>
