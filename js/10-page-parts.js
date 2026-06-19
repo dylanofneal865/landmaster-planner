@@ -994,7 +994,7 @@ registerRoute("parts", () => {
                 </td></tr>
                 ${parts.slice(0, 500).map(p => `
                   <tr class="clickable" data-parts-row data-pt-pn="${esc(partsHeaderValue(p, "pn"))}" data-pt-desc="${esc(partsHeaderValue(p, "desc"))}" data-pt-supplier="${esc(partsHeaderValue(p, "supplier"))}" data-pt-cls="${esc(partsHeaderValue(p, "cls"))}" data-pt-status="${esc(partsHeaderValue(p, "status"))}" onclick="openPartDetail('${esc(p.pn)}')">
-                    <td class="pn">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
+                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
                     <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>
