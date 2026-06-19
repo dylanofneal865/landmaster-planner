@@ -601,9 +601,7 @@ function renderBaseBomUsage() {
         </div>
       </div>
 
-      <div class="two-col">
-        <div>
-          <div class="panel">
+      <div class="panel">
             <div class="filterbar">
               <div class="search-input">
                 <input class="input" placeholder="Search part # or description…" value="${esc(BBU_STATE.search)}"
@@ -686,20 +684,6 @@ function renderBaseBomUsage() {
                 </div>
               `}
             </div>
-          </div>
-        </div>
-
-        <div>
-          <div class="panel">
-            <div class="panel-head"><div class="panel-title">How rates work</div></div>
-            <div class="panel-body" style="font-size:12px;color:var(--t2);line-height:1.6">
-              <p>Daily-use rates here feed the <strong>Base BOM Queue</strong>'s stockout projections.</p>
-              <p>Set rates by <strong>importing a sheet</strong>, <strong>pasting rows</strong>, or <strong>editing inline</strong>. Each change saves immediately and syncs to Supabase.</p>
-              <p>Rows flagged <span class="pill warn">MISSING RATE</span> contribute nothing to demand and won't be flagged for reorder.</p>
-              <p>Service usage is tracked separately and isn't affected by changes here.</p>
-            </div>
-          </div>
-        </div>
       </div>
     </div>`;
 }

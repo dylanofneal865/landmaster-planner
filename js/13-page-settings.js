@@ -23,21 +23,18 @@ registerRoute("settings", () => {
       <div class="page-head">
         <div>
           <div class="page-title">Settings</div>
-          <div class="page-sub mono">CONFIGURE ALERT THRESHOLDS, DEFAULTS, AND DATA OPTIONS</div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">Alert thresholds</div>
-          <div class="panel-sub">When parts get flagged as critical or warning</div>
         </div>
         <div class="panel-body">
           <div class="settings-grid">
             <label>Safety buffer (days)</label>
             <div>
               <input class="input" type="number" min="0" id="set-safety" value="${s.safetyDays}">
-              <div class="help">Extra buffer beyond lead time before a part is flagged critical. Higher = order earlier.</div>
             </div>
             <label>Warning threshold (days)</label>
             <div>
@@ -65,10 +62,13 @@ registerRoute("settings", () => {
             <div><input class="input" id="set-currency" value="${esc(s.currency||"USD")}" maxlength="6"></div>
             <label>PO number prefix</label>
             <div><input class="input" id="set-po-prefix" value="${esc(s.poPrefix||"PO-")}"></div>
-            <label>Next PO #</label>
-            <div>
+            <!-- Next PO# row hidden from view — the underlying DB.poNum
+                 logic and nextPONumber() flow are unchanged. The input
+                 stays in the DOM (display:none) so saveSettings() can
+                 still read it and round-trip the value without surprises. -->
+            <label style="display:none">Next PO #</label>
+            <div style="display:none">
               <input class="input num" type="number" min="1" id="set-po-next" value="${DB.poNum}">
-              <div class="help">Will be assigned to the next PO created.</div>
             </div>
           </div>
           <div class="row" style="margin-top:14px">
