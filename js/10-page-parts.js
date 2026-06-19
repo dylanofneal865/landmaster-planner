@@ -27,6 +27,15 @@ function renderPartDetail(part) {
     ? { ...part, onHand: chainBoost.combinedOnHand, daily: Math.max(Number(part.daily) || 0, chainBoost.dailyRate) }
     : part;
 
+  // Chain-aware daily for the stat cell AND the edit form. Non-anchor members
+  // of an actively-transitioning chain inherit the anchor's rate for display
+  // (and lock their edit field so the stored value can't drift). Anchor and
+  // non-chain parts behave exactly as before.
+  const dailySrc = (typeof chainDisplayDailySource === "function")
+    ? chainDisplayDailySource(part)
+    : { daily: Number(part.daily) || 0, anchorPn: null, transitioning: false, isAnchor: false };
+  const dailyInherited = dailySrc.transitioning && !dailySrc.isAnchor;
+
   const status = partStatus(effectivePart);
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
@@ -411,16 +420,8 @@ function renderPartDetail(part) {
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
         <div class="stat">
           <div class="stat-label">Daily Use</div>
-          ${(() => {
-            // Chain members all display the anchor's daily so the number on
-            // the row matches what's actually being consumed. Annotation
-            // fires only for non-anchor members (the anchor IS its own rate).
-            const ds = chainDisplayDailySource(part);
-            const note = (ds.transitioning && !ds.isAnchor)
-              ? `<div class="dim tiny" style="margin-top:2px">from chain anchor ${esc(ds.anchorPn)}</div>`
-              : '';
-            return `<div class="stat-value">${fmtNum(ds.daily, 2)}</div>${note}`;
-          })()}
+          <div class="stat-value">${fmtNum(dailySrc.daily, 2)}</div>
+          ${dailyInherited ? `<div class="dim tiny" style="margin-top:2px">from chain anchor ${esc(dailySrc.anchorPn)}</div>` : ''}
         </div>
         <div class="stat"><div class="stat-label">Days Cover</div><div class="stat-value ${status.status==='critical'?'crit':status.status==='warning'?'warn':'ok'}">${status.daysOfCover === Infinity ? '∞' : status.daysOfCover + 'd'}</div>${(() => { const s = stockoutDateStr(status.daysOfCover); return s ? `<div class="dim tiny mono" style="margin-top:2px">${s}</div>` : ''; })()}</div>
         <div class="stat"><div class="stat-label">Lead Time</div><div class="stat-value">${part.ltWeeks||0}w</div></div>
@@ -463,7 +464,13 @@ function renderPartDetail(part) {
         <div class="field"><label>Supplier</label><input class="input" id="pd-supplier" value="${esc(part.supplier||"")}"></div>
         <div class="field"><label>Buyer</label><input class="input" id="pd-buyer" value="${esc(part.buyer||"")}"></div>
         <div class="field"><label>On Hand</label><input class="input num" type="number" min="0" id="pd-oh" value="${part.onHand||0}"></div>
-        <div class="field"><label>Daily Use (avg)</label><input class="input num" type="number" min="0" step="0.01" id="pd-daily" value="${part.daily||0}"></div>
+        <div class="field">
+          <label>Daily Use (avg)</label>
+          <input class="input num" type="number" min="0" step="0.01" id="pd-daily"
+            value="${dailyInherited ? fmtNum(dailySrc.daily, 2) : (part.daily||0)}"
+            ${dailyInherited ? 'disabled style="opacity:0.55;cursor:not-allowed"' : ''}>
+          ${dailyInherited ? `<div class="muted tiny" style="margin-top:4px">inherited from chain anchor ${esc(dailySrc.anchorPn)} — edit there</div>` : ''}
+        </div>
         <div class="field"><label>Unit Cost</label><input class="input num" type="number" min="0" step="0.01" id="pd-cost" value="${part.cost||0}"></div>
         <div class="field"><label>Lead Time (weeks)</label><input class="input num" type="number" min="0" step="0.5" id="pd-lt" value="${part.ltWeeks||0}"></div>
         <div class="field"><label>MOQ</label><input class="input num" type="number" min="0" id="pd-moq" value="${part.moq||0}"></div>
@@ -567,7 +574,13 @@ function savePartFromDetail(originalPn) {
   part.supplier = $("#pd-supplier").value.trim();
   part.buyer = $("#pd-buyer").value.trim();
   part.onHand = Math.max(0, Math.round(parseFloat($("#pd-oh").value) || 0));
-  part.daily = Math.max(0, parseFloat($("#pd-daily").value) || 0);
+  // Chain-inheriting parts render the Daily Use field disabled (anchor is the
+  // single source of truth). Skip the write so the displayed anchor rate
+  // never gets copied into this part's stored daily — derivation only.
+  const dailyInput = document.getElementById("pd-daily");
+  if (dailyInput && !dailyInput.disabled) {
+    part.daily = Math.max(0, parseFloat(dailyInput.value) || 0);
+  }
   // Stamp costUpdatedAt only when the cost actually changes — this is what
   // lets orderUnitCostSource() decide "newer wins" against the last PO date.
   // Bumping on every save would defeat the comparison.
