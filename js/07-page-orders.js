@@ -512,8 +512,21 @@ function renderOrderQueueFor(itemType) {
       <div class="empty-msg">No parts need ordering right now. Looking good.</div>
     </div>
   ` : `
-    <div class="tbl-wrap">
-              <table class="tbl">
+    <div class="tbl-wrap oq-tbl-wrap">
+              <table class="tbl oq-tbl">
+                <colgroup>
+                  <col class="oq-c-pn">
+                  <col class="oq-c-desc">
+                  <col class="oq-c-supplier">
+                  <col class="oq-c-cover">
+                  <col class="oq-c-lead">
+                  <col class="oq-c-onhand">
+                  <col class="oq-c-onpo">
+                  <col class="oq-c-daily">
+                  <col class="oq-c-sq">
+                  <col class="oq-c-est">
+                  <col class="oq-c-add">
+                </colgroup>
                 <thead>
   <tr>
     ${oqHeaderDropdown("pn", "Part", headerFilterRows)}
@@ -546,13 +559,12 @@ function renderOrderQueueFor(itemType) {
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
                       <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Chain runs dry in ${risk.runoutDays}d — order not yet placed">TRANSITION RISK</span>` : ''}</td>
-                      <td onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
-                      <td class="dim" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
-                      <td class="right" onclick="openPartDetail('${esc(p.pn)}')">
+                      <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
+                      <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
+                      <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? ` title="Projected stockout: ${s}"` : ''; })()}>
                         <span class="meter">
                           <span class="meter-bar ${p.status==='critical'?'crit':'warn'}"><i style="width:${clamp((p.daysOfCover/Math.max(p.leadDays+30,30))*100,5,100)}%"></i></span>
                           <span class="num bold ${p.status==='critical'?'text-crit':'text-warn'}">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
-                          ${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? `<span class="dim tiny mono" style="margin-left:6px">· ${s}</span>` : ''; })()}
                         </span>
                       </td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${p.leadDays}d</td>

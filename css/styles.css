@@ -1495,3 +1495,47 @@ tr.oh-row-edited td:first-child { border-left: 2px solid var(--accent); }
   overflow-y: auto;
   overflow-x: hidden;
 }
+
+/* ============================================================
+   ORDER QUEUE TABLE — fixed-layout column widths so all 11
+   columns fit without a horizontal scrollbar at any window
+   width down to ~1000px. Scoped to .oq-tbl so Parts Catalog,
+   PO Lines, drawer tables, etc. are unaffected.
+   Wide text columns (Description, Supplier) truncate with
+   ellipsis; full text is on the cell's title attribute.
+   ============================================================ */
+.oq-tbl-wrap.tbl-wrap { overflow-x: hidden; }
+.oq-tbl { table-layout: fixed; width: 100%; }
+
+.oq-tbl col.oq-c-pn       { width: 15%; }
+.oq-tbl col.oq-c-desc     { width: 16%; }
+.oq-tbl col.oq-c-supplier { width: 11%; }
+.oq-tbl col.oq-c-cover    { width: 12%; }
+.oq-tbl col.oq-c-lead     { width: 6%; }
+.oq-tbl col.oq-c-onhand   { width: 6%; }
+.oq-tbl col.oq-c-onpo     { width: 5.5%; }
+.oq-tbl col.oq-c-daily    { width: 6%; }
+.oq-tbl col.oq-c-sq       { width: 5.5%; }
+.oq-tbl col.oq-c-est      { width: 6.5%; }
+.oq-tbl col.oq-c-add      { width: 10.5%; }
+
+/* Tighter horizontal padding so content fits in the narrow
+   numeric columns without shrinking the base font. */
+.oq-tbl th, .oq-tbl td { padding-left: 8px; padding-right: 8px; }
+
+/* Numeric headers wrap to two lines when needed
+   ("Suggest Qty", "Daily Use") — short labels still single-line. */
+.oq-tbl th { white-space: normal; vertical-align: bottom; }
+
+/* PN column can wrap so the TRANSITION RISK pill drops below
+   the PN on narrow viewports instead of overflowing horizontally. */
+.oq-tbl td.pn { white-space: normal; line-height: 1.35; }
+
+/* Description and Supplier truncate with ellipsis. Cell-level
+   title attr provides the full text on hover. */
+.oq-tbl td.oq-desc-cell,
+.oq-tbl td.oq-supplier-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
