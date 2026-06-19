@@ -1025,6 +1025,11 @@ function _svcUsageSearchInput(value) {
 
 registerRoute("service-usage", () => {
   if (!_usageGate("service-usage")) return;
+  // "Sort: biggest difference" was removed alongside the hidden Δ column.
+  // Self-heal any in-session state that still pointed at it so the
+  // dropdown isn't blank-selected and the sort doesn't silently rank by
+  // an invisible value.
+  if (SERVICE_USAGE_STATE.sortBy === "diff") SERVICE_USAGE_STATE.sortBy = "units";
   const demand = getAllDemand();
   const txCount = (DB.usage || []).length;
 
@@ -1069,9 +1074,6 @@ registerRoute("service-usage", () => {
           <div class="page-title">Service Usage</div>
           <div class="page-sub mono">${txCount.toLocaleString()} TRANSACTIONS · ${rows.length} PARTS · ${fmtNum(totalUnits)} UNITS IN LAST 180 DAYS</div>
         </div>
-        <div class="page-actions">
-          <button class="btn primary" onclick="bulkApplyComputedDaily()">⚡ Apply all computed daily rates</button>
-        </div>
       </div>
 
       <div class="panel">
@@ -1082,7 +1084,6 @@ registerRoute("service-usage", () => {
           <select class="select" onchange="SERVICE_USAGE_STATE.sortBy = this.value; refresh()">
             <option value="units" ${SERVICE_USAGE_STATE.sortBy==='units'?'selected':''}>Sort: most units sold</option>
             <option value="daily" ${SERVICE_USAGE_STATE.sortBy==='daily'?'selected':''}>Sort: highest daily rate</option>
-            <option value="diff" ${SERVICE_USAGE_STATE.sortBy==='diff'?'selected':''}>Sort: biggest difference</option>
             <option value="last" ${SERVICE_USAGE_STATE.sortBy==='last'?'selected':''}>Sort: most recent sale</option>
           </select>
         </div>
@@ -1099,29 +1100,20 @@ registerRoute("service-usage", () => {
                   <th>Part</th>
                   <th>Description</th>
                   <th class="right">180d Units</th>
-                  <th class="right">Current Daily</th>
                   <th class="right">Computed Daily</th>
-                  <th class="right">Δ</th>
                   <th>Last Sale</th>
-                  <th></th>
                 </tr></thead>
                 <tbody>
                   ${rows.slice(0, 500).map(r => {
-                    const diffSign = r.diff > 0 ? "+" : "";
-                    const diffColor = Math.abs(r.diff) < 0.05 ? "var(--t3)" : (r.diff > 0 ? "var(--crit)" : "var(--accent)");
                     const lastSale = r.demand.lastOrderDate ? fmtDate(r.demand.lastOrderDate) : "—";
                     const desc = r.part?.desc || "—";
-                    const hasChange = r.diff !== 0;
                     return `
                       <tr>
                         <td class="pn">${esc(r.pn)}</td>
                         <td>${esc(desc)}</td>
                         <td class="right num">${fmtNum(r.demand.units)}</td>
-                        <td class="right num dim">${fmtNum(r.storedDaily, 3)}</td>
                         <td class="right num bold">${fmtNum(r.computedDaily, 3)}</td>
-                        <td class="right num" style="color:${diffColor}">${diffSign}${fmtNum(r.diff, 3)}</td>
                         <td class="dim tiny">${lastSale}</td>
-                        <td>${hasChange ? `<button class="btn sm" onclick="applyServicePartDaily('${esc(r.pn)}', ${r.computedDaily})">Apply</button>` : ""}</td>
                       </tr>
                     `;
                   }).join("")}
