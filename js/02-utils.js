@@ -85,12 +85,31 @@ function gateDelete() {
   return false;
 }
 
-// Edit-action gate (daily-use edits, inline rate edits, bulk-apply paths).
-// Same 4616, same per-action prompt-each-time behavior as gateDelete — just
-// named for the read-side at call sites. Single source of truth: this is a
-// thin alias, never a parallel mechanism. Rotate DELETE_PIN to rotate both.
+// Edit-action gate (daily-use edits, inline rate edits, bulk-apply paths,
+// part drawer Save changes). Same 4616 as gateDelete, but with:
+//   - neutral prompt text — these aren't deletes; the prompt shouldn't
+//     read "delete password" when the user just clicked Save changes.
+//   - session-based unlock via sessionStorage — reuses the SAME key
+//     ("usage_unlocked") that _usageGate (js/19-page-usage.js) writes,
+//     so entering 4616 anywhere (page-lock OR edit-gate) covers both
+//     for the rest of the browser session. Closing the tab re-locks
+//     both. Wrong password still blocks (returns false).
+//
+// Deliberately a separate function from gateDelete — deletes stay
+// per-action / prompt-every-time with their original "Enter delete
+// password:" text. They never read or write the session flag.
 function gateEdit() {
-  return gateDelete();
+  try {
+    if (sessionStorage.getItem("usage_unlocked") === "1") return true;
+  } catch (e) {}
+  const v = prompt("Enter password to save changes:");
+  if (v === null) return false;
+  if (v === DELETE_PIN) {
+    try { sessionStorage.setItem("usage_unlocked", "1"); } catch (e) {}
+    return true;
+  }
+  showToast("Incorrect password", "warn");
+  return false;
 }
 
 function uid(prefix="id") {
