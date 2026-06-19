@@ -3,6 +3,11 @@
    Sections: PAGE: DASHBOARD
    ===================================================== */
 
+// Supplier follow-up threshold (days). Open PO lines whose expected date
+// is more than this many days in the past surface in the dashboard's
+// Supplier Follow-Ups panel. Single knob so the cutoff is easy to retune.
+const FOLLOWUP_DAYS = 10;
+
 /* ============================================================
    PAGE: DASHBOARD
    ============================================================ */
@@ -41,6 +46,59 @@ registerRoute("dashboard", () => {
 
   // Recent activity
   const recent = DB.audit.slice(0, 6);
+
+  // Supplier Follow-Ups: every open PO line whose expected date is more
+  // than FOLLOWUP_DAYS in the past. Uses ln.expectedDate first, falls
+  // back to po.expectedDate — same convention as chainTransitionRisk and
+  // the part-drawer open-PO list. Same retired-line statuses (received /
+  // cancelled) excluded as everywhere else. YYYY-MM-DD strings (from the
+  // Acumatica sync) are parsed as local dates to avoid the off-by-one
+  // shift `new Date("2026-05-27")` would introduce.
+  const statsByPn = new Map(stats.map(p => [p.pn, p]));
+  const followUps = [];
+  for (const po of (DB.pos || [])) {
+    if (po.status === "received" || po.status === "closed" || po.status === "cancelled") continue;
+    for (const ln of (po.lines || [])) {
+      if (ln.status === "received" || ln.status === "cancelled") continue;
+      const openQty = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (openQty <= 0) continue;
+      const expRaw = ln.expectedDate || po.expectedDate;
+      if (!expRaw) continue;
+      let exp;
+      if (typeof expRaw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(expRaw)) {
+        const [y, m, d] = expRaw.split("-").map(Number);
+        exp = new Date(y, m - 1, d);
+      } else {
+        exp = new Date(expRaw);
+      }
+      if (isNaN(exp.getTime())) continue;
+      exp.setHours(0, 0, 0, 0);
+      const daysPastDue = Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS);
+      if (daysPastDue <= FOLLOWUP_DAYS) continue;
+      const pStat = statsByPn.get(ln.pn);
+      followUps.push({
+        po, ln, expRaw,
+        supplier: po.supplier || (pStat && pStat.supplier) || "—",
+        pn: ln.pn,
+        desc: (pStat && pStat.desc) || ln.desc || "",
+        openQty,
+        daysPastDue,
+        partStatus: (pStat && pStat.status) || null,
+        daysOfCover: pStat ? pStat.daysOfCover : null,
+      });
+    }
+  }
+  // Sort: most overdue first; tiebreak critical → warning → ok so the
+  // hurting parts float to the top inside the same days-late bucket;
+  // then supplier alphabetical so a vendor's follow-ups group together.
+  const followUpStatusRank = (s) => s === "critical" ? 0 : s === "warning" ? 1 : 2;
+  followUps.sort((a, b) => {
+    if (b.daysPastDue !== a.daysPastDue) return b.daysPastDue - a.daysPastDue;
+    if (followUpStatusRank(a.partStatus) !== followUpStatusRank(b.partStatus)) {
+      return followUpStatusRank(a.partStatus) - followUpStatusRank(b.partStatus);
+    }
+    return String(a.supplier).localeCompare(String(b.supplier));
+  });
 
   $("#main").innerHTML = `
     <div class="page">
@@ -200,12 +258,46 @@ registerRoute("dashboard", () => {
 
           <div class="panel">
             <div class="panel-head">
-              <div class="panel-title">Quick Actions</div>
+              <div class="panel-title">Supplier Follow-Ups</div>
+              <div class="panel-sub">${followUps.length} · overdue &gt; ${FOLLOWUP_DAYS}d</div>
+              ${followUps.length ? `<div class="panel-actions"><button class="btn sm" onclick="navigate('pos')">All POs</button></div>` : ''}
             </div>
-            <div class="panel-body col">
-              <button class="btn lg" onclick="openOnHandQuickModal()">↑ Update on-hand inventory</button>
-              <button class="btn lg" onclick="navigate('order-queue')">→ Build today's orders</button>
-              <button class="btn lg" onclick="$('#file-input').click()">⇪ Import data</button>
+            <div class="panel-body" style="${followUps.length ? 'padding:0' : ''}">
+              ${followUps.length === 0 ? `
+                <div class="empty" style="padding:36px 16px">
+                  <div class="empty-title">All caught up</div>
+                  <div class="empty-msg">No overdue POs to follow up on.</div>
+                </div>
+              ` : `
+                <div style="max-height:560px; overflow-y:auto; padding:12px 14px 4px">
+                  ${followUps.map(fu => {
+                    const isCrit = fu.partStatus === "critical";
+                    const isWarn = fu.partStatus === "warning";
+                    const borderColor = isCrit ? 'var(--crit)' : isWarn ? 'var(--warn)' : 'var(--line)';
+                    const bgTint = isCrit ? 'background: var(--crit-soft);' : isWarn ? 'background: var(--warn-soft);' : '';
+                    const lateClass = isCrit ? 'text-crit' : isWarn ? 'text-warn' : 'muted';
+                    const coverShow = (fu.daysOfCover !== null && fu.daysOfCover !== undefined && fu.daysOfCover !== Infinity);
+                    const coverText = coverShow ? `${fu.daysOfCover}d cover` : null;
+                    const coverClass = isCrit ? 'text-crit bold' : isWarn ? 'text-warn bold' : 'dim';
+                    return `
+                    <div class="audit-entry" style="cursor:pointer; border-left-width:3px; border-left-color:${borderColor}; ${bgTint}"
+                         onclick="openPODetail('${esc(fu.po.id)}')"
+                         title="Open PO ${esc(fu.po.num)}">
+                      <div class="audit-ts" style="display:flex; justify-content:space-between; align-items:center; gap:8px">
+                        <span style="color: var(--t2)">${esc(fu.supplier)} · PO ${esc(fu.po.num)}</span>
+                        <span class="${lateClass} bold mono" style="font-size:11px; letter-spacing:0.04em; white-space:nowrap">${fu.daysPastDue} DAYS LATE</span>
+                      </div>
+                      <div class="audit-msg" style="margin-top:4px"><span class="mono">${esc(fu.pn)}</span>${fu.desc ? ` <span class="dim">· ${esc(fu.desc)}</span>` : ''}</div>
+                      <div class="audit-detail" style="display:flex; flex-wrap:wrap; gap:2px 12px; margin-top:4px">
+                        <span>Open ${fmtNum(fu.openQty)}</span>
+                        <span>Exp ${fmtDate(fu.expRaw)}</span>
+                        ${coverText ? `<span class="${coverClass}">${coverText}</span>` : ''}
+                      </div>
+                    </div>
+                    `;
+                  }).join("")}
+                </div>
+              `}
             </div>
           </div>
         </div>
