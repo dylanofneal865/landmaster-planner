@@ -121,6 +121,54 @@ function leadTimeDays(part) {
   return Math.round((part.ltWeeks || 0) * 7);
 }
 
+/* ------------------------------------------------------------------
+   WORKDAY → CALENDAR conversion (shared, single source of truth)
+
+   dailyUse is a PER-WORKDAY rate (units consumed per working day — the usage
+   page divides by workdays, not calendar days). So "(onHand + incoming) /
+   dailyUse" is a count of WORKDAYS of cover, and it must be walked across the
+   calendar skipping non-workdays to land on the real runout DATE — NOT added
+   as calendar days (the bug) and NOT scaled by a 7/5 average (imprecise).
+
+   workdaysPerWeek is ALWAYS read from settings through effectiveWorkdaysPerWeek
+   — never hardcode 5 — so changing it visibly shifts every runout date.
+   ------------------------------------------------------------------ */
+function effectiveWorkdaysPerWeek() {
+  const w = Number(DB.settings && DB.settings.workdaysPerWeek);
+  return Math.min(7, Math.max(1, Number.isFinite(w) ? Math.round(w) : 5));
+}
+
+// Workdays are the first `wpw` days of the week counting from Monday:
+//   wpw=5 → Mon–Fri, wpw=6 → Mon–Sat, wpw=4 → Mon–Thu, wpw=7 → every day.
+function isWorkday(date, wpw = effectiveWorkdaysPerWeek()) {
+  const mondayIdx = (date.getDay() + 6) % 7; // Mon=0 … Sun=6
+  return mondayIdx < wpw;
+}
+
+// Convert a (possibly fractional) number of WORKDAYS of cover into CALENDAR
+// days from `startDate`, anchored to startDate's actual weekday so the result
+// is exact (not a 7/5 average). Stock runs out on the k-th workday, where
+// k = ceil(coverWorkdays) — that workday's calendar offset is the runout date.
+// O(1): whole weeks map 1:1 (any 7 consecutive calendar days hold exactly wpw
+// workdays, regardless of phase), so we skip floor((k-1)/wpw) weeks in one
+// step, then walk the final partial week (≤ ~7 iterations) across the calendar
+// skipping non-workdays. The epsilon guards float noise (e.g. 15/3 = 5.0000001)
+// from rounding the runout a day late.
+function workdaysToCalendarDays(coverWorkdays, startDate = TODAY, wpw = effectiveWorkdaysPerWeek()) {
+  if (!Number.isFinite(coverWorkdays) || coverWorkdays <= 0) return 0;
+  if (wpw >= 7) return Math.ceil(coverWorkdays - 1e-9); // every calendar day is a workday
+  const k = Math.ceil(coverWorkdays - 1e-9);            // runout occurs on the k-th workday
+  if (k <= 0) return 0;
+  const fullWeeks = Math.floor((k - 1) / wpw);          // complete weeks before the final partial
+  let cursor = fullWeeks * 7;                            // wpw workdays ⇆ 7 calendar days
+  let workdaysLeft = k - fullWeeks * wpw;                // in [1, wpw]
+  while (workdaysLeft > 0) {
+    cursor += 1;
+    if (isWorkday(addDays(startDate, cursor), wpw)) workdaysLeft -= 1;
+  }
+  return cursor;
+}
+
 // ----- Shared "is this PO line actually open?" gate -------------------------
 //
 // The PO Lines GI was changed to also feed back received / closed lines so
@@ -278,10 +326,16 @@ function projectOnHand(part, days = 365, lines) {
       }
     }
   }
+  // dailyUse is a PER-WORKDAY rate, so only deplete on workdays — the line
+  // flatlines across weekends and the runout lands on the correct calendar
+  // date. Receipts still land on their actual calendar offset (PO arrivals are
+  // wall-clock). workdaysPerWeek read via the shared helper.
+  const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
-    if (i > 0) oh -= (part.daily || 0);
+    const d = addDays(TODAY, i);
+    if (i > 0 && isWorkday(d, wpw)) oh -= (part.daily || 0);
     oh += receipts[i];
-    series.push({ d: addDays(TODAY, i), oh: oh, recv: receipts[i] });
+    series.push({ d, oh: oh, recv: receipts[i] });
   }
   // Attach the overdue summary as plain properties on the array. Existing
   // callers (.map / .length / indexing / .findIndex) are unaffected.
@@ -290,13 +344,28 @@ function projectOnHand(part, days = 365, lines) {
   return series;
 }
 
-// Days until stockout (without any new orders). Optional precomputed lines.
+// Days until stockout (CALENDAR days, without any new orders). Optional
+// precomputed lines. dailyUse is per-workday, so cover is computed in workdays
+// and converted to a calendar count through the shared helper — this is what
+// makes changing workdaysPerWeek shift every runout date.
 function daysUntilStockout(part, lines) {
-  if (!part.daily || part.daily <= 0) return Infinity;
-  // Project with current PO receipts factored in
+  const daily = Number(part.daily) || 0;
+  if (daily <= 0) return Infinity;
+  const incoming = openPOQty(part.pn, lines);
+  // No incoming receipts → exact O(1) workday→calendar conversion of the cover.
+  // (onHand / dailyUse) = WORKDAYS of cover. Cap at the 365-day projection
+  // horizon so slow movers read as Infinity (status "ok"), matching the
+  // receipt-aware branch below.
+  if (incoming <= 0) {
+    const coverWorkdays = (Number(part.onHand) || 0) / daily;
+    const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
+    return cal > 365 ? Infinity : cal;
+  }
+  // Incoming POs exist → use the receipt-timing-aware projection (which now
+  // also depletes on workdays via the same isWorkday helper) so a PO landing
+  // too late still surfaces a stockout. Find the LAST day on-hand is still
+  // positive — accounts for transient dips that recover when a PO lands.
   const series = projectOnHand(part, 365, lines);
-  // Find the LAST day on-hand is still positive — accounts for transient dips
-  // that recover when an incoming PO lands.
   let lastPositive = -1;
   for (let i = 0; i < series.length; i++) {
     if (series[i].oh > 0) lastPositive = i;
@@ -759,12 +828,20 @@ function partsWithStatus() {
     const status = partStatus(effectiveForStatus, lines);
 
     const muted = isSupplierMuted(p.supplier);
+    // Pre-launch superseding parts are gated the same way muted-supplier parts
+    // are: keep the TRUE computed status in _rawStatus, but force the public
+    // status to "ok" so they fall out of every alert/queue surface (queues,
+    // dashboard KPIs, nav badges, topbar). Order soon/behind for a pre-launch
+    // part is computed relative to its start date on the Model Year page, not
+    // here. Evaluated after mute so either condition silences the part.
+    const preLaunch = isPreLaunch(p);
     return {
       ...p,
       onPO,
       isKit: isKitVal,
       ...status,
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
+      ...(preLaunch ? { _preLaunch: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
       _suggestedQty: suggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
@@ -789,6 +866,30 @@ function partsWithStatus() {
 const _QUEUE_ITEM_TYPES = new Set(["base_bom", "options", "service"]);
 function isQueueEligible(part) {
   return !!(part && _QUEUE_ITEM_TYPES.has(part.itemType));
+}
+
+// PRE-LAUNCH GATE — a superseding part carries a planner-owned
+// transitionStartDate (the cut-in date it's allowed to go live). While that
+// date is still in the FUTURE the part is "pre-launch": not real demand yet,
+// so it must not throw purchasing signals (critical/warn, days-cover stockout,
+// the three order queues, reorder-overdue copy) as if it were live.
+//
+// This is the single shared predicate. It's applied in ONE place that gates all
+// of the above — partsWithStatus() forces a pre-launch part's public status to
+// "ok" (the same mechanism supplier-mute already uses), so every status-driven
+// surface (queues via queueParts, dashboard KPIs, nav badges, topbar counts)
+// drops it without any of them forking their own date logic. The part drawer
+// and the Model Year page read this predicate directly for their own copy.
+//
+// Returns false for a blank / invalid / today-or-past date, so parts without a
+// start date — or already launched — behave exactly as before.
+function isPreLaunch(part) {
+  if (!part || !part.transitionStartDate) return false;
+  const d = (typeof parseDateLocal === "function")
+    ? parseDateLocal(part.transitionStartDate)
+    : null;
+  if (!d) return false;
+  return d.getTime() > TODAY.getTime();
 }
 
 // Returns the parts that would appear in an order queue before any

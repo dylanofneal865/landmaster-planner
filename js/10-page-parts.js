@@ -37,6 +37,15 @@ function renderPartDetail(part) {
   const dailyInherited = dailySrc.transitioning && !dailySrc.isAnchor;
 
   const status = partStatus(effectivePart);
+  // PRE-LAUNCH: a superseding part whose transitionStartDate is still in the
+  // future isn't live demand yet. Reuse the shared isPreLaunch predicate (the
+  // same one partsWithStatus applies to drop it from queues/KPIs) so the drawer
+  // doesn't render a false STOCKED OUT / reorder-overdue runway. Neutralize the
+  // displayed status to "ok" so the header pill, Days-Cover tile, and order
+  // affordances stop showing it as critical. The runway banner below gets a
+  // dedicated pre-launch state.
+  const preLaunch = (typeof isPreLaunch === "function") && isPreLaunch(part);
+  if (preLaunch) status.status = "ok";
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
   // Pricing provenance for the Unit Cost tile. Source resolution lives in
@@ -240,7 +249,16 @@ function renderPartDetail(part) {
 
   // Status banner — plain-language summary placed above the chart.
   let runwayBanner;
-  if (!Number.isFinite(coverDays)) {
+  if (preLaunch) {
+    // Pre-launch: this superseding part isn't live yet, so the runout math
+    // would read as a false "STOCKED OUT / reorder overdue". Replace it with
+    // the pre-launch state: phases in <start>, order by <start − lead>.
+    const startD = parseDateLocal(part.transitionStartDate);
+    const orderByD = startD ? addDays(startD, -leadDays) : null;
+    const orderByTxt = !orderByD ? "—"
+      : (orderByD.getTime() <= TODAY.getTime() ? "now" : fmtDate(orderByD));
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--accent);font-weight:600">Pre-launch — phases in ${fmtDate(startD)} · order by ${orderByTxt} (start − ${leadDays}d lead). Not counted as live demand yet.</div>`;
+  } else if (!Number.isFinite(coverDays)) {
     runwayBanner = `<div class="dim tiny" style="margin-bottom:8px">No projected stockout at current demand.</div>`;
   } else if (leadDays > coverDays) {
     runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--crit);font-weight:600">Runs out in ${coverDays}d (${stockoutDateStr(coverDays)}). Resupply takes ${leadDays}d — reorder overdue by ${leadDays - coverDays}d.</div>`;
@@ -501,6 +519,11 @@ function renderPartDetail(part) {
           ${successorMissing ? `<div class="text-warn tiny" style="margin-top:4px">⚠ successor not in catalog</div>` : ''}
         </div>
         <div class="field">
+          <label>Transition start date</label>
+          <input class="input" type="date" id="pd-transition-start" value="${esc((part.transitionStartDate||"").slice(0,10))}">
+          <div class="muted tiny" style="margin-top:4px">Cut-in date this part goes live. Before it, the part is pre-launch — excluded from queues &amp; stockout flags; order-by = this date − lead time.</div>
+        </div>
+        <div class="field">
           <label>Phasing out</label>
           <label class="row" style="gap:8px;cursor:pointer;align-items:center;padding:6px 0">
             <input type="checkbox" class="chk" id="pd-phasing" ${part.phasingOut ? 'checked' : ''}>
@@ -615,6 +638,12 @@ function savePartFromDetail(originalPn) {
   const phaseEl = document.getElementById("pd-phasing");
   if (supEl) part.supersededBy = supEl.value.trim() || "";
   if (phaseEl) part.phasingOut = !!phaseEl.checked;
+  // Transition start date (cut-in) — a planner-owned field. It rides along in
+  // the part's `data` blob to Supabase and survives the Acumatica sync, which
+  // only overrides onHand (see netlify/functions/acumatica-sync.js). Stored as
+  // a bare "YYYY-MM-DD" string (or null when cleared).
+  const transEl = document.getElementById("pd-transition-start");
+  if (transEl) part.transitionStartDate = transEl.value ? transEl.value.slice(0, 10) : null;
   part.notes = $("#pd-notes").value.trim();
   // If PN changed, update PO line refs
   if (newPN !== originalPn) {

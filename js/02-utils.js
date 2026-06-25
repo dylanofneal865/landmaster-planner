@@ -67,6 +67,23 @@ const isoDate = (d) => {
   return dt.toISOString().slice(0,10);
 };
 const addDays = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
+// Parse a date value to a LOCAL midnight Date. Bare "YYYY-MM-DD" strings (date
+// inputs, the Acumatica feed) are parsed as a local calendar date — NOT UTC
+// midnight, which `new Date("2026-09-01")` would give and which shifts back a
+// day for US users. Same rule fmtDate uses. Returns null for empty/invalid.
+const parseDateLocal = (d) => {
+  if (!d) return null;
+  let dt;
+  if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+    const [y, m, day] = d.split("-").map(Number);
+    dt = new Date(y, m - 1, day);
+  } else {
+    dt = (d instanceof Date) ? new Date(d) : new Date(d);
+  }
+  if (isNaN(dt.getTime())) return null;
+  dt.setHours(0, 0, 0, 0);
+  return dt;
+};
 const ucFirst = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
 const round = (n, d=0) => Math.round(n * Math.pow(10,d)) / Math.pow(10,d);
 const clamp = (n, mn, mx) => Math.max(mn, Math.min(mx, n));
