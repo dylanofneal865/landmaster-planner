@@ -306,6 +306,14 @@ async function cloudInit() {
   _hookDraftSave();
   _showCloudIndicator(true);
   _setupRealtimeSubscriptions();
+
+  // First-class kit migration: tag parts present in kit_boms as itemType="kit".
+  // Runs AFTER snapshot priming + _hookSaveDB so the tagged parts are detected
+  // as dirty by _detectChanges and pushed to cloud (persisted), not just
+  // mutated locally. Idempotent — a no-op once everything is already tagged.
+  if (typeof tagKitsFromKitBoms === "function") {
+    try { tagKitsFromKitBoms(); } catch (e) { console.warn("[kits] tag migration failed", e); }
+  }
 }
 
 let _realtimeChannel = null;

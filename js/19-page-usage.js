@@ -979,7 +979,7 @@ function bbuApplyPaste() {
   if (!gateEdit()) return;
   const mode = document.querySelector('input[name="bbu-paste-mode"]:checked')?.value || "daily";
   const divisor = mode === "monthly" ? 30 : 1;
-  const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p.pn)).map(p => p.pn));
+  const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p)).map(p => p.pn));
   const lines = txt.split(/\r?\n/);
   let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0;
   for (const line of lines) {

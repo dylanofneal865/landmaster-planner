@@ -282,8 +282,14 @@ function renderPartDetail(part) {
     <circle cx="${xS(0)}" cy="${yS(0)}" r="4" stroke="var(--warn)" stroke-width="1.5" fill="none"/>
   ` : "";
 
-  const partIsKit = typeof isKit === "function" && isKit(part.pn);
-  const kitComponents = partIsKit ? getComponentsOfKit(part.pn) : [];
+  const partIsKit = typeof isKit === "function" && isKit(part);
+  // Resolve components through the shared resolver (bom_links → stripped →
+  // kit_boms) so the kit drawer shows whatever the resolver picked, plus its
+  // provenance (sourcePN/source) — surfaced below when the source PN differs.
+  const kitResolved = partIsKit && typeof resolveKitComponents === "function"
+    ? resolveKitComponents(part.pn)
+    : { components: [], sourcePN: null, source: null };
+  const kitComponents = kitResolved.components;
 
   // Per-component buildable: floor(onHand / qtyPerKit) for each component.
   // `builds: null` means qtyPerKit <= 0 — excluded from the kit-wide minimum
@@ -367,6 +373,14 @@ function renderPartDetail(part) {
           </div>
         </div>
         <div class="dr-section">Kit components</div>
+        ${(() => {
+          const srcLabel = { bom_links: "LM Planner BOM", bom_links_stripped: "LM Planner BOM", kit_boms: "kit_boms import" }[kitResolved.source] || "";
+          const stripped = kitResolved.source === "bom_links_stripped";
+          if (kitResolved.sourcePN && kitResolved.sourcePN !== part.pn) {
+            return `<div class="tiny ${stripped ? 'text-warn' : 'muted'}" style="margin:-4px 0 8px">components from BOM <span class="mono">${esc(kitResolved.sourcePN)}</span>${stripped ? ' (auto-matched by stripping suffix — verify this is correct)' : ''}${srcLabel ? ` · ${srcLabel}` : ''}</div>`;
+          }
+          return srcLabel ? `<div class="muted tiny" style="margin:-4px 0 8px">source: ${srcLabel}</div>` : "";
+        })()}
         <div class="tbl-wrap"><table class="tbl">
           <thead><tr>
             <th>Component</th>
@@ -392,7 +406,7 @@ function renderPartDetail(part) {
                   <td class="right num bold">${qtyStr}</td>
                   <td class="right num">${onHandCell}</td>
                   <td class="right num bold ${isBottleneck ? 'text-crit' : ''}">${buildsCell}</td>
-                  <td class="dim tiny">${c.isStock ? 'Stock' : 'Non-stock'}</td>
+                  <td class="dim tiny">${c.isStock === true ? 'Stock' : c.isStock === false ? 'Non-stock' : '—'}</td>
                 </tr>
               `;
             }).join("")}
@@ -510,6 +524,7 @@ function renderPartDetail(part) {
             <option value="base_bom"     ${part.itemType === "base_bom"     ? "selected" : ""}>Base BOM</option>
             <option value="options"      ${part.itemType === "options"      ? "selected" : ""}>Options</option>
             <option value="service"      ${part.itemType === "service"      ? "selected" : ""}>Service</option>
+            <option value="kit"          ${part.itemType === "kit"          ? "selected" : ""}>Kit</option>
             <option value="do_not_order" ${part.itemType === "do_not_order" ? "selected" : ""}>Do Not Order</option>
           </select>
         </div>

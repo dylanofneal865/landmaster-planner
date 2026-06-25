@@ -813,7 +813,7 @@ function partsWithStatus() {
   const out = DB.parts.map(p => {
     const lines = lineIndex.get(p.pn);
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
-    const isKitVal = typeof isKit === "function" ? isKit(p.pn) : false;
+    const isKitVal = typeof isKit === "function" ? isKit(p) : false;
 
     // Phase 2: every member of an actively-transitioning chain gets an
     // effective view fed to partStatus, so the sequential burn-down shows up
