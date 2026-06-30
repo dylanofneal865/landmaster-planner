@@ -261,59 +261,163 @@ function computeCoverageGaps() {
 }
 
 /* ============================================================
-   SESSION "MARK CHASED" — per-line, sessionStorage only (no schema change).
-   A line key is `${po.id}::${ln.id}` (falls back to PN if a line has no id).
-   Chased lines are de-emphasized in place, and can be hidden via the toolbar
-   toggle. Cleared when the tab closes.
-   ============================================================ */
-const _FOLLOWUP_CHASED_KEY = "followups.chased.v1";
+   CROSS-USER PERSISTED MARKS — Sent (Coverage Gaps) + Chased (supplier
+   follow-ups). Backed by the `follow_marks` Supabase table; loaded into
+   window.followMarks on boot by js/30-supabase.js, kept in sync across
+   tabs/users via realtime, mutated IN PLACE so the same Map reference
+   stays valid for any downstream consumer.
 
+   Dated checkmark only — no user, no name. Active = within 3 business
+   days of markedAt (computed at READ time in isMarkActive). Stale rows
+   render as inactive automatically; they are NEVER deleted on load
+   (deleting during boot fires DELETE events that re-enter the realtime
+   handler — earlier attempt looped because of that).
+
+   Optimistic UI: local Map mutates first, then the Supabase write
+   fires; on failure the local change is reverted. The realtime echo
+   for the same content is detected and skipped by 30-supabase.js's
+   _handleRealtimeFollowMark via content-equality, so writer + echo
+   can never ping-pong.
+
+   The legacy sessionStorage keys (followups.chased.v1,
+   followups.coverage.sent.v1) are gone. Nothing in this module reads
+   or writes sessionStorage for marks — single source of truth is
+   window.followMarks.
+   ============================================================ */
+
+// Eager init; cloudInit will .clear() + populate after the boot fetch.
+// Never reassign — only .set/.delete/.clear — so any reference held
+// elsewhere stays current.
+if (!window.followMarks) window.followMarks = new Map();
+
+// Stable line key for follow-ups (matches the existing convention used
+// by the chased indicator).
 function _followupKey(fu) {
   const lnId = (fu.ln && fu.ln.id) ? fu.ln.id : fu.pn;
   return `${fu.po.id}::${lnId}`;
 }
-function _getChasedSet() {
-  try {
-    const raw = sessionStorage.getItem(_FOLLOWUP_CHASED_KEY);
-    return new Set(raw ? JSON.parse(raw) : []);
-  } catch (e) { return new Set(); }
-}
-function _saveChasedSet(set) {
-  try { sessionStorage.setItem(_FOLLOWUP_CHASED_KEY, JSON.stringify([...set])); } catch (e) { /* ignore */ }
-}
-function toggleFollowupChased(key) {
-  const set = _getChasedSet();
-  if (set.has(key)) set.delete(key); else set.add(key);
-  _saveChasedSet(set);
-  refresh();
-}
-
-/* ============================================================
-   SESSION "MARK SENT" for Coverage Gaps — mirrors the chased pattern
-   above. Per-row, sessionStorage only, cleared when the tab closes. A
-   gap key is the part PN (computeCoverageGap returns one gap per part,
-   so PN is uniquely identifying).
-   ============================================================ */
-const _COVERAGE_SENT_KEY = "followups.coverage.sent.v1";
-
+// Stable part key for coverage gaps (one gap per part by detector
+// contract, so the PN is uniquely identifying).
 function _coverageGapKey(g) {
   return (g && g.part && g.part.pn) ? String(g.part.pn) : "";
 }
-function _getSentSet() {
-  try {
-    const raw = sessionStorage.getItem(_COVERAGE_SENT_KEY);
-    return new Set(raw ? JSON.parse(raw) : []);
-  } catch (e) { return new Set(); }
+// Full row ids include the type prefix so the same line can carry an
+// independent "sent" and "chased" record (different rows in
+// follow_marks). For sent, the "po" portion is the first covering
+// PO's id when present; "__no_po__" for No-PO coverage gaps.
+function _chasedRowId(fu) { return `chased::${_followupKey(fu)}`; }
+function _sentRowId(g) {
+  const poId = (g.coveringPOs && g.coveringPOs[0] && g.coveringPOs[0].poId) || "__no_po__";
+  return `sent::${poId}::${_coverageGapKey(g)}`;
 }
-function _saveSentSet(set) {
-  try { sessionStorage.setItem(_COVERAGE_SENT_KEY, JSON.stringify([...set])); } catch (e) { /* ignore */ }
+
+// Active-mark check — 3 business days from markedAt, weekends + non-
+// workdays skipped per the effectiveWorkdaysPerWeek setting in the
+// calc engine. Computed at READ time; no deletion required for expiry.
+function isMarkActive(mark) {
+  if (!mark || !mark.markedAt) return false;
+  const from = new Date(mark.markedAt);
+  if (isNaN(from.getTime())) return false;
+  from.setHours(0, 0, 0, 0);
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  if (typeof isWorkday !== "function") return true; // defensive — treat as active
+  let count = 0;
+  let cursor = from.getTime();
+  for (let i = 0; i < 365; i++) {
+    cursor += 86400000;
+    if (cursor > now.getTime()) break;
+    if (isWorkday(new Date(cursor))) count++;
+    if (count >= 3) return false;
+  }
+  return true;
 }
-function toggleCoverageGapSent(key) {
-  const set = _getSentSet();
-  if (set.has(key)) set.delete(key); else set.add(key);
-  _saveSentSet(set);
+
+// Toggle helpers — optimistic local update, then persist; on failure
+// revert. NO writes happen inside the realtime handler (see
+// 30-supabase.js), so the toggle path here is the only writer.
+function toggleFollowupChased(key) {
+  // key = `${po.id}::${lineIdOrPn}` from _followupKey. Look up the
+  // follow-up in the render stash for poId / pn enrichment.
+  const fu = (window._FOLLOWUPS || []).find(f => _followupKey(f) === key);
+  if (!fu) { showToast("Follow-up not found — refresh the page", "warn"); return; }
+  const rowId = `chased::${key}`;
+  const existing = window.followMarks.get(rowId);
+  if (existing) {
+    // Unmark — optimistic delete + persist.
+    window.followMarks.delete(rowId);
+    if (typeof deleteFollowMarkCloud === "function") {
+      deleteFollowMarkCloud(rowId).then(r => {
+        if (!r.ok) {
+          window.followMarks.set(rowId, existing);
+          showToast("Failed to sync unmark — toggle again to retry", "warn");
+          refresh();
+        }
+      });
+    }
+  } else {
+    const data = {
+      type: "chased",
+      poId: fu.po.id,
+      lineId: (fu.ln && fu.ln.id) || null,
+      pn: fu.pn,
+      markedAt: new Date().toISOString(),
+    };
+    window.followMarks.set(rowId, data);
+    if (typeof upsertFollowMarkCloud === "function") {
+      upsertFollowMarkCloud(rowId, data).then(r => {
+        if (!r.ok) {
+          window.followMarks.delete(rowId);
+          showToast("Failed to sync mark — toggle again to retry", "warn");
+          refresh();
+        }
+      });
+    }
+  }
   refresh();
 }
+
+function toggleCoverageGapSent(key) {
+  // key = part PN from _coverageGapKey. Look up the coverage gap in
+  // the render stash for poId enrichment.
+  const g = (window._COVERAGE_GAPS || []).find(x => _coverageGapKey(x) === key);
+  if (!g) { showToast("Coverage gap not found — refresh the page", "warn"); return; }
+  const rowId = _sentRowId(g);
+  const existing = window.followMarks.get(rowId);
+  if (existing) {
+    window.followMarks.delete(rowId);
+    if (typeof deleteFollowMarkCloud === "function") {
+      deleteFollowMarkCloud(rowId).then(r => {
+        if (!r.ok) {
+          window.followMarks.set(rowId, existing);
+          showToast("Failed to sync unmark — toggle again to retry", "warn");
+          refresh();
+        }
+      });
+    }
+  } else {
+    const data = {
+      type: "sent",
+      poId: (g.coveringPOs[0] && g.coveringPOs[0].poId) || null,
+      lineId: null,
+      pn: g.part.pn,
+      markedAt: new Date().toISOString(),
+    };
+    window.followMarks.set(rowId, data);
+    if (typeof upsertFollowMarkCloud === "function") {
+      upsertFollowMarkCloud(rowId, data).then(r => {
+        if (!r.ok) {
+          window.followMarks.delete(rowId);
+          showToast("Failed to sync mark — toggle again to retry", "warn");
+          refresh();
+        }
+      });
+    }
+  }
+  refresh();
+}
+
+window.isMarkActive = isMarkActive;
 
 /* ============================================================
    PAGE
@@ -335,17 +439,32 @@ function _followupSearchInput(value) {
 
 function renderFollowUps() {
   // Coverage Gaps — part-level "exposed before resupply" list. Distinct
+  // Build active-marks Maps from window.followMarks once per render.
+  // Active = within 3 business days (isMarkActive); expired entries
+  // fall through and the row renders normal. sentByPn keys on the part
+  // PN (coverage-gap unit); chasedByKey keys on `${po.id}::${lineId||pn}`
+  // (follow-up line unit). Values carry markedAt for the "Sent on
+  // <date>" / "Chased on <date>" display.
+  const sentByPn = new Map();      // pn → markedAt (ISO)
+  const chasedByKey = new Map();   // `${po.id}::${lineId||pn}` → markedAt (ISO)
+  for (const [, mark] of (window.followMarks || new Map()).entries()) {
+    if (!mark || !isMarkActive(mark)) continue;
+    if (mark.type === "sent" && mark.pn) {
+      sentByPn.set(String(mark.pn), mark.markedAt);
+    } else if (mark.type === "chased" && mark.poId) {
+      chasedByKey.set(`${mark.poId}::${mark.lineId || mark.pn}`, mark.markedAt);
+    }
+  }
+
   // from the PO-line supplier follow-ups below; computed independently so
   // search / sort / hide-chased on the follow-up panel don't affect it.
   const allCoverageGaps = computeCoverageGaps();
-  // Session-scoped "sent" tracking, mirroring the chased pattern below.
-  const sent = _getSentSet();
-  const sentCount = allCoverageGaps.reduce((n, g) => n + (sent.has(_coverageGapKey(g)) ? 1 : 0), 0);
-  // Optional hide-sent filter. Total stays = allCoverageGaps.length so
-  // the section header reflects ALL exposed parts, not just the visible
-  // ones — same convention as the chased counter on the supplier list.
+  // Hide-sent now filters by ACTIVE-marked rows. Total stays =
+  // allCoverageGaps.length so the section header reflects ALL exposed
+  // parts. sentCount = count of active sent marks among the exposed.
+  const sentCount = allCoverageGaps.reduce((n, g) => n + (sentByPn.has(_coverageGapKey(g)) ? 1 : 0), 0);
   const coverageGaps = FOLLOWUP_STATE.hideSentGaps
-    ? allCoverageGaps.filter(g => !sent.has(_coverageGapKey(g)))
+    ? allCoverageGaps.filter(g => !sentByPn.has(_coverageGapKey(g)))
     : allCoverageGaps;
   // Stash for the email-draft handlers to look rows back up by index
   // (mirrors window._FOLLOWUPS / window._FOLLOWUP_GROUPS). Indexes are
@@ -356,12 +475,11 @@ function renderFollowUps() {
 
   const all = computeFollowUps();
   const total = all.length;                 // header + badge count (full predicate)
-  const chased = _getChasedSet();
-  const chasedCount = all.reduce((n, fu) => n + (chased.has(_followupKey(fu)) ? 1 : 0), 0);
+  const chasedCount = all.reduce((n, fu) => n + (chasedByKey.has(_followupKey(fu)) ? 1 : 0), 0);
 
   // Working set: optional hide-chased, then supplier search.
   let working = all;
-  if (FOLLOWUP_STATE.hideChased) working = working.filter(fu => !chased.has(_followupKey(fu)));
+  if (FOLLOWUP_STATE.hideChased) working = working.filter(fu => !chasedByKey.has(_followupKey(fu)));
   const q = FOLLOWUP_STATE.search.trim().toLowerCase();
   if (q) working = working.filter(fu => String(fu.supplier).toLowerCase().includes(q));
 
@@ -420,7 +538,13 @@ function renderFollowUps() {
               ${coverageGaps.map(g => {
                 const p = g.part;
                 const sentKey = _coverageGapKey(g);
-                const isSent = sent.has(sentKey);
+                const sentAt = sentByPn.get(sentKey) || null;
+                const isSent = !!sentAt;
+                // "Sent on <Mon D>" — date from the mark itself
+                // (markedAt), not from the current user / current day.
+                const sentOn = sentAt && typeof fmtDate === "function"
+                  ? fmtDate(new Date(sentAt))
+                  : "";
                 // Sent rows are de-emphasized in place — same opacity +
                 // PN strike-through treatment as chased rows on the
                 // supplier list below.
@@ -469,10 +593,10 @@ function renderFollowUps() {
                       ${firstPoId ? `<button class="btn sm" onclick="event.stopPropagation(); openPODetail('${esc(firstPoId)}')" title="Open PO ${esc(firstPoNum)}">PO</button>` : ''}
                     </td>
                     <td class="right">
-                      <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="Mark sent for this session"
+                      <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${isSent ? `Marked sent on ${sentOn} (shared across users · uncheck to clear)` : "Mark sent (shared across users for 3 business days)"}"
                              onclick="event.stopPropagation()">
                         <input type="checkbox" class="chk" ${isSent ? "checked" : ""} onchange="toggleCoverageGapSent('${esc(sentKey)}')">
-                        <span class="muted tiny" style="min-width:34px; text-align:left">${isSent ? "Sent" : ""}</span>
+                        <span class="muted tiny" style="min-width:34px; text-align:left">${isSent ? `Sent on ${esc(sentOn)}` : ""}</span>
                       </label>
                     </td>
                   </tr>
@@ -509,12 +633,14 @@ function renderFollowUps() {
                 ? "No overdue POs to follow up on."
                 : (FOLLOWUP_STATE.hideChased && chasedCount ? "Every late line is marked chased. Untick “Hide chased” to see them." : "No suppliers match the current filter.")}</div>
             </div>
-          ` : groups.map(g => _followupGroupHtml(g, chased)).join("")}
+          ` : groups.map(g => _followupGroupHtml(g, chasedByKey)).join("")}
         </div>
       </div>
     </div>`;
 }
 
+// `chased` is the chasedByKey Map<key, markedAt-ISO> already filtered
+// to active marks by the caller.
 function _followupGroupHtml(g, chased) {
   const sev = g.worstStatus === "critical" ? "crit" : "warn"; // every line here is overdue > threshold
   return `
@@ -539,7 +665,11 @@ function _followupGroupHtml(g, chased) {
         <tbody>
           ${g.lines.map(fu => {
             const key = _followupKey(fu);
-            const isChased = chased.has(key);
+            const chasedAt = chased.get(key) || null;
+            const isChased = !!chasedAt;
+            const chasedOn = chasedAt && typeof fmtDate === "function"
+              ? fmtDate(new Date(chasedAt))
+              : "";
             const lc = fu.partStatus === "critical" ? "crit" : "warn";
             return `
             <tr style="${isChased ? "opacity:0.45" : ""}">
@@ -558,9 +688,9 @@ function _followupGroupHtml(g, chased) {
                 </div>
               </td>
               <td class="right">
-                <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="Mark chased for this session">
+                <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${isChased ? `Marked chased on ${chasedOn} (shared across users · uncheck to clear)` : "Mark chased (shared across users for 3 business days)"}">
                   <input type="checkbox" class="chk" ${isChased ? "checked" : ""} onchange="toggleFollowupChased('${esc(key)}')">
-                  <span class="muted tiny" style="min-width:42px; text-align:left">${isChased ? "Chased" : ""}</span>
+                  <span class="muted tiny" style="min-width:42px; text-align:left">${isChased ? `Chased on ${esc(chasedOn)}` : ""}</span>
                 </label>
               </td>
             </tr>`;
@@ -680,8 +810,15 @@ function draftCoverageExpediteAll() {
   if (!gaps.length) { showToast("No coverage gaps to draft", "warn"); return; }
   // Drop already-sent rows up front — even if they're still visible
   // (Hide-sent off), the supplier was already told about those.
-  const sent = _getSentSet();
-  const pending = gaps.filter(g => !sent.has(_coverageGapKey(g)));
+  // Reads window.followMarks filtered to active marks; mirrors the
+  // hide-sent / sentByPn logic in renderFollowUps so the bundled-draft
+  // skips the same rows the row checkboxes consider already sent.
+  const isSentActive = (g) => {
+    const rowId = _sentRowId(g);
+    const mark = (window.followMarks || new Map()).get(rowId);
+    return !!(mark && isMarkActive(mark));
+  };
+  const pending = gaps.filter(g => !isSentActive(g));
   if (!pending.length) { showToast("Every visible coverage gap is already marked sent", "warn"); return; }
   // Group by primarySupplier so each vendor gets one bundled email.
   const bySupplier = new Map();

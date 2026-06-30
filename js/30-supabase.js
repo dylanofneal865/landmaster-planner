@@ -127,6 +127,75 @@ async function _fetchAllAudit() {
   return all;
 }
 
+// ------------------------------------------------------------------
+// follow_marks — shared "Sent" / "Chased" dated checkmarks for the
+// Follow-Ups page. Table is {id text PK, data jsonb}; data = { type,
+// poId, lineId, pn, markedAt } (no user, no name — dated flag only).
+// Active = within 3 business days of markedAt (computed at READ time
+// by js/22-page-followups.js — never deleted on load to keep the
+// realtime path inert).
+//
+// LOOP-PROOFING — strict rules for callers and the realtime handler:
+//   - cloudInit fetches ONCE and populates window.followMarks. No
+//     prune-on-load. No deletes during boot. (Earlier prune-on-load
+//     fired DELETE events that re-entered the realtime handler.)
+//   - The realtime handler may ONLY: update window.followMarks via
+//     .set/.delete (with content-equality echo skip), and request a
+//     debounced re-render IFF the Follow-Ups page is the active route.
+//     It must NEVER call cloudInit, re-subscribe, fetch, write, or
+//     call saveDB.
+//   - Optimistic writes from the UI (upsert/delete) are echoed back
+//     by realtime; the content-equality check (.markedAt match) makes
+//     the echo a no-op, so writer + echo can never ping-pong.
+// ------------------------------------------------------------------
+async function _fetchAllFollowMarks() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("follow_marks")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] follow_marks page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Write helpers — called optimistically from 22-page-followups.js after
+// the in-memory map is already updated. The realtime echo for the same
+// content is detected and ignored by _handleRealtimeFollowMark.
+async function upsertFollowMarkCloud(id, data) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { error } = await _supa.from("follow_marks").upsert({ id, data });
+  if (error) {
+    console.error("[cloud] follow_marks upsert failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+async function deleteFollowMarkCloud(id) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { error } = await _supa.from("follow_marks").delete().eq("id", id);
+  if (error) {
+    console.error("[cloud] follow_marks delete failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+window.upsertFollowMarkCloud = upsertFollowMarkCloud;
+window.deleteFollowMarkCloud = deleteFollowMarkCloud;
+
 async function cloudInit() {
   const ok = await _waitForDB();
   if (!ok) {
@@ -302,6 +371,23 @@ async function cloudInit() {
   for (const u of (DB.usage || [])) if (u.id) _usageSnapshot.set(u.id, JSON.stringify(u));
   for (const [kit_pn, kit] of Object.entries(DB.kitBoms || {})) _kitBomsSnapshot.set(kit_pn, JSON.stringify(kit));
   _partsSnapshot.set("__settings__", JSON.stringify(DB.settings || {}));
+  // follow_marks — ONE fetch, populate window.followMarks, NEVER prune
+  // on load. Expiry (3 business days) is decided at READ time by the
+  // UI consumer; deleting on boot would fire DELETE events into the
+  // realtime handler and could re-enter the load path. Stale rows just
+  // render as inactive — table cleanliness is a non-goal here.
+  // Mutate IN PLACE so any earlier consumer holding the map ref stays
+  // valid (the page may have rendered an empty list before this fetch).
+  if (!window.followMarks) window.followMarks = new Map();
+  const fmRows = await _fetchAllFollowMarks();
+  if (Array.isArray(fmRows)) {
+    window.followMarks.clear();
+    for (const r of fmRows) {
+      if (r && r.id && r.data) window.followMarks.set(r.id, r.data);
+    }
+    console.log(`[cloud] loaded ${window.followMarks.size} follow_marks`);
+  }
+
   _hookSaveDB();
   _hookDraftSave();
   _showCloudIndicator(true);
@@ -345,6 +431,9 @@ function _setupRealtimeSubscriptions() {
     })
     .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" }, (payload) => {
       _handleRealtimeKitBoms(payload);
+    })
+    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" }, (payload) => {
+      _handleRealtimeFollowMark(payload);
     })
     .subscribe((status) => {
       console.log("[cloud] realtime status:", status);
@@ -476,6 +565,68 @@ function _handleRealtimeKitBoms(payload) {
   }
   _lastCloudKitBomsHash = _hashKitBoms(DB.kitBoms);
   _applyAndRefresh();
+}
+
+// follow_marks realtime — INERT by design (see top-of-file rules).
+// Only does: update window.followMarks (.set/.delete) with content-
+// equality echo skip, then request a debounced re-render IFF the
+// Follow-Ups page is the active route. Never calls cloudInit, never
+// re-subscribes, never writes to Supabase, never calls saveDB.
+let _followMarksRedrawTimer = null;
+let _followMarksRendering = false;
+function _handleRealtimeFollowMark(payload) {
+  if (!window.followMarks) window.followMarks = new Map();
+  const { eventType, new: row, old } = payload;
+
+  let changed = false;
+  if (eventType === "DELETE") {
+    const id = old && old.id;
+    if (id && window.followMarks.has(id)) {
+      window.followMarks.delete(id);
+      changed = true;
+    }
+    // else: already absent (likely the echo of our own delete) — no-op
+  } else if (row && row.id) {
+    const next = row.data || {};
+    const existing = window.followMarks.get(row.id);
+    // Content-equality echo skip: identical markedAt + type means this
+    // is the realtime echo of our own optimistic write. Skip both the
+    // set (idempotent anyway) and the re-render.
+    if (existing
+        && existing.type === next.type
+        && existing.markedAt === next.markedAt
+        && (existing.pn || "") === (next.pn || "")) {
+      return;
+    }
+    window.followMarks.set(row.id, next);
+    changed = true;
+  }
+  if (!changed) return;
+
+  // Route guard — silently update the map for users on other pages so
+  // their next switch to Follow-Ups already has fresh data, but skip
+  // the heavy re-render here.
+  if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE !== "followups") return;
+
+  // Re-entrancy guard — refresh() is synchronous so this is mostly
+  // defense-in-depth, but it prevents a future async refresh from
+  // queueing another mid-flight.
+  if (_followMarksRendering) return;
+  clearTimeout(_followMarksRedrawTimer);
+  _followMarksRedrawTimer = setTimeout(() => {
+    _followMarksRendering = true;
+    try {
+      // Pure re-render. No writes, no fetches, no subscribes. Reads
+      // window.followMarks via the renderer. Scroll position is left
+      // alone — navigate() resets main.scrollTop, but a remote mark
+      // landing while the user is mid-scroll on Follow-Ups is rare;
+      // if it becomes annoying we can preserve scroll the way
+      // _applyAndRefresh does for parts/pos.
+      if (typeof refresh === "function") refresh();
+    } finally {
+      _followMarksRendering = false;
+    }
+  }, 150);
 }
 
 async function _pushAllParts() {
