@@ -149,6 +149,16 @@ function updateNavBadges() {
   const poBadge = $("#badge-pos");
   if (poBadge) poBadge.textContent = openPOs;
 
+  // Follow-Ups badge — late open-PO lines (overdue > threshold). Uses the same
+  // computeFollowUps predicate as the Follow-Ups page so the badge equals the
+  // page header count.
+  const fuBadge = $("#badge-followups");
+  if (fuBadge) {
+    const late = (typeof followUpCount === "function") ? followUpCount() : 0;
+    fuBadge.textContent = late;
+    fuBadge.className = "badge " + (late > 0 ? "warn" : "");
+  }
+
   // Single-pass tally of needs/crit per itemType bucket, plus an aggregate
   // (excluding DNO) for the legacy generic order-queue badge.
   const tally = {
