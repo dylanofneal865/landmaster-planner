@@ -91,11 +91,57 @@ exports.handler = async (event) => {
   const entries = xml.split(/<entry[^>]*>/i).slice(1);
   log(`Found ${entries.length} <entry> elements`);
 
+  // ── Parent-item-type field discovery ──────────────────────────────────────
+  // The GI now exposes the parent's ItemType. The GI-designer column name
+  // isn't known to this code by hand, so we try a small list of likely
+  // spellings on each row and use whichever one has a value. If NONE of them
+  // ever produces a value, we log a warning and skip the Component-Part
+  // filter entirely — safer than a wrong guess silently dropping thousands
+  // of rows. (Any real field name we missed can be added here after one
+  // manual run shows it in the tag-sample log below.)
+  const PARENT_TYPE_FIELD_CANDIDATES = [
+    "ParentType",
+    "ParentItemType",
+    "ParentItemClass",
+    "ParentClass",
+    "ParentInventoryType",
+  ];
+  function getParentType(getFn) {
+    for (const f of PARENT_TYPE_FIELD_CANDIDATES) {
+      const v = getFn(f);
+      if (v != null && String(v).trim() !== "") return { field: f, value: String(v).trim() };
+    }
+    return { field: null, value: "" };
+  }
+
+  // Discovery aid: dump the first entry's <d:...> tag names once, so a
+  // manual run reveals the actual column name if none of the candidates
+  // above hit. Bounded so a large first entry doesn't flood the log.
+  if (entries.length > 0) {
+    const tagNames = Array.from(new Set(
+      (entries[0].match(/<d:([A-Za-z0-9_]+)[\s>]/g) || []).map(s => s.replace(/^<d:/, "").replace(/[\s>]$/, ""))
+    ));
+    log(`Sample entry[0] tag names (${tagNames.length}):`, tagNames.slice(0, 80).join(", "));
+  }
+
   // Parse each entry into a normalized link record. Dedupe by composite id
   // (BOMID::Parent::Child) so a row listed twice in the GI never produces
   // duplicates — first-wins, matching the on-hand pass in acumatica-sync.js.
+  //
+  // Rows whose parent is a "Component Part" are dropped: those items are
+  // purchased whole and their children must NOT flow into per-child demand.
+  // The filter runs in code because the GI condition approach didn't hold
+  // reliably. Filter uses exact match against the value returned by the
+  // GI ("Component Part") — we log any unexpected variants so we can react
+  // if the naming drifts.
   const feedById = new Map();
   const parentBoms = new Set();
+  const parentTypeCounts = Object.create(null);   // "Component Part": N, "Subassembly": N, "": N
+  const parentTypeByParent = new Map();           // parent → detected type (last non-empty wins)
+  let detectedFieldName = null;
+  let droppedComponentPartRows = 0;
+  const droppedParentsSet = new Set();
+  const droppedByParent = new Map();              // parent → rows dropped
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
 
@@ -103,6 +149,18 @@ exports.handler = async (event) => {
     const parent = sanitizeIdPart(get("ParentID"));
     const child  = sanitizeIdPart(get("ChildID"));
     if (!bomId || !parent || !child) continue;
+
+    const { field: pField, value: pType } = getParentType(get);
+    if (pField && !detectedFieldName) detectedFieldName = pField;
+    parentTypeCounts[pType || "<empty>"] = (parentTypeCounts[pType || "<empty>"] || 0) + 1;
+    if (pType) parentTypeByParent.set(parent, pType);
+
+    if (pType === "Component Part") {
+      droppedComponentPartRows++;
+      droppedParentsSet.add(parent);
+      droppedByParent.set(parent, (droppedByParent.get(parent) || 0) + 1);
+      continue;
+    }
 
     const qtyRaw = get("QtyRequired");
     const qty = parseFloat(qtyRaw);
@@ -124,7 +182,34 @@ exports.handler = async (event) => {
     }
   }
 
-  log(`Parsed ${feedById.size} BOM links across ${parentBoms.size} parent BOMs`);
+  // Fail-safe: if we never resolved any parent-type value from any candidate
+  // field, none of the candidates matched the GI. Log loudly, and (because
+  // the drop loop above short-circuits on empty string) no rows were
+  // dropped — the reconcile proceeds as if the filter didn't exist.
+  if (!detectedFieldName) {
+    log("WARNING: no parent-type field resolved — Component-Part filter is INACTIVE. " +
+      "Check the tag-sample log above and add the correct field name to " +
+      "PARENT_TYPE_FIELD_CANDIDATES.");
+  } else {
+    log(`Parent-type field detected: "${detectedFieldName}"`);
+  }
+  log("Parent-type value counts:", parentTypeCounts);
+  log(`Dropped ${droppedComponentPartRows} rows across ${droppedParentsSet.size} Component-Part parents`);
+
+  // User-requested spot-checks for the review — these show up in the
+  // Netlify function log alongside the counts so a single manual run
+  // answers the "17984 dropped? 17985 kept?" question without a Supabase
+  // query.
+  const SPOT_CHECK_DROP = "17984";
+  const SPOT_CHECK_KEEP = "17985";
+  const spotDropDetected = parentTypeByParent.get(SPOT_CHECK_DROP) || "<never seen>";
+  const spotKeepDetected = parentTypeByParent.get(SPOT_CHECK_KEEP) || "<never seen>";
+  const spotDropCount = droppedByParent.get(SPOT_CHECK_DROP) || 0;
+  const spotKeepInFeed = parentBoms.has(SPOT_CHECK_KEEP);
+  log(`Spot-check ${SPOT_CHECK_DROP}: detected type="${spotDropDetected}", dropped ${spotDropCount} row(s)`);
+  log(`Spot-check ${SPOT_CHECK_KEEP}: detected type="${spotKeepDetected}", in-feed after filter=${spotKeepInFeed}`);
+
+  log(`Parsed ${feedById.size} BOM links across ${parentBoms.size} parent BOMs (raw entries: ${entries.length}, dropped: ${droppedComponentPartRows})`);
 
   // Guard against a feed that parsed to zero — we never want to wipe the
   // table on a transient schema/auth glitch. The on-hand pass uses the same
@@ -270,6 +355,11 @@ exports.handler = async (event) => {
           removed: totalDeleted,
           upsertFailed,
           deleteFailed,
+          rawEntries: entries.length,
+          componentPartRowsDropped: droppedComponentPartRows,
+          componentPartParentsDropped: droppedParentsSet.size,
+          parentTypeField: detectedFieldName,
+          parentTypeCounts,
           durationMs: Date.now() - t0,
         },
       },
@@ -285,6 +375,11 @@ exports.handler = async (event) => {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,
+      rawEntries: entries.length,
+      componentPartRowsDropped: droppedComponentPartRows,
+      componentPartParentsDropped: droppedParentsSet.size,
+      parentTypeField: detectedFieldName,
+      parentTypeCounts,
       linksInFeed: feedById.size,
       parentBoms: parentBoms.size,
       upserted: totalUpserted,
