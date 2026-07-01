@@ -283,9 +283,15 @@ function mlbSetSearch(q) {
 
 function renderMultiLevelBom() {
   const partByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
-  const fgRows = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS) ? FINISHED_GOODS : []).map(pn => {
+  // FINISHED_GOODS is now an array of { pn, desc } objects. Catalog desc
+  // wins when the part is in DB.parts; Engineering's authoritative desc
+  // (from the constant) is the fallback when the catalog is missing —
+  // strict improvement over the old empty-string fallback.
+  const fgRows = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS) ? FINISHED_GOODS : []).map(fg => {
+    const pn = fg.pn;
     const cat = partByPn.get(pn);
-    return { pn, desc: cat?.desc || "", inCatalog: !!cat };
+    const desc = (cat && cat.desc) || fg.desc || "";
+    return { pn, desc, inCatalog: !!cat };
   });
 
   const q = MLB_STATE.search.trim().toLowerCase();
@@ -339,7 +345,8 @@ function renderMultiLevelBom() {
     return;
   }
 
-  const sel = MLB_STATE.selectedFg && FINISHED_GOODS.includes(MLB_STATE.selectedFg) ? MLB_STATE.selectedFg : null;
+  // FINISHED_GOODS is [{pn, desc}, ...] — check pn membership via .some.
+  const sel = MLB_STATE.selectedFg && FINISHED_GOODS.some(fg => fg.pn === MLB_STATE.selectedFg) ? MLB_STATE.selectedFg : null;
   const expl = sel ? explodeBOM(sel) : null;
 
   $("#main").innerHTML = `
@@ -370,13 +377,22 @@ function renderMultiLevelBom() {
                   <tbody>
                     ${filteredFgs.map(fg => {
                       const isSel = fg.pn === sel;
-                      const noCat = !fg.inCatalog;
+                      // Sidebar always shows the resolved description. fg.desc
+                      // was built at map-time as `catalog.desc || engineering
+                      // desc from FINISHED_GOODS || ""`, so every FG with an
+                      // Engineering description (all 91 of them) renders it
+                      // here. The old "not in catalog" label was misleading
+                      // for finished-goods sidebar rows — FGs are demand
+                      // drivers, not purchased parts, and aren't expected to
+                      // have a DB.parts record. That label is still used
+                      // where it's genuinely meaningful (e.g. exploded-BOM
+                      // component rows with no parts record).
                       return `
                         <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
                             style="${isSel ? 'background:var(--bg-3);' : ''}">
                           <td>
                             <div class="pn">${esc(fg.pn)}</div>
-                            <div class="muted tiny">${noCat ? '<em>not in catalog</em>' : esc(fg.desc || '—')}</div>
+                            <div class="muted tiny">${esc(fg.desc || '—')}</div>
                           </td>
                         </tr>
                       `;

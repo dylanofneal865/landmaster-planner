@@ -189,44 +189,63 @@ exports.handler = async (event) => {
 
   log(`Will upsert ${rowsToUpsert.length} (${unchanged} unchanged) and delete ${idsToDelete.length} stale links`);
 
-  // Batched upsert — 500 at a time, matching the parts pass in acumatica-sync.js.
-  const BATCH = 500;
+  // Batched upsert — 500 rows per request. Upsert payloads travel in the JSON
+  // body, so 500 is comfortable. If a chunk fails, retry it once, then log its
+  // ids and continue instead of aborting the whole reconcile with a partial
+  // state (the next run will retry the same rows since diff/delete are both
+  // computed against the current feed).
+  const UPSERT_BATCH = 500;
   let totalUpserted = 0;
-  for (let i = 0; i < rowsToUpsert.length; i += BATCH) {
-    const batch = rowsToUpsert.slice(i, i + BATCH);
-    const { error } = await supa.from("bom_links").upsert(batch);
+  const failedUpsertIds = [];
+  for (let i = 0; i < rowsToUpsert.length; i += UPSERT_BATCH) {
+    const batch = rowsToUpsert.slice(i, i + UPSERT_BATCH);
+    let { error } = await supa.from("bom_links").upsert(batch);
     if (error) {
-      log("bom_links upsert error", error);
-      return {
-        statusCode: 500,
-        body: JSON.stringify({
-          error: "bom_links upsert failed",
-          detail: error.message,
-          partial: totalUpserted,
-        }),
-      };
+      log(`upsert chunk ${i}-${i + batch.length - 1} failed, retrying once`, error.message);
+      ({ error } = await supa.from("bom_links").upsert(batch));
+    }
+    if (error) {
+      log(`upsert chunk ${i}-${i + batch.length - 1} failed after retry — skipping`, {
+        detail: error.message,
+        count: batch.length,
+        ids: batch.map((r) => r.id),
+      });
+      failedUpsertIds.push(...batch.map((r) => r.id));
+      continue;
     }
     totalUpserted += batch.length;
   }
 
-  // Batched delete — same chunk size for consistency.
+  // Batched delete — 200 ids per request. The delete filter is sent in the URL
+  // as `id=in.(id1,id2,...)`, which is capped by PostgREST/nginx around 16 KB.
+  // At ~30–60 chars per url-encoded composite id, 200 keeps us safely under
+  // that ceiling; 500 (the prior value) blew past it and returned 400 Bad
+  // Request when the filtered GI produced ~3.1k stale rows in one run.
+  const DELETE_BATCH = 200;
   let totalDeleted = 0;
-  for (let i = 0; i < idsToDelete.length; i += BATCH) {
-    const batch = idsToDelete.slice(i, i + BATCH);
-    const { error } = await supa.from("bom_links").delete().in("id", batch);
+  const failedDeleteIds = [];
+  for (let i = 0; i < idsToDelete.length; i += DELETE_BATCH) {
+    const batch = idsToDelete.slice(i, i + DELETE_BATCH);
+    let { error } = await supa.from("bom_links").delete().in("id", batch);
     if (error) {
-      log("bom_links delete error", error);
-      return {
-        statusCode: 500,
-        body: JSON.stringify({
-          error: "bom_links delete failed",
-          detail: error.message,
-          partial: totalDeleted,
-        }),
-      };
+      log(`delete chunk ${i}-${i + batch.length - 1} failed, retrying once`, error.message);
+      ({ error } = await supa.from("bom_links").delete().in("id", batch));
+    }
+    if (error) {
+      log(`delete chunk ${i}-${i + batch.length - 1} failed after retry — skipping`, {
+        detail: error.message,
+        count: batch.length,
+        ids: batch,
+      });
+      failedDeleteIds.push(...batch);
+      continue;
     }
     totalDeleted += batch.length;
   }
+
+  const upsertFailed = failedUpsertIds.length;
+  const deleteFailed = failedDeleteIds.length;
+  const anyChunkFailed = upsertFailed > 0 || deleteFailed > 0;
 
   // Audit row — same shape and conventions as the on-hand / PO passes.
   const auditId = `audit_acumatica_bom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -237,7 +256,10 @@ exports.handler = async (event) => {
         id: auditId,
         ts: new Date().toISOString(),
         type: "acumatica-bom-sync",
-        msg: `Acumatica BOM sync: ${totalUpserted} links upserted (${unchanged} unchanged), ${totalDeleted} removed across ${parentBoms.size} parent BOMs`,
+        msg:
+          `Acumatica BOM sync: ${totalUpserted} links upserted (${unchanged} unchanged), ` +
+          `${totalDeleted} removed across ${parentBoms.size} parent BOMs` +
+          (anyChunkFailed ? ` — ${upsertFailed} upsert / ${deleteFailed} delete ids failed after retry` : ""),
         detail: {
           source: "netlify-scheduled-function",
           linksInFeed: feedById.size,
@@ -246,13 +268,18 @@ exports.handler = async (event) => {
           upserted: totalUpserted,
           unchanged,
           removed: totalDeleted,
+          upsertFailed,
+          deleteFailed,
           durationMs: Date.now() - t0,
         },
       },
     },
   ]);
 
-  log(`Done. ${totalUpserted} upserted, ${totalDeleted} removed across ${parentBoms.size} parent BOMs in ${Date.now() - t0}ms`);
+  log(
+    `Done. ${totalUpserted} upserted, ${totalDeleted} removed across ${parentBoms.size} parent BOMs in ${Date.now() - t0}ms` +
+      (anyChunkFailed ? ` (skipped ${upsertFailed} upsert / ${deleteFailed} delete ids)` : "")
+  );
 
   return {
     statusCode: 200,
@@ -263,6 +290,8 @@ exports.handler = async (event) => {
       upserted: totalUpserted,
       unchanged,
       removed: totalDeleted,
+      upsertFailed,
+      deleteFailed,
     }),
   };
 };
