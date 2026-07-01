@@ -276,9 +276,24 @@ function mlbSelectFg(pn) {
   refresh();
 }
 
+// Typing in the FG search box used to call refresh() on every keystroke,
+// which rebuilds the whole #main innerHTML — including the <input> the user
+// is typing into — so focus (and caret position) was lost after every char.
+// Two changes to fix continuous typing:
+//   1) Never re-render the input on filter. Update state immediately, then
+//      swap ONLY the list container + count element by id (see
+//      _mlbRerenderList). The <input> node is never touched, so focus and
+//      selection persist natively.
+//   2) Debounce the (potentially large) list re-render at 150ms of quiet
+//      so we don't rebuild the full FG list on every keydown.
+let _mlbSearchTimer = null;
 function mlbSetSearch(q) {
   MLB_STATE.search = q || "";
-  refresh();
+  if (_mlbSearchTimer) clearTimeout(_mlbSearchTimer);
+  _mlbSearchTimer = setTimeout(() => {
+    _mlbSearchTimer = null;
+    _mlbRerenderList();
+  }, 150);
 }
 
 function renderMultiLevelBom() {
@@ -358,49 +373,16 @@ function renderMultiLevelBom() {
         <div class="panel">
           <div class="panel-head">
             <div class="panel-title">Finished goods</div>
-            <div class="panel-sub">${filteredFgs.length} of ${fgRows.length}</div>
+            <div class="panel-sub" id="mlb-fg-count">${filteredFgs.length} of ${fgRows.length}</div>
           </div>
           <div class="filterbar" style="padding:8px 12px">
             <div class="search-input" style="flex:1">
-              <input class="input" placeholder="Search PN or description…" value="${esc(MLB_STATE.search)}"
+              <input class="input" id="mlb-fg-search" placeholder="Search PN or description…" value="${esc(MLB_STATE.search)}"
                 oninput="mlbSetSearch(this.value)">
             </div>
           </div>
-          <div class="panel-body flush" style="max-height:70vh;overflow-y:auto">
-            ${filteredFgs.length === 0 ? `
-              <div class="empty">
-                <div class="empty-msg">No finished goods match the search.</div>
-              </div>
-            ` : `
-              <div class="tbl-wrap">
-                <table class="tbl">
-                  <tbody>
-                    ${filteredFgs.map(fg => {
-                      const isSel = fg.pn === sel;
-                      // Sidebar always shows the resolved description. fg.desc
-                      // was built at map-time as `catalog.desc || engineering
-                      // desc from FINISHED_GOODS || ""`, so every FG with an
-                      // Engineering description (all 91 of them) renders it
-                      // here. The old "not in catalog" label was misleading
-                      // for finished-goods sidebar rows — FGs are demand
-                      // drivers, not purchased parts, and aren't expected to
-                      // have a DB.parts record. That label is still used
-                      // where it's genuinely meaningful (e.g. exploded-BOM
-                      // component rows with no parts record).
-                      return `
-                        <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
-                            style="${isSel ? 'background:var(--bg-3);' : ''}">
-                          <td>
-                            <div class="pn">${esc(fg.pn)}</div>
-                            <div class="muted tiny">${esc(fg.desc || '—')}</div>
-                          </td>
-                        </tr>
-                      `;
-                    }).join("")}
-                  </tbody>
-                </table>
-              </div>
-            `}
+          <div class="panel-body flush" id="mlb-fg-list" style="max-height:70vh;overflow-y:auto">
+            ${_mlbListHtml(filteredFgs, sel)}
           </div>
         </div>
 
@@ -421,6 +403,73 @@ function renderMultiLevelBom() {
         </div>
       </div>
     </div>`;
+}
+
+// List-markup helper shared by the initial render and the partial re-render
+// on filter. Only the list-body branch below moves — everything outside the
+// #mlb-fg-list container (page head, panel head, search input, exploded
+// panel) stays untouched by _mlbRerenderList so the user's typing focus
+// and caret position survive.
+function _mlbListHtml(filteredFgs, sel) {
+  if (filteredFgs.length === 0) {
+    return `
+      <div class="empty">
+        <div class="empty-msg">No finished goods match the search.</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <tbody>
+          ${filteredFgs.map(fg => {
+            const isSel = fg.pn === sel;
+            // Sidebar always shows the resolved description. fg.desc was
+            // built at map-time as `catalog.desc || FINISHED_GOODS desc ||
+            // ""`, so every FG with an Engineering description renders it
+            // here. The old "not in catalog" label was misleading for FG
+            // sidebar rows — FGs are demand drivers, not purchased parts,
+            // and aren't expected to have a DB.parts record.
+            return `
+              <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
+                  style="${isSel ? 'background:var(--bg-3);' : ''}">
+                <td>
+                  <div class="pn">${esc(fg.pn)}</div>
+                  <div class="muted tiny">${esc(fg.desc || '—')}</div>
+                </td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// Partial re-render used by the debounced search handler. Recomputes the
+// filtered FG list from current state and swaps only the list container's
+// innerHTML + the count element's textContent. Does NOT touch the <input>,
+// so focus and caret position are preserved across the update.
+function _mlbRerenderList() {
+  const listEl = document.getElementById("mlb-fg-list");
+  if (!listEl) return;  // user navigated away before the debounce fired
+
+  const partByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const fgRows = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS) ? FINISHED_GOODS : []).map(fg => {
+    const pn = fg.pn;
+    const cat = partByPn.get(pn);
+    const desc = (cat && cat.desc) || fg.desc || "";
+    return { pn, desc, inCatalog: !!cat };
+  });
+  const q = MLB_STATE.search.trim().toLowerCase();
+  const filteredFgs = q
+    ? fgRows.filter(r => r.pn.toLowerCase().includes(q) || (r.desc || "").toLowerCase().includes(q))
+    : fgRows;
+  const sel = MLB_STATE.selectedFg && FINISHED_GOODS.some(fg => fg.pn === MLB_STATE.selectedFg) ? MLB_STATE.selectedFg : null;
+
+  listEl.innerHTML = _mlbListHtml(filteredFgs, sel);
+  const countEl = document.getElementById("mlb-fg-count");
+  if (countEl) countEl.textContent = `${filteredFgs.length} of ${fgRows.length}`;
 }
 
 function _mlbPageHead(fgCount, linkCount, parentCount) {
