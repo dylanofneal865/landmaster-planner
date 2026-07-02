@@ -242,6 +242,8 @@ function computeCoverageGap(part, lines) {
 function computeCoverageGaps() {
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const out = [];
+  let transitionSuppressedCount = 0;
+  const transitionSuppressedSample = [];
   for (const p of stats) {
     // Allowlist gate up front — same Set the detector uses. Excludes
     // service / do_not_order / blank / any future itemType by default.
@@ -250,13 +252,56 @@ function computeCoverageGaps() {
     if ((Number(p.daily) || 0) <= 0) continue;
     if ((Number(p.onPO) || 0) <= 0) continue;
     const gap = computeCoverageGap(p);
-    if (gap) out.push({ part: p, ...gap });
+    if (!gap) continue;
+
+    // Pre-launch cut-in suppression. If the part has a planner-owned
+    // transitionStartDate (same field the Model Year page and isPreLaunch
+    // read) and the earliest covering PO lands on OR before that date, the
+    // resupply arrives before the part is live — no real exposure, so
+    // don't surface it as a gap. Additive to the existing rules; parts
+    // without a transitionStartDate keep their normal behavior.
+    // Timezone-safe: parseDateLocal for the cut-in, and coveringPOs[i]
+    // .expectedDate is already a local-midnight Date built by the
+    // detector's YYYY-MM-DD-as-local re-parse. Both sides share the same
+    // anchor, so the <= compare is calendar-day accurate.
+    if (p.transitionStartDate) {
+      const startDate = (typeof parseDateLocal === "function")
+        ? parseDateLocal(p.transitionStartDate) : null;
+      if (startDate) {
+        // Earliest covering-PO arrival across all covering lines at
+        // recoverIdx — they share the same offset but their display
+        // dates can differ by a day when some raws are YYYY-MM-DD
+        // (local parse) and others are ISO timestamps (UTC parse).
+        let earliestCoveringMs = null;
+        for (const co of (gap.coveringPOs || [])) {
+          const t = co.expectedDate ? co.expectedDate.getTime() : null;
+          if (t != null && (earliestCoveringMs == null || t < earliestCoveringMs)) {
+            earliestCoveringMs = t;
+          }
+        }
+        if (earliestCoveringMs != null && earliestCoveringMs <= startDate.getTime()) {
+          transitionSuppressedCount++;
+          if (transitionSuppressedSample.length < 8) transitionSuppressedSample.push(p.pn);
+          continue;
+        }
+      }
+    }
+
+    out.push({ part: p, ...gap });
   }
   out.sort((a, b) => {
     const da = a.gapStart.getTime() - b.gapStart.getTime();
     if (da !== 0) return da;
     return b.gapDays - a.gapDays;
   });
+  if (transitionSuppressedCount > 0) {
+    console.info(
+      `[coverage-gaps] Suppressed ${transitionSuppressedCount} pre-launch part(s) whose covering PO lands on or before transitionStartDate` +
+      (transitionSuppressedSample.length
+        ? ` (sample: ${transitionSuppressedSample.join(", ")}${transitionSuppressedCount > transitionSuppressedSample.length ? ", …" : ""})`
+        : "")
+    );
+  }
   return out;
 }
 
