@@ -84,7 +84,7 @@ registerRoute("settings", () => {
           <div class="panel-sub">Sourced live from Acumatica via Supabase — no manual file needed.</div>
         </div>
         <div class="panel-body">
-          <div class="row gap-md" style="align-items:center">
+          <div class="row gap-md">
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${DB.pos.length} POs · ${poLineCount} lines</span>
             <div class="grow"></div>
@@ -99,7 +99,7 @@ registerRoute("settings", () => {
           <div class="panel-sub">Sourced live from Acumatica via Supabase — no manual file needed.</div>
         </div>
         <div class="panel-body">
-          <div class="row gap-md" style="align-items:center">
+          <div class="row gap-md">
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${DB.parts.length} parts</span>
             <div class="grow"></div>
@@ -114,7 +114,7 @@ registerRoute("settings", () => {
           <div class="panel-sub">Finished-goods BOM structure, synced nightly from Acumatica.</div>
         </div>
         <div class="panel-body">
-          <div class="row gap-md" style="align-items:center">
+          <div class="row gap-md">
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${bomLinksLoaded ? `${fmtNum(bomLinksCount)} links · ${fgCount} finished goods` : 'loading…'}</span>
             <div class="grow"></div>
@@ -139,7 +139,7 @@ registerRoute("settings", () => {
                   <label>${labels[k]}</label>
                   <div>
                     ${linked ? `
-                      <div class="row gap-md" style="align-items:center">
+                      <div class="row gap-md">
                         <span class="pill ok">● Linked</span>
                         <span class="mono dim" style="font-size:11px">${esc(handle.name)}</span>
                         <div class="grow"></div>
@@ -150,7 +150,7 @@ registerRoute("settings", () => {
                       <div class="help">${k === 'onhand' ? 'Auto-writes the full inventory snapshot. Pull reads on-hand counts back from Excel — perfect for warehouse cycle counts.' :
                                           'Auto-writes every usage transaction. Pull merges new rows added in Excel.'}</div>
                     ` : `
-                      <div class="row gap-md" style="align-items:center">
+                      <div class="row gap-md">
                         <button class="btn primary" onclick="pickAndLinkFile('${k}', 'save').then(refresh)">Connect new file</button>
                         <button class="btn" onclick="pickAndLinkFile('${k}', 'open').then(refresh)">Connect existing file</button>
                         <span class="muted tiny">Pick a location once — the app remembers it.</span>
@@ -181,7 +181,7 @@ registerRoute("settings", () => {
           <div class="panel-sub">Monthly import of sales order shipments from Acumatica's 'Sales Orders by Line Item' report. Updates the Service Usage page and Service Queue urgency.</div>
         </div>
         <div class="panel-body">
-          <div class="row gap-md" style="align-items:center">
+          <div class="row gap-md">
             <button class="btn" onclick="$('#sales-order-import-input').click()">⇪ Import Sales Orders</button>
             <input type="file" id="sales-order-import-input" accept=".xlsx" style="display:none" onchange="handleSalesOrderImportFile(event)">
             ${DB.meta.lastSalesOrderImport ? `
@@ -202,11 +202,11 @@ registerRoute("settings", () => {
             <button class="btn" onclick="exportFullDB()">⇩ Export full database (JSON)</button>
             <button class="btn" onclick="importFullDBPrompt()">⇪ Restore database (JSON)</button>
           </div>
-          <div class="row gap-md" style="margin-top:8px">
+          <div class="row gap-md mt-sm">
             <button class="btn" onclick="$('#kit-bom-file-input').click()">⇪ Import Kit BOMs (Acumatica Excel)</button>
             <input type="file" id="kit-bom-file-input" accept=".xlsx" style="display:none" onchange="handleKitBomsImportFile(event)">
           </div>
-          <div class="row gap-md" style="margin-top:8px">
+          <div class="row gap-md mt-sm">
             <button class="btn" onclick="exportPartsAsCSV()">⇩ Export parts (CSV)</button>
             <button class="btn" onclick="exportAllPOsAsCSV()">⇩ Export all POs (CSV)</button>
             <button class="btn" onclick="exportAuditAsCSV()">⇩ Export audit (CSV)</button>
@@ -286,7 +286,7 @@ function exportAllPOsAsCSV() {
 
 function importFullDBPrompt() {
   openModal(`
-    <div class="modal-head"><div style="font-size:13px;font-weight:600">Restore database from JSON</div></div>
+    <div class="modal-head"><div class="head-sm">Restore database from JSON</div></div>
     <div class="modal-body">
       <p class="muted tiny" style="margin-bottom:10px">Paste a previously exported Landmaster backup JSON. This <strong>replaces</strong> all current data.</p>
       <textarea class="paste-area" id="db-restore" placeholder='{"settings":{...},"parts":[...],"pos":[...]}'></textarea>
@@ -324,7 +324,7 @@ function doImportFullDB() {
 function confirmReset() {
   if (!gateDelete()) return;
   openModal(`
-    <div class="modal-head"><div style="font-size:13px;font-weight:600">Reset all data?</div></div>
+    <div class="modal-head"><div class="head-sm">Reset all data?</div></div>
     <div class="modal-body">
       <p>This deletes <strong>everything</strong> — parts, POs, audit log — and loads fresh sample data.</p>
       <p class="muted tiny">Consider exporting a backup first.</p>
@@ -495,8 +495,8 @@ function showSalesOrderImportPreview(preview) {
   const canConfirm = preview.newRows.length > 0;
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Service usage import preview</div>
-      <div class="muted tiny" style="margin-top:4px">${esc(preview.fileName)}</div>
+      <div class="head-sm">Service usage import preview</div>
+      <div class="muted tiny mt-xs">${esc(preview.fileName)}</div>
     </div>
     <div class="modal-body">
       <div class="stat-strip" style="margin-bottom:10px">
@@ -635,8 +635,8 @@ function showSalesOrderImportResult(result) {
 
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Sales order import complete</div>
-      <div class="muted tiny" style="margin-top:4px">${esc(result.fileName)}</div>
+      <div class="head-sm">Sales order import complete</div>
+      <div class="muted tiny mt-xs">${esc(result.fileName)}</div>
     </div>
     <div class="modal-body">
       <div class="stat-strip" style="margin-bottom:10px">

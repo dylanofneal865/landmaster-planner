@@ -559,7 +559,7 @@ function renderPODetail(po) {
       `}
 
       <div class="dr-section">PO Actions</div>
-      <div class="row gap-md" style="flex-wrap:wrap">
+      <div class="row gap-md flex-wrap">
         ${po.status === "draft" ? `<button class="btn primary" onclick="submitPO('${esc(po.id)}')">▶ Submit PO</button>` : ""}
         ${(po.status === "submitted" || po.status === "in_transit") ? `<button class="btn primary" onclick="receiveAllPO('${esc(po.id)}')">↓ Receive all open</button>` : ""}
         <button class="btn" onclick="duplicatePO('${esc(po.id)}')">⧉ Duplicate</button>

@@ -149,7 +149,7 @@ registerRoute("onhand", () => {
           <div class="action-bar">
             <span class="count">${editCount}</span>
             <span>pending update${editCount===1?'':'s'} · net Δ ${deltaQty>0?'+':''}${fmtNum(deltaQty)} units · ${deltaVal>=0?'+':''}${fmtMoney(deltaVal)}</span>
-            <div class="grow" style="flex:1"></div>
+            <div class="grow flex-1"></div>
             <button class="btn" onclick="OH_STATE.edits.clear(); refresh()">Discard all</button>
             <button class="btn primary" onclick="commitOnHandEdits()">✓ Apply ${editCount} update${editCount===1?'':'s'}</button>
           </div>
@@ -292,7 +292,7 @@ function openOnHandQuickModal(prefillPn = "") {
               <input class="input lg" id="qoh-note" placeholder="Cycle count, found extra, scrapped…">
             </div>
           </div>
-          <div class="row gap-md" style="margin-top:8px">
+          <div class="row gap-md mt-sm">
             <button class="btn" onclick="(window._qohAdjust)(-10)">−10</button>
             <button class="btn" onclick="(window._qohAdjust)(-1)">−1</button>
             <button class="btn" onclick="(window._qohAdjust)(1)">+1</button>
@@ -357,7 +357,7 @@ function openOnHandBulkModal() {
         <label>Paste data</label>
         <textarea class="paste-area" id="bulk-paste-area" autofocus placeholder="C9-10000	42&#10;C9-10003	158&#10;C9-10006	0"></textarea>
       </div>
-      <div class="row gap-md" style="margin-top:8px">
+      <div class="row gap-md mt-sm">
         <button class="btn" onclick="bulkParsePreview()">Parse & preview →</button>
         <div class="grow"></div>
       </div>

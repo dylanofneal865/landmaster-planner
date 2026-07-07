@@ -865,6 +865,34 @@ body {
 .gap-md { gap: 12px; }
 .mt-md { margin-top: 12px; }
 .mb-md { margin-bottom: 12px; }
+/* Spacing rhythm on the existing 4px base — extends the -md set above
+   with -xs (4px), -sm (8px), -lg (16px). Introduced by the front-end
+   polish pass to replace ~80+ repeated inline styles across page modules.
+   No new tokens; all values are on the app's design-system rhythm. */
+.mt-xs { margin-top: 4px; }
+.mt-sm { margin-top: 8px; }
+.mt-lg { margin-top: 16px; }
+.mb-xs { margin-bottom: 4px; }
+.mb-sm { margin-bottom: 8px; }
+.mb-lg { margin-bottom: 16px; }
+.gap-xs { gap: 4px; }
+.gap-sm { gap: 6px; }
+.gap-lg { gap: 16px; }
+/* Flex helpers. .grow (flex:1 in a couple places) already exists but is
+   scoped under .sidebar / .filterbar — .flex-1 is a global shorthand. */
+.flex-1 { flex: 1; }
+.flex-wrap { flex-wrap: wrap; }
+.items-center { align-items: center; }
+/* Text truncation with ellipsis. Use with a fixed-width parent (table cell,
+   sidebar row) — pair with a title attribute so full text is discoverable
+   on hover. */
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Small section head — the "font-size:13px; font-weight:600" pattern that
+   appears ~19 times across modules for panel/subsection titles. */
+.head-sm { font-size: 13px; font-weight: 600; }
+/* Larger empty-state padding — several pages use this for prominent
+   "nothing to show" panels (padding:48px 16px was the recurring value). */
+.empty-lg { padding: 48px 16px; }
 .text-crit { color: var(--crit); }
 .text-warn { color: var(--warn); }
 .text-ok { color: var(--ok); }

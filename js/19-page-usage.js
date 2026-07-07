@@ -208,7 +208,7 @@ function _openUsagePasswordModal(routeName) {
   window._pendingUsageRoute = routeName;
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Enter password</div>
+      <div class="head-sm">Enter password</div>
     </div>
     <div class="modal-body">
       <p class="muted tiny" style="margin-bottom:10px">These pages are restricted. Please enter the password to continue.</p>
@@ -455,7 +455,7 @@ function renderMultiLevelBom() {
             <div class="panel-sub" id="mlb-fg-count">${filteredFgs.length} of ${fgRows.length}</div>
           </div>
           <div class="filterbar" style="padding:8px 12px">
-            <div class="search-input" style="flex:1">
+            <div class="search-input flex-1">
               <input class="input" id="mlb-fg-search" placeholder="Search PN or description…" value="${esc(MLB_STATE.search)}"
                 oninput="mlbSetSearch(this.value)">
             </div>
@@ -869,8 +869,8 @@ function bbuApplyRateFromInput(pn, raw) {
 function bbuOpenImportModal() {
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Import base BOM rates</div>
-      <div class="muted tiny" style="margin-top:4px">CSV or XLSX with a PN column and a daily-rate (or monthly-rate) column. Only updates existing base_bom parts; no new parts created.</div>
+      <div class="head-sm">Import base BOM rates</div>
+      <div class="muted tiny mt-xs">CSV or XLSX with a PN column and a daily-rate (or monthly-rate) column. Only updates existing base_bom parts; no new parts created.</div>
     </div>
     <div class="modal-body">
       <div class="field">
@@ -878,8 +878,8 @@ function bbuOpenImportModal() {
         <input type="file" id="bbu-import-file" accept=".csv,.xlsx,.xls">
       </div>
       <div style="margin-top:10px">
-        <label class="row" style="gap:6px;margin-bottom:6px"><input type="radio" name="bbu-imp-mode" value="daily" checked> <span>Rate column is <strong>daily</strong> (units / day)</span></label>
-        <label class="row" style="gap:6px"><input type="radio" name="bbu-imp-mode" value="monthly"> <span>Rate column is <strong>monthly</strong> (will divide by 30)</span></label>
+        <label class="row gap-sm mb-xs"><input type="radio" name="bbu-imp-mode" value="daily" checked> <span>Rate column is <strong>daily</strong> (units / day)</span></label>
+        <label class="row gap-sm"><input type="radio" name="bbu-imp-mode" value="monthly"> <span>Rate column is <strong>monthly</strong> (will divide by 30)</span></label>
       </div>
     </div>
     <div class="modal-foot">
@@ -992,8 +992,8 @@ function bbuShowImportPreview(buckets, mode, filename, totalRows, pnCol, rateCol
 
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Import preview · ${esc(filename)}</div>
-      <div class="muted tiny" style="margin-top:4px">${totalRows} file row${totalRows === 1 ? '' : 's'} · PN col: <span class="mono">${esc(pnCol)}</span> · rate col: <span class="mono">${esc(rateCol)}</span> · mode: <strong>${esc(mode)}</strong>${mode === 'monthly' ? ' (÷30)' : ''}</div>
+      <div class="head-sm">Import preview · ${esc(filename)}</div>
+      <div class="muted tiny mt-xs">${totalRows} file row${totalRows === 1 ? '' : 's'} · PN col: <span class="mono">${esc(pnCol)}</span> · rate col: <span class="mono">${esc(rateCol)}</span> · mode: <strong>${esc(mode)}</strong>${mode === 'monthly' ? ' (÷30)' : ''}</div>
     </div>
     <div class="modal-body">
       <div class="stat-strip" style="margin-bottom:14px">
@@ -1107,13 +1107,13 @@ function bbuCommitImport() {
 function bbuOpenPasteModal() {
   openModal(`
     <div class="modal-head">
-      <div style="font-size:13px;font-weight:600">Paste base BOM rates</div>
-      <div class="muted tiny" style="margin-top:4px">One row per line: <span class="mono">PART_NUMBER &lt;TAB&gt; RATE</span> (comma also accepted). Only updates existing base_bom parts.</div>
+      <div class="head-sm">Paste base BOM rates</div>
+      <div class="muted tiny mt-xs">One row per line: <span class="mono">PART_NUMBER &lt;TAB&gt; RATE</span> (comma also accepted). Only updates existing base_bom parts.</div>
     </div>
     <div class="modal-body">
       <div style="margin-bottom:10px">
-        <label class="row" style="gap:6px;margin-bottom:6px"><input type="radio" name="bbu-paste-mode" value="daily" checked> <span>Rate is <strong>daily</strong></span></label>
-        <label class="row" style="gap:6px"><input type="radio" name="bbu-paste-mode" value="monthly"> <span>Rate is <strong>monthly</strong> (will divide by 30)</span></label>
+        <label class="row gap-sm mb-xs"><input type="radio" name="bbu-paste-mode" value="daily" checked> <span>Rate is <strong>daily</strong></span></label>
+        <label class="row gap-sm"><input type="radio" name="bbu-paste-mode" value="monthly"> <span>Rate is <strong>monthly</strong> (will divide by 30)</span></label>
       </div>
       <div class="field"><label>Paste rows</label>
         <textarea class="paste-area" id="bbu-paste-area" autofocus placeholder="LM-FR-1000\t0.5&#10;LM-FR-1001\t1.2"></textarea>
@@ -1359,8 +1359,8 @@ function openLogUsageModal(prefillPn = "") {
 
     openModal(`
       <div class="modal-head">
-        <div style="font-size: 13px; font-weight: 600;">Log usage</div>
-        <div class="muted tiny" style="margin-top:4px">Records a consumption transaction. By default this decrements on-hand inventory.</div>
+        <div class="head-sm">Log usage</div>
+        <div class="muted tiny mt-xs">Records a consumption transaction. By default this decrements on-hand inventory.</div>
       </div>
       <div class="modal-body">
         ${!part ? `
@@ -1419,11 +1419,11 @@ function openLogUsageModal(prefillPn = "") {
               <input class="input lg" id="lu-notes" placeholder="(optional)">
             </div>
           </div>
-          <label class="row" style="gap:8px;margin-top:10px;cursor:pointer">
+          <label class="row mt-sm" style="cursor:pointer">
             <input type="checkbox" class="chk" id="lu-decrement" checked>
             <span>Decrement on-hand inventory by this qty</span>
           </label>
-          <div class="row gap-md" style="margin-top:8px">
+          <div class="row gap-md mt-sm">
             <button class="btn ghost" onclick="(window._luClear)()">← Pick different part</button>
           </div>
         `}
@@ -1479,10 +1479,10 @@ function confirmDeleteUsage(id) {
   const u = DB.usage.find(x => x.id === id);
   if (!u) return;
   openModal(`
-    <div class="modal-head"><div style="font-size:13px;font-weight:600">Delete this usage entry?</div></div>
+    <div class="modal-head"><div class="head-sm">Delete this usage entry?</div></div>
     <div class="modal-body">
       <p>${fmtTime(u.ts)} · <span class="pn">${esc(u.pn)}</span> · <strong>${fmtNum(u.qty)}</strong> ${u.buildLine?'on '+esc(u.buildLine):''}</p>
-      <label class="row" style="gap:8px;margin-top:10px;cursor:pointer">
+      <label class="row mt-sm" style="cursor:pointer">
         <input type="checkbox" class="chk" id="du-restore" checked>
         <span>Restore on-hand by ${fmtNum(u.qty)} (reverse the decrement)</span>
       </label>
@@ -1520,8 +1520,8 @@ function deleteUsage(id) {
 function openBulkUsageModal() {
   openModal(`
     <div class="modal-head">
-      <div style="font-size: 13px; font-weight: 600;">Bulk log usage</div>
-      <div class="muted tiny" style="margin-top:4px">Paste rows: <span class="mono">PART_NUMBER &lt;TAB&gt; QTY [&lt;TAB&gt; BUILD_LINE]</span> — one per line. Date defaults to today; uncheck to skip on-hand decrement.</div>
+      <div class="head-sm">Bulk log usage</div>
+      <div class="muted tiny mt-xs">Paste rows: <span class="mono">PART_NUMBER &lt;TAB&gt; QTY [&lt;TAB&gt; BUILD_LINE]</span> — one per line. Date defaults to today; uncheck to skip on-hand decrement.</div>
     </div>
     <div class="modal-body">
       <div class="field"><label>Paste data</label>
@@ -1531,7 +1531,7 @@ function openBulkUsageModal() {
         <input type="checkbox" class="chk" id="bu-decrement" checked>
         <span>Decrement on-hand for each row</span>
       </label>
-      <div class="row gap-md" style="margin-top:8px">
+      <div class="row gap-md mt-sm">
         <button class="btn" onclick="bulkUsageParse()">Parse & preview →</button>
         <div class="grow"></div>
       </div>

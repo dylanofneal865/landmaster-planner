@@ -483,7 +483,7 @@ function renderPartDetail(part) {
       </div>
 
       <div class="dr-section">Quick actions</div>
-      <div class="row gap-md" style="flex-wrap:wrap">
+      <div class="row gap-md flex-wrap">
         <button class="btn primary" onclick="closeDrawer(); openOnHandQuickModal('${esc(part.pn)}')">⚡ Update on-hand</button>
         ${!partIsKit && !part.phasingOut && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
         <button class="btn" onclick="closeDrawer(); navigate('order-queue')">View order queue</button>
@@ -502,7 +502,7 @@ function renderPartDetail(part) {
           <input class="input num" type="number" min="0" step="0.01" id="pd-daily"
             value="${dailyInherited ? fmtNum(dailySrc.daily, 2) : (part.daily||0)}"
             ${dailyInherited ? 'disabled style="opacity:0.55;cursor:not-allowed"' : ''}>
-          ${dailyInherited ? `<div class="muted tiny" style="margin-top:4px">inherited from chain anchor ${esc(dailySrc.anchorPn)} — edit there</div>` : ''}
+          ${dailyInherited ? `<div class="muted tiny mt-xs">inherited from chain anchor ${esc(dailySrc.anchorPn)} — edit there</div>` : ''}
         </div>
         <div class="field"><label>Unit Cost</label><input class="input num" type="number" min="0" step="0.01" id="pd-cost" value="${part.cost||0}"></div>
         <div class="field"><label>Lead Time (weeks)</label><input class="input num" type="number" min="0" step="0.5" id="pd-lt" value="${part.ltWeeks||0}"></div>
@@ -536,7 +536,7 @@ function renderPartDetail(part) {
         <div class="field">
           <label>Transition start date</label>
           <input class="input" type="date" id="pd-transition-start" value="${esc((part.transitionStartDate||"").slice(0,10))}">
-          <div class="muted tiny" style="margin-top:4px">Cut-in date this part goes live. Before it, the part is pre-launch — excluded from queues &amp; stockout flags; order-by = this date − lead time.</div>
+          <div class="muted tiny mt-xs">Cut-in date this part goes live. Before it, the part is pre-launch — excluded from queues &amp; stockout flags; order-by = this date − lead time.</div>
         </div>
         <div class="field">
           <label>Phasing out</label>
@@ -591,7 +591,7 @@ function renderPartDetail(part) {
     </div>
     <div class="drawer-foot">
       <button class="btn danger" onclick="confirmDeletePart('${esc(part.pn)}')">Delete</button>
-      <div class="grow" style="flex:1"></div>
+      <div class="grow flex-1"></div>
       <button class="btn ghost" data-close>Close</button>
       <button class="btn primary" onclick="savePartFromDetail('${esc(part.pn)}')">Save changes</button>
     </div>
@@ -679,7 +679,7 @@ function savePartFromDetail(originalPn) {
 function confirmDeletePart(pn) {
   if (!gateDelete()) return;
   openModal(`
-    <div class="modal-head"><div style="font-size:13px;font-weight:600">Delete part?</div></div>
+    <div class="modal-head"><div class="head-sm">Delete part?</div></div>
     <div class="modal-body">
       <p>This will permanently remove <span class="pn">${esc(pn)}</span> from the catalog.</p>
       <p class="muted tiny">Open PO lines for this part will remain but will reference a missing part. This cannot be undone.</p>
@@ -1156,7 +1156,7 @@ registerRoute("parts", () => {
 
 function openAddPartModal() {
   openModal(`
-    <div class="modal-head"><div style="font-size:13px;font-weight:600">Add new part</div></div>
+    <div class="modal-head"><div class="head-sm">Add new part</div></div>
     <div class="modal-body">
       <div class="grid-2">
         <div class="field"><label>Part # *</label><input class="input lg" id="ap-pn" autofocus></div>

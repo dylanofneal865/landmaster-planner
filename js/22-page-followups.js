@@ -804,7 +804,7 @@ function renderFollowUps() {
         </div>
         <div class="panel-body flush">
           ${groups.length === 0 ? `
-            <div class="empty" style="padding:48px 16px">
+            <div class="empty empty-lg">
               <div class="empty-title">${total === 0 ? "All caught up" : "Nothing to show"}</div>
               <div class="empty-msg">${total === 0
                 ? "No overdue POs to follow up on."
@@ -1219,7 +1219,7 @@ function _followupCopyModal(subject, body) {
   openModal(`
     <div class="modal-head">
       <div style="font-size:13px;font-weight:600">Draft email</div>
-      <div class="muted tiny" style="margin-top:4px">No mail handler / clipboard access — copy the text below into your email client.</div>
+      <div class="muted tiny mt-xs">No mail handler / clipboard access — copy the text below into your email client.</div>
     </div>
     <div class="modal-body">
       <div class="field"><label>Subject</label>
@@ -1285,7 +1285,7 @@ function renderCoverageGaps() {
       ${allCoverageGaps.length === 0 ? `
       <div class="panel">
         <div class="panel-body">
-          <div class="empty" style="padding:48px 16px">
+          <div class="empty empty-lg">
             <div class="empty-title">All parts covered</div>
             <div class="empty-msg">No base-BOM or option parts stock out before their covering PO arrives.</div>
           </div>
