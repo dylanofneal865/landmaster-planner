@@ -811,7 +811,7 @@ function _followupGroupHtml(g, chased) {
                   <input type="checkbox" class="chk" ${isChased ? "checked" : ""} onchange="toggleFollowupChased('${esc(key)}')">
                   <span class="muted tiny" style="min-width:42px; text-align:left">${isChased ? `Chased on ${esc(chasedOn)}` : ""}</span>
                 </label>
-                ${sentMark ? `<div class="dim tiny mono" style="margin-top:3px" title="A Coverage Gaps sent mark for this part+PO is active (shared across users)">Sent via CG · ${esc(sentOnCG)}</div>` : ""}
+                ${sentMark ? `<div class="muted tiny" style="margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="A Coverage Gaps sent mark for this part+PO is active on ${esc(sentOnCG)} (shared across users)">Sent on ${esc(sentOnCG)}</div>` : ""}
               </td>
             </tr>`;
           }).join("")}
@@ -1412,7 +1412,7 @@ function renderCoverageGaps() {
                         <input type="checkbox" class="chk" ${isSent ? "checked" : ""} onchange="toggleCoverageGapSent('${esc(sentKey)}')">
                         <span class="muted tiny" style="min-width:34px; text-align:left">${isSent ? `Sent on ${esc(sentOn)}` : ""}</span>
                       </label>
-                      ${handledMark ? `<div class="dim tiny mono" style="margin-top:3px" title="A Follow-Ups chased mark for this part+PO is active (shared across users)">Chased on FU · ${esc(handledOn)}</div>` : ""}
+                      ${handledMark ? `<div class="muted tiny" style="margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="A Follow-Ups chased mark for this part+PO is active on ${esc(handledOn)} (shared across users)">Chased on ${esc(handledOn)}</div>` : ""}
                     </td>
                   </tr>
                 `;
