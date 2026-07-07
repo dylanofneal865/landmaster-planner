@@ -159,6 +159,17 @@ function updateNavBadges() {
     fuBadge.className = "badge " + (late > 0 ? "warn" : "");
   }
 
+  // Coverage Gaps badge — at-risk parts (normal gap OR overdue-PO risk).
+  // Uses the same computeCoverageGaps predicate as the page so badge ==
+  // page header count. "crit" styling (not "warn") because a coverage
+  // gap is a genuine stockout risk, not just a chase.
+  const cgBadge = $("#badge-coverage-gaps");
+  if (cgBadge) {
+    const risk = (typeof coverageGapCount === "function") ? coverageGapCount() : 0;
+    cgBadge.textContent = risk;
+    cgBadge.className = "badge " + (risk > 0 ? "crit" : "");
+  }
+
   // Single-pass tally of needs/crit per itemType bucket, plus an aggregate
   // (excluding DNO) for the legacy generic order-queue badge.
   const tally = {

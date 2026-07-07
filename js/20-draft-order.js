@@ -49,6 +49,9 @@ function draftOrderClear() {
   DRAFT_ORDER.length = 0;
   draftOrderSave();
   updateDraftOrderPill();
+  // Force-persist the empty state immediately, bypassing debounce/hash gate,
+  // so a cleared draft can't be resurrected by a stale realtime echo.
+  if (typeof _forcePushDraftNow === "function") _forcePushDraftNow();
 }
 
 function draftOrderTotals() {

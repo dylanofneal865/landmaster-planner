@@ -504,6 +504,13 @@ function _handleRealtimePO(payload) {
 function _handleRealtimeDraft(payload) {
   const { new: row } = payload;
   const items = row?.data?.items || [];
+  // Echo-skip: if the incoming content hash matches what we just pushed,
+  // this event is our own write coming back around — don't re-apply it,
+  // and don't stomp DRAFT_ORDER (a stale out-of-order UPDATE carrying the
+  // pre-clear state was the exact loop this guards against). Mirrors the
+  // content-equality skip in _handleRealtimeFollowMark.
+  const incomingHash = _hashDraft(items);
+  if (incomingHash === _lastCloudDraftHash) return;
   if (typeof DRAFT_ORDER !== "undefined") {
     DRAFT_ORDER.length = 0;
     DRAFT_ORDER.push(...items);
@@ -514,7 +521,7 @@ function _handleRealtimeDraft(payload) {
     }
     if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
   }
-  _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+  _lastCloudDraftHash = incomingHash;
 }
 
 function _handleRealtimeAudit(payload) {
@@ -604,9 +611,13 @@ function _handleRealtimeFollowMark(payload) {
   if (!changed) return;
 
   // Route guard — silently update the map for users on other pages so
-  // their next switch to Follow-Ups already has fresh data, but skip
-  // the heavy re-render here.
-  if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE !== "followups") return;
+  // their next switch to Follow-Ups / Coverage Gaps already has fresh
+  // data, but skip the heavy re-render here. Both pages consume
+  // follow_marks (chased marks on Follow-Ups, sent marks on Coverage
+  // Gaps), so either being current warrants a redraw.
+  if (typeof CURRENT_ROUTE !== "undefined"
+      && CURRENT_ROUTE !== "followups"
+      && CURRENT_ROUTE !== "coverage-gaps") return;
 
   // Re-entrancy guard — refresh() is synchronous so this is mostly
   // defense-in-depth, but it prevents a future async refresh from
@@ -1037,7 +1048,24 @@ function _scheduleDraftPush() {
       _showCloudIndicator(false, "error");
     }
   }, 250);
+
 }
+
+// Force-push the current DRAFT_ORDER to Supabase immediately, bypassing the
+// 250ms debounce AND the hash gate. Called by draftOrderClear() so a cleared
+// draft can't be resurrected by a stale realtime UPDATE echoing the
+// pre-clear state. Updates _lastCloudDraftHash BEFORE the write so the
+// realtime event echoing our own push is content-equal and skipped by
+// _handleRealtimeDraft.
+async function _forcePushDraftNow() {
+  if (!_cloudReady) return;
+  clearTimeout(_draftPushTimer);
+  _lastCloudDraftHash = _hashDraft(
+    typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []
+  );
+  await _pushDraft();
+}
+window._forcePushDraftNow = _forcePushDraftNow;
 
 function _showCloudIndicator(ready, state) {
   let el = document.getElementById("cloud-indicator");

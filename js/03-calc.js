@@ -378,7 +378,13 @@ function openPOQty(pn, lines) {
 // 0 — they continue to prop up the projection — but the units and source
 // lines are surfaced via series.overdueUnits / series.overdueLines so the
 // UI can flag the assumption without changing any math.
-function projectOnHand(part, days = 365, lines) {
+//
+// `opts.ignoreOverdue` (default false): when true, past-due lines are NOT
+// credited into receipts[] — the projection shows the "what if the late PO
+// never lands" world. overdueUnits / overdueLines are still reported so
+// callers can identify which lines drove the divergence. All existing
+// callers pass no opts and see byte-identical behavior.
+function projectOnHand(part, days = 365, lines, opts = {}) {
   const series = [];
   let oh = part.onHand || 0;
   const receipts = new Array(days + 1).fill(0);
@@ -401,7 +407,11 @@ function projectOnHand(part, days = 365, lines) {
         offset = 0;
       }
     }
-    if (offset <= days) receipts[offset] += remaining;
+    // Credit the receipt UNLESS the caller asked to ignore overdue lines
+    // AND this line is overdue. The overdue tracking below is unchanged so
+    // callers can still see which lines were skipped.
+    const skipCredit = opts.ignoreOverdue && isOverdue;
+    if (offset <= days && !skipCredit) receipts[offset] += remaining;
     if (isOverdue) {
       overdueAtZero += remaining;
       overdueLines.push({
