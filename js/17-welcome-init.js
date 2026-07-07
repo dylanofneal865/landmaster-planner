@@ -64,6 +64,13 @@ async function initApp() {
     if (!Array.isArray(DB.pos)) DB.pos = [];
     if (!Array.isArray(DB.audit)) DB.audit = [];
     if (!Array.isArray(DB.usage)) DB.usage = [];
+    // Tombstone store: Map<pn, {deletedAt, deletedBy, snapshot}>. NEVER
+    // reassigned — mutate via .set()/.delete()/.clear() only (same rule
+    // as window.followMarks). Persisted as {} through saveDB's JSON
+    // round-trip; the Supabase `deleted_parts` table is source-of-
+    // truth and cloudInit repopulates from it on every boot. This
+    // shape-guard resets any object that came back as {} on load.
+    if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
 
     ensureIds();
 

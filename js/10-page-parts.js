@@ -694,15 +694,94 @@ function confirmDeletePart(pn) {
 function deletePart(pn) {
   const idx = DB.parts.findIndex(p => p.pn === pn);
   if (idx < 0) return;
+  // Snapshot BEFORE splice so the tombstone carries a lossless copy
+  // for un-delete. splice mutates DB.parts in place — never reassign.
+  const snapshot = { ...DB.parts[idx] };
   DB.parts.splice(idx, 1);
+  // Local tombstone — the Map lives on DB.deletedParts, mutated in
+  // place (never reassigned) same as window.followMarks.
+  const tombstoneMeta = {
+    deletedAt: new Date().toISOString(),
+    deletedBy: null,      // no auth today; reserved for future attribution
+    snapshot,
+  };
+  if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+  DB.deletedParts.set(pn, tombstoneMeta);
   logAudit("part-del", `Deleted part ${pn}`, { pn });
   saveDB();
   bumpStatusCache();
+  // Cloud persistence — TWO writes: upsert the tombstone AND delete
+  // the parts row so no future load resurrects it. Both are optimistic;
+  // on failure the local state is reverted so the client and cloud
+  // stay in sync. deleted_parts uses `id` as the PK column (matching
+  // follow_marks); the pn goes in the id column, the metadata + snapshot
+  // in the data jsonb.
+  if (typeof upsertDeletedPartCloud === "function") {
+    upsertDeletedPartCloud(pn, { pn, ...tombstoneMeta }).then(r => {
+      if (!r.ok) {
+        DB.deletedParts.delete(pn);
+        DB.parts.push(snapshot);
+        showToast("Failed to persist delete — refresh & try again", "warn");
+        refresh();
+      }
+    });
+  }
+  if (typeof deletePartRowCloud === "function") {
+    deletePartRowCloud(pn).then(r => {
+      // Non-fatal on failure — the tombstone still stops resurrection
+      // via the cloudInit filter and the realtime-parts guard. Log
+      // for diagnostics.
+      if (!r.ok) console.warn(`[parts] cloud delete of ${pn} failed:`, r.error && r.error.message);
+    });
+  }
   closeModal();
   closeDrawer();
   showToast(`${pn} deleted`, "warn");
   refresh();
 }
+
+// Un-delete: restore a tombstoned part from its snapshot. Console-
+// callable this turn (window.undeletePart); a Settings-page list can
+// come later. Reverses every effect of deletePart: pushes the snapshot
+// back into DB.parts (in place), removes the tombstone locally and in
+// cloud, and re-upserts the parts row so other clients pick it up
+// via realtime. Legacy tombstones without a snapshot are refused with
+// a toast — the delete predates this feature and can't be auto-
+// restored.
+function undeletePart(pn) {
+  if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+  const meta = DB.deletedParts.get(pn);
+  if (!meta) { showToast(`${pn} is not tombstoned`, "warn"); return; }
+  if (!meta.snapshot || typeof meta.snapshot !== "object") {
+    showToast(`${pn}: no snapshot to restore (delete predates this feature)`, "warn");
+    return;
+  }
+  const restored = { ...meta.snapshot };
+  DB.parts.push(restored);
+  DB.deletedParts.delete(pn);
+  logAudit("part-undel", `Un-deleted part ${pn}`, { pn });
+  saveDB();
+  bumpStatusCache();
+  if (typeof upsertPartCloud === "function") {
+    upsertPartCloud(pn, restored).then(r => {
+      if (!r.ok) {
+        const idx = DB.parts.findIndex(p => p.pn === pn);
+        if (idx >= 0) DB.parts.splice(idx, 1);
+        DB.deletedParts.set(pn, meta);
+        showToast("Failed to restore — refresh & try again", "warn");
+        refresh();
+      }
+    });
+  }
+  if (typeof deleteDeletedPartCloud === "function") {
+    deleteDeletedPartCloud(pn).then(r => {
+      if (!r.ok) console.warn(`[parts] cloud tombstone delete of ${pn} failed:`, r.error && r.error.message);
+    });
+  }
+  showToast(`${pn} restored`, "ok");
+  refresh();
+}
+window.undeletePart = undeletePart;
 
 /* ============================================================
    PAGE: PARTS CATALOG — search, filter, edit any part

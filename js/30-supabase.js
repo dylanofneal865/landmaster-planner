@@ -196,6 +196,84 @@ async function deleteFollowMarkCloud(id) {
 window.upsertFollowMarkCloud = upsertFollowMarkCloud;
 window.deleteFollowMarkCloud = deleteFollowMarkCloud;
 
+// ── deleted_parts tombstone helpers ─────────────────────────────────
+// Table schema: { id text PK, data jsonb } — matches follow_marks and
+// bom_links. The pn goes in the `id` column; meta + snapshot in `data`.
+async function upsertDeletedPartCloud(id, data) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { error } = await _supa.from("deleted_parts").upsert({ id, data });
+  if (error) {
+    console.error("[cloud] deleted_parts upsert failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+async function deleteDeletedPartCloud(id) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { error } = await _supa.from("deleted_parts").delete().eq("id", id);
+  if (error) {
+    console.error("[cloud] deleted_parts delete failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+// Delete a single parts row by pn — used at delete-time so no future
+// load resurrects the pn. Returns { ok, error } like the other helpers.
+async function deletePartRowCloud(pn) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { error } = await _supa.from("parts").delete().eq("pn", pn);
+  if (error) {
+    console.error("[cloud] parts row delete failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+// Upsert a single parts row — used by undeletePart to restore the row
+// so other clients pick it up via realtime.
+async function upsertPartCloud(pn, part) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const { pn: _, ...rest } = part;
+  const { error } = await _supa.from("parts").upsert({ pn, data: rest });
+  if (error) {
+    console.error("[cloud] parts row upsert failed:", error);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+window.upsertDeletedPartCloud = upsertDeletedPartCloud;
+window.deleteDeletedPartCloud = deleteDeletedPartCloud;
+window.deletePartRowCloud = deletePartRowCloud;
+window.upsertPartCloud = upsertPartCloud;
+
+// Paginated fetch of all deleted_parts rows. Runs during cloudInit
+// BEFORE the parts fetch so the tombstone Set is ready when the
+// parts filter runs.
+async function _fetchAllDeletedParts() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("deleted_parts")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] deleted_parts page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
 async function cloudInit() {
   const ok = await _waitForDB();
   if (!ok) {
@@ -210,6 +288,23 @@ async function cloudInit() {
   }
 
   _supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  // Tombstones FIRST — populated before the parts fetch so the
+  // filter below can drop any tombstoned pn coming back from cloud.
+  // The Map is initialized as a shape-guard in js/17-welcome-init.js
+  // but we defensively re-guard here in case cloudInit is called
+  // before that init (e.g. tests, hot-reload).
+  if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+  else DB.deletedParts.clear();
+  const cloudTombstones = await _fetchAllDeletedParts();
+  if (cloudTombstones !== null) {
+    for (const row of cloudTombstones) {
+      DB.deletedParts.set(String(row.id), row.data || {});
+    }
+    console.log(`[cloud] loaded ${DB.deletedParts.size} deleted-part tombstone(s)`);
+  } else {
+    console.warn("[cloud] deleted_parts fetch failed — tombstone filter INACTIVE this session");
+  }
 
   // Pull current cloud parts (paginated to handle >1000 rows)
   const data = await _fetchAllParts();
@@ -228,13 +323,23 @@ async function cloudInit() {
       showToast(`Migration complete: ${DB.parts.length} parts now in cloud`, "ok", "Cloud sync");
     }
   } else if (data.length > 0) {
-    // Cloud has data → replace local
+    // Cloud has data → replace local. In-place mutation (length=0 +
+    // push) so any pre-existing reference to DB.parts stays valid —
+    // matches the invariant realtime handlers rely on. Filter drops
+    // any pn present in DB.deletedParts so tombstoned parts never
+    // enter DB.parts.
     const cloudParts = data.map(r => ({ pn: r.pn, ...r.data }));
-    DB.parts = cloudParts;
+    const filtered = cloudParts.filter(p => !DB.deletedParts.has(String(p.pn)));
+    const droppedCount = cloudParts.length - filtered.length;
+    DB.parts.length = 0;
+    for (const p of filtered) DB.parts.push(p);
     _origSaveDB ? _origSaveDB.call(window) : saveDB();
     if (typeof bumpStatusCache === "function") bumpStatusCache();
     if (typeof refresh === "function") refresh();
-    showToast(`Synced ${cloudParts.length} parts from cloud`, "ok", "Cloud connected");
+    showToast(
+      `Synced ${filtered.length} parts from cloud${droppedCount > 0 ? ` (${droppedCount} tombstoned)` : ""}`,
+      "ok", "Cloud connected"
+    );
   }
 
   // ---- POs ----
@@ -435,6 +540,9 @@ function _setupRealtimeSubscriptions() {
     .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" }, (payload) => {
       _handleRealtimeFollowMark(payload);
     })
+    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, (payload) => {
+      _handleRealtimeDeletedParts(payload);
+    })
     .subscribe((status) => {
       console.log("[cloud] realtime status:", status);
     });
@@ -479,10 +587,44 @@ function _handleRealtimePart(payload) {
     const i = DB.parts.findIndex(p => p.pn === old.pn);
     if (i >= 0) DB.parts.splice(i, 1);
   } else {
+    // Tombstone guard: another user's edit to a tombstoned pn must NOT
+    // resurrect it locally. If the incoming pn is in DB.deletedParts,
+    // drop the event silently. The tombstone is the source of truth
+    // for "this part is deleted" — a UPDATE event on parts for that
+    // pn means the sync fn (or another client) still has a stale row.
+    const rowPn = String(row.pn);
+    if (DB.deletedParts instanceof Map && DB.deletedParts.has(rowPn)) {
+      return;   // no _applyAndRefresh — nothing to redraw
+    }
     const merged = { pn: row.pn, ...row.data };
     const i = DB.parts.findIndex(p => p.pn === row.pn);
     if (i >= 0) DB.parts[i] = merged;
     else DB.parts.push(merged);
+  }
+  _applyAndRefresh();
+}
+
+// Realtime handler for the deleted_parts table. UPSERT events add a
+// tombstone and splice the matching pn out of DB.parts if it's still
+// there (defense in depth — the parts-row DELETE event should have
+// fired too, but ordering across two tables isn't guaranteed). DELETE
+// events remove the tombstone locally; the un-delete flow's parts
+// UPSERT re-inserts the part via _handleRealtimePart.
+function _handleRealtimeDeletedParts(payload) {
+  const { eventType, new: row, old } = payload;
+  if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+  if (eventType === "DELETE") {
+    const pn = String(old && old.id);
+    if (pn) DB.deletedParts.delete(pn);
+  } else {
+    const pn = String(row && row.id);
+    if (!pn) return;
+    DB.deletedParts.set(pn, (row && row.data) || {});
+    // Purge any matching parts row that slipped in — splice keeps
+    // DB.parts' identity intact so any reference held elsewhere stays
+    // valid. Same in-place rule the app enforces everywhere.
+    const i = DB.parts.findIndex(p => p.pn === pn);
+    if (i >= 0) DB.parts.splice(i, 1);
   }
   _applyAndRefresh();
 }
