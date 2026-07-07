@@ -550,105 +550,186 @@ function partPoHandledBy(pn, poId) {
   return null;
 }
 
-// Toggle helpers — optimistic local update, then persist; on failure
-// revert. NO writes happen inside the realtime handler (see
-// 30-supabase.js), so the toggle path here is the only writer.
-function toggleFollowupChased(key) {
-  // key = `${po.id}::${lineIdOrPn}` from _followupKey. Look up the
-  // follow-up in the render stash for poId / pn enrichment.
-  const fu = (window._FOLLOWUPS || []).find(f => _followupKey(f) === key);
-  if (!fu) { showToast("Follow-up not found — refresh the page", "warn"); return; }
-  const rowId = `chased::${key}`;
-  const existing = window.followMarks.get(rowId);
-  if (existing) {
-    // Unmark — optimistic delete + persist.
-    window.followMarks.delete(rowId);
-    if (typeof deleteFollowMarkCloud === "function") {
-      deleteFollowMarkCloud(rowId).then(r => {
+/* ============================================================
+   UNIFIED HANDLED-MARK MODEL — one canonical record per (pn, poId).
+   Both tabs write and read the SAME record so a checkbox on either
+   tab reflects the shared state:
+
+     - Toggling a Follow-Ups line writes/removes ONE handled mark for
+       (fu.pn, fu.po.id).
+     - Toggling a Coverage Gaps row writes/removes N marks — one per
+       covering PO (normal-gap coveringPOs + overdue-line resolutions).
+     - CG box is checked when ALL of the row's covering POs are handled;
+       partial coverage renders as indeterminate (native browser style,
+       no new CSS); zero coverage is unchecked.
+     - FU box is checked when the row's exact (pn, po.id) is handled.
+
+   Compat: legacy sent::…::pn and chased::${po.id}::${lineId||pn} marks
+   are still recognized via isPartPoHandled + _markPoIds. Unchecking
+   wipes them out too, so users can naturally decommission the old
+   scheme by unchecking a box.
+   ============================================================ */
+function _handledRowId(pn, poId) { return `handled::${poId}::${pn}`; }
+
+// Enumerate the (poId, poNum) pairs a coverage-gap row targets.
+// Unions coveringPOs + overdueRisk.overdueLines (poNum → poId via DB.pos).
+// Preserves first-seen poNum per poId so display can show the number.
+function _coverageGapPoIds(g) {
+  const out = new Map(); // poId → poNum
+  for (const c of (g.coveringPOs || [])) {
+    if (c.poId && !out.has(c.poId)) out.set(c.poId, c.poNum || "");
+  }
+  const overdueLines = (g.overdueRisk && g.overdueRisk.overdueLines) || [];
+  for (const ol of overdueLines) {
+    const rec = ol.po ? (DB.pos || []).find(x => x && x.num === ol.po) : null;
+    if (rec && rec.id && !out.has(rec.id)) out.set(rec.id, ol.po || rec.num || "");
+  }
+  return [...out.entries()].map(([poId, poNum]) => ({ poId, poNum }));
+}
+
+// Read the (pn, poId)-handled state for a coverage-gap row.
+//   all:     every covering poId has an active mark → checkbox checked
+//   partial: SOME but not all handled            → checkbox indeterminate
+//   any:     at least one handled                → used by button dim etc
+//   marks:   parallel array of active marks (null where absent) for label/date
+function _cgHandledState(g) {
+  const pairs = _coverageGapPoIds(g);
+  const marks = pairs.map(({ poId }) => partPoHandledBy(g.part.pn, poId));
+  const activeCount = marks.filter(Boolean).length;
+  return {
+    all: pairs.length > 0 && activeCount === pairs.length,
+    any: activeCount > 0,
+    partial: activeCount > 0 && activeCount < pairs.length,
+    pairs,
+    marks,
+    activeCount,
+  };
+}
+
+// Earliest markedAt across active marks (or null) — CG "Sent on <date>"
+// label reads this so a partial-then-completed row shows the ORIGINAL
+// mark date, not the most recent write.
+function _earliestActiveDate(marks) {
+  let min = null;
+  for (const m of marks) {
+    if (!m || !m.markedAt) continue;
+    const d = new Date(m.markedAt);
+    if (isNaN(d.getTime())) continue;
+    if (min === null || d < min) min = d;
+  }
+  return min;
+}
+
+// Write a canonical handled mark for (pn, poId). Optimistic local set,
+// then cloud upsert; revert on failure. Idempotent — if a legacy mark
+// already covers this pair, the new-canonical is still written (harmless
+// duplicate; unchecking clears both).
+function _writeHandledMark(pn, poId, poNum) {
+  if (!pn || !poId) return;
+  const rowId = _handledRowId(pn, poId);
+  const data = {
+    type: "handled",
+    pn: String(pn),
+    poId: String(poId),
+    poNum: poNum || "",
+    // Keep coveredPoIds so the existing _markPoIds() correlation helpers
+    // treat the new type identically to legacy sent marks.
+    coveredPoIds: [String(poId)],
+    markedAt: new Date().toISOString(),
+  };
+  window.followMarks.set(rowId, data);
+  if (typeof upsertFollowMarkCloud === "function") {
+    upsertFollowMarkCloud(rowId, data).then(r => {
+      if (!r.ok) {
+        window.followMarks.delete(rowId);
+        showToast("Failed to sync mark — toggle again to retry", "warn");
+        refresh();
+      }
+    });
+  }
+}
+
+// Delete every ACTIVE mark that covers (pn, poId) — new-canonical AND
+// legacy sent/chased. Optimistic local delete + cloud delete per row;
+// revert individual rows on failure so a partial failure doesn't leave
+// the client and cloud out of sync.
+function _clearHandledMarks(pn, poId) {
+  if (!pn || !poId) return;
+  const targets = [];
+  for (const [rowId, m] of (window.followMarks || new Map())) {
+    if (!m || !isMarkActive(m)) continue;
+    if (String(m.pn) !== String(pn)) continue;
+    if (!_markPoIds(m).some(id => String(id) === String(poId))) continue;
+    targets.push({ rowId, snapshot: m });
+  }
+  for (const t of targets) window.followMarks.delete(t.rowId);
+  if (typeof deleteFollowMarkCloud === "function") {
+    for (const t of targets) {
+      deleteFollowMarkCloud(t.rowId).then(r => {
         if (!r.ok) {
-          window.followMarks.set(rowId, existing);
+          window.followMarks.set(t.rowId, t.snapshot);
           showToast("Failed to sync unmark — toggle again to retry", "warn");
           refresh();
         }
       });
     }
+  }
+}
+
+// Toggle helpers — optimistic local update, then persist; on failure
+// revert. NO writes happen inside the realtime handler (see
+// 30-supabase.js), so the toggle path here is the only writer.
+function toggleFollowupChased(key) {
+  // key = `${po.id}::${lineIdOrPn}` from _followupKey. Look up the
+  // follow-up in the render stash for pn/poId/poNum enrichment.
+  const fu = (window._FOLLOWUPS || []).find(f => _followupKey(f) === key);
+  if (!fu) { showToast("Follow-up not found — refresh the page", "warn"); return; }
+  const wasHandled = isPartPoHandled(fu.pn, fu.po.id);
+  if (wasHandled) {
+    _clearHandledMarks(fu.pn, fu.po.id);
   } else {
-    const data = {
-      type: "chased",
-      poId: fu.po.id,
-      lineId: (fu.ln && fu.ln.id) || null,
-      pn: fu.pn,
-      markedAt: new Date().toISOString(),
-    };
-    window.followMarks.set(rowId, data);
-    if (typeof upsertFollowMarkCloud === "function") {
-      upsertFollowMarkCloud(rowId, data).then(r => {
-        if (!r.ok) {
-          window.followMarks.delete(rowId);
-          showToast("Failed to sync mark — toggle again to retry", "warn");
-          refresh();
-        }
-      });
-    }
+    _writeHandledMark(fu.pn, fu.po.id, fu.po.num);
   }
   refresh();
 }
 
 function toggleCoverageGapSent(key) {
   // key = part PN from _coverageGapKey. Look up the coverage gap in
-  // the render stash for poId enrichment.
+  // the render stash so we can enumerate ALL its covering POs.
   const g = (window._COVERAGE_GAPS || []).find(x => _coverageGapKey(x) === key);
   if (!g) { showToast("Coverage gap not found — refresh the page", "warn"); return; }
-  const rowId = _sentRowId(g);
-  const existing = window.followMarks.get(rowId);
-  if (existing) {
-    window.followMarks.delete(rowId);
-    if (typeof deleteFollowMarkCloud === "function") {
-      deleteFollowMarkCloud(rowId).then(r => {
-        if (!r.ok) {
-          window.followMarks.set(rowId, existing);
-          showToast("Failed to sync unmark — toggle again to retry", "warn");
-          refresh();
-        }
-      });
-    }
-  } else {
-    // Union all covering-PO poIds and overdue-line poIds so any
-    // Follow-Ups "chased" mark on the same part+PO is recognized as
-    // already-handled here (and vice versa). See _markPoIds /
-    // isPartPoHandled below. rowId scheme is unchanged for backward
-    // compat — older sent marks (no coveredPoIds) still work via the
-    // poId-fallback in _markPoIds.
-    const overdueLineIds = ((g.overdueRisk && g.overdueRisk.overdueLines) || [])
-      .map(ol => {
-        const rec = ol.po ? (DB.pos || []).find(x => x && x.num === ol.po) : null;
-        return rec ? rec.id : null;
-      })
-      .filter(Boolean);
-    const coveredPoIds = Array.from(new Set([
-      ...g.coveringPOs.map(c => c.poId).filter(Boolean),
-      ...overdueLineIds,
-    ]));
-    const data = {
-      type: "sent",
-      poId: (g.coveringPOs[0] && g.coveringPOs[0].poId) || null,
-      lineId: null,
-      pn: g.part.pn,
-      coveredPoIds,
-      markedAt: new Date().toISOString(),
-    };
-    window.followMarks.set(rowId, data);
-    if (typeof upsertFollowMarkCloud === "function") {
-      upsertFollowMarkCloud(rowId, data).then(r => {
-        if (!r.ok) {
-          window.followMarks.delete(rowId);
-          showToast("Failed to sync mark — toggle again to retry", "warn");
-          refresh();
-        }
-      });
+  const st = _cgHandledState(g);
+  if (st.pairs.length === 0) {
+    showToast("No covering PO on this row — nothing to mark", "warn");
+    return;
+  }
+  // "checked" = all handled. Click toggles the ROW: fully checked → clear
+  // all; not-fully-checked (unchecked OR indeterminate) → check all.
+  const targetOn = !st.all;
+  for (const { poId, poNum } of st.pairs) {
+    if (targetOn) {
+      // Skip if already handled — leaves any existing legacy mark alone
+      // so we don't churn cross-user sync when the row was already fully
+      // covered by legacy records.
+      if (isPartPoHandled(g.part.pn, poId)) continue;
+      _writeHandledMark(g.part.pn, poId, poNum);
+    } else {
+      _clearHandledMarks(g.part.pn, poId);
     }
   }
   refresh();
+}
+
+// Post-render helper: apply the DOM-only `indeterminate` property to
+// checkboxes that carry data-indeterminate="1". Called at the end of
+// renderCoverageGaps after `$("#main").innerHTML = …` lands. Native
+// browser affordance — dash-in-box glyph. No CSS class involved.
+function _applyIndeterminateBoxes() {
+  const main = document.getElementById("main");
+  if (!main) return;
+  main.querySelectorAll('input[type="checkbox"][data-indeterminate="1"]').forEach(el => {
+    el.indeterminate = true;
+  });
 }
 
 window.isMarkActive = isMarkActive;
@@ -672,27 +753,17 @@ function _followupSearchInput(value) {
 }
 
 function renderFollowUps() {
-  // Build the chased marks Map from window.followMarks once per render.
-  // Active = within 3 business days (isMarkActive); expired entries
-  // fall through and the row renders normal. chasedByKey keys on
-  // `${po.id}::${lineId||pn}` — the follow-up line unit. Sent marks
-  // (part-level coverage gaps) are consumed on the Coverage Gaps page
-  // and not needed here.
-  const chasedByKey = new Map();   // `${po.id}::${lineId||pn}` → markedAt (ISO)
-  for (const [, mark] of (window.followMarks || new Map()).entries()) {
-    if (!mark || !isMarkActive(mark)) continue;
-    if (mark.type === "chased" && mark.poId) {
-      chasedByKey.set(`${mark.poId}::${mark.lineId || mark.pn}`, mark.markedAt);
-    }
-  }
-
+  // Under the unified handled-mark model a line is "chased" iff its
+  // (pn, po.id) is handled by ANY active mark — new-canonical handled,
+  // or legacy sent/chased. No pre-built Map here; isPartPoHandled does
+  // the lookup and is cheap for the row count we're dealing with.
   const all = computeFollowUps();
   const total = all.length;                 // header + badge count (full predicate)
-  const chasedCount = all.reduce((n, fu) => n + (chasedByKey.has(_followupKey(fu)) ? 1 : 0), 0);
+  const chasedCount = all.reduce((n, fu) => n + (isPartPoHandled(fu.pn, fu.po.id) ? 1 : 0), 0);
 
   // Working set: optional hide-chased, then supplier search.
   let working = all;
-  if (FOLLOWUP_STATE.hideChased) working = working.filter(fu => !chasedByKey.has(_followupKey(fu)));
+  if (FOLLOWUP_STATE.hideChased) working = working.filter(fu => !isPartPoHandled(fu.pn, fu.po.id));
   const q = FOLLOWUP_STATE.search.trim().toLowerCase();
   if (q) working = working.filter(fu => String(fu.supplier).toLowerCase().includes(q));
 
@@ -739,15 +810,15 @@ function renderFollowUps() {
                 ? "No overdue POs to follow up on."
                 : (FOLLOWUP_STATE.hideChased && chasedCount ? "Every late line is marked chased. Untick “Hide chased” to see them." : "No suppliers match the current filter.")}</div>
             </div>
-          ` : groups.map(g => _followupGroupHtml(g, chasedByKey)).join("")}
+          ` : groups.map(g => _followupGroupHtml(g)).join("")}
         </div>
       </div>
     </div>`;
 }
 
-// `chased` is the chasedByKey Map<key, markedAt-ISO> already filtered
-// to active marks by the caller.
-function _followupGroupHtml(g, chased) {
+// Renders one supplier group. Per-row "handled" state is computed
+// inline via isPartPoHandled — no external map to thread through.
+function _followupGroupHtml(g) {
   const sev = g.worstStatus === "critical" ? "crit" : "warn"; // every line here is overdue > threshold
   return `
     <div class="followup-group">
@@ -771,30 +842,29 @@ function _followupGroupHtml(g, chased) {
         <tbody>
           ${g.lines.map(fu => {
             const key = _followupKey(fu);
-            const chasedAt = chased.get(key) || null;
-            const isChased = !!chasedAt;
-            const chasedOn = chasedAt && typeof fmtDate === "function"
-              ? fmtDate(new Date(chasedAt))
+            // Unified handled state — checked when the canonical
+            // (fu.pn, fu.po.id) pair has ANY active mark of any type
+            // (new-canonical handled OR legacy sent OR legacy chased).
+            // The checkbox on either tab writes/removes the SAME record,
+            // so the two tabs stay in sync per (pn, poId).
+            const isHandled = isPartPoHandled(fu.pn, fu.po.id);
+            const mark = isHandled ? partPoHandledBy(fu.pn, fu.po.id) : null;
+            const chasedOn = mark && typeof fmtDate === "function"
+              ? fmtDate(new Date(mark.markedAt))
               : "";
-            // Cross-page correlation: if this line isn't own-chased but
-            // a Coverage-Gaps "sent" mark for the same PN covers this
-            // exact PO, another user (or the current user on CG) already
-            // sent an expedite. Only "sent" marks count here — a chased
-            // mark on a different line for the same PN is unrelated.
-            let sentMark = null;
-            if (!isChased) {
-              const m = partPoHandledBy(fu.pn, fu.po.id);
-              if (m && m.type === "sent") sentMark = m;
-            }
-            const sentOnCG = sentMark && typeof fmtDate === "function"
-              ? fmtDate(new Date(sentMark.markedAt))
-              : "";
+            const chasedBoxTitle = isHandled
+              ? `Marked chased on ${chasedOn} (shared across users · uncheck to clear)`
+              : "Mark chased (shared across users for 3 business days)";
+            const emailBtnStyle = isHandled ? "opacity:0.55" : "";
+            const emailBtnTitle = isHandled
+              ? `Marked chased on ${esc(chasedOn)} — click to draft again`
+              : "Draft a chase email for this late line";
             const lc = fu.partStatus === "critical" ? "crit" : "warn";
             return `
-            <tr style="${isChased ? "opacity:0.45" : ""}">
+            <tr style="${isHandled ? "opacity:0.45" : ""}">
               <td class="pn clickable" onclick="openPODetail('${esc(fu.po.id)}')">${esc(fu.po.num)}</td>
               <td>
-                <span class="pn" style="${isChased ? "text-decoration:line-through" : ""}">${esc(fu.pn)}</span>
+                <span class="pn" style="${isHandled ? "text-decoration:line-through" : ""}">${esc(fu.pn)}</span>
                 ${fu.desc ? `<div class="dim tiny">${esc(fu.desc)}</div>` : ""}
               </td>
               <td class="right num">${fmtNum(fu.openQty)}</td>
@@ -802,16 +872,15 @@ function _followupGroupHtml(g, chased) {
               <td class="right"><span class="pill ${lc}" style="font-weight:700">${fu.daysPastDue}d late</span></td>
               <td>
                 <div style="display:flex; gap:6px; flex-wrap:wrap">
-                  <button class="btn sm" onclick="draftFollowupEmailRow(${fu._idx})" title="${sentMark ? `A Coverage Gaps expedite for this part+PO was sent on ${esc(sentOnCG)} — click to draft anyway` : "Draft a chase email for this late line"}">✉ Draft email${sentMark ? " (already sent)" : ""}</button>
+                  <button class="btn sm" style="${emailBtnStyle}" onclick="draftFollowupEmailRow(${fu._idx})" title="${emailBtnTitle}">✉ Draft email</button>
                   <button class="btn sm" onclick="openPODetail('${esc(fu.po.id)}')">Open PO</button>
                 </div>
               </td>
               <td class="right">
-                <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${isChased ? `Marked chased on ${chasedOn} (shared across users · uncheck to clear)` : "Mark chased (shared across users for 3 business days)"}">
-                  <input type="checkbox" class="chk" ${isChased ? "checked" : ""} onchange="toggleFollowupChased('${esc(key)}')">
-                  <span class="muted tiny" style="min-width:42px; text-align:left">${isChased ? `Chased on ${esc(chasedOn)}` : ""}</span>
+                <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${chasedBoxTitle}">
+                  <input type="checkbox" class="chk" ${isHandled ? "checked" : ""} onchange="toggleFollowupChased('${esc(key)}')">
+                  <span class="muted tiny" style="min-width:42px; text-align:left">${isHandled ? `Chased on ${esc(chasedOn)}` : ""}</span>
                 </label>
-                ${sentMark ? `<div class="muted tiny" style="margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="A Coverage Gaps sent mark for this part+PO is active on ${esc(sentOnCG)} (shared across users)">Sent on ${esc(sentOnCG)}</div>` : ""}
               </td>
             </tr>`;
           }).join("")}
@@ -956,20 +1025,11 @@ function draftFollowupEmailRow(idx) {
 function draftFollowupEmailSupplier(gidx) {
   const g = (window._FOLLOWUP_GROUPS || [])[gidx];
   if (!g || !g.lines.length) { showToast("Follow-up group not found — refresh the page", "warn"); return; }
-  // Skip lines already handled — either own-chased on this screen, or
-  // covered by an active Coverage Gaps "sent" mark for the same
-  // part+PO. Same pattern as draftCoverageExpediteAll's dedup, mirrored
-  // so a supplier isn't asked twice about the same PO line.
-  const chasedRowActive = (fu) => {
-    const rowId = `chased::${_followupKey(fu)}`;
-    const mark = (window.followMarks || new Map()).get(rowId);
-    return !!(mark && isMarkActive(mark));
-  };
-  const sentElsewhere = (fu) => {
-    const m = partPoHandledBy(fu.pn, fu.po.id);
-    return !!(m && m.type === "sent");
-  };
-  const pendingLines = g.lines.filter(fu => !chasedRowActive(fu) && !sentElsewhere(fu));
+  // Skip lines already handled — unified predicate: any active mark
+  // (new-canonical handled, legacy sent, legacy chased) for this
+  // (pn, po.id) counts. A supplier is never asked twice about the
+  // same PO line, regardless of which tab made the mark.
+  const pendingLines = g.lines.filter(fu => !isPartPoHandled(fu.pn, fu.po.id));
   if (!pendingLines.length) {
     showToast("Every line for this supplier is already chased or sent", "warn");
     return;
@@ -1084,29 +1144,15 @@ function draftCoverageExpediteRow(idx) {
 function draftCoverageExpediteAll() {
   const gaps = (window._COVERAGE_GAPS || []);
   if (!gaps.length) { showToast("No coverage gaps to draft", "warn"); return; }
-  const isSentActive = (g) => {
-    const rowId = _sentRowId(g);
-    const mark = (window.followMarks || new Map()).get(rowId);
-    return !!(mark && isMarkActive(mark));
-  };
-  const _resolveOverduePoId = (poNum) => {
-    const rec = poNum ? (DB.pos || []).find(x => x && x.num === poNum) : null;
-    return rec ? rec.id : null;
-  };
-  const isHandledElsewhere = (g) => {
-    const overdueLines = (g.overdueRisk && g.overdueRisk.overdueLines) || [];
-    const poIds = Array.from(new Set([
-      ...(g.coveringPOs || []).map(c => c.poId).filter(Boolean),
-      ...overdueLines.map(ol => _resolveOverduePoId(ol.po)).filter(Boolean),
-    ]));
-    return poIds.some(pid => isPartPoHandled(g.part.pn, pid));
-  };
-  const pending = gaps.filter(g => !isSentActive(g) && !isHandledElsewhere(g));
+  // Under the unified handled-mark model, a CG row is considered
+  // "handled" (skip in bulk draft) iff EVERY covering PO carries an
+  // active mark — same predicate the checkbox uses for its checked
+  // state. Partial rows (indeterminate box) still get drafted so the
+  // remaining POs are chased. `_st` was precomputed by the render.
+  const rowHandled = (g) => (g._st ? g._st.all : _cgHandledState(g).all);
+  const pending = gaps.filter(g => !rowHandled(g));
   if (!pending.length) {
-    const msg = gaps.every(g => isSentActive(g) || isHandledElsewhere(g))
-      ? "All at-risk parts already followed up this session"
-      : "Every visible coverage gap is already marked sent";
-    showToast(msg, "warn");
+    showToast("All at-risk parts already followed up this session", "warn");
     return;
   }
   // Group by primarySupplier — ONE email per supplier, always.
@@ -1204,25 +1250,20 @@ function coverageGapCount() {
 }
 
 function renderCoverageGaps() {
-  // Build the sentByPn map from window.followMarks — same pattern the
-  // Follow-Ups render used to use when Coverage Gaps was inline there.
-  // Active = within 3 business days (isMarkActive); stale rows fall
-  // through and render normal.
-  const sentByPn = new Map();      // pn → markedAt (ISO)
-  for (const [, mark] of (window.followMarks || new Map()).entries()) {
-    if (!mark || !isMarkActive(mark)) continue;
-    if (mark.type === "sent" && mark.pn) {
-      sentByPn.set(String(mark.pn), mark.markedAt);
-    }
-  }
-
   const allCoverageGaps = computeCoverageGaps();
-  // Hide-sent filters by ACTIVE-marked rows. Totals stay =
-  // allCoverageGaps.length so the header count reflects ALL exposed parts.
-  const sentCount = allCoverageGaps.reduce((n, g) => n + (sentByPn.has(_coverageGapKey(g)) ? 1 : 0), 0);
+  // Attach unified handled-state per gap ONCE. Used by header count,
+  // hide-sent filter, row-render checkbox state, and PN-strikethrough /
+  // row-dim styling. Reads window.followMarks via isPartPoHandled —
+  // legacy sent/chased marks are still recognized so anything already
+  // checked stays checked on load.
+  for (const g of allCoverageGaps) g._st = _cgHandledState(g);
+  // "Sent this session" = fully-handled rows (every covering PO marked).
+  // Partial state is NOT counted here — the row is still exposed and
+  // needs the remaining POs chased.
+  const sentCount = allCoverageGaps.reduce((n, g) => n + (g._st.all ? 1 : 0), 0);
   const overdueRiskCount = allCoverageGaps.reduce((n, g) => n + (g.overdueRisk ? 1 : 0), 0);
   const coverageGaps = FOLLOWUP_STATE.hideSentGaps
-    ? allCoverageGaps.filter(g => !sentByPn.has(_coverageGapKey(g)))
+    ? allCoverageGaps.filter(g => !g._st.all)
     : allCoverageGaps;
   // _idx assigned on the post-filter array so per-row Draft buttons still
   // resolve when hide-sent is on. Mirrors the earlier inline behavior.
@@ -1286,13 +1327,16 @@ function renderCoverageGaps() {
               ${coverageGaps.map(g => {
                 const p = g.part;
                 const sentKey = _coverageGapKey(g);
-                const sentAt = sentByPn.get(sentKey) || null;
-                const isSent = !!sentAt;
-                const sentOn = sentAt && typeof fmtDate === "function"
-                  ? fmtDate(new Date(sentAt))
+                // Unified handled state per row (precomputed in the page
+                // header). Fully-handled = every covering PO carries an
+                // active mark; partial = at least one but not all.
+                const st = g._st;
+                const earliestDate = _earliestActiveDate(st.marks);
+                const sentOn = earliestDate && typeof fmtDate === "function"
+                  ? fmtDate(earliestDate)
                   : "";
-                const sentRowStyle = isSent ? "opacity:0.45" : "";
-                const sentPnStyle = isSent ? "text-decoration:line-through" : "";
+                const sentRowStyle = st.all ? "opacity:0.45" : "";
+                const sentPnStyle = st.all ? "text-decoration:line-through" : "";
                 // Overdue-risk fallbacks (see computeCoverageGap): when
                 // the normal-gap projection didn't dip (because the late
                 // PO was clamped to today) but ignoring the overdue line
@@ -1360,36 +1404,29 @@ function renderCoverageGaps() {
                   ? g.coveringPOs[0].poNum
                   : (hasOverdueLines ? (overdueLines[0].po || "") : "");
                 const hasAnyPO = hasCoveringPO || hasOverdueLines;
-                // Cross-page correlation: if this row wasn't own-sent but
-                // any of its covering/overdue poIds appears in an active
-                // Follow-Ups "chased" mark for the same PN, another user
-                // (or the current user on Follow-Ups) already chased it.
-                // Union the poIds we care about — the same set that goes
-                // into the sent-write's coveredPoIds — then look up the
-                // matching mark for its markedAt display.
-                const rowPoIds = Array.from(new Set([
-                  ...g.coveringPOs.map(c => c.poId).filter(Boolean),
-                  ...overdueLines.map(ol => _findPoId(ol.po)).filter(Boolean),
-                ]));
-                let handledMark = null;
-                if (!isSent) {
-                  for (const pid of rowPoIds) {
-                    const m = partPoHandledBy(p.pn, pid);
-                    // Only cross-page marks matter here — a legacy "sent"
-                    // mark that already surfaces via the sentByPn check
-                    // above shouldn't double-count.
-                    if (m && m.type === "chased") { handledMark = m; break; }
-                  }
-                }
-                const handledOn = handledMark && typeof fmtDate === "function"
-                  ? fmtDate(new Date(handledMark.markedAt))
-                  : "";
-                const draftLabel = hasAnyPO
-                  ? (handledMark ? "✉ Move up (already chased)" : "✉ Move up")
-                  : "✉ Order";
+                // Checkbox state derives from the row-level `st` object.
+                // Three-state affordance:
+                //   all handled     → checked
+                //   partial handled → indeterminate (native browser dash
+                //                     glyph, set via _applyIndeterminateBoxes
+                //                     after render)
+                //   none handled    → unchecked
+                const cgBoxTitle = st.all
+                  ? `Marked sent on ${esc(sentOn)} — all ${st.pairs.length} covering PO${st.pairs.length === 1 ? '' : 's'} handled (shared across users · uncheck to clear)`
+                  : (st.partial
+                      ? `${st.activeCount} of ${st.pairs.length} covering POs marked handled — click to mark all (shared across users)`
+                      : "Mark sent (shared across users for 3 business days)");
+                const cgBoxLabel = st.all
+                  ? `Sent on ${esc(sentOn)}`
+                  : (st.partial ? `Sent ${st.activeCount}/${st.pairs.length}` : "");
+                // Draft button: label stays short; opacity dims when the
+                // row is fully handled so the "already dealt with" signal
+                // is visually apparent without changing the button width.
+                const draftLabel = hasAnyPO ? "✉ Move up" : "✉ Order";
+                const draftBtnStyle = st.all ? "opacity:0.55" : "";
                 const draftTitle = hasAnyPO
-                  ? (handledMark
-                      ? `Already chased on Follow-Ups on ${esc(handledOn)} — click to draft anyway`
+                  ? (st.any
+                      ? `Marked sent on ${esc(sentOn)} — click to draft again`
                       : `Draft delivery move-up email to ${esc(g.primarySupplier || "supplier")} for PO ${esc(firstPoNum)} — deliver by ${esc(fmtDate(effWantBy))}`)
                   : `Draft order/quote request to ${esc(g.primarySupplier || "supplier")} — deliver by ${esc(fmtDate(effWantBy))}`;
                 return `
@@ -1403,16 +1440,15 @@ function renderCoverageGaps() {
                     <td class="right num bold text-crit">${effGapDays != null ? fmtNum(effGapDays) + 'd' : '<span class="dim">—</span>'}</td>
                     <td class="right num">${effShortfall != null ? fmtNum(effShortfall) : '<span class="dim">—</span>'}</td>
                     <td>
-                      <button class="btn sm primary" onclick="event.stopPropagation(); draftCoverageExpediteRow(${g._idx})" title="${draftTitle}">${draftLabel}</button>
+                      <button class="btn sm primary" style="${draftBtnStyle}" onclick="event.stopPropagation(); draftCoverageExpediteRow(${g._idx})" title="${draftTitle}">${draftLabel}</button>
                       ${firstPoId ? `<button class="btn sm" onclick="event.stopPropagation(); openPODetail('${esc(firstPoId)}')" title="Open PO ${esc(firstPoNum)}">PO</button>` : ''}
                     </td>
                     <td class="right" style="white-space:normal">
-                      <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${isSent ? `Marked sent on ${sentOn} (shared across users · uncheck to clear)` : "Mark sent (shared across users for 3 business days)"}"
+                      <label class="row" style="gap:5px; justify-content:flex-end; cursor:pointer" title="${cgBoxTitle}"
                              onclick="event.stopPropagation()">
-                        <input type="checkbox" class="chk" ${isSent ? "checked" : ""} onchange="toggleCoverageGapSent('${esc(sentKey)}')">
-                        <span class="muted tiny" style="min-width:34px; text-align:left">${isSent ? `Sent on ${esc(sentOn)}` : ""}</span>
+                        <input type="checkbox" class="chk" ${st.all ? "checked" : ""} ${st.partial ? 'data-indeterminate="1"' : ''} onchange="toggleCoverageGapSent('${esc(sentKey)}')">
+                        <span class="muted tiny" style="min-width:34px; text-align:left">${cgBoxLabel}</span>
                       </label>
-                      ${handledMark ? `<div class="muted tiny" style="margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="A Follow-Ups chased mark for this part+PO is active on ${esc(handledOn)} (shared across users)">Chased on ${esc(handledOn)}</div>` : ""}
                     </td>
                   </tr>
                 `;
@@ -1425,6 +1461,11 @@ function renderCoverageGaps() {
       `}
     </div>
   `;
+  // The `indeterminate` state of a checkbox is a DOM-only property and
+  // can't be set via HTML attribute — apply it now that the innerHTML
+  // has landed. Partial-handled multi-PO rows use this native affordance
+  // (dash-in-box glyph) with no new CSS.
+  _applyIndeterminateBoxes();
 }
 
 registerRoute("followups", renderFollowUps);
