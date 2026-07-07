@@ -14,3 +14,8 @@
 # "LM Planner BOM" GI; slow-moving reference data, separate cadence.
 [functions."acumatica-bom-sync"]
   schedule = "0 6 * * *"
+
+# Daily Kit sync — runs once at 06:00 UTC. Reconciles kit_boms from the
+# "LM Planner Kit Components" GI; slow-moving reference data, same cadence as BOM.
+[functions."acumatica-kit-sync"]
+  schedule = "0 6 * * *"
