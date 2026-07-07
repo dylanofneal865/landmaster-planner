@@ -821,38 +821,135 @@ function _followupGroupHtml(g, chased) {
 }
 
 /* ============================================================
-   DRAFT CHASE EMAILS
-   No email backend exists, so we build a mailto: draft (opened via a transient
-   anchor so the SPA doesn't navigate) AND copy the text to the clipboard as a
-   fallback. If the clipboard is unavailable, a modal shows the text to copy by
-   hand. Data is read back from the window stash by the index baked into the
-   button, so descriptions with quotes/commas never go through an onclick string.
+   DRAFT CHASE EMAILS — shared voice across Follow-Ups + Coverage Gaps.
+
+   No email backend exists, so we build a mailto: draft (opened via a
+   transient anchor so the SPA doesn't navigate) AND copy the text to
+   the clipboard as a fallback. If the clipboard is unavailable, a
+   modal shows the text to copy by hand. Data is read back from the
+   window stash by index, so descriptions with quotes/commas never
+   round-trip through an onclick string.
+
+   The voice — greeting rule, INTRO/ASK/CLOSE lines, subject
+   template, per-line bullet format — is defined ONCE below and
+   every drafter reuses it. To reword any of it, change the const or
+   helper here, never inside a specific drafter.
    ============================================================ */
-function _followupLineBlock(fu) {
-  return [
-    `PO ${fu.po.num}`,
-    `Part: ${fu.pn}${fu.desc ? " — " + fu.desc : ""}`,
-    `Qty open: ${fmtNum(fu.openQty)}`,
-    `Original expected date: ${fmtDate(fu.expRaw)}`,
-    `Days overdue: ${fu.daysPastDue}`,
-  ].join("\n");
+
+// ── Shared voice ─────────────────────────────────────────────────
+const CHASE_INTRO = "This is an automated message. Our system flagged the line below as overdue, and we're following up — a short, quick reply would be great.";
+const CHASE_ASK   = "Please reply with the current status and a revised ship date. If something's holding it up, let us know and we'll help however we can.";
+const CHASE_CLOSE = "Thanks for the help.";
+
+// Pluralization is a small swap on the same INTRO const — not a
+// separate string — so a future INTRO rewrite can't drift between
+// the singular and plural variants.
+function _chaseIntro(multi) {
+  return multi ? CHASE_INTRO.replace("the line below", "the lines below") : CHASE_INTRO;
 }
 
+// Full 4-digit year — never "Jun 19, 26". fmtDate in js/02-utils.js
+// uses year:"2-digit" for on-screen density; supplier-facing dates
+// must not truncate the year. YYYY-MM-DD strings parse as local
+// dates to avoid the UTC-midnight off-by-one in US timezones.
+function _fmtDateForEmail(d) {
+  if (!d) return "";
+  let dt;
+  if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d) && typeof parseDateLocal === "function") {
+    dt = parseDateLocal(d);
+  } else {
+    dt = (d instanceof Date) ? d : new Date(d);
+  }
+  if (!dt || isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
+// Greeting name: strip a trailing legal suffix so
+// "Schafer Driveline, LLC" reads "Schafer Driveline team", not
+// "Schafer Driveline, LLC team". Suffix can be preceded by a comma
+// or plain space; trailing period is optional. Falls back to "there"
+// for empty or dash-placeholder supplier names.
+function _supplierGreetingName(name) {
+  const s = String(name || "").trim();
+  if (!s || s === "—") return "there";
+  const stripped = s.replace(/,?\s+(l\.?l\.?c|l\.?l\.?p|inc|corp(?:oration)?|co|company|ltd|limited)\.?\s*$/i, "").trim();
+  return stripped || s;
+}
+function _chaseGreeting(name) {
+  const clean = _supplierGreetingName(name);
+  return clean === "there" ? "Hi there," : `Hi ${clean} team,`;
+}
+
+// Per-line bullet block — one shape, two phrasings depending on
+// whether the line is literally overdue (daysPastDue > 0) or a
+// pull-in request (covering PO is still future). All four drafters
+// normalize their source data into this input shape so the wording
+// lives in one place.
+function _chaseBulletForLine({ pn, desc, openQty, expectedDate, daysPastDue, wantByDate }) {
+  const isOverdue = daysPastDue != null && daysPastDue > 0;
+  const partLine = `  • Part ${pn}${desc ? ` — ${desc}` : ""}`;
+  const qtyLine  = `    Qty open: ${fmtNum(openQty)}`;
+  const dateLine = isOverdue
+    ? `    Originally expected: ${_fmtDateForEmail(expectedDate)} (${daysPastDue} days overdue)`
+    : (wantByDate
+        ? `    Currently expected: ${_fmtDateForEmail(expectedDate)} — needed by ${_fmtDateForEmail(wantByDate)}`
+        : `    Currently expected: ${_fmtDateForEmail(expectedDate)}`);
+  return [partLine, qtyLine, dateLine].join("\n");
+}
+function _chasePOBlock(poNum, lines) {
+  return `PO ${poNum}\n${lines.map(_chaseBulletForLine).join("\n")}`;
+}
+function _assembleChaseEmail({ supplier, multi, poBlocks }) {
+  return [
+    _chaseGreeting(supplier),
+    "",
+    _chaseIntro(multi),
+    "",
+    poBlocks.join("\n\n"),
+    "",
+    CHASE_ASK,
+    "",
+    CHASE_CLOSE,
+  ].join("\n");
+}
+function _chaseSubjectSingleOverdue(poNum, pn, days) {
+  return `Action needed — PO ${poNum} overdue (Part ${pn}, ${days} days)`;
+}
+function _chaseSubjectSinglePullIn(poNum, pn) {
+  return `Action needed — PO ${poNum} delivery pull-in requested (Part ${pn})`;
+}
+function _chaseSubjectBundle(lineCount, anyOverdue) {
+  const today = _fmtDateForEmail(new Date());
+  return anyOverdue
+    ? `Action needed — ${lineCount} overdue line${lineCount === 1 ? "" : "s"} (as of ${today})`
+    : `Action needed — ${lineCount} line${lineCount === 1 ? "" : "s"} needing attention (as of ${today})`;
+}
+
+// Effective want-by for compose paths: normal target when set, else
+// TODAY (overdue-only rows have targetArrivalDate === null and their
+// asked delivery is "as soon as possible / right now").
+function _effectiveWantBy(g) {
+  return g.targetArrivalDate || TODAY;
+}
+
+// ── Follow-Ups drafters ─────────────────────────────────────────
 function draftFollowupEmailRow(idx) {
   const fu = (window._FOLLOWUPS || [])[idx];
   if (!fu) { showToast("Follow-up not found — refresh the page", "warn"); return; }
-  const who = (fu.supplier && fu.supplier !== "—") ? fu.supplier : "there";
-  const subject = `Follow-up: PO ${fu.po.num} overdue ${fu.daysPastDue} days`;
-  const body =
-`Hi ${who},
-
-Following up on an overdue purchase order line:
-
-${_followupLineBlock(fu)}
-
-Could you confirm the current status and a revised ship/arrival date?
-
-Thank you.`;
+  const line = {
+    pn: fu.pn,
+    desc: fu.desc || "",
+    openQty: fu.openQty,
+    expectedDate: fu.expRaw,
+    daysPastDue: fu.daysPastDue,
+    wantByDate: null,
+  };
+  const subject = _chaseSubjectSingleOverdue(fu.po.num, fu.pn, fu.daysPastDue);
+  const body = _assembleChaseEmail({
+    supplier: fu.supplier,
+    multi: false,
+    poBlocks: [_chasePOBlock(fu.po.num, [line])],
+  });
   _openMailDraft(subject, body);
 }
 
@@ -877,112 +974,121 @@ function draftFollowupEmailSupplier(gidx) {
     showToast("Every line for this supplier is already chased or sent", "warn");
     return;
   }
-  const who = (g.supplier && g.supplier !== "—") ? g.supplier : "there";
-  const worstPending = pendingLines.reduce((m, fu) => Math.max(m, fu.daysPastDue), 0);
-  const subject = `Follow-up: ${pendingLines.length} overdue PO line${pendingLines.length === 1 ? "" : "s"} — worst ${worstPending} days`;
-  const lines = pendingLines.map(fu => _followupLineBlock(fu).split("\n").map((l, i) => (i === 0 ? `• ${l}` : `  ${l}`)).join("\n")).join("\n\n");
-  const body =
-`Hi ${who},
-
-We have ${pendingLines.length} overdue purchase order line${pendingLines.length === 1 ? "" : "s"} we'd like to chase:
-
-${lines}
-
-Could you confirm current status and revised dates for each?
-
-Thank you.`;
+  // Group by PO within this supplier so a supplier with multiple
+  // late lines on one PO sees them clustered under that PO, not
+  // scattered as top-level bullets.
+  const byPo = new Map();
+  for (const fu of pendingLines) {
+    if (!byPo.has(fu.po.num)) byPo.set(fu.po.num, []);
+    byPo.get(fu.po.num).push({
+      pn: fu.pn,
+      desc: fu.desc || "",
+      openQty: fu.openQty,
+      expectedDate: fu.expRaw,
+      daysPastDue: fu.daysPastDue,
+      wantByDate: null,
+    });
+  }
+  const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _chasePOBlock(poNum, lines));
+  const subject = _chaseSubjectBundle(pendingLines.length, true);   // Follow-Ups: always literally overdue
+  const body = _assembleChaseEmail({
+    supplier: g.supplier,
+    multi: pendingLines.length > 1,
+    poBlocks,
+  });
   _openMailDraft(subject, body);
 }
 
-/* ============================================================
-   COVERAGE-GAP EMAILS — delivery-move-up draft per row, plus a
-   section-level "Draft all expedites" that bundles by supplier.
-   Reuses _openMailDraft (mailto: → clipboard → modal) for parity with
-   the supplier follow-up drafts above.
-
-   IMPORTANT — supplier-facing wording only. No runout date, no
-   "2.5 weeks", no on-hand / daily / shortfall, no current expected.
-   The email states only what the supplier needs to act on: PO# (if
-   any), part PN + desc, and the requested delivery date (the want-by
-   computed internally as runout − 18d). The reasoning behind that
-   date is deliberately not exposed.
-   ============================================================ */
-
-// PO numbers to reference when composing a chase email: normal covering
-// POs when the projection dips + recovers; else the overdue-line PO nums
-// from overdueRisk (both are "a PO already on order for this part"). An
-// overdue-only row has an overdue PO to chase, not a fresh order to place.
-function _chasePoNums(g) {
-  if (g.coveringPOs && g.coveringPOs.length) {
-    return g.coveringPOs.map(c => c.poNum).filter(Boolean);
+// ── Coverage Gaps drafters ──────────────────────────────────────
+// Build normalized chase lines from one gap. Overdue-only rows use
+// overdueLines (literally overdue POs); normal-gap rows use
+// coveringPOs (future-expected, delivery needs pull-in). Overdue
+// takes precedence when both are set — the overdue line IS the
+// covering line and its actual expected date is the truth.
+function _coverageGapChaseLines(g) {
+  const chaseLines = [];
+  const overdueLines = (g.overdueRisk && g.overdueRisk.overdueLines) || [];
+  const wantBy = _effectiveWantBy(g);
+  if (overdueLines.length) {
+    for (const ol of overdueLines) {
+      const exp = ol.expected
+        ? (typeof parseDateLocal === "function" ? parseDateLocal(ol.expected) : new Date(ol.expected))
+        : null;
+      const days = (exp && !isNaN(exp.getTime()))
+        ? Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS)
+        : 0;
+      chaseLines.push({
+        poNum: ol.po || "",
+        pn: g.part.pn,
+        desc: g.part.desc || "",
+        openQty: ol.qty || 0,
+        expectedDate: exp || ol.expected,
+        daysPastDue: days,
+        wantByDate: wantBy,
+      });
+    }
+  } else {
+    for (const c of (g.coveringPOs || [])) {
+      const exp = c.expectedDate;
+      const days = (exp && exp.getTime)
+        ? Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS)
+        : 0;
+      chaseLines.push({
+        poNum: c.poNum || "",
+        pn: g.part.pn,
+        desc: g.part.desc || "",
+        openQty: c.qty || 0,
+        expectedDate: exp,
+        daysPastDue: days,   // will be <= 0 → pull-in phrasing in the bullet
+        wantByDate: wantBy,
+      });
+    }
   }
-  const overdueLines = g.overdueRisk && g.overdueRisk.overdueLines;
-  if (overdueLines && overdueLines.length) {
-    return overdueLines.map(ol => ol.po).filter(Boolean);
-  }
-  return [];
-}
-
-// Effective want-by for compose paths: normal target when set, else TODAY
-// (overdue-only rows have targetArrivalDate === null and their asked
-// delivery is "as soon as possible / right now").
-function _effectiveWantBy(g) {
-  return g.targetArrivalDate || TODAY;
-}
-
-// One-line supplier-facing description of an exposed part:
-//   "PO <#> for <PN> (<desc>)"   when a covering PO OR overdue PO exists
-//   "<PN> (<desc>)"               otherwise
-// Used both standalone (per-row) and as the bullet content (bundled).
-function _coverageGapLineDescription(g) {
-  const p = g.part;
-  const partPart = p.desc ? `${p.pn} (${p.desc})` : p.pn;
-  const poNums = _chasePoNums(g);
-  if (poNums.length) {
-    return `PO ${poNums.join(", ")} for ${partPart}`;
-  }
-  return partPart;
+  return chaseLines;
 }
 
 function draftCoverageExpediteRow(idx) {
   const g = (window._COVERAGE_GAPS || [])[idx];
   if (!g) { showToast("Coverage gap not found — refresh the page", "warn"); return; }
-  const who = (g.primarySupplier && g.primarySupplier !== "—") ? g.primarySupplier : "there";
-  const wantBy = fmtDate(_effectiveWantBy(g));
-  const poNums = _chasePoNums(g);
-  const hasAnyPO = poNums.length > 0;
-  const subject = hasAnyPO
-    ? `Delivery move-up request: PO ${poNums.join(", ")} by ${wantBy}`
-    : `Delivery request: ${g.part.pn} by ${wantBy}`;
-  // Single short sentence covering the ask. No runout, no buffer
-  // language, no internal numbers.
-  const sentence = hasAnyPO
-    ? `We need to move up delivery on ${_coverageGapLineDescription(g)}. Could you confirm whether you can deliver by ${wantBy}?`
-    : `We'd like to order ${_coverageGapLineDescription(g)}. Could you confirm whether you can deliver by ${wantBy}?`;
-  const body = `Hi ${who},\n\n${sentence}\n\nThank you.`;
+  const chaseLines = _coverageGapChaseLines(g);
+  if (!chaseLines.length) {
+    showToast("No PO on this row to reference — nothing to draft", "warn");
+    return;
+  }
+  // Group by PO — a row can carry multiple covering/overdue POs, and
+  // grouping keeps each PO's lines clustered under its own header.
+  const byPo = new Map();
+  for (const l of chaseLines) {
+    if (!byPo.has(l.poNum)) byPo.set(l.poNum, []);
+    byPo.get(l.poNum).push(l);
+  }
+  const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _chasePOBlock(poNum, lines));
+  const anyOverdue = chaseLines.some(l => l.daysPastDue > 0);
+  const worstDays = chaseLines.reduce((m, l) => Math.max(m, l.daysPastDue), 0);
+  const firstPo = chaseLines[0].poNum;
+  const subject = anyOverdue
+    ? _chaseSubjectSingleOverdue(firstPo, g.part.pn, worstDays)
+    : _chaseSubjectSinglePullIn(firstPo, g.part.pn);
+  const body = _assembleChaseEmail({
+    supplier: g.primarySupplier || "",
+    multi: chaseLines.length > 1,
+    poBlocks,
+  });
   _openMailDraft(subject, body);
 }
 
-// Section-level "Draft all expedites": one email per supplier covering
-// every NOT-YET-SENT exposed line they own. Sent rows are skipped
-// regardless of the Hide-sent toggle state — bundling something the
-// user already sent would re-spam the supplier.
+// Section-level "Draft all expedites": one email per supplier
+// covering every NOT-YET-SENT + NOT-HANDLED-ELSEWHERE exposed line
+// they own. Per-supplier fan-out is critical — bundling parts from
+// different suppliers into one email is never correct.
 function draftCoverageExpediteAll() {
   const gaps = (window._COVERAGE_GAPS || []);
   if (!gaps.length) { showToast("No coverage gaps to draft", "warn"); return; }
-  // Drop already-sent rows up front — even if they're still visible
-  // (Hide-sent off), the supplier was already told about those.
-  // Reads window.followMarks filtered to active marks; mirrors the
-  // hide-sent / sentByPn logic in renderCoverageGaps so the bundled-draft
-  // skips the same rows the row checkboxes consider already sent.
   const isSentActive = (g) => {
     const rowId = _sentRowId(g);
     const mark = (window.followMarks || new Map()).get(rowId);
     return !!(mark && isMarkActive(mark));
   };
-  // Also drop rows where the same (part+PO) already has an active
-  // chased mark on Follow-Ups. Bulk expedite must not re-contact a
-  // supplier for a part the other screen already flagged as chased.
   const _resolveOverduePoId = (poNum) => {
     const rec = poNum ? (DB.pos || []).find(x => x && x.num === poNum) : null;
     return rec ? rec.id : null;
@@ -1003,27 +1109,36 @@ function draftCoverageExpediteAll() {
     showToast(msg, "warn");
     return;
   }
-  // Group by primarySupplier so each vendor gets one bundled email.
+  // Group by primarySupplier — ONE email per supplier, always.
+  // Cross-supplier bundling would send factually wrong content
+  // (a supplier reading about parts they don't own).
   const bySupplier = new Map();
   for (const g of pending) {
     const key = g.primarySupplier || "—";
     if (!bySupplier.has(key)) bySupplier.set(key, []);
     bySupplier.get(key).push(g);
   }
-  // Soonest want-by per supplier drives the subject line. Uses the
-  // effective want-by so overdue-only rows (null targetArrivalDate) are
-  // pulled in at TODAY rather than throwing a null-compare.
-  const earliestOf = (list) => list.reduce((m, g) => {
-    const w = _effectiveWantBy(g);
-    return (m === null || w < m) ? w : m;
-  }, null);
   let opened = 0;
   for (const [supplier, list] of bySupplier.entries()) {
-    const who = (supplier && supplier !== "—") ? supplier : "there";
-    const earliest = earliestOf(list);
-    const subject = `Delivery move-up request: ${list.length} line${list.length === 1 ? "" : "s"} — earliest by ${fmtDate(earliest)}`;
-    const bullets = list.map(g => `• ${_coverageGapLineDescription(g)} — deliver by ${fmtDate(_effectiveWantBy(g))}`).join("\n");
-    const body = `Hi ${who},\n\nWe need to move up delivery on the following:\n\n${bullets}\n\nCould you confirm what's achievable for each?\n\nThank you.`;
+    // Flatten every gap for this supplier into chase lines, then
+    // group by PO within THIS supplier's email so the same email
+    // never spans multiple suppliers but does cluster multiple
+    // lines under a shared PO header when relevant.
+    const allChaseLines = list.flatMap(_coverageGapChaseLines);
+    if (!allChaseLines.length) continue;
+    const byPo = new Map();
+    for (const l of allChaseLines) {
+      if (!byPo.has(l.poNum)) byPo.set(l.poNum, []);
+      byPo.get(l.poNum).push(l);
+    }
+    const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _chasePOBlock(poNum, lines));
+    const anyOverdue = allChaseLines.some(l => l.daysPastDue > 0);
+    const subject = _chaseSubjectBundle(allChaseLines.length, anyOverdue);
+    const body = _assembleChaseEmail({
+      supplier,
+      multi: allChaseLines.length > 1,
+      poBlocks,
+    });
     _openMailDraft(subject, body);
     opened++;
   }

@@ -296,6 +296,85 @@ function mlbSetSearch(q) {
   }, 150);
 }
 
+/* ============================================================
+   MISSING-COMPONENTS BADGE — for each finished good, count how many
+   distinct exploded leaf PNs aren't in DB.parts. Zero → no badge.
+   Flags FGs whose builds reference parts the planner isn't tracking
+   so engineering can decide whether they belong in the catalog.
+
+   Reuses explodeBOM (js/03-calc.js:157) — no second explosion path.
+   PN comparison follows the app convention: strict `===` on p.pn,
+   matching openPOQty / partByPn / every other DB.parts.find site.
+
+   Cache: 91 FGs × recursive explosion over 13k+ links is heavy for
+   every render, so results live in a Map(fgPn → count) and only
+   rebuild when either the BOM data reference or the parts version
+   changes. bumpStatusCache() (js/03-calc.js:889) bumps
+   _statusCacheVer on every DB.parts mutation, and the BOM index
+   auto-invalidates when DB.bomLinks is replaced by cloud sync.
+   ============================================================ */
+let _mlbMissingCache = null;
+let _mlbMissingCacheKey = null;
+function _mlbMissingKeyNow() {
+  return {
+    bomSrc: (typeof DB !== "undefined" && Array.isArray(DB.bomLinks)) ? DB.bomLinks : null,
+    partsVer: (typeof _statusCacheVer !== "undefined") ? _statusCacheVer : 0,
+  };
+}
+function _mlbBuildMissingCache() {
+  const partsSet = new Set(
+    ((typeof DB !== "undefined" && Array.isArray(DB.parts)) ? DB.parts : [])
+      .map(p => p && p.pn)
+      .filter(Boolean)
+  );
+  const fgs = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS)) ? FINISHED_GOODS : [];
+  const cache = new Map();
+  for (const fg of fgs) {
+    const pn = (fg && typeof fg === "object") ? fg.pn : (typeof fg === "string" ? fg : null);
+    if (!pn) continue;
+    const seenLeafPns = new Set();
+    let missing = 0;
+    try {
+      const result = (typeof explodeBOM === "function") ? explodeBOM(pn) : null;
+      const leaves = (result && Array.isArray(result.leaves)) ? result.leaves : [];
+      for (const l of leaves) {
+        if (!l || !l.pn) continue;
+        if (seenLeafPns.has(l.pn)) continue;
+        seenLeafPns.add(l.pn);
+        if (!partsSet.has(l.pn)) missing++;
+      }
+    } catch (e) {
+      console.warn(`[mlb-missing] explodeBOM failed for ${pn}`, e);
+    }
+    cache.set(pn, missing);
+  }
+  _mlbMissingCache = cache;
+  _mlbMissingCacheKey = _mlbMissingKeyNow();
+  // One summary log per cache rebuild — user can sanity-check totals
+  // against reality without opening 91 rows individually.
+  const withMissing = [...cache.entries()].filter(([, n]) => n > 0);
+  if (withMissing.length) {
+    const top3 = withMissing.sort((a, b) => b[1] - a[1]).slice(0, 3);
+    console.info(
+      `[mlb-missing] ${withMissing.length} finished good(s) with ≥1 missing component; ` +
+      `top 3: ${top3.map(([pn, n]) => `${pn}=${n}`).join(", ")}`
+    );
+  } else {
+    console.info(`[mlb-missing] All ${cache.size} finished good(s) have every component in DB.parts`);
+  }
+}
+function missingComponentCount(fgPn) {
+  if (!fgPn) return 0;
+  const key = _mlbMissingKeyNow();
+  if (!_mlbMissingCache
+      || !_mlbMissingCacheKey
+      || _mlbMissingCacheKey.bomSrc !== key.bomSrc
+      || _mlbMissingCacheKey.partsVer !== key.partsVer) {
+    _mlbBuildMissingCache();
+  }
+  return _mlbMissingCache.get(fgPn) || 0;
+}
+
 function renderMultiLevelBom() {
   const partByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
   // FINISHED_GOODS is now an array of { pn, desc } objects. Catalog desc
@@ -430,11 +509,21 @@ function _mlbListHtml(filteredFgs, sel) {
             // here. The old "not in catalog" label was misleading for FG
             // sidebar rows — FGs are demand drivers, not purchased parts,
             // and aren't expected to have a DB.parts record.
+            //
+            // Missing-components badge: red pill count of exploded leaves
+            // that aren't in DB.parts. `.badge crit` styling is nav-scoped
+            // so we reuse the global `.pill.crit` (same red the Coverage
+            // Gaps rows use for "PO Nd overdue") with inline sizing to
+            // match a count badge. Zero → no badge, per spec.
+            const missing = (typeof missingComponentCount === "function") ? missingComponentCount(fg.pn) : 0;
+            const missingBadge = missing > 0
+              ? ` <span class="pill crit mono" style="font-size:10px; padding:1px 5px; margin-left:4px; border-width:0" title="${missing} component${missing === 1 ? '' : 's'} not in parts catalog">${missing}</span>`
+              : "";
             return `
               <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
                   style="${isSel ? 'background:var(--bg-3);' : ''}">
                 <td>
-                  <div class="pn">${esc(fg.pn)}</div>
+                  <div class="pn">${esc(fg.pn)}${missingBadge}</div>
                   <div class="muted tiny">${esc(fg.desc || '—')}</div>
                 </td>
               </tr>
