@@ -183,7 +183,14 @@ registerRoute("suppliers", () => {
     });
     const a = map.get(key);
     a.parts++;
-    if (p.itemType !== "do_not_order") {
+    // Skip reorder-suppressed parts (Do Not Order OR phasingOut — the
+    // "burn down existing stock" checkbox) from the critical/warning
+    // counters. They still count toward a.parts and a.ohValue (the
+    // supplier still carries them and their on-hand value is real);
+    // only the counters that drive the "should this supplier be
+    // chased?" signal exclude them. Predicate lives in js/03-calc.js
+    // next to isQueueEligible so the rule doesn't drift.
+    if (!isReorderSuppressed(p)) {
       // Count off the TRUE status so muted suppliers still show real
       // crit/warn tallies in their own row. The "muted" override in
       // partsWithStatus flips p.status to "ok" for header/queue/dashboard
@@ -289,9 +296,12 @@ function openSupplierDetail(name) {
   const pos = DB.pos.filter(p => p.supplier === name).sort((a,b) => new Date(b.createdDate) - new Date(a.createdDate));
   const ohValue = parts.reduce((s,p) => s + (p.onHand||0)*(p.cost||0), 0);
   // Drawer always shows the TRUE status; muted parts have p.status forced to
-  // "ok" but keep their original in p._rawStatus.
-  const crit = parts.filter(p => (p._rawStatus || p.status) === "critical" && p.itemType !== "do_not_order").length;
-  const warn = parts.filter(p => (p._rawStatus || p.status) === "warning"  && p.itemType !== "do_not_order").length;
+  // "ok" but keep their original in p._rawStatus. Reorder-suppressed parts
+  // (Do Not Order OR phasingOut) drop out of the crit/warn tally — same
+  // predicate the Suppliers table row uses so the drawer stats never
+  // disagree with the row you clicked.
+  const crit = parts.filter(p => (p._rawStatus || p.status) === "critical" && !isReorderSuppressed(p)).length;
+  const warn = parts.filter(p => (p._rawStatus || p.status) === "warning"  && !isReorderSuppressed(p)).length;
   const avgLT = parts.length > 0 ? round(parts.reduce((s,p) => s + (p.ltWeeks||0), 0) / parts.length, 1) : 0;
   const buyers = [...new Set(parts.map(p => p.buyer).filter(Boolean))];
   const muted = isSupplierMuted(name);

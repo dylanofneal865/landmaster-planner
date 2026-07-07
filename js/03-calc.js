@@ -977,6 +977,25 @@ function isQueueEligible(part) {
   return !!(part && _QUEUE_ITEM_TYPES.has(part.itemType));
 }
 
+// TRUE when a part is intentionally excluded from reorder signals — either
+// itemType === "do_not_order" (the ITEM TYPE dropdown in the part drawer;
+// see js/10-page-parts.js) OR phasingOut === true (the "Stop reordering —
+// burn down existing stock" checkbox on the same drawer). Both flags mean
+// "no future PO should be placed for this part," so critical/warning
+// counters on any supplier-facing / queue-facing surface should skip it.
+//
+// Single-place predicate so the composite rule doesn't drift. Existing
+// call sites (Dashboard "untagged critical" safety net, nav badges,
+// queueParts, order queue) inline the same two checks today and can be
+// refactored to call this helper in a follow-up commit; this turn adds
+// it and wires it into the Suppliers aggregation.
+function isReorderSuppressed(part) {
+  if (!part) return false;
+  if (part.itemType === "do_not_order") return true;
+  if (part.phasingOut) return true;
+  return false;
+}
+
 // PRE-LAUNCH GATE — a superseding part carries a planner-owned
 // transitionStartDate (the cut-in date it's allowed to go live). While that
 // date is still in the FUTURE the part is "pre-launch": not real demand yet,
