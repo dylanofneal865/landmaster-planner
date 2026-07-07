@@ -107,6 +107,65 @@ exports.handler = async (event) => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
+  // ── Tombstone pre-fetch ───────────────────────────────────────────
+  // Every pn present as an active tombstone in `deleted_parts` must be
+  // skipped by the upsert loop AND scrubbed from the `parts` table if
+  // any stale row is still there. The client-side deletePart flow
+  // already does the parts-row delete at delete-time, but this sync
+  // is the safety net for the cases where that write failed silently.
+  //
+  // Table schema mirrors follow_marks / bom_links: `id` text PK + data
+  // jsonb. The pn goes in the `id` column.
+  log("Fetching deleted_parts tombstones");
+  const tombstoned = new Set();
+  {
+    const TS_PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await supa
+        .from("deleted_parts")
+        .select("id")
+        .range(from, from + TS_PAGE - 1);
+      if (error) {
+        // Non-fatal: log and proceed WITHOUT the filter. Better to run
+        // the sync and update on-hands than to bail on a tombstone
+        // fetch glitch — the client's cloudInit filter is a second
+        // line of defense. But surface it loudly in the log.
+        log("WARNING: deleted_parts fetch failed — tombstone filter INACTIVE this run", error);
+        break;
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) if (row && row.id) tombstoned.add(String(row.id));
+      if (data.length < TS_PAGE) break;
+      from += TS_PAGE;
+    }
+  }
+  log(`Loaded ${tombstoned.size} tombstoned pn(s)`);
+
+  // Belt-and-suspenders: scrub any stale `parts` row whose pn is
+  // tombstoned. Chunked delete to stay under the ~16 KB PostgREST URL
+  // ceiling (`id=in.(...)` filter). Non-fatal per chunk — a single
+  // failed scrub doesn't abort the sync; the client filter still
+  // stops resurrection at load time.
+  const tombstonedFeedPns = [];
+  for (const pn of dedupe.keys()) {
+    if (tombstoned.has(pn)) tombstonedFeedPns.push(pn);
+  }
+  if (tombstonedFeedPns.length > 0) {
+    const SCRUB_BATCH = 200;
+    let scrubbed = 0;
+    for (let i = 0; i < tombstonedFeedPns.length; i += SCRUB_BATCH) {
+      const batch = tombstonedFeedPns.slice(i, i + SCRUB_BATCH);
+      const { error } = await supa.from("parts").delete().in("pn", batch);
+      if (error) {
+        log(`WARNING: parts-scrub chunk ${i}-${i + batch.length - 1} failed`, error.message);
+        continue;
+      }
+      scrubbed += batch.length;
+    }
+    log(`Scrubbed ${scrubbed} stale parts row(s) matching tombstones`);
+  }
+
   log("Fetching existing parts from Supabase");
   const existingPns = Array.from(dedupe.keys());
   const PAGE = 1000;
@@ -129,7 +188,11 @@ exports.handler = async (event) => {
 
   const rows = [];
   let unchanged = 0;
+  let tombstoneSkipped = 0;
   for (const [pn, qtyAvail] of dedupe.entries()) {
+    // PRIMARY tombstone gate: even if a stale parts row somehow survived
+    // the scrub above, don't re-upsert it here. Belt AND suspenders.
+    if (tombstoned.has(pn)) { tombstoneSkipped++; continue; }
     const existing = existingMap.get(pn);
     if (!existing) continue;
     if (Number(existing.onHand) === qtyAvail) {
@@ -139,7 +202,7 @@ exports.handler = async (event) => {
     const merged = { ...existing, onHand: qtyAvail };
     rows.push({ pn, data: merged });
   }
-  log(`Will update ${rows.length} parts (${unchanged} unchanged, skipped)`);
+  log(`Will update ${rows.length} parts (${unchanged} unchanged, ${tombstoneSkipped} tombstoned, skipped)`);
 
   const BATCH = 500;
   let totalUpserted = 0;
