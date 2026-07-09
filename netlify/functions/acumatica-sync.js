@@ -458,6 +458,22 @@ async function runPOSync(ctx) {
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
 
+    // Diagnostic — first successfully-keyed entry only. `raw` is the Atom XML
+    // fragment string (see makeFieldGetters), NOT an object, so we scrape
+    // <d:TagName> occurrences via regex to reproduce the "list every tag"
+    // intent. Global guard survives across parse-loop iterations.
+    if (!global.__tagDumped) {
+      global.__tagDumped = true;
+      const tagNames = [...new Set(
+        [...raw.matchAll(/<d:([A-Za-z0-9_]+)(?:\s[^>]*)?>/g)].map(m => m[1])
+      )].sort();
+      console.log("[acumatica-sync] ALL TAGS:", JSON.stringify(tagNames));
+      const dateExpTags = tagNames
+        .filter(k => /exp|date/i.test(k))
+        .map(k => ({ tag: k, val: get(k) }));
+      console.log("[acumatica-sync] DATE/EXP TAGS:", JSON.stringify(dateExpTags));
+    }
+
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
       headerExpectedByOrder.set(num, toDateStr(get("ExpectedDate")));
