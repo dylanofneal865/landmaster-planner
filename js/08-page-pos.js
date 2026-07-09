@@ -132,10 +132,39 @@ function posDisplayStatus(po) {
   return fb[po.status] || { label: poStatusLabel(po.status), cls: "muted" };
 }
 
+// Time-based status badge for a PO row/drawer:
+//   • Normal / Release PO with a past expected date → OVERDUE (solid-crit)
+//   • Blanket PO past its expiration → EXPIRED (warn pill)
+//   • Blanket PO within its authorization window OR blanketExpires unknown
+//     → no badge at all (a blanket is never "overdue" — it's an
+//     authorization, not a scheduled receipt, so comparing po.expectedDate
+//     against today would flag every blanket incorrectly).
+//   • received / closed POs → no badge.
+// Returns { html: string, isOverdue: boolean } — isOverdue drives the
+// expected-date column's text-crit styling on the list row.
+function poTimeBadge(po) {
+  if (!po || po.status === "received" || po.status === "closed") {
+    return { html: "", isOverdue: false };
+  }
+  const bm = poBlanketMeta(po);
+  if (bm.kind === "blanket") {
+    const bExp = bm.blanketLine && bm.blanketLine.blanketExpires;
+    if (bExp && new Date(bExp) < TODAY) {
+      return { html: '<span class="pill warn">EXPIRED</span>', isOverdue: false };
+    }
+    return { html: "", isOverdue: false };
+  }
+  const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY;
+  if (overdue) {
+    return { html: '<span class="pill solid-crit">OVERDUE</span>', isOverdue: true };
+  }
+  return { html: "", isOverdue: false };
+}
+
 function posSubLineHTML(po) {
   const ds = posDisplayStatus(po);
-  const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY && po.status !== "received" && po.status !== "closed";
-  return `${esc(po.supplier)} · <span class="pill ${ds.cls}">${esc(ds.label)}</span> ${overdue ? '<span class="pill solid-crit">OVERDUE</span>' : ''}`;
+  const badge = poTimeBadge(po);
+  return `${esc(po.supplier)} · <span class="pill ${ds.cls}">${esc(ds.label)}</span> ${badge.html}`;
 }
 
 // Classify a PO by its blanket relationship. A PO is:
@@ -454,8 +483,14 @@ registerRoute("pos", () => {
               ${pos.map(po => {
                 const open = (po.lines || []).filter(l => isLineOpen(po, l));
                 const totalQty = po.lines.reduce((s,l) => s + (l.qty||0), 0);
-                const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY && po.status !== "received" && po.status !== "closed";
                 const bm = poBlanketMeta(po);
+                // Time-badge helper handles the blanket-vs-normal split:
+                // blankets never show OVERDUE (they're authorizations, not
+                // scheduled deliveries) and instead flag EXPIRED when their
+                // authorization window has closed. isOverdue is only true
+                // for actual overdue Normal/Release POs, so the expected-
+                // date column's crit-red styling won't fire on blankets.
+                const timeBadge = poTimeBadge(po);
                 let blanketIndicatorHTML = "";
                 if (bm.kind === "blanket") {
                   blanketIndicatorHTML = ` <span class="pill info" style="margin-left:4px" title="Blanket order">BLANKET</span>` +
@@ -468,13 +503,13 @@ registerRoute("pos", () => {
                 <tr class="clickable" data-pos-row data-po-num="${esc(posHeaderValue(po, "num"))}" data-po-supplier="${esc(posHeaderValue(po, "supplier"))}" data-po-status="${esc(posHeaderValue(po, "status"))}" onclick="openPODetail('${esc(po.id)}')">
                   <td class="pn">${esc(po.num)}</td>
                   <td>${esc(po.supplier)}</td>
-                  <td>${(() => { const ds = posDisplayStatus(po); return `<span class="pill ${ds.cls}">${esc(ds.label)}</span>`; })()} ${overdue ? '<span class="pill solid-crit" style="margin-left:4px">OVERDUE</span>' : ''}${blanketIndicatorHTML}</td>
+                  <td>${(() => { const ds = posDisplayStatus(po); return `<span class="pill ${ds.cls}">${esc(ds.label)}</span>`; })()} ${timeBadge.html ? `<span style="margin-left:4px">${timeBadge.html}</span>` : ""}${blanketIndicatorHTML}</td>
                   <td class="dim">${esc(displayBuyer(po) || "—")}</td>
                   <td class="right num">${po.lines.length}${open.length !== po.lines.length ? ` <span class="dim">/ ${open.length} open</span>` : ''}</td>
                   <td class="right num">${fmtNum(totalQty)}</td>
                   <td class="right num">${fmtMoney(poTotalValue(po))}</td>
                   <td class="dim num">${fmtDate(po.createdDate)}</td>
-                  <td class="num ${overdue ? 'text-crit bold' : 'dim'}">${fmtDate(po.expectedDate)}</td>
+                  <td class="num ${timeBadge.isOverdue ? 'text-crit bold' : 'dim'}">${fmtDate(po.expectedDate)}</td>
                   <td><button class="btn sm" onclick="event.stopPropagation(); openPODetail('${esc(po.id)}')">Open</button></td>
                 </tr>`;
               }).join("")}
