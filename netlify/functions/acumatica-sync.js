@@ -469,7 +469,7 @@ async function runPOSync(ctx) {
       )].sort();
       console.log("[acumatica-sync] ALL TAGS:", JSON.stringify(tagNames));
       const dateExpTags = tagNames
-        .filter(k => /exp|date/i.test(k))
+        .filter(k => /exp|date|blank/i.test(k))
         .map(k => ({ tag: k, val: get(k) }));
       console.log("[acumatica-sync] DATE/EXP TAGS:", JSON.stringify(dateExpTags));
     }
