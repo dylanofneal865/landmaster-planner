@@ -468,6 +468,18 @@ async function runPOSync(ctx) {
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
 
+    // Diagnostic — fires on the FIRST entry whose raw XML contains "Expire"
+    // (case-insensitive). Skips normal-PO lines that carry no expiration
+    // markup at all. Guarded so we only log once per invocation.
+    if (!global.__expRawDumped) {
+      const i = raw.search(/Expire/i);
+      if (i >= 0) {
+        global.__expRawDumped = true;
+        console.log("[acumatica-sync] RAW AROUND EXPIRE:",
+          raw.slice(Math.max(0, i - 40), i + 120));
+      }
+    }
+
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
       headerExpectedByOrder.set(num, toDateStr(get("ExpectedDate")));
