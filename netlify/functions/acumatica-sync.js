@@ -460,6 +460,20 @@ async function runPOSync(ctx) {
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
 
+    // Diagnostic — pin down why getFirstHit("BlanketExpireson") returns
+    // null even though the tag-dump saw the tag in the raw XML. Fires on
+    // the first parsed entry only. Log the raw substring around the tag
+    // (200 chars) so we can see the actual markup (self-closing null?
+    // full open+close? weird casing?) and the direct get() result.
+    if (!global.__expTagDumped) {
+      global.__expTagDumped = true;
+      const idx = raw.indexOf("BlanketExpireson");
+      console.log("[acumatica-sync] RAW AROUND EXPTAG:",
+        idx >= 0 ? raw.slice(Math.max(0, idx - 20), idx + 180) : "NOT FOUND");
+      console.log("[acumatica-sync] get(BlanketExpireson) =",
+        JSON.stringify(get("BlanketExpireson")));
+    }
+
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
       headerExpectedByOrder.set(num, toDateStr(get("ExpectedDate")));
