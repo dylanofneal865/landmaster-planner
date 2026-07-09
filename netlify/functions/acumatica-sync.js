@@ -421,11 +421,13 @@ async function runPOSync(ctx) {
   // Only meaningful when ln.type === "Blanket". Normalized to a YYYY-MM-DD
   // string (via toDateStr) or null. If no candidate resolves the client
   // renders "—" in the drawer instead of a wrong fallback.
-  //   "BlanketExpiresOn" — first-guess DAC/caption spelling (Acumatica
-  //   captions typically read "Blanket Expires On")
+  //   "BlanketExp" — actual GI column caption (confirmed from LM Planner
+  //   PO Lines GI header). Other entries stay as fallbacks in case the GI
+  //   caption is later renamed or aliased.
   const BLANKET_EXPIRES_CANDIDATES = [
-    "BlanketExpiresOn",
+    "BlanketExp",
     "BlanketExpires",
+    "BlanketExpiresOn",
     "BlanketExpDate",
     "ExpirationDate",
   ];
