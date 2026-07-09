@@ -354,6 +354,42 @@ async function runPOSync(ctx) {
   // shifts US users back a day; slice the calendar portion directly instead.
   const toDateStr = (v) => (v ? String(v).slice(0, 10) : null);
 
+  // ── PO Line Type discovery ────────────────────────────────────────
+  // The GI exposes a "Type" column (Normal vs Blanket) that we need to
+  // distinguish scheduled receipts from release-against placeholders.
+  // Acumatica strips whitespace from GI result-column display names to
+  // form the OData tag — the spelling depends on how the designer named
+  // it. Try a small candidate list on each row and use whichever hits
+  // first; log the winner and the distinct raw values on this run so
+  // the real vocabulary is visible. Fail-safe: if NO candidate ever
+  // resolves, ln.type stays "" and downstream code treats it as unknown.
+  const PO_TYPE_FIELD_CANDIDATES = [
+    "Type",
+    "OrderType",
+    "POType",
+    "PoType",
+    "LineType",
+    "POLineType",
+  ];
+  function getPOLineType(getFn) {
+    for (const f of PO_TYPE_FIELD_CANDIDATES) {
+      const v = getFn(f);
+      if (v != null && String(v).trim() !== "") return { field: f, value: String(v).trim() };
+    }
+    return { field: null, value: "" };
+  }
+  // Normalize a raw type value — trim + title-case first letter so
+  // "NORMAL"/"normal"/"Normal" all collapse to "Normal". Unknown
+  // spellings pass through unchanged so we can spot them in the log.
+  function normalizePOLineType(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return "";
+    return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  }
+  let detectedPOTypeField = null;
+  const poTypeRawCounts = Object.create(null);   // raw string → count
+  const poTypeNormCounts = Object.create(null);  // normalized string → count
+
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
   const headerExpectedByOrder = new Map();
@@ -389,6 +425,15 @@ async function runPOSync(ctx) {
     else if (acumStatus === "Completed") status = "received";
     else status = "open";
 
+    // PO Line Type — first-hit-wins on the candidate list. Detected
+    // field name and vocab counts are logged after the loop so a single
+    // manual run reveals the real column spelling + value distribution.
+    const { field: poTypeField, value: poTypeRaw } = getPOLineType(get);
+    if (poTypeField && !detectedPOTypeField) detectedPOTypeField = poTypeField;
+    const poTypeNorm = normalizePOLineType(poTypeRaw);
+    if (poTypeRaw) poTypeRawCounts[poTypeRaw] = (poTypeRawCounts[poTypeRaw] || 0) + 1;
+    if (poTypeNorm) poTypeNormCounts[poTypeNorm] = (poTypeNormCounts[poTypeNorm] || 0) + 1;
+
     const line = {
       id: `${num}::${lineNbr}`,            // stable across syncs (dedupe key)
       pn: (get("InventoryID") || "").trim(),
@@ -406,6 +451,7 @@ async function runPOSync(ctx) {
       vendorName: get("VendorName") || "",
       status,
       acumStatus,
+      type: poTypeNorm,                     // "Normal" / "Blanket" / … / "" if unknown
       lineNbr,
       notes: "",
     };
@@ -415,6 +461,21 @@ async function runPOSync(ctx) {
   }
 
   log(`PO sync: grouped into ${byOrder.size} POs`);
+
+  // ── PO line Type discovery log ─────────────────────────────────────
+  // Surfaces which candidate field name won and every distinct raw
+  // value seen so the true vocabulary is visible after a single run.
+  // If NO candidate ever resolved, log loudly — downstream code sees
+  // ln.type === "" everywhere and can't distinguish Normal vs Blanket.
+  if (detectedPOTypeField) {
+    log(`PO Type field detected: "${detectedPOTypeField}"`);
+  } else {
+    log(`WARNING: no PO Type field resolved from candidates [${PO_TYPE_FIELD_CANDIDATES.join(", ")}] — ` +
+      `every ln.type set to "". Check the LM Planner PO Lines GI column names and add the correct spelling.`);
+  }
+  log("PO Type raw value counts:", poTypeRawCounts);
+  log("PO Type normalized counts:", poTypeNormCounts);
+
   if (byOrder.size === 0) {
     return { posInFeed: 0, linesInFeed: entries.length, upserted: 0, reconciled: 0, note: "No PO entries parsed" };
   }
@@ -511,11 +572,22 @@ async function runPOSync(ctx) {
           linesInFeed: entries.length,
           upserted,
           reconciled,
+          poTypeField: detectedPOTypeField,
+          poTypeRawCounts,
+          poTypeNormCounts,
         },
       },
     },
   ]);
 
   log(`PO sync done: ${byOrder.size} POs upserted, ${reconciled} reconciled`);
-  return { posInFeed: byOrder.size, linesInFeed: entries.length, upserted, reconciled };
+  return {
+    posInFeed: byOrder.size,
+    linesInFeed: entries.length,
+    upserted,
+    reconciled,
+    poTypeField: detectedPOTypeField,
+    poTypeRawCounts,
+    poTypeNormCounts,
+  };
 }
