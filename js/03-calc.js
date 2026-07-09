@@ -317,9 +317,29 @@ function isActivePO(po) {
   return true;
 }
 
+// Blanket PO lines are release-against authorizations, not scheduled
+// receipts. Acumatica's PO Line Type column carries "Normal" vs "Blanket";
+// the sync writes it verbatim (title-cased) into ln.type. Only an EXPLICIT
+// "blanket" (case-insensitive) counts — null / undefined / "" / "Normal"
+// are all treated as scheduled supply. Missing type (64 of ~1874 lines in
+// current data) is deliberately permissive per the field discovery — it
+// most likely reflects legacy rows synced before the type-capture landed.
+function isBlanketLine(ln) {
+  return !!(ln && String(ln.type || "").trim().toLowerCase() === "blanket");
+}
+
 function isLineOpen(po, ln) {
   if (!isActivePO(po)) return false;
   if (!ln) return false;
+  // Blanket = release-against authorization, not a scheduled receipt.
+  // Gate here so every downstream supply-math consumer inherits the
+  // exclusion for free: openPOQty, projectOnHand, and
+  // _buildOpenPOLineIndex all route through isLineOpen. suggestedQty's
+  // onPO param sources from openPOQty, so it's covered too.
+  // PO drawer and PO list read DB.pos directly (not via isLineOpen),
+  // so blanket lines still render in the UI — this is a SUPPLY-MATH
+  // gate only.
+  if (isBlanketLine(ln)) return false;
   const lnStatus = String(ln.status || "").toLowerCase().trim();
   if (_CLOSED_LINE_STATUSES.has(lnStatus)) return false;
   const lnAcum = String(ln.acumStatus || "").toLowerCase().trim();
