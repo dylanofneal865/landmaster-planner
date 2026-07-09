@@ -15,17 +15,25 @@
 const { createClient } = require("@supabase/supabase-js");
 
 // Shared field extractors for an Acumatica OData Atom-XML <entry>.
+// The "d:" prefix is treated as OPTIONAL because Acumatica emits it for
+// native DAC fields (<d:OrderNbr>) but omits it for custom-GI-added tags
+// like <BlanketExpireson>. Both shapes need to resolve through the same
+// getter. Boundary is still enforced: after the field name the pattern
+// requires either whitespace (attributes) or the closing ">", so
+// "BlanketExp" never partial-matches "BlanketExpireson" and vice versa.
 function makeFieldGetters(raw) {
   const get = (field) => {
     // Exact field-name match: allow attributes (m:type, etc.) but NOT numbered
     // siblings like <d:CreatedBy_2> — the optional group requires whitespace
     // after the name, so "_2"/"_3" suffixes can't slip through.
-    const re = new RegExp(`<d:${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/d:${field}>`, "i");
+    const re = new RegExp(`<(?:d:)?${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:d:)?${field}>`, "i");
     const m = raw.match(re);
     return m ? m[1].trim() : null;
   };
   const isNull = (field) => {
-    const re = new RegExp(`<d:${field}[^>]*m:null="true"`, "i");
+    // \b after the field name blocks partial-name matches (e.g. isNull("Qty")
+    // must not fire on "<d:QtyReceived m:null=…").
+    const re = new RegExp(`<(?:d:)?${field}\\b[^>]*m:null="true"`, "i");
     return re.test(raw);
   };
   return { get, isNull };
@@ -459,20 +467,6 @@ async function runPOSync(ctx) {
     const { get } = makeFieldGetters(raw);
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
-
-    // Diagnostic — pin down why getFirstHit("BlanketExpireson") returns
-    // null even though the tag-dump saw the tag in the raw XML. Fires on
-    // the first parsed entry only. Log the raw substring around the tag
-    // (200 chars) so we can see the actual markup (self-closing null?
-    // full open+close? weird casing?) and the direct get() result.
-    if (!global.__expTagDumped) {
-      global.__expTagDumped = true;
-      const idx = raw.indexOf("BlanketExpireson");
-      console.log("[acumatica-sync] RAW AROUND EXPTAG:",
-        idx >= 0 ? raw.slice(Math.max(0, idx - 20), idx + 180) : "NOT FOUND");
-      console.log("[acumatica-sync] get(BlanketExpireson) =",
-        JSON.stringify(get("BlanketExpireson")));
-    }
 
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
