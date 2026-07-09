@@ -546,16 +546,17 @@ function renderPODetail(po) {
   const bm = poBlanketMeta(po);
   let blanketStripHTML = "";
   if (bm.kind === "blanket") {
-    // NOTE: blanket expiration date is NOT synced from Acumatica yet. po.expectedDate
-    // on a blanket header is the created date, not the true expiration, so we
-    // deliberately omit "expires <date>" from the strip. When the expiration
-    // field is added to the PO Lines GI + acumatica-sync (candidate: something like
-    // BlanketExpDate / EndDate on the blanket header), re-add the clause as:
-    //   · expires <span class="mono">${esc(fmtDate(bm.blanketLine.blanketExpDate))}</span>
+    // Blanket expiration is now sourced from ln.blanketExpires (synced from
+    // Acumatica via BLANKET_EXPIRES_CANDIDATES in acumatica-sync). Clause is
+    // conditionally rendered — pre-expires-sync POs, or a candidate mismatch,
+    // leaves blanketExpires null and the strip omits the clause rather than
+    // showing a wrong fallback date.
+    const bExp = bm.blanketLine && bm.blanketLine.blanketExpires;
+    const expiresClause = bExp ? ` · expires <span class="mono">${esc(fmtDate(bExp))}</span>` : "";
     blanketStripHTML = `
       <div style="margin:0 0 14px; padding:10px 12px; background:var(--accent-soft); border-left:3px solid var(--accent-d); border-radius:3px; font-size:12px; color:var(--t1);">
         <span class="pill info" style="margin-right:8px">BLANKET</span>
-        <span>Blanket order · <strong class="mono">${fmtNum(bm.open)}</strong> of <strong class="mono">${fmtNum(bm.total)}</strong> units remaining</span>
+        <span>Blanket order · <strong class="mono">${fmtNum(bm.open)}</strong> of <strong class="mono">${fmtNum(bm.total)}</strong> units remaining${expiresClause}</span>
       </div>`;
   } else if (bm.kind === "release") {
     // Try to resolve the parent blanket so we can inline its remaining. Match
@@ -616,9 +617,20 @@ function renderPODetail(po) {
         <div class="field"><label>Supplier</label>
           <input class="input" id="po-supplier" value="${esc(po.supplier||"")}">
         </div>
-        <div class="field"><label>Expected Delivery</label>
+        ${bm.kind === "blanket" ? (() => {
+          // Blanket POs: swap the "Expected Delivery" input for a read-only
+          // "Expires On" showing ln.blanketExpires. The blanket's expiration
+          // is sourced from Acumatica, not editable in the planner. po.expectedDate
+          // on a blanket header is the created date (wrong to show), so we
+          // omit the editable input entirely — savePOHeader guards against
+          // the missing #po-expected.
+          const bExp = bm.blanketLine && bm.blanketLine.blanketExpires;
+          return `<div class="field"><label>Expires On</label>
+            <div class="dim" style="padding:8px 0">${bExp ? esc(fmtDate(bExp)) : "—"}</div>
+          </div>`;
+        })() : `<div class="field"><label>Expected Delivery</label>
           <input class="input" type="date" id="po-expected" value="${po.expectedDate ? isoDate(po.expectedDate) : ""}">
-        </div>
+        </div>`}
         <div class="field"><label>Created</label>
           <input class="input" type="date" id="po-created" value="${po.createdDate ? isoDate(po.createdDate) : ""}">
         </div>
@@ -911,7 +923,12 @@ function savePOHeader(poId) {
   const buyerInput = $("#po-buyer");
   const newBuyer = buyerInput ? buyerInput.value.trim() : null;
   const newSupplier = $("#po-supplier").value.trim();
-  const newExpected = $("#po-expected").value;
+  // Blanket POs render "Expires On" (read-only, sourced from ln.blanketExpires)
+  // in place of the editable "Expected Delivery" input, so #po-expected is
+  // absent. Fall back to the current expectedDate ISO so the field passes
+  // through unchanged rather than throwing on null.value.
+  const expectedInput = $("#po-expected");
+  const newExpected = expectedInput ? expectedInput.value : (po.expectedDate ? isoDate(po.expectedDate) : "");
   const newCreated = $("#po-created").value;
   const newSubmitted = $("#po-submitted").value;
   const newNotes = $("#po-notes").value.trim();
@@ -920,7 +937,7 @@ function savePOHeader(poId) {
   if (po.status !== newStatus) changes.push(`status: ${po.status} → ${newStatus}`);
   if (buyerInput && po.buyer !== newBuyer) changes.push(`buyer`);
   if (po.supplier !== newSupplier) changes.push(`supplier`);
-  if (isoDate(po.expectedDate||0) !== newExpected) changes.push(`expected`);
+  if (expectedInput && isoDate(po.expectedDate||0) !== newExpected) changes.push(`expected`);
 
   po.status = newStatus;
   if (buyerInput) po.buyer = newBuyer;

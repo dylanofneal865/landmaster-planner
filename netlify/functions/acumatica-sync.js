@@ -417,6 +417,18 @@ async function runPOSync(ctx) {
     "BlanketOrderNbr",
     "BlanketPO",
   ];
+  // Blanket expiration — end-of-authorization date on a Blanket-type line.
+  // Only meaningful when ln.type === "Blanket". Normalized to a YYYY-MM-DD
+  // string (via toDateStr) or null. If no candidate resolves the client
+  // renders "—" in the drawer instead of a wrong fallback.
+  //   "BlanketExpiresOn" — first-guess DAC/caption spelling (Acumatica
+  //   captions typically read "Blanket Expires On")
+  const BLANKET_EXPIRES_CANDIDATES = [
+    "BlanketExpiresOn",
+    "BlanketExpires",
+    "BlanketExpDate",
+    "ExpirationDate",
+  ];
   function getFirstHit(getFn, candidates) {
     for (const f of candidates) {
       const v = getFn(f);
@@ -426,10 +438,13 @@ async function runPOSync(ctx) {
   }
   let detectedBlanketOpenQtyField = null;
   let detectedBlanketPoNumField = null;
+  let detectedBlanketExpiresField = null;
   let blanketOpenQtyHits = 0;
   let blanketPoNumHits = 0;
+  let blanketExpiresHits = 0;
   const blanketOpenQtySamples = [];   // up to 8 non-empty (poNum, lineNbr, raw, parsed)
   const blanketPoNumSamples = [];     // up to 8 non-empty (poNum, lineNbr, raw)
+  const blanketExpiresSamples = [];   // up to 8 non-empty (poNum, lineNbr, raw, iso)
 
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
@@ -497,6 +512,19 @@ async function runPOSync(ctx) {
         blanketPoNumSamples.push({ po: num, lineNbr, raw: bPnHit.value });
       }
     }
+    // Blanket expiration date. Normalize via toDateStr (same YYYY-MM-DD
+    // slice used for expectedDate/requestedDate) so the client can compare
+    // and format it identically. Null when no candidate resolves OR when
+    // the resolved candidate's value is empty on this line.
+    const bExpHit = getFirstHit(get, BLANKET_EXPIRES_CANDIDATES);
+    if (bExpHit.field && !detectedBlanketExpiresField) detectedBlanketExpiresField = bExpHit.field;
+    const blanketExpires = bExpHit.value ? toDateStr(bExpHit.value) : null;
+    if (bExpHit.value) {
+      blanketExpiresHits++;
+      if (blanketExpiresSamples.length < 8) {
+        blanketExpiresSamples.push({ po: num, lineNbr, raw: bExpHit.value, iso: blanketExpires });
+      }
+    }
 
     const line = {
       id: `${num}::${lineNbr}`,            // stable across syncs (dedupe key)
@@ -518,6 +546,7 @@ async function runPOSync(ctx) {
       type: poTypeNorm,                     // "Normal" / "Blanket" / … / "" if unknown
       blanketOpenQty,                       // remaining qty available to release (blanket lines only)
       blanketPoNum,                         // parent blanket PO # (child lines only, else null)
+      blanketExpires,                       // ISO date string when blanket authorization ends (blanket lines only, else null)
       lineNbr,
       notes: "",
     };
@@ -557,6 +586,13 @@ async function runPOSync(ctx) {
       `every ln.blanketPoNum set to null. Check the LM Planner PO Lines GI column names.`);
   }
   if (blanketPoNumSamples.length) log("Blanket PO Num samples:", blanketPoNumSamples);
+  if (detectedBlanketExpiresField) {
+    log(`Blanket Expires field detected: "${detectedBlanketExpiresField}" (${blanketExpiresHits} non-empty values)`);
+  } else {
+    log(`WARNING: no Blanket Expires field resolved from candidates [${BLANKET_EXPIRES_CANDIDATES.join(", ")}] — ` +
+      `every ln.blanketExpires set to null. Check the LM Planner PO Lines GI column names.`);
+  }
+  if (blanketExpiresSamples.length) log("Blanket Expires samples:", blanketExpiresSamples);
 
   if (byOrder.size === 0) {
     return { posInFeed: 0, linesInFeed: entries.length, upserted: 0, reconciled: 0, note: "No PO entries parsed" };
@@ -661,6 +697,8 @@ async function runPOSync(ctx) {
           blanketOpenQtyHits,
           blanketPoNumField: detectedBlanketPoNumField,
           blanketPoNumHits,
+          blanketExpiresField: detectedBlanketExpiresField,
+          blanketExpiresHits,
         },
       },
     },
@@ -681,5 +719,8 @@ async function runPOSync(ctx) {
     blanketPoNumField: detectedBlanketPoNumField,
     blanketPoNumHits,
     blanketPoNumSamples,
+    blanketExpiresField: detectedBlanketExpiresField,
+    blanketExpiresHits,
+    blanketExpiresSamples,
   };
 }
