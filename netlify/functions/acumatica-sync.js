@@ -334,27 +334,51 @@ async function runPOSync(ctx) {
   const { supa, log, baseUrl, company, username, password } = ctx;
   const PO_GI = "LMInventoryPlannerPOLines";
   const url = `${baseUrl}/OData/${company}/${encodeURIComponent(PO_GI)}`;
-  log("PO sync: fetching", url);
+  // Paginated fetch — Acumatica OData caps a single response at ~1000 rows
+  // by default. The GI has grown past that (blanket lines were sitting past
+  // the cap, invisible to a single-shot fetch), so walk pages via $top/$skip
+  // until a short page tells us we've drained the feed. Cap the loop at
+  // MAX_PAGES so a mis-configured server can't spin forever.
+  //
+  // NOTE: the inventory feed at the top of this file uses the same
+  // single-shot pattern and may be latently truncating too — evaluate
+  // separately; DO NOT expand this pass to that feed.
+  const PAGE_SIZE = 1000;
+  const MAX_PAGES = 20;
+  log("PO sync: fetching (paginated)", url);
 
-  let xml;
+  let entries = [];
+  let pageCount = 0;
   try {
     const auth = Buffer.from(`${username}:${password}`).toString("base64");
-    const resp = await fetch(url, {
-      headers: { Authorization: `Basic ${auth}`, Accept: "application/atom+xml" },
-    });
-    if (!resp.ok) {
-      const body = await resp.text();
-      log("PO GI non-OK status", { status: resp.status, body: body.slice(0, 200) });
-      return { error: "PO fetch failed", status: resp.status };
+    for (let page = 0, skip = 0; page < MAX_PAGES; page++, skip += PAGE_SIZE) {
+      const pageUrl = `${url}?$top=${PAGE_SIZE}&$skip=${skip}`;
+      const resp = await fetch(pageUrl, {
+        headers: { Authorization: `Basic ${auth}`, Accept: "application/atom+xml" },
+      });
+      if (!resp.ok) {
+        const body = await resp.text();
+        log("PO GI non-OK status", { status: resp.status, page, skip, body: body.slice(0, 200) });
+        return { error: "PO fetch failed", status: resp.status, page };
+      }
+      const pageXml = await resp.text();
+      const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
+      pageCount++;
+      log(`PO sync: page ${pageCount} (skip=${skip}) returned ${pageEntries.length} entries`);
+      entries.push(...pageEntries);
+      // A page shorter than PAGE_SIZE is the last page — stop before
+      // firing a wasted round-trip for an empty page.
+      if (pageEntries.length < PAGE_SIZE) break;
     }
-    xml = await resp.text();
+    if (pageCount === MAX_PAGES && entries.length && entries.length % PAGE_SIZE === 0) {
+      log(`WARNING: PO sync hit MAX_PAGES=${MAX_PAGES} cap without a short page — the feed may have more rows. Raise MAX_PAGES.`);
+    }
   } catch (err) {
     log("PO fetch threw", err.message);
     return { error: "PO fetch error", detail: err.message };
   }
 
-  const entries = xml.split(/<entry[^>]*>/i).slice(1);
-  log(`PO sync: found ${entries.length} <entry> elements`);
+  log(`PO sync: fetched ${entries.length} entries across ${pageCount} pages`);
 
   const toNum = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
   // Acumatica returns date fields as midnight in an unspecified timezone
@@ -467,18 +491,6 @@ async function runPOSync(ctx) {
     const { get } = makeFieldGetters(raw);
     const num = (get("OrderNbr") || "").trim();
     if (!num) continue;
-
-    // Diagnostic — fires on the FIRST entry whose raw XML contains "Expire"
-    // (case-insensitive). Skips normal-PO lines that carry no expiration
-    // markup at all. Guarded so we only log once per invocation.
-    if (!global.__expRawDumped) {
-      const i = raw.search(/Expire/i);
-      if (i >= 0) {
-        global.__expRawDumped = true;
-        console.log("[acumatica-sync] RAW AROUND EXPIRE:",
-          raw.slice(Math.max(0, i - 40), i + 120));
-      }
-    }
 
     // PO header fields — same value on every line of a PO; first-wins.
     if (!headerExpectedByOrder.has(num)) {
