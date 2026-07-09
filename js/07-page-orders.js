@@ -555,26 +555,18 @@ function renderOrderQueueFor(itemType) {
                     // off the row's cached partsWithStatus state — non-final
                     // / non-chain parts get falsy here (zero cost).
                     const risk = (typeof chainTransitionRisk === "function") ? chainTransitionRisk(p) : false;
-                    // Open blanket lookup — if a blanket covering this pn has
-                    // remaining capacity, the row's +Add flips to +Release and
-                    // the Suggest-Qty cell picks up a "↳ from POxxxx" caption.
+                    // Open blanket lookup — only used to decide whether to
+                    // hang a "BLANKET AVAIL" pill on the pn cell. Everything
+                    // else about the blanket (PO#, remaining qty, release
+                    // guidance) lives in the draft-order drawer + PDF, wired
+                    // via draftOrderAdd → blanketPoNum snapshot at add-time.
+                    // Deliberately no visible guidance on the queue row: the
+                    // Suggest-Qty column is ~5.5% wide, too narrow for any
+                    // caption, and the pill alone is the at-a-glance signal.
                     const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(p.pn) : null;
-                    let blkGuidance = "";
-                    if (blk) {
-                      if (sq > 0 && sq <= blk.open) {
-                        blkGuidance = `<div class="tiny mono dim" style="margin-top:2px;text-align:right">↳ Release ${fmtNum(sq)} from <span style="color:var(--accent-d)">${esc(blk.po.num)}</span></div>`;
-                      } else if (sq > 0 && sq > blk.open) {
-                        const extra = sq - blk.open;
-                        blkGuidance = `<div class="tiny mono dim" style="margin-top:2px;text-align:right">↳ Release ${fmtNum(blk.open)} (max) from <span style="color:var(--accent-d)">${esc(blk.po.num)}</span>, order ${fmtNum(extra)} separately</div>`;
-                      } else {
-                        blkGuidance = `<div class="tiny mono dim" style="margin-top:2px;text-align:right">↳ Blanket available: <span style="color:var(--accent-d)">${esc(blk.po.num)}</span></div>`;
-                      }
-                    }
                     const blkPill = blk
-                      ? ` <span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:4px;letter-spacing:0.04em" title="Open blanket ${esc(blk.po.num)} · ${fmtNum(blk.open)} available">BLANKET AVAIL</span>` +
-                        ` <span class="mono dim tiny" style="margin-left:4px">${esc(blk.po.num)} · ${fmtNum(blk.open)} avail</span>`
+                      ? ` <span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:4px;letter-spacing:0.04em" title="Open blanket ${esc(blk.po.num)} · ${fmtNum(blk.open)} available">BLANKET AVAIL</span>`
                       : "";
-                    const addBtnLabel = blk ? "+ Release" : "+ Add";
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
                       <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Chain runs dry in ${risk.runoutDays}d — order not yet placed">TRANSITION RISK</span>` : ''}${blkPill}</td>
@@ -590,11 +582,11 @@ function renderOrderQueueFor(itemType) {
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onHand)}</td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onPO)}</td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(chainDisplayDaily(p),2)}</td>
-                      <td class="right num bold text-accent" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(sq)}${blkGuidance}</td>
+                      <td class="right num bold text-accent" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(sq)}</td>
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtMoney(sq * orderUnitCost(p))}</td>
                       <td>${draftOrderHas(p.pn)
                         ? `<span class="btn sm" aria-disabled="true" style="min-width:72px;justify-content:center;cursor:default;color:var(--t2);font-weight:500;pointer-events:none">IN DRAFT</span>`
-                        : `<button class="btn sm primary" style="min-width:72px;justify-content:center" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}'); oqRerenderPreservingScroll();">${addBtnLabel}</button>`}</td>
+                        : `<button class="btn sm primary" style="min-width:72px;justify-content:center" onclick="event.stopPropagation(); quickAddToDraft('${esc(p.pn)}'); oqRerenderPreservingScroll();">+ Add</button>`}</td>
                     </tr>`;
                   }).join("")}
                 </tbody>
