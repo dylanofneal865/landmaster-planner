@@ -138,6 +138,59 @@ function posSubLineHTML(po) {
   return `${esc(po.supplier)} · <span class="pill ${ds.cls}">${esc(ds.label)}</span> ${overdue ? '<span class="pill solid-crit">OVERDUE</span>' : ''}`;
 }
 
+// Classify a PO by its blanket relationship. A PO is:
+//   • blanket  → any line has type === "Blanket"
+//   • release  → any line carries a blanketPoNum (parent link)
+//   • normal   → neither
+// Returned meta drives both the list-row indicator and the drawer strip
+// so those two surfaces can't drift out of sync.
+function poBlanketMeta(po) {
+  if (!po || !Array.isArray(po.lines)) return { kind: "normal" };
+  let blanketLine = null;
+  let parentBlanketNum = null;
+  for (const ln of po.lines) {
+    if (!blanketLine && String(ln.type || "").trim().toLowerCase() === "blanket") {
+      blanketLine = ln;
+    }
+    if (!parentBlanketNum && ln.blanketPoNum) {
+      parentBlanketNum = String(ln.blanketPoNum).trim() || null;
+    }
+    if (blanketLine && parentBlanketNum) break;
+  }
+  if (blanketLine) {
+    const open = Math.max(0, Number(blanketLine.blanketOpenQty || 0));
+    const total = Math.max(0, Number(blanketLine.qty || 0));
+    return { kind: "blanket", blanketLine, open, total };
+  }
+  if (parentBlanketNum) {
+    return { kind: "release", parentBlanketNum };
+  }
+  return { kind: "normal" };
+}
+
+// Find an OPEN blanket PO covering `pn`. Returns { po, line, open } for the
+// blanket line with the greatest remaining blanketOpenQty (so if two blankets
+// exist, the queue points at the one with more capacity). Null if none.
+// Used by the queue row + draft-order tagging.
+function findOpenBlanketForPart(pn) {
+  if (!pn) return null;
+  const target = String(pn).trim();
+  let best = null;
+  for (const po of (DB.pos || [])) {
+    if (!isActivePO(po)) continue;
+    for (const ln of (po.lines || [])) {
+      if (String(ln.pn || "").trim() !== target) continue;
+      if (String(ln.type || "").trim().toLowerCase() !== "blanket") continue;
+      const open = Math.max(0, Number(ln.blanketOpenQty || 0));
+      if (open <= 0) continue;
+      if (!best || open > best.open) {
+        best = { po, line: ln, open };
+      }
+    }
+  }
+  return best;
+}
+
 function posLineStatusCellHTML(ln) {
   const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
   return `<span class="pill ${lineStatusClass(ln.status)}">${esc(ln.status)}</span>${remaining > 0 && ln.status !== "received" && ln.status !== "cancelled" ? `<div class="tiny dim mono" style="margin-top:2px">${fmtNum(remaining)} open</div>` : ""}`;
@@ -402,11 +455,20 @@ registerRoute("pos", () => {
                 const open = (po.lines || []).filter(l => isLineOpen(po, l));
                 const totalQty = po.lines.reduce((s,l) => s + (l.qty||0), 0);
                 const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY && po.status !== "received" && po.status !== "closed";
+                const bm = poBlanketMeta(po);
+                let blanketIndicatorHTML = "";
+                if (bm.kind === "blanket") {
+                  blanketIndicatorHTML = ` <span class="pill info" style="margin-left:4px" title="Blanket order">BLANKET</span>` +
+                    ` <span class="mono dim tiny" style="margin-left:4px">${fmtNum(bm.open)} / ${fmtNum(bm.total)} open</span>`;
+                } else if (bm.kind === "release") {
+                  blanketIndicatorHTML = ` <span class="pill muted" style="margin-left:4px" title="Release against blanket ${esc(bm.parentBlanketNum)}">RELEASE</span>` +
+                    ` <span class="mono dim tiny" style="margin-left:4px">↳ ${esc(bm.parentBlanketNum)}</span>`;
+                }
                 return `
                 <tr class="clickable" data-pos-row data-po-num="${esc(posHeaderValue(po, "num"))}" data-po-supplier="${esc(posHeaderValue(po, "supplier"))}" data-po-status="${esc(posHeaderValue(po, "status"))}" onclick="openPODetail('${esc(po.id)}')">
                   <td class="pn">${esc(po.num)}</td>
                   <td>${esc(po.supplier)}</td>
-                  <td>${(() => { const ds = posDisplayStatus(po); return `<span class="pill ${ds.cls}">${esc(ds.label)}</span>`; })()} ${overdue ? '<span class="pill solid-crit" style="margin-left:4px">OVERDUE</span>' : ''}</td>
+                  <td>${(() => { const ds = posDisplayStatus(po); return `<span class="pill ${ds.cls}">${esc(ds.label)}</span>`; })()} ${overdue ? '<span class="pill solid-crit" style="margin-left:4px">OVERDUE</span>' : ''}${blanketIndicatorHTML}</td>
                   <td class="dim">${esc(displayBuyer(po) || "—")}</td>
                   <td class="right num">${po.lines.length}${open.length !== po.lines.length ? ` <span class="dim">/ ${open.length} open</span>` : ''}</td>
                   <td class="right num">${fmtNum(totalQty)}</td>
@@ -481,6 +543,41 @@ function renderPODetail(po) {
   const recvQty = po.lines.reduce((s,l) => s + (l.qtyReceived||0), 0);
   const totalVal = poTotalValue(po);
 
+  const bm = poBlanketMeta(po);
+  let blanketStripHTML = "";
+  if (bm.kind === "blanket") {
+    // NOTE: blanket expiration date is NOT synced from Acumatica yet. po.expectedDate
+    // on a blanket header is the created date, not the true expiration, so we
+    // deliberately omit "expires <date>" from the strip. When the expiration
+    // field is added to the PO Lines GI + acumatica-sync (candidate: something like
+    // BlanketExpDate / EndDate on the blanket header), re-add the clause as:
+    //   · expires <span class="mono">${esc(fmtDate(bm.blanketLine.blanketExpDate))}</span>
+    blanketStripHTML = `
+      <div style="margin:0 0 14px; padding:10px 12px; background:var(--accent-soft); border-left:3px solid var(--accent-d); border-radius:3px; font-size:12px; color:var(--t1);">
+        <span class="pill info" style="margin-right:8px">BLANKET</span>
+        <span>Blanket order · <strong class="mono">${fmtNum(bm.open)}</strong> of <strong class="mono">${fmtNum(bm.total)}</strong> units remaining</span>
+      </div>`;
+  } else if (bm.kind === "release") {
+    // Try to resolve the parent blanket so we can inline its remaining. Match
+    // by po.num — the same key the release line carries in blanketPoNum.
+    const parent = (DB.pos || []).find(p => String(p.num || "").trim() === bm.parentBlanketNum);
+    let parentTail = "";
+    if (parent) {
+      const parentMeta = poBlanketMeta(parent);
+      if (parentMeta.kind === "blanket") {
+        parentTail = ` <span class="dim">(<span class="mono">${fmtNum(parentMeta.open)}</span> of <span class="mono">${fmtNum(parentMeta.total)}</span> left on blanket)</span>`;
+      }
+    }
+    const linkAttrs = parent
+      ? `onclick="openPODetail('${esc(parent.id)}')" style="cursor:pointer;color:var(--accent-d);text-decoration:underline"`
+      : `style="color:var(--t2)"`;
+    blanketStripHTML = `
+      <div style="margin:0 0 14px; padding:10px 12px; background:var(--info-soft); border-left:3px solid var(--info); border-radius:3px; font-size:12px; color:var(--t1);">
+        <span class="pill muted" style="margin-right:8px">RELEASE</span>
+        <span>Release against blanket <span class="mono" ${linkAttrs}>↳ ${esc(bm.parentBlanketNum)}</span>${parentTail}</span>
+      </div>`;
+  }
+
   const html = `
     <div class="drawer-head">
       <div class="title-block">
@@ -491,6 +588,7 @@ function renderPODetail(po) {
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
+      ${blanketStripHTML}
       <div class="stat-strip">
         <div class="stat"><div class="stat-label">Lines</div><div class="stat-value">${po.lines.length}</div></div>
         <div class="stat"><div class="stat-label">Qty Ordered</div><div class="stat-value">${fmtNum(totalQty)}</div></div>

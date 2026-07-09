@@ -29,10 +29,23 @@ function draftOrderHas(pn) {
 
 function draftOrderAdd(pn, qty) {
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
+  // Snapshot the source blanket (if any) at add-time so the draft line, drawer,
+  // and PDF all render as a release against that blanket. Held on the item as
+  // { blanketPoNum, blanketOpenQty } — a null blanketPoNum means "normal order".
+  const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(pn) : null;
+  const blanketPoNum = blk ? blk.po.num : null;
+  const blanketOpenQty = blk ? blk.open : 0;
   if (existing) {
     existing.qty = qty;
+    // Preserve manual clears: only OVERWRITE the linkage when we actually
+    // resolve a blanket now. If the user later un-blankets (blanket exhausted)
+    // and re-adds, they'll get the new snapshot.
+    if (blanketPoNum) {
+      existing.blanketPoNum = blanketPoNum;
+      existing.blanketOpenQty = blanketOpenQty;
+    }
   } else {
-    DRAFT_ORDER.push({ pn, qty, addedAt: new Date().toISOString() });
+    DRAFT_ORDER.push({ pn, qty, addedAt: new Date().toISOString(), blanketPoNum, blanketOpenQty });
   }
   draftOrderSave();
   updateDraftOrderPill();
@@ -69,7 +82,13 @@ function draftOrderTotals() {
     const noCost = hasNoOrderCost(part);
     const unit = noCost ? 0 : orderUnitCost(part);
     const lineTotal = (item.qty || 0) * unit;
-    groups[supplier].lines.push({ part, qty: item.qty, unit, lineTotal, noCost });
+    // Pass the blanket linkage through to the drawer/PDF renderers so the line
+    // reads as a release, not a fresh order. Null blanketPoNum = normal.
+    groups[supplier].lines.push({
+      part, qty: item.qty, unit, lineTotal, noCost,
+      blanketPoNum: item.blanketPoNum || null,
+      blanketOpenQty: item.blanketOpenQty || 0,
+    });
     if (!noCost) {
       groups[supplier].subtotal += lineTotal;
       grandTotal += lineTotal;
@@ -135,11 +154,12 @@ function openDraftOrderDrawer() {
               <th></th>
             </tr></thead>
             <tbody>
-              ${grp.lines.map(({ part, qty, unit, lineTotal, noCost }) => `
+              ${grp.lines.map(({ part, qty, unit, lineTotal, noCost, blanketPoNum }) => `
                 <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}">
                   <td>
                     <div class="pn">${esc(part.pn)}</div>
                     <div class="dim tiny">${esc(part.desc || '—')}</div>
+                    ${blanketPoNum ? `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">↳ Release against ${esc(blanketPoNum)}</div>` : ''}
                   </td>
                   <td class="right" style="width:90px">
                     <input class="input num" type="number" min="0" value="${qty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
@@ -406,16 +426,22 @@ async function _buildDraftOrderPDF() {
   const rowStatuses = [];
   for (const supplier of supplierKeys) {
     const grp = supplierGroups[supplier];
-    for (const { part, qty, unit, lineTotal, noCost } of grp.lines) {
+    for (const { part, qty, unit, lineTotal, noCost, blanketPoNum } of grp.lines) {
       const stat = partStatus(part);
       const cover = stat.daysOfCover === Infinity ? "—" : `${stat.daysOfCover}d`;
       // Pricing source: orderUnitCost (last PO → stored cost fallback), pulled
       // from draftOrderTotals so the PDF and drawer can't drift apart. No-
       // cost rows render "—" rather than a misleading $0.
+      // Blanket linkage: for release lines, append "↳ Release against {po#}"
+      // to the description so the PDF reads as a release, not a fresh order.
+      const desc = part.desc || "";
+      const descWithRelease = blanketPoNum
+        ? (desc ? `${desc}\n↳ Release against ${blanketPoNum}` : `↳ Release against ${blanketPoNum}`)
+        : desc;
       allRows.push([
         supplier,
         part.pn || "",
-        part.desc || "",
+        descWithRelease,
         fmtNum(part.onHand || 0),
         cover,
         `${part.ltWeeks || 0}w`,
