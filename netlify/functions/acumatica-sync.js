@@ -390,6 +390,47 @@ async function runPOSync(ctx) {
   const poTypeRawCounts = Object.create(null);   // raw string → count
   const poTypeNormCounts = Object.create(null);  // normalized string → count
 
+  // ── Blanket-linkage field discovery ────────────────────────────────
+  // Two additional fields we need for the blanket workflow (kept
+  // separate from the Type discovery so each field can be spotted in
+  // the log independently):
+  //   1. Blanket Open Qty — remaining qty on a Blanket-type line still
+  //      available to release against. Only meaningful when ln.type is
+  //      "Blanket"; we store the raw value regardless and the client
+  //      decides when to read it.
+  //   2. Blanket PO Nbr. — the parent Blanket PO's number, populated on
+  //      Normal child lines that were released from a blanket.
+  //
+  // POLine_bLOrderNbr is DELIBERATELY NOT synced — it's a duplicate
+  // Acumatica-internal field per the user's spec.
+  //
+  // Same first-hit-wins + discovery-log pattern as the Type field.
+  const BLANKET_OPEN_QTY_CANDIDATES = [
+    "BlanketOpenQty",
+    "BlanketOpenQty_",
+    "OpenQtyBlanket",
+  ];
+  const BLANKET_PO_NUM_CANDIDATES = [
+    "BlanketPONbr",
+    "BlanketPONumber",
+    "BlanketPONbr_",
+    "BlanketOrderNbr",
+    "BlanketPO",
+  ];
+  function getFirstHit(getFn, candidates) {
+    for (const f of candidates) {
+      const v = getFn(f);
+      if (v != null && String(v).trim() !== "") return { field: f, value: String(v).trim() };
+    }
+    return { field: null, value: "" };
+  }
+  let detectedBlanketOpenQtyField = null;
+  let detectedBlanketPoNumField = null;
+  let blanketOpenQtyHits = 0;
+  let blanketPoNumHits = 0;
+  const blanketOpenQtySamples = [];   // up to 8 non-empty (poNum, lineNbr, raw, parsed)
+  const blanketPoNumSamples = [];     // up to 8 non-empty (poNum, lineNbr, raw)
+
   // Parse each line and group by OrderNbr.
   const byOrder = new Map();
   const headerExpectedByOrder = new Map();
@@ -434,6 +475,29 @@ async function runPOSync(ctx) {
     if (poTypeRaw) poTypeRawCounts[poTypeRaw] = (poTypeRawCounts[poTypeRaw] || 0) + 1;
     if (poTypeNorm) poTypeNormCounts[poTypeNorm] = (poTypeNormCounts[poTypeNorm] || 0) + 1;
 
+    // Blanket linkage fields — first-hit-wins, discovery logged. Store
+    // the raw parsed values regardless of ln.type; the client will only
+    // READ blanketOpenQty on Blanket-type lines and READ blanketPoNum on
+    // Normal-type lines that link back to a parent blanket.
+    const bOqHit = getFirstHit(get, BLANKET_OPEN_QTY_CANDIDATES);
+    if (bOqHit.field && !detectedBlanketOpenQtyField) detectedBlanketOpenQtyField = bOqHit.field;
+    const blanketOpenQty = bOqHit.value ? toNum(bOqHit.value) : 0;
+    if (bOqHit.value) {
+      blanketOpenQtyHits++;
+      if (blanketOpenQtySamples.length < 8) {
+        blanketOpenQtySamples.push({ po: num, lineNbr, raw: bOqHit.value, parsed: blanketOpenQty });
+      }
+    }
+    const bPnHit = getFirstHit(get, BLANKET_PO_NUM_CANDIDATES);
+    if (bPnHit.field && !detectedBlanketPoNumField) detectedBlanketPoNumField = bPnHit.field;
+    const blanketPoNum = bPnHit.value ? bPnHit.value : null;
+    if (bPnHit.value) {
+      blanketPoNumHits++;
+      if (blanketPoNumSamples.length < 8) {
+        blanketPoNumSamples.push({ po: num, lineNbr, raw: bPnHit.value });
+      }
+    }
+
     const line = {
       id: `${num}::${lineNbr}`,            // stable across syncs (dedupe key)
       pn: (get("InventoryID") || "").trim(),
@@ -452,6 +516,8 @@ async function runPOSync(ctx) {
       status,
       acumStatus,
       type: poTypeNorm,                     // "Normal" / "Blanket" / … / "" if unknown
+      blanketOpenQty,                       // remaining qty available to release (blanket lines only)
+      blanketPoNum,                         // parent blanket PO # (child lines only, else null)
       lineNbr,
       notes: "",
     };
@@ -475,6 +541,22 @@ async function runPOSync(ctx) {
   }
   log("PO Type raw value counts:", poTypeRawCounts);
   log("PO Type normalized counts:", poTypeNormCounts);
+
+  // ── Blanket-linkage discovery logs ────────────────────────────────
+  if (detectedBlanketOpenQtyField) {
+    log(`Blanket Open Qty field detected: "${detectedBlanketOpenQtyField}" (${blanketOpenQtyHits} non-empty values)`);
+  } else {
+    log(`WARNING: no Blanket Open Qty field resolved from candidates [${BLANKET_OPEN_QTY_CANDIDATES.join(", ")}] — ` +
+      `every ln.blanketOpenQty set to 0. Check the LM Planner PO Lines GI column names.`);
+  }
+  if (blanketOpenQtySamples.length) log("Blanket Open Qty samples:", blanketOpenQtySamples);
+  if (detectedBlanketPoNumField) {
+    log(`Blanket PO Num field detected: "${detectedBlanketPoNumField}" (${blanketPoNumHits} non-empty values)`);
+  } else {
+    log(`WARNING: no Blanket PO Num field resolved from candidates [${BLANKET_PO_NUM_CANDIDATES.join(", ")}] — ` +
+      `every ln.blanketPoNum set to null. Check the LM Planner PO Lines GI column names.`);
+  }
+  if (blanketPoNumSamples.length) log("Blanket PO Num samples:", blanketPoNumSamples);
 
   if (byOrder.size === 0) {
     return { posInFeed: 0, linesInFeed: entries.length, upserted: 0, reconciled: 0, note: "No PO entries parsed" };
@@ -575,6 +657,10 @@ async function runPOSync(ctx) {
           poTypeField: detectedPOTypeField,
           poTypeRawCounts,
           poTypeNormCounts,
+          blanketOpenQtyField: detectedBlanketOpenQtyField,
+          blanketOpenQtyHits,
+          blanketPoNumField: detectedBlanketPoNumField,
+          blanketPoNumHits,
         },
       },
     },
@@ -589,5 +675,11 @@ async function runPOSync(ctx) {
     poTypeField: detectedPOTypeField,
     poTypeRawCounts,
     poTypeNormCounts,
+    blanketOpenQtyField: detectedBlanketOpenQtyField,
+    blanketOpenQtyHits,
+    blanketOpenQtySamples,
+    blanketPoNumField: detectedBlanketPoNumField,
+    blanketPoNumHits,
+    blanketPoNumSamples,
   };
 }
