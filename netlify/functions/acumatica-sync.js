@@ -453,11 +453,13 @@ async function runPOSync(ctx) {
   // Only meaningful when ln.type === "Blanket". Normalized to a YYYY-MM-DD
   // string (via toDateStr) or null. If no candidate resolves the client
   // renders "—" in the drawer instead of a wrong fallback.
-  //   "BlanketExpireson" — real OData tag name (confirmed via tag-dump;
-  //   the "on" is lowercase, which is why the mixed-case guesses missed).
-  //   Other entries stay as fallbacks in case the GI caption is later
-  //   renamed or aliased.
+  //   "_BlanketExpires" — real OData tag with LEADING UNDERSCORE (confirmed
+  //   from the raw XML: <d:_BlanketExpires m:type="Edm.DateTime">…</d:_BlanketExpires>).
+  //   The leading "_" is why every non-underscore guess missed even after
+  //   the prefix-optional getter fix. Other entries stay as fallbacks in
+  //   case the GI caption is later renamed or aliased.
   const BLANKET_EXPIRES_CANDIDATES = [
+    "_BlanketExpires",
     "BlanketExpireson",
     "BlanketExp",
     "BlanketExpires",
