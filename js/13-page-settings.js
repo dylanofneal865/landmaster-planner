@@ -12,6 +12,8 @@ registerRoute("settings", () => {
   const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
   const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
   const lastBomSync = (DB.audit || []).find(a => a.type === "acumatica-bom-sync")?.ts || null;
+  const lastSvcUsageSync = (DB.audit || []).find(a => a.type === "service-usage-sync")?.ts || null;
+  const servicePartsCount = (DB.parts || []).filter(p => p.itemType === "service").length;
   // BOM links load asynchronously after first paint; distinguish "not yet
   // arrived" (undefined) from "loaded but empty" (0) so the card doesn't
   // misleadingly show "0 links" during the brief boot window.
@@ -177,16 +179,23 @@ registerRoute("settings", () => {
 
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title">Service Usage Import</div>
-          <div class="panel-sub">Monthly import of sales order shipments from Acumatica's 'Sales Orders by Line Item' report. Updates the Service Usage page and Service Queue urgency.</div>
+          <div class="panel-title">Service Usage</div>
+          <div class="panel-sub">Sales-order usage incl. kit explosion, synced daily from Acumatica.</div>
         </div>
         <div class="panel-body">
           <div class="row gap-md">
-            <button class="btn" onclick="$('#sales-order-import-input').click()">⇪ Import Sales Orders</button>
+            <span class="pill ok">● Acumatica · live</span>
+            <span class="mono dim" style="font-size:11px">${fmtNum((DB.usage || []).length)} usage txns · ${servicePartsCount} service parts</span>
+            <div class="grow"></div>
+            <span class="muted tiny">Syncs daily 6:00 AM${lastSvcUsageSync ? ' · last ' + fmtDate(lastSvcUsageSync) : ''}</span>
+          </div>
+          <div class="row mt-sm">
+            <div class="grow"></div>
+            <button class="btn sm ghost" onclick="$('#sales-order-import-input').click()">⇪ Manual import (fallback)</button>
             <input type="file" id="sales-order-import-input" accept=".xlsx" style="display:none" onchange="handleSalesOrderImportFile(event)">
             ${DB.meta.lastSalesOrderImport ? `
-              <span class="muted tiny">Last imported: ${fmtDate(DB.meta.lastSalesOrderImport.date)} from <span class="mono">${esc(DB.meta.lastSalesOrderImport.fileName)}</span> · ${DB.meta.lastSalesOrderImport.addedCount} added</span>
-            ` : `<span class="muted tiny">No imports yet.</span>`}
+              <span class="muted tiny" style="margin-left:12px">Last manual: ${fmtDate(DB.meta.lastSalesOrderImport.date)}</span>
+            ` : ''}
           </div>
         </div>
       </div>
