@@ -1,22 +1,35 @@
-// Netlify Scheduled Function — computes a 180-day rolling daily-usage rate
-// per LMCOMPO service part from the Acumatica "LM Planner Service Usage" GI
-// and merge-safely writes it to parts.data.daily.
+// Netlify Scheduled Function — refreshes Acumatica-sourced sales-order
+// rows in the Supabase `usage` table from the "LM Planner Service Usage" GI.
 //
 // Schedule: 06:00 UTC daily (see netlify.toml).
 //
-// This REPLACES the monthly-manual Excel "Service Usage Import" chain
-// (js/13-page-settings.js handleSalesOrderImportFile → commitSalesOrderImport
-// → js/40-demand.js computeDemand → js/19-page-usage.js bulkApplyComputedDaily)
-// as the daily-rate source. The Service Queue reads part.daily via
-// chainDisplayDaily / daysUntilStockout / suggestedQty (all in js/03-calc.js);
-// none of those change. Only the number they read gets refreshed once a day.
+// Design contract (grep-verifiable):
+//   1. Writes ONLY to Supabase `usage`. Zero calls to _supa.from("parts").
+//      No daily rate is computed anywhere. part.data.daily is never read
+//      or written. `parts` table is completely untouched.
+//   2. Sync-owned rows are namespaced by id prefix `us_acumatica-so_` so
+//      the scoped rebuild (delete + reinsert) below can never touch
+//      Excel-imported rows (`sales-order-…` sourceKey), C9 Big Sheet
+//      rows, manual logs, warranty/damaged/loss entries, or any other
+//      non-Acumatica usage transaction.
+//   3. Raw sales rows only — kits are written with pn = <kitPn>, NO
+//      component explosion here. The client is expected to handle
+//      kit-driven component demand.
 //
-// Formula match (mirrors js/40-demand.js computeDemand exactly):
-//   daily = Math.round((units_shipped_in_last_180_days / 180) * 1000) / 1000
-//
-// Scope: only rows where existing.itemType === "service" are touched. base_bom
-// and options parts get their daily from elsewhere and are ignored here — even
-// if the GI accidentally leaks a non-LMCOMPO row.
+//      IMPORTANT KNOWN GAP: as of this deploy, the client does NOT
+//      explode kits at read time. computeDemand (js/40-demand.js:16-42)
+//      is a plain per-pn sum with zero kit awareness. Kit explosion
+//      historically happened at write time in the Excel import
+//      (js/13-page-settings.js:543-573). This sync's raw-only writes
+//      mean kit-component service parts (e.g. CP00537) will NOT receive
+//      credit for NEW Acumatica-sourced kit sales until either:
+//        (a) a client-side getDailyUse + kit_boms read-time explosion
+//            is built, OR
+//        (b) this sync is extended to explode at write time via a
+//            server-side bom_links/kit_boms fetch.
+//      Prior Excel-import exploded rows survive (they carry
+//      `sourceKey: kit-explosion-…` and are outside this sync's
+//      rebuild scope) so historical credit is intact.
 //
 // Required env vars:
 //   ACUMATICA_BASE_URL
@@ -30,10 +43,10 @@
 const { createClient } = require("@supabase/supabase-js");
 
 // Prefix-optional field extractor — copied verbatim from acumatica-sync.js.
-// Divergence between the two files would be a latent bug: any future getter
-// fix (e.g. the underscore/prefix work for _BlanketExpires) must land here
-// too. Boundary is enforced by the trailing `(?:\s[^>]*)?>` group so
-// "InventoryID" never partial-matches "InventoryIDExt" and vice versa.
+// Handles both <d:Foo> (native DAC) and <_Foo> (custom GI columns like
+// _BlanketExpires). Boundary-safe: the trailing (?:\s[^>]*)?> group
+// forces either whitespace or > after the field name, so "InventoryID"
+// won't partial-match "InventoryIDExt" or vice versa.
 function makeFieldGetters(raw) {
   const get = (field) => {
     const re = new RegExp(`<(?:d:)?${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:d:)?${field}>`, "i");
@@ -47,8 +60,6 @@ function makeFieldGetters(raw) {
   return { get, isNull };
 }
 
-// First-hit-wins over a candidate list — same shape as the PO Type /
-// Blanket-linkage lookups in acumatica-sync.js runPOSync.
 function getFirstHit(getFn, candidates) {
   for (const f of candidates) {
     const v = getFn(f);
@@ -58,21 +69,27 @@ function getFirstHit(getFn, candidates) {
 }
 
 // Robust date parse — handles ISO ("2026-06-15T00:00:00") AND M/D/YYYY
-// ("6/15/2026"). The blanket-expiration work already proved that Acumatica
-// GI date columns arrive in either shape depending on the column's DAC/
-// display setting, so support both. Returns UTC epoch ms at 12:00 UTC on
-// the parsed date (matching parseSalesOrderWorkbook's noon-UTC convention
-// so a same-date shipment lands at the same ms whether it came via the
-// Excel importer or via this sync). NaN when unparseable.
+// ("6/15/2026"). Returns UTC epoch ms at 12:00 UTC on the parsed date,
+// matching parseSalesOrderWorkbook's noon-UTC convention so a same-date
+// sale lands at the same ms whether it came via Excel importer or this
+// sync. Also returns an ISO date string for storage. NaN/null when
+// unparseable.
 function parseFeedDate(v) {
-  if (!v) return NaN;
+  if (!v) return { ms: NaN, iso: null };
   const s = String(v).trim();
   const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return Date.UTC(+iso[1], +iso[2] - 1, +iso[3], 12, 0, 0);
+  if (iso) {
+    const ms = Date.UTC(+iso[1], +iso[2] - 1, +iso[3], 12, 0, 0);
+    return { ms, iso: new Date(ms).toISOString() };
+  }
   const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (us) return Date.UTC(+us[3], +us[1] - 1, +us[2], 12, 0, 0);
+  if (us) {
+    const ms = Date.UTC(+us[3], +us[1] - 1, +us[2], 12, 0, 0);
+    return { ms, iso: new Date(ms).toISOString() };
+  }
   const d = new Date(s);
-  return d.getTime();
+  const ms = d.getTime();
+  return { ms, iso: isFinite(ms) ? new Date(ms).toISOString() : null };
 }
 
 function toNum(v) {
@@ -105,11 +122,7 @@ exports.handler = async () => {
   const company = ACUMATICA_COMPANY || "LIVE";
   const url = `${ACUMATICA_BASE_URL}/OData/${company}/${giEncoded}`;
 
-  // ── Paginated fetch ─────────────────────────────────────────────────
-  // Mirrors runPOSync's $top/$skip loop. This GI is ~10k rows so a
-  // single-shot fetch WILL truncate at 1000. MAX_PAGES caps at 30 (30k
-  // rows) with a WARNING log if we hit the ceiling on full pages —
-  // headroom over the current 10k with room to grow.
+  // ── Paginated fetch — mirrors runPOSync in acumatica-sync.js ────────
   const PAGE_SIZE = 1000;
   const MAX_PAGES = 30;
   log("Fetching (paginated)", url);
@@ -145,48 +158,44 @@ exports.handler = async () => {
   log(`Fetched ${entries.length} entries across ${pageCount} pages`);
 
   if (entries.length === 0) {
-    log("No entries — bailing without touching parts");
-    return { statusCode: 200, body: JSON.stringify({ updated: 0, note: "No entries" }) };
+    log("No entries — bailing without touching usage table");
+    return { statusCode: 200, body: JSON.stringify({ upserted: 0, deleted: 0, note: "No entries" }) };
   }
 
   // ── Field discovery ────────────────────────────────────────────────
-  // Same first-hit-wins pattern as the blanket-linkage work. Real OData
-  // tag names occasionally have a leading underscore (see _BlanketExpires)
-  // or slightly different casing, so log which candidate won for each
-  // field. If any critical field can't be resolved we short-circuit
-  // with a 500 rather than write zeros to every service part.
+  // Same first-hit-wins pattern as blanket-linkage in acumatica-sync.
+  // OrderNbr is added to the field set because we need it to build a
+  // stable per-row id (`us_acumatica-so_<orderNbr>_<invId>`). If it
+  // can't be resolved we short-circuit — a random id would break the
+  // scoped-rebuild deletion contract.
   const PN_CANDIDATES     = ["InventoryID", "Inventory_ID", "InventoryID_"];
   const QTY_CANDIDATES    = ["Quantity", "Qty", "OrderQty"];
   const DATE_CANDIDATES   = ["SOLine_orderDate", "SOLineorderDate", "OrderDate"];
-  const STATUS_CANDIDATES = ["Status", "OrderStatus", "SOStatus"];   // optional — cancel guard
+  const ORDER_CANDIDATES  = ["OrderNbr", "SOOrderNbr", "OrderNumber", "OrderNo", "OrderNbr_"];
+  const STATUS_CANDIDATES = ["Status", "OrderStatus", "SOStatus"];   // optional cancel guard
 
   let detectedPnField     = null;
   let detectedQtyField    = null;
   let detectedDateField   = null;
+  let detectedOrderField  = null;
   let detectedStatusField = null;
-  let pnHits = 0, qtyHits = 0, dateHits = 0, statusHits = 0;
-  const dateSamples = [];   // first 5 (raw → iso) so we can eyeball parse correctness
+  let pnHits = 0, qtyHits = 0, dateHits = 0, orderHits = 0, statusHits = 0;
+  const dateSamples = [];
 
-  // ── 180-day window accumulation ────────────────────────────────────
-  // Formula (identical to js/40-demand.js:35 computeDemand):
-  //   daily = Math.round((units_in_last_180_days / 180) * 1000) / 1000
-  // Boundary: `t > cutoff` — strictly after, matches computeDemand's
-  // `t > cutoff` predicate at line 30.
-  const WINDOW_DAYS  = 180;
-  const nowMs        = Date.now();
-  const cutoffMs     = nowMs - WINDOW_DAYS * 86400000;
-  const CANCELED     = new Set([
-    "canceled", "cancelled", "voided", "void", "rejected", "hold", "on hold",
-  ]);
+  // Defensive cancel status skip. GI is expected to filter these
+  // server-side; this is belt-and-suspenders.
+  const CANCELED = new Set(["canceled", "cancelled", "voided", "void", "rejected", "hold", "on hold"]);
 
-  const unitsByPn    = new Map();   // pn → in-window units (only if > 0)
-  const lastSaleByPn = new Map();   // pn → epoch ms of latest sale (any date)
+  // Row accumulation — one output row per (orderNbr, invId) combo. If
+  // the same combo appears twice in the feed (rare — usually only via
+  // schema quirks), we keep the LAST occurrence's values.
+  const rowsByKey = new Map();   // "orderNbr::invId" → { orderNbr, pn, qty, ts, iso }
 
   let skippedCanceled = 0;
-  let skippedOutOfWindow = 0;
   let skippedNoPn = 0;
   let skippedNoQty = 0;
   let skippedNoDate = 0;
+  let skippedNoOrder = 0;
 
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
@@ -197,10 +206,6 @@ exports.handler = async () => {
     pnHits++;
     const pn = pnHit.value;
 
-    // Defensive cancel guard. The GI is supposed to filter these
-    // server-side, but a designer change upstream that broke the filter
-    // shouldn't silently poison every daily rate. Only fires if the GI
-    // exposes a Status column at all.
     const statHit = getFirstHit(get, STATUS_CANDIDATES);
     if (statHit.field && !detectedStatusField) detectedStatusField = statHit.field;
     if (statHit.value) {
@@ -219,47 +224,44 @@ exports.handler = async () => {
     if (dateHit.field && !detectedDateField) detectedDateField = dateHit.field;
     if (!dateHit.value) { skippedNoDate++; continue; }
     dateHits++;
-    const tsMs = parseFeedDate(dateHit.value);
-    if (!isFinite(tsMs)) { skippedNoDate++; continue; }
-    if (dateSamples.length < 5) {
-      dateSamples.push({ raw: dateHit.value, iso: new Date(tsMs).toISOString().slice(0, 10) });
-    }
+    const parsed = parseFeedDate(dateHit.value);
+    if (!isFinite(parsed.ms) || !parsed.iso) { skippedNoDate++; continue; }
+    if (dateSamples.length < 5) dateSamples.push({ raw: dateHit.value, iso: parsed.iso.slice(0, 10) });
 
-    // Track latest sale regardless of window — needed for the
-    // "part was in feed at some point" vs "never in feed" distinction
-    // that matches manual-import behavior for the drop-off decision.
-    if (!lastSaleByPn.has(pn) || tsMs > lastSaleByPn.get(pn)) {
-      lastSaleByPn.set(pn, tsMs);
-    }
+    const orderHit = getFirstHit(get, ORDER_CANDIDATES);
+    if (orderHit.field && !detectedOrderField) detectedOrderField = orderHit.field;
+    if (!orderHit.value) { skippedNoOrder++; continue; }
+    orderHits++;
+    const orderNbr = orderHit.value;
 
-    if (tsMs <= cutoffMs) { skippedOutOfWindow++; continue; }
-    unitsByPn.set(pn, (unitsByPn.get(pn) || 0) + qty);
+    const key = `${orderNbr}::${pn}`;
+    rowsByKey.set(key, {
+      orderNbr,
+      pn,
+      qty: Math.round(qty),
+      ts: parsed.iso,
+    });
   }
 
-  log(`Parsed: ${entries.length} entries → ${unitsByPn.size} pns with in-window units, ${lastSaleByPn.size} pns with any sale`);
-  log(`Skipped: noPn=${skippedNoPn}, noQty=${skippedNoQty}, noDate=${skippedNoDate}, canceled=${skippedCanceled}, outOfWindow=${skippedOutOfWindow}`);
+  log(`Parsed: ${entries.length} entries → ${rowsByKey.size} distinct (orderNbr, invId) pairs`);
+  log(`Skipped: noPn=${skippedNoPn}, noQty=${skippedNoQty}, noDate=${skippedNoDate}, noOrder=${skippedNoOrder}, canceled=${skippedCanceled}`);
 
-  // ── Field-discovery report ─────────────────────────────────────────
-  if (detectedPnField) log(`InventoryID field detected: "${detectedPnField}" (${pnHits} non-empty)`);
-  else                 log(`WARNING: no InventoryID field resolved from [${PN_CANDIDATES.join(", ")}] — everything was skipped for missing pn`);
-
-  if (detectedQtyField) log(`Quantity field detected: "${detectedQtyField}" (${qtyHits} non-empty)`);
-  else                  log(`WARNING: no Quantity field resolved from [${QTY_CANDIDATES.join(", ")}] — everything was skipped for missing qty`);
-
-  if (detectedDateField) log(`Order-date field detected: "${detectedDateField}" (${dateHits} non-empty)`);
-  else                   log(`WARNING: no order-date field resolved from [${DATE_CANDIDATES.join(", ")}] — everything was skipped for missing date`);
-
-  if (dateSamples.length) log("Date samples (raw → iso):", dateSamples);
-
-  if (detectedStatusField) log(`Status field detected: "${detectedStatusField}" (${statusHits} non-empty) — used for canceled-row guard`);
+  if (detectedPnField)     log(`InventoryID field detected: "${detectedPnField}" (${pnHits} non-empty)`);
+  else                     log(`WARNING: no InventoryID field resolved from [${PN_CANDIDATES.join(", ")}]`);
+  if (detectedQtyField)    log(`Quantity field detected: "${detectedQtyField}" (${qtyHits} non-empty)`);
+  else                     log(`WARNING: no Quantity field resolved from [${QTY_CANDIDATES.join(", ")}]`);
+  if (detectedDateField)   log(`Order-date field detected: "${detectedDateField}" (${dateHits} non-empty)`);
+  else                     log(`WARNING: no order-date field resolved from [${DATE_CANDIDATES.join(", ")}]`);
+  if (detectedOrderField)  log(`OrderNbr field detected: "${detectedOrderField}" (${orderHits} non-empty)`);
+  else                     log(`WARNING: no OrderNbr field resolved from [${ORDER_CANDIDATES.join(", ")}] — stable ids cannot be built`);
+  if (dateSamples.length)  log("Date samples (raw → iso):", dateSamples);
+  if (detectedStatusField) log(`Status field detected: "${detectedStatusField}" (${statusHits} non-empty) — used for canceled guard`);
   else                     log(`Status field not present in GI — GI-side filter is the only defense against canceled rows`);
 
-  // Bail early if a critical field never resolved. Better to no-op than
-  // to write zeros across every service part because the parser missed.
-  if (!detectedPnField || !detectedQtyField || !detectedDateField) {
+  if (!detectedPnField || !detectedQtyField || !detectedDateField || !detectedOrderField) {
     return { statusCode: 500, body: JSON.stringify({
       error: "Critical GI field(s) missing — verify candidate lists against the GI header",
-      pnField: detectedPnField, qtyField: detectedQtyField, dateField: detectedDateField,
+      pnField: detectedPnField, qtyField: detectedQtyField, dateField: detectedDateField, orderField: detectedOrderField,
     }) };
   }
 
@@ -268,10 +270,9 @@ exports.handler = async () => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  // deleted_parts is {id TEXT PK, data JSONB}, pn goes in `id`. Same as
-  // the tombstone fetch in acumatica-sync.js. Non-fatal on error: log
-  // loudly and proceed WITHOUT the filter so a Supabase blip doesn't
-  // skip the whole day's rate refresh.
+  // deleted_parts tombstones — non-fatal fetch. If the fetch fails we
+  // proceed WITHOUT the filter (better than blocking the whole day's
+  // sync) but log loudly.
   log("Fetching deleted_parts tombstones");
   const tombstoned = new Set();
   {
@@ -294,157 +295,125 @@ exports.handler = async () => {
   }
   log(`Loaded ${tombstoned.size} tombstoned pn(s)`);
 
-  // Fetch every parts row. We filter by itemType === "service" in
-  // memory rather than server-side because the jsonb key isn't
-  // guaranteed to have an index; the parts table is well under 10k
-  // rows total so this is trivially fast. Paginated at 1000-row cap.
-  log("Fetching existing parts from Supabase");
-  const existingMap = new Map();   // pn → data jsonb
-  {
-    const PAGE = 1000;
-    let from = 0;
-    while (true) {
-      const { data, error } = await supa
-        .from("parts")
-        .select("pn, data")
-        .range(from, from + PAGE - 1);
-      if (error) {
-        log("Supabase parts select failed", error);
-        return { statusCode: 500, body: JSON.stringify({ error: "parts fetch failed", detail: error.message }) };
-      }
-      if (!data || data.length === 0) break;
-      for (const row of data) existingMap.set(row.pn, row.data || {});
-      if (data.length < PAGE) break;
-      from += PAGE;
+  // Filter out tombstoned pns from the write set.
+  let tombstoneFiltered = 0;
+  for (const key of Array.from(rowsByKey.keys())) {
+    const r = rowsByKey.get(key);
+    if (tombstoned.has(r.pn)) {
+      rowsByKey.delete(key);
+      tombstoneFiltered++;
     }
   }
-  log(`Loaded ${existingMap.size} existing parts`);
+  if (tombstoneFiltered > 0) log(`Filtered ${tombstoneFiltered} sales rows for tombstoned pns`);
 
-  // ── Merge-safe write ───────────────────────────────────────────────
-  // Match bulkApplyComputedDaily's semantics (js/19-page-usage.js:1320)
-  // exactly:
-  //   - iterate over service parts
-  //   - if pn appears in feed (lastSaleByPn.has(pn)):
-  //       compute daily = round(units/180, 3) and write if different
-  //     else:
-  //       part is not in the feed at all → skip (preserve hand-set daily)
-  // A part IN the feed with 0 in-window units gets daily=0 (drop-off),
-  // matching manual behavior when a part's demand.map entry has
-  // appliedDaily=0 after old sales aged out.
+  // ── Scoped rebuild ─────────────────────────────────────────────────
+  // Step 1: DELETE existing sync-owned rows whose id matches
+  //   `us_acumatica-so_%`. This is the "rebuild" step — sales that
+  //   Acumatica has since removed (e.g. order voided post-sync) go away.
+  //   Non-sync rows (Excel import `sales-order-…`, kit-explosion rows
+  //   from Excel, C9 Big Sheet historical, manual log, warranty/damage
+  //   entries) are OUTSIDE the id prefix and are NEVER touched.
   //
-  // Non-service parts are never touched — their daily comes from the
-  // Base BOM Usage / Options Usage editors.
-  const rows = [];
-  let consideredService = 0;
-  let refreshedRate = 0;      // had oldDaily, has new nonzero daily, differ
-  let newlyRated = 0;         // oldDaily === 0, has new nonzero daily
-  let zeroedDropOff = 0;      // in feed, 0 in-window units, oldDaily > 0 → zero
-  let unchanged = 0;          // new === old (nonzero or both zero)
-  let neverInFeedPreserved = 0;  // not in feed at all → skip; hand-set daily kept
-  let skippedNonService = 0;  // itemType !== "service"
-  let skippedTombstoned = 0;
-
-  for (const [pn, existing] of existingMap.entries()) {
-    if (tombstoned.has(pn)) { skippedTombstoned++; continue; }
-    if (existing.itemType !== "service") { skippedNonService++; continue; }
-    consideredService++;
-
-    const inFeed  = lastSaleByPn.has(pn);
-    const oldDaily = Number(existing.daily) || 0;
-
-    if (!inFeed) {
-      // Never appeared in the feed. bulkApplyComputedDaily would skip
-      // (its `demand.get(pn)` returns undefined for a pn absent from
-      // DB.usage). Preserve whatever daily this part had.
-      neverInFeedPreserved++;
-      continue;
+  //   NOTE ON DELETE SEMANTICS: this deliberately deletes ALL prior
+  //   sync-owned rows (including ones that STILL appear in the current
+  //   feed) and re-inserts them via the upsert below. Correct because
+  //   the row shape is deterministic from the feed — no local state
+  //   is on these rows that a delete could destroy.
+  log("Scoped rebuild — deleting prior sync-owned rows (id LIKE 'us_acumatica-so_%')");
+  {
+    const { error, count } = await supa
+      .from("usage")
+      .delete({ count: "exact" })
+      .like("id", "us_acumatica-so\\_%");   // escape underscore so it's literal, not a wildcard
+    if (error) {
+      log("Scoped delete failed", error);
+      return { statusCode: 500, body: JSON.stringify({ error: "Scoped delete failed", detail: error.message }) };
     }
-
-    const units    = unitsByPn.get(pn) || 0;   // 0 if all sales fell out of window
-    const rawDaily = units / WINDOW_DAYS;
-    const newDaily = Math.round(rawDaily * 1000) / 1000;
-
-    if (newDaily === oldDaily) { unchanged++; continue; }
-
-    // Merge: preserve every other field on data, override ONLY daily.
-    // Never write {daily: N} alone — that would drop everything the
-    // primary acumatica-sync writes to the same row (onHand, notes,
-    // audit fields, itemType, and any client-added fields).
-    const merged = { ...existing, daily: newDaily };
-    rows.push({ pn, data: merged });
-
-    if (newDaily === 0) zeroedDropOff++;
-    else if (oldDaily === 0) newlyRated++;
-    else refreshedRate++;
+    log(`Deleted ${count ?? "?"} prior sync-owned row(s)`);
   }
 
-  // Also count feed pns not in DB.parts — informative only, we never
-  // create parts from this sync.
-  let feedPnsNotInCatalog = 0;
-  for (const pn of lastSaleByPn.keys()) {
-    if (!existingMap.has(pn)) feedPnsNotInCatalog++;
-  }
-  if (feedPnsNotInCatalog > 0) {
-    log(`Feed contains ${feedPnsNotInCatalog} pn(s) not in DB.parts (never created — add via catalog)`);
+  // Step 2: build & upsert the new rows. Row shape mirrors the Excel
+  // import as closely as possible so downstream consumers (computeDemand,
+  // Service Usage page, any manual audit) see identical fields — the
+  // only distinguishing marks are:
+  //   - id prefix `us_acumatica-so_` (Excel uses random `us_…`)
+  //   - sourceKey prefix `acumatica-so-` (Excel uses `sales-order-`)
+  //   - reason "…Acumatica sync" (Excel uses "…imported")
+  //   - user "acumatica-sync" (Excel uses "imported")
+  // pn, qty, ts, buildLine ARE identical. computeDemand only cares
+  // about ts/pn/qty so demand math is byte-equivalent to what a fresh
+  // Excel import of the same GI data would produce.
+  const rowsToWrite = [];
+  for (const r of rowsByKey.values()) {
+    rowsToWrite.push({
+      id: `us_acumatica-so_${r.orderNbr}_${r.pn}`,
+      data: {
+        ts: r.ts,
+        pn: r.pn,
+        qty: r.qty,
+        buildLine: "service",
+        reason: "Sales order shipment - Acumatica sync",
+        user: "acumatica-sync",
+        sourceKey: `acumatica-so-${r.orderNbr}-${r.pn}`,
+      },
+    });
   }
 
-  log(`Considered ${consideredService} service parts: ${refreshedRate} refreshed, ${newlyRated} newly rated, ${zeroedDropOff} zeroed drop-off, ${unchanged} unchanged, ${neverInFeedPreserved} never-in-feed preserved, ${skippedNonService} non-service (untouched), ${skippedTombstoned} tombstoned`);
-
-  if (rows.length === 0) {
-    log("No parts needed update");
+  if (rowsToWrite.length === 0) {
+    log("No rows to write after tombstone filter — sync-owned scope is now empty");
     return { statusCode: 200, body: JSON.stringify({
-      updated: 0, consideredService, unchanged, neverInFeedPreserved,
-      note: "No changes",
+      upserted: 0,
+      deletedPriorSyncRows: "see log",
+      note: "Empty write set after tombstone filter",
     }) };
   }
 
-  // Batch upsert — 500-row batches, same as acumatica-sync's parts path.
+  log(`Upserting ${rowsToWrite.length} row(s) into usage table`);
   const BATCH = 500;
   let totalUpserted = 0;
-  for (let i = 0; i < rows.length; i += BATCH) {
-    const batch = rows.slice(i, i + BATCH);
-    const { error } = await supa.from("parts").upsert(batch);
+  for (let i = 0; i < rowsToWrite.length; i += BATCH) {
+    const batch = rowsToWrite.slice(i, i + BATCH);
+    const { error } = await supa.from("usage").upsert(batch);
     if (error) {
       log(`Batch ${i}-${i + batch.length - 1} upsert failed`, error);
       return { statusCode: 500, body: JSON.stringify({
-        error: "parts upsert failed", detail: error.message, upsertedBefore: totalUpserted,
+        error: "usage upsert failed", detail: error.message, upsertedBefore: totalUpserted,
       }) };
     }
     totalUpserted += batch.length;
   }
-  log(`Upserted ${totalUpserted} parts row(s) with refreshed daily`);
+  log(`usage_txns rebuilt: ${totalUpserted} row(s)`);
 
   const elapsedMs = Date.now() - t0;
   log(`Done in ${elapsedMs}ms`);
 
-  // Structured audit — best-effort insert into the `audit` table if it
-  // exists in this environment. Same shape acumatica-sync uses.
+  // Structured audit — best-effort insert.
   try {
     await supa.from("audit").insert({
       ts: new Date().toISOString(),
       type: "service-usage-sync",
-      msg: `Refreshed daily on ${totalUpserted}/${consideredService} service parts (${zeroedDropOff} zeroed drop-offs, ${unchanged} unchanged) in ${elapsedMs}ms`,
+      msg: `usage_txns rebuilt: ${totalUpserted} Acumatica-sourced row(s) in ${elapsedMs}ms`,
       detail: {
         entries: entries.length,
         pagesFetched: pageCount,
-        distinctPnsWithUnits: unitsByPn.size,
-        distinctPnsAnySale: lastSaleByPn.size,
-        consideredService,
-        refreshedRate,
-        newlyRated,
-        zeroedDropOff,
-        unchanged,
-        neverInFeedPreserved,
-        skippedNonService,
-        skippedTombstoned,
-        feedPnsNotInCatalog,
+        distinctRows: rowsByKey.size,
+        upserted: totalUpserted,
+        tombstoneFiltered,
+        skipped: {
+          noPn: skippedNoPn,
+          noQty: skippedNoQty,
+          noDate: skippedNoDate,
+          noOrder: skippedNoOrder,
+          canceled: skippedCanceled,
+        },
         detectedFields: {
           pn: detectedPnField,
           qty: detectedQtyField,
           date: detectedDateField,
+          order: detectedOrderField,
           status: detectedStatusField,
         },
-        formula: `Math.round((units / ${WINDOW_DAYS}) * 1000) / 1000`,
+        note: "raw sales rows only — kits NOT exploded by this sync",
       },
     });
   } catch (e) {
@@ -452,20 +421,15 @@ exports.handler = async () => {
   }
 
   return { statusCode: 200, body: JSON.stringify({
-    updated: totalUpserted,
-    consideredService,
-    refreshedRate,
-    newlyRated,
-    zeroedDropOff,
-    unchanged,
-    neverInFeedPreserved,
+    upserted: totalUpserted,
     entries: entries.length,
     pagesFetched: pageCount,
-    distinctPnsWithUnits: unitsByPn.size,
+    tombstoneFiltered,
     detectedFields: {
       pn: detectedPnField,
       qty: detectedQtyField,
       date: detectedDateField,
+      order: detectedOrderField,
       status: detectedStatusField,
     },
   }) };
