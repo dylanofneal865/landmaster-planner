@@ -19,3 +19,11 @@
 # "LM Planner Kit Components" GI; slow-moving reference data, same cadence as BOM.
 [functions."acumatica-kit-sync"]
   schedule = "0 6 * * *"
+
+# Daily Service-Usage sync — runs once at 06:00 UTC. Computes 180-day rolling
+# daily-usage rate per LMCOMPO service part from the "LM Planner Service Usage"
+# GI and merge-safely writes it to parts.data.daily. Replaces the monthly
+# manual Excel Service-Usage Import; the Service Queue reads part.daily
+# (unchanged), so this simply refreshes the number every morning.
+[functions."acumatica-service-usage-sync"]
+  schedule = "0 6 * * *"
