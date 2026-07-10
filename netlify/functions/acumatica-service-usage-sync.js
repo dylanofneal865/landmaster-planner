@@ -1,52 +1,46 @@
-// Netlify Scheduled Function — refreshes Acumatica-sourced sales-order
-// rows in the Supabase `usage` table from the "LM Planner Service Usage" GI.
+// Netlify Scheduled Function — refreshes Acumatica-sourced sales-order rows
+// in the Supabase `usage` table from the "LM Planner Service Usage" GI.
+// Kits are exploded to their leaf-component parts at write time, mirroring
+// the manual Excel importer's behavior so kit-driven component demand
+// carries through into computeDemand's per-pn sum.
 //
 // Schedule: 06:00 UTC daily (see netlify.toml).
 //
 // Design contract (grep-verifiable):
-//   1. Writes ONLY to Supabase `usage`. Zero calls to _supa.from("parts").
-//      No daily rate is computed anywhere. part.data.daily is never read
-//      or written. `parts` table is completely untouched.
-//   2. Sync-owned rows are namespaced by id prefix `us_acumatica-so_` so
-//      the scoped rebuild (delete + reinsert) below can never touch
+//   1. Writes ONLY to Supabase `usage`. Zero calls to _supa.from("parts")
+//      that write (only .select is used to load itemType for a defensive
+//      unmatched-in-catalog skip, mirroring the Excel importer). part.data
+//      is never written. `daily` is never read or written.
+//   2. Sync-owned rows are namespaced by id prefix `us_acumatica-`:
+//        - direct sales:  `us_acumatica-so_<orderNbr>_<pn>`
+//        - kit explosion: `us_acumatica-so-kit_<orderNbr>_<topKitPn>_<leafPn>`
+//      The scoped rebuild (delete + reinsert) only touches these ids, so
 //      Excel-imported rows (`sales-order-…` sourceKey), C9 Big Sheet
-//      rows, manual logs, warranty/damaged/loss entries, or any other
-//      non-Acumatica usage transaction.
-//   3. Raw sales rows only — kits are written with pn = <kitPn>, NO
-//      component explosion here. The client is expected to handle
-//      kit-driven component demand.
+//      historicals, manual logs, warranty/damage/loss entries, and any
+//      other non-Acumatica usage transaction are NEVER touched.
+//   3. Kit explosion — for every sold kit line, the sync walks the kit
+//      recursively (bom_links first, kit_boms fallback — same priority as
+//      js/41-kit-boms.js resolveKitComponents) down to the leaf level and
+//      writes one row per (topKit, leaf) pair with qty = kitQty × Π(sub-qty)s.
+//      Cycle-guarded via a DFS in-path set. Sums duplicates that would
+//      arrive via multiple sub-tree paths so one leaf per kit sale yields
+//      exactly one row.
 //
-//      IMPORTANT KNOWN GAP: as of this deploy, the client does NOT
-//      explode kits at read time. computeDemand (js/40-demand.js:16-42)
-//      is a plain per-pn sum with zero kit awareness. Kit explosion
-//      historically happened at write time in the Excel import
-//      (js/13-page-settings.js:543-573). This sync's raw-only writes
-//      mean kit-component service parts (e.g. CP00537) will NOT receive
-//      credit for NEW Acumatica-sourced kit sales until either:
-//        (a) a client-side getDailyUse + kit_boms read-time explosion
-//            is built, OR
-//        (b) this sync is extended to explode at write time via a
-//            server-side bom_links/kit_boms fetch.
-//      Prior Excel-import exploded rows survive (they carry
-//      `sourceKey: kit-explosion-…` and are outside this sync's
-//      rebuild scope) so historical credit is intact.
+//      Row shape matches the Excel importer's kit-explosion rows exactly on
+//      the fields that drive demand math (ts, pn, qty, buildLine) — see the
+//      "Row shape parity" note in the exploded-row builder below.
 //
-// Required env vars:
-//   ACUMATICA_BASE_URL
-//   ACUMATICA_COMPANY
-//   ACUMATICA_SERVICE_USAGE_GI_NAME   e.g. "LM Planner Service Usage"
-//   ACUMATICA_USERNAME
-//   ACUMATICA_PASSWORD
-//   SUPABASE_URL
-//   SUPABASE_SERVICE_KEY
+//      DIVERGENCE from Excel importer: this sync RECURSES into sub-kits.
+//      The importer has a `TODO: handle nested kits` comment at
+//      js/13-page-settings.js:546 and only explodes one level. This sync
+//      is strictly more correct: a service component reached via a
+//      sub-kit still gets credit here where the importer would have missed it.
+//
+// Required env vars: same as acumatica-sync.js.
 
 const { createClient } = require("@supabase/supabase-js");
 
 // Prefix-optional field extractor — copied verbatim from acumatica-sync.js.
-// Handles both <d:Foo> (native DAC) and <_Foo> (custom GI columns like
-// _BlanketExpires). Boundary-safe: the trailing (?:\s[^>]*)?> group
-// forces either whitespace or > after the field name, so "InventoryID"
-// won't partial-match "InventoryIDExt" or vice versa.
 function makeFieldGetters(raw) {
   const get = (field) => {
     const re = new RegExp(`<(?:d:)?${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/(?:d:)?${field}>`, "i");
@@ -68,12 +62,6 @@ function getFirstHit(getFn, candidates) {
   return { field: null, value: "" };
 }
 
-// Robust date parse — handles ISO ("2026-06-15T00:00:00") AND M/D/YYYY
-// ("6/15/2026"). Returns UTC epoch ms at 12:00 UTC on the parsed date,
-// matching parseSalesOrderWorkbook's noon-UTC convention so a same-date
-// sale lands at the same ms whether it came via Excel importer or this
-// sync. Also returns an ISO date string for storage. NaN/null when
-// unparseable.
 function parseFeedDate(v) {
   if (!v) return { ms: NaN, iso: null };
   const s = String(v).trim();
@@ -95,6 +83,101 @@ function parseFeedDate(v) {
 function toNum(v) {
   const n = parseFloat(v);
   return isFinite(n) ? n : 0;
+}
+
+// Strip a trailing supersession suffix — mirrors _stripKitSuffix in
+// js/41-kit-boms.js. Turns "18931-R" → "18931". A trailing numeric-only
+// segment like "18155-2" is NOT stripped (letters only).
+function stripKitSuffix(pn) {
+  const m = String(pn || "").match(/^(.*)-[A-Za-z]+$/);
+  return m ? m[1] : null;
+}
+
+// Server-side kit-component resolver — mirrors resolveKitComponents priority
+// order in js/41-kit-boms.js:78-104.
+//   a. direct bom_links parent
+//   b. stripped supersession suffix → bom_links (only if stripped pn is a real parent)
+//   c. kit_boms fallback
+// Returns [{pn, qty}] or [] when nothing resolves.
+function makeResolver(bomLinksByParent, kitBomsMap) {
+  return function resolveKitComponents(pn) {
+    if (!pn) return [];
+    if (bomLinksByParent.has(pn)) {
+      const rows = bomLinksByParent.get(pn);
+      const comps = rows.map(r => ({ pn: r.child, qty: Number(r.qty) || 0 }));
+      if (comps.length) return comps;
+    }
+    const stripped = stripKitSuffix(pn);
+    if (stripped && stripped !== pn && bomLinksByParent.has(stripped)) {
+      const rows = bomLinksByParent.get(stripped);
+      const comps = rows.map(r => ({ pn: r.child, qty: Number(r.qty) || 0 }));
+      if (comps.length) return comps;
+    }
+    const kb = kitBomsMap.get(pn);
+    if (kb && Array.isArray(kb.components) && kb.components.length) {
+      return kb.components.map(c => ({ pn: c.pn, qty: Number(c.qty) || 0 }));
+    }
+    return [];
+  };
+}
+
+// Kit detection — DELIBERATELY DIVERGES from the client-side isKit at
+// js/41-kit-boms.js:111. The client requires part.itemType === "kit"
+// AND resolvable components; the migration tagKitsFromKitBoms() only
+// tags parts present as keys in DB.kitBoms, so kits that live only in
+// bom_links (Acumatica-native finished-goods with a BOM but no hand-
+// imported kit_boms row) never get the "kit" itemType tag and slip
+// through the client isKit gate — the Excel importer inherits the same
+// blind spot.
+//
+// Server-side we cannot rely on itemType tagging being complete in
+// Supabase, so the sync trusts resolveKitComponents alone: if a sold
+// pn has any resolvable components (bom_links parent OR stripped-
+// suffix bom_links parent OR kit_boms entry), explode it. This is
+// strictly more correct for service usage tracking — a sale of a
+// finished-good with a BOM consumes its components, whether the part
+// is UI-marked as a kit or not.
+function makeIsKit(_partsItemTypeMap, resolveKitComponents) {
+  return function isKit(pn) {
+    if (!pn) return false;
+    return resolveKitComponents(pn).length > 0;
+  };
+}
+
+// Recursive kit-to-leaves explosion. Returns Map<leafPn, totalQty> aggregated
+// across all sub-tree paths that reach the same leaf.
+//
+// Recursion gate uses `isSubKit`, NOT the broad top-level `isKit`. A component
+// only recurses if it's explicitly tagged itemType === "kit" (in DB.parts /
+// partsItemTypeMap). Rationale:
+//   - Top-level: broad (any resolvable BOM → explode). Fixes the untagged-
+//     finished-good case (e.g. Acumatica-native kit "16164" not present in
+//     the hand-imported kit_boms table so tagKitsFromKitBoms never tagged it).
+//   - Recursion: strict. A service kit often contains a welded sub-assembly
+//     (itemType === "base_bom") which itself has a bom_links BOM listing raw
+//     steel sheets. Recursing into that sub-assembly would credit the raw
+//     stock as service demand — wrong. Untagged sub-parts are treated as
+//     leaves and receive credit directly.
+// Cycle-guarded via a DFS in-path Set.
+function explodeToLeaves(rootKitPn, rootQty, isSubKit, resolveKitComponents) {
+  const totals = new Map();
+  const inPath = new Set();
+  function walk(kitPn, qty) {
+    if (inPath.has(kitPn)) return;
+    inPath.add(kitPn);
+    for (const comp of resolveKitComponents(kitPn)) {
+      const q = qty * (Number(comp.qty) || 0);
+      if (q <= 0) continue;
+      if (isSubKit(comp.pn)) {
+        walk(comp.pn, q);
+      } else {
+        totals.set(comp.pn, (totals.get(comp.pn) || 0) + q);
+      }
+    }
+    inPath.delete(kitPn);
+  }
+  walk(rootKitPn, rootQty);
+  return totals;
 }
 
 exports.handler = async () => {
@@ -122,7 +205,7 @@ exports.handler = async () => {
   const company = ACUMATICA_COMPANY || "LIVE";
   const url = `${ACUMATICA_BASE_URL}/OData/${company}/${giEncoded}`;
 
-  // ── Paginated fetch — mirrors runPOSync in acumatica-sync.js ────────
+  // ── Paginated GI fetch ─────────────────────────────────────────────
   const PAGE_SIZE = 1000;
   const MAX_PAGES = 30;
   log("Fetching (paginated)", url);
@@ -159,43 +242,27 @@ exports.handler = async () => {
 
   if (entries.length === 0) {
     log("No entries — bailing without touching usage table");
-    return { statusCode: 200, body: JSON.stringify({ upserted: 0, deleted: 0, note: "No entries" }) };
+    return { statusCode: 200, body: JSON.stringify({ upserted: 0, note: "No entries" }) };
   }
 
   // ── Field discovery ────────────────────────────────────────────────
-  // Same first-hit-wins pattern as blanket-linkage in acumatica-sync.
-  // OrderNbr is added to the field set because we need it to build a
-  // stable per-row id (`us_acumatica-so_<orderNbr>_<invId>`). If it
-  // can't be resolved we short-circuit — a random id would break the
-  // scoped-rebuild deletion contract.
   const PN_CANDIDATES     = ["InventoryID", "Inventory_ID", "InventoryID_"];
   const QTY_CANDIDATES    = ["Quantity", "Qty", "OrderQty"];
   const DATE_CANDIDATES   = ["SOLine_orderDate", "SOLineorderDate", "OrderDate"];
   const ORDER_CANDIDATES  = ["OrderNbr", "SOOrderNbr", "OrderNumber", "OrderNo", "OrderNbr_"];
-  const STATUS_CANDIDATES = ["Status", "OrderStatus", "SOStatus"];   // optional cancel guard
+  const STATUS_CANDIDATES = ["Status", "OrderStatus", "SOStatus"];
 
-  let detectedPnField     = null;
-  let detectedQtyField    = null;
-  let detectedDateField   = null;
-  let detectedOrderField  = null;
-  let detectedStatusField = null;
+  let detectedPnField = null, detectedQtyField = null, detectedDateField = null;
+  let detectedOrderField = null, detectedStatusField = null;
   let pnHits = 0, qtyHits = 0, dateHits = 0, orderHits = 0, statusHits = 0;
   const dateSamples = [];
 
-  // Defensive cancel status skip. GI is expected to filter these
-  // server-side; this is belt-and-suspenders.
   const CANCELED = new Set(["canceled", "cancelled", "voided", "void", "rejected", "hold", "on hold"]);
 
-  // Row accumulation — one output row per (orderNbr, invId) combo. If
-  // the same combo appears twice in the feed (rare — usually only via
-  // schema quirks), we keep the LAST occurrence's values.
-  const rowsByKey = new Map();   // "orderNbr::invId" → { orderNbr, pn, qty, ts, iso }
+  // Raw sales-line accumulation — dedupe on (orderNbr, invId).
+  const salesByKey = new Map();
 
-  let skippedCanceled = 0;
-  let skippedNoPn = 0;
-  let skippedNoQty = 0;
-  let skippedNoDate = 0;
-  let skippedNoOrder = 0;
+  let skippedCanceled = 0, skippedNoPn = 0, skippedNoQty = 0, skippedNoDate = 0, skippedNoOrder = 0;
 
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
@@ -234,16 +301,10 @@ exports.handler = async () => {
     orderHits++;
     const orderNbr = orderHit.value;
 
-    const key = `${orderNbr}::${pn}`;
-    rowsByKey.set(key, {
-      orderNbr,
-      pn,
-      qty: Math.round(qty),
-      ts: parsed.iso,
-    });
+    salesByKey.set(`${orderNbr}::${pn}`, { orderNbr, pn, qty: Math.round(qty), ts: parsed.iso });
   }
 
-  log(`Parsed: ${entries.length} entries → ${rowsByKey.size} distinct (orderNbr, invId) pairs`);
+  log(`Parsed: ${entries.length} entries → ${salesByKey.size} distinct (orderNbr, invId) sales`);
   log(`Skipped: noPn=${skippedNoPn}, noQty=${skippedNoQty}, noDate=${skippedNoDate}, noOrder=${skippedNoOrder}, canceled=${skippedCanceled}`);
 
   if (detectedPnField)     log(`InventoryID field detected: "${detectedPnField}" (${pnHits} non-empty)`);
@@ -253,40 +314,31 @@ exports.handler = async () => {
   if (detectedDateField)   log(`Order-date field detected: "${detectedDateField}" (${dateHits} non-empty)`);
   else                     log(`WARNING: no order-date field resolved from [${DATE_CANDIDATES.join(", ")}]`);
   if (detectedOrderField)  log(`OrderNbr field detected: "${detectedOrderField}" (${orderHits} non-empty)`);
-  else                     log(`WARNING: no OrderNbr field resolved from [${ORDER_CANDIDATES.join(", ")}] — stable ids cannot be built`);
+  else                     log(`WARNING: no OrderNbr field resolved from [${ORDER_CANDIDATES.join(", ")}]`);
   if (dateSamples.length)  log("Date samples (raw → iso):", dateSamples);
-  if (detectedStatusField) log(`Status field detected: "${detectedStatusField}" (${statusHits} non-empty) — used for canceled guard`);
-  else                     log(`Status field not present in GI — GI-side filter is the only defense against canceled rows`);
+  if (detectedStatusField) log(`Status field detected: "${detectedStatusField}" (${statusHits} non-empty) — cancel guard`);
 
   if (!detectedPnField || !detectedQtyField || !detectedDateField || !detectedOrderField) {
     return { statusCode: 500, body: JSON.stringify({
-      error: "Critical GI field(s) missing — verify candidate lists against the GI header",
+      error: "Critical GI field(s) missing — verify candidate lists",
       pnField: detectedPnField, qtyField: detectedQtyField, dateField: detectedDateField, orderField: detectedOrderField,
     }) };
   }
 
-  // ── Supabase setup + tombstone fetch ───────────────────────────────
+  // ── Supabase setup + reference-data fetch ──────────────────────────
   const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  // deleted_parts tombstones — non-fatal fetch. If the fetch fails we
-  // proceed WITHOUT the filter (better than blocking the whole day's
-  // sync) but log loudly.
+  // deleted_parts tombstones — non-fatal on error (proceed WITHOUT filter).
   log("Fetching deleted_parts tombstones");
   const tombstoned = new Set();
   {
     const TS_PAGE = 1000;
     let from = 0;
     while (true) {
-      const { data, error } = await supa
-        .from("deleted_parts")
-        .select("id")
-        .range(from, from + TS_PAGE - 1);
-      if (error) {
-        log("WARNING: deleted_parts fetch failed — tombstone filter INACTIVE this run", error);
-        break;
-      }
+      const { data, error } = await supa.from("deleted_parts").select("id").range(from, from + TS_PAGE - 1);
+      if (error) { log("WARNING: deleted_parts fetch failed", error); break; }
       if (!data || data.length === 0) break;
       for (const row of data) if (row && row.id) tombstoned.add(String(row.id));
       if (data.length < TS_PAGE) break;
@@ -295,36 +347,192 @@ exports.handler = async () => {
   }
   log(`Loaded ${tombstoned.size} tombstoned pn(s)`);
 
-  // Filter out tombstoned pns from the write set.
-  let tombstoneFiltered = 0;
-  for (const key of Array.from(rowsByKey.keys())) {
-    const r = rowsByKey.get(key);
-    if (tombstoned.has(r.pn)) {
-      rowsByKey.delete(key);
-      tombstoneFiltered++;
+  // parts — LOAD ONLY THE itemType FIELD (defensive: to skip lines whose pn
+  // isn't in the catalog, matching the Excel importer's
+  // "unmatchedNotInCatalog" behavior, and to gate isKit via itemType).
+  // This is a SELECT — grep the file: no _supa.from("parts").upsert or
+  // .from("parts").delete anywhere.
+  log("Fetching parts itemType map from Supabase");
+  const partsItemTypeMap = new Map();  // pn → itemType (string or null)
+  {
+    const PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await supa.from("parts").select("pn, data").range(from, from + PAGE - 1);
+      if (error) {
+        log("parts select failed", error);
+        return { statusCode: 500, body: JSON.stringify({ error: "parts fetch failed", detail: error.message }) };
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) partsItemTypeMap.set(row.pn, (row.data && row.data.itemType) || null);
+      if (data.length < PAGE) break;
+      from += PAGE;
     }
   }
-  if (tombstoneFiltered > 0) log(`Filtered ${tombstoneFiltered} sales rows for tombstoned pns`);
+  log(`Loaded ${partsItemTypeMap.size} parts (itemType only)`);
+
+  // bom_links — parent → [{child, qty}].
+  log("Fetching bom_links");
+  const bomLinksByParent = new Map();
+  {
+    const PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await supa.from("bom_links").select("id, data").range(from, from + PAGE - 1);
+      if (error) {
+        log("bom_links select failed", error);
+        return { statusCode: 500, body: JSON.stringify({ error: "bom_links fetch failed", detail: error.message }) };
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        const d = row.data || {};
+        const parent = d.parent, child = d.child;
+        if (!parent || !child) continue;
+        if (!bomLinksByParent.has(parent)) bomLinksByParent.set(parent, []);
+        bomLinksByParent.get(parent).push({ child, qty: Number(d.qty) || 0 });
+      }
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+  log(`Loaded ${bomLinksByParent.size} distinct bom_links parents`);
+
+  // kit_boms — kit_pn → { components: [{pn, qty, ...}] }.
+  log("Fetching kit_boms");
+  const kitBomsMap = new Map();
+  {
+    const PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await supa.from("kit_boms").select("kit_pn, data").range(from, from + PAGE - 1);
+      if (error) {
+        log("kit_boms select failed", error);
+        return { statusCode: 500, body: JSON.stringify({ error: "kit_boms fetch failed", detail: error.message }) };
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) if (row.kit_pn && row.data) kitBomsMap.set(row.kit_pn, row.data);
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+  }
+  log(`Loaded ${kitBomsMap.size} kit_boms entries`);
+
+  const resolveKitComponents = makeResolver(bomLinksByParent, kitBomsMap);
+  // Broad top-level detection: any sold pn with a resolvable BOM explodes.
+  const isKit = makeIsKit(partsItemTypeMap, resolveKitComponents);
+  // Strict recursion gate: only recurse into components tagged itemType="kit"
+  // AND with resolvable components — prevents drilling into base_bom sub-
+  // assemblies that happen to have manufacturing BOMs. See explodeToLeaves.
+  const isSubKit = (pn) => {
+    if (!pn) return false;
+    if (partsItemTypeMap.get(pn) !== "kit") return false;
+    return resolveKitComponents(pn).length > 0;
+  };
+
+  // ── Build write rows ───────────────────────────────────────────────
+  // Two row types, both share the `us_acumatica-` id prefix so the scoped
+  // rebuild delete catches both:
+  //
+  // DIRECT (one per sales line, matches Excel importer's raw pass):
+  //   id: us_acumatica-so_<orderNbr>_<pn>
+  //   data: { ts, pn, qty, buildLine: "service", reason: "Sales order shipment - Acumatica sync",
+  //           user: "acumatica-sync", sourceKey: "acumatica-so-<orderNbr>-<pn>" }
+  //
+  // EXPLODED (one per leaf per kit sale, matches Excel importer's kit-explosion pass):
+  //   id: us_acumatica-so-kit_<orderNbr>_<topKitPn>_<leafPn>
+  //   data: { ts, pn: leafPn, qty: kitQty × (product of subQtys), buildLine: "kit-explosion",
+  //           reason: "From kit <topKitPn>", user: "acumatica-sync",
+  //           sourceKey: "kit-explosion-acumatica-so-<orderNbr>-<topKitPn>-<leafPn>" }
+  //
+  // Row shape parity: pn/qty/ts/buildLine/reason match the Excel importer's
+  // kit-explosion row shape field-for-field. Only user, id, and sourceKey
+  // differ (all traceability — they identify the row as sync-owned so the
+  // scoped rebuild can operate without touching Excel-imported rows).
+  const rowsToWrite = [];
+  let directRows = 0;
+  let explodedRows = 0;
+  let kitSales = 0;
+  let leafSkippedTombstone = 0;
+  let leafSkippedNotInCatalog = 0;
+  let directSkippedTombstone = 0;
+  let directSkippedNotInCatalog = 0;
+  let kitNoBomSkipped = 0;
+
+  for (const sale of salesByKey.values()) {
+    // Direct row — write for ANY sold pn present in the catalog (matches
+    // Excel importer semantics: it also writes the raw sales-line row for
+    // kits as well as non-kits).
+    if (tombstoned.has(sale.pn)) {
+      directSkippedTombstone++;
+      // Even if the direct row is dropped, we still explode the kit — the
+      // Excel importer also writes explosion rows independently of the
+      // direct row's fate. Keep going.
+    } else if (!partsItemTypeMap.has(sale.pn)) {
+      directSkippedNotInCatalog++;
+    } else {
+      rowsToWrite.push({
+        id: `us_acumatica-so_${sale.orderNbr}_${sale.pn}`,
+        data: {
+          ts: sale.ts,
+          pn: sale.pn,
+          qty: sale.qty,
+          buildLine: "service",
+          reason: "Sales order shipment - Acumatica sync",
+          user: "acumatica-sync",
+          sourceKey: `acumatica-so-${sale.orderNbr}-${sale.pn}`,
+        },
+      });
+      directRows++;
+    }
+
+    // Kit explosion — only fires when the sold pn passes the isKit gate.
+    if (!isKit(sale.pn)) continue;
+    kitSales++;
+    const leafTotals = explodeToLeaves(sale.pn, sale.qty, isSubKit, resolveKitComponents);
+    if (leafTotals.size === 0) {
+      // Should not happen since isKit requires resolvable components, but
+      // guard just in case (e.g. a cycle-only kit).
+      kitNoBomSkipped++;
+      continue;
+    }
+    for (const [leafPn, totalQty] of leafTotals.entries()) {
+      if (tombstoned.has(leafPn)) { leafSkippedTombstone++; continue; }
+      if (!partsItemTypeMap.has(leafPn)) { leafSkippedNotInCatalog++; continue; }
+      const roundedQty = Math.round(totalQty);
+      if (roundedQty <= 0) continue;
+      rowsToWrite.push({
+        id: `us_acumatica-so-kit_${sale.orderNbr}_${sale.pn}_${leafPn}`,
+        data: {
+          ts: sale.ts,
+          pn: leafPn,
+          qty: roundedQty,
+          buildLine: "kit-explosion",
+          reason: `From kit ${sale.pn}`,
+          user: "acumatica-sync",
+          sourceKey: `kit-explosion-acumatica-so-${sale.orderNbr}-${sale.pn}-${leafPn}`,
+        },
+      });
+      explodedRows++;
+    }
+  }
+
+  log(`Row build: ${directRows} direct + ${explodedRows} exploded (from ${kitSales} kit sales) = ${rowsToWrite.length} total`);
+  log(`Skipped direct: tombstone=${directSkippedTombstone}, notInCatalog=${directSkippedNotInCatalog}`);
+  log(`Skipped explode-leaves: tombstone=${leafSkippedTombstone}, notInCatalog=${leafSkippedNotInCatalog}`);
+  if (kitNoBomSkipped > 0) log(`WARNING: ${kitNoBomSkipped} kit sales had zero resolvable leaves (unexpected — check bom_links/kit_boms coverage)`);
 
   // ── Scoped rebuild ─────────────────────────────────────────────────
-  // Step 1: DELETE existing sync-owned rows whose id matches
-  //   `us_acumatica-so_%`. This is the "rebuild" step — sales that
-  //   Acumatica has since removed (e.g. order voided post-sync) go away.
-  //   Non-sync rows (Excel import `sales-order-…`, kit-explosion rows
-  //   from Excel, C9 Big Sheet historical, manual log, warranty/damage
-  //   entries) are OUTSIDE the id prefix and are NEVER touched.
-  //
-  //   NOTE ON DELETE SEMANTICS: this deliberately deletes ALL prior
-  //   sync-owned rows (including ones that STILL appear in the current
-  //   feed) and re-inserts them via the upsert below. Correct because
-  //   the row shape is deterministic from the feed — no local state
-  //   is on these rows that a delete could destroy.
-  log("Scoped rebuild — deleting prior sync-owned rows (id LIKE 'us_acumatica-so_%')");
+  // Delete every sync-owned row (both direct + exploded namespaces) then
+  // upsert the fresh set. The `us\_acumatica-%` LIKE pattern uses a
+  // backslash-escaped underscore so the first `_` is literal — matches
+  // "us_acumatica-…" only, never "usXacumatica-…" for other X. Non-
+  // Acumatica rows are outside this prefix and are NEVER touched.
+  log("Scoped rebuild — deleting prior sync-owned rows (id LIKE 'us_acumatica-%')");
   {
     const { error, count } = await supa
       .from("usage")
       .delete({ count: "exact" })
-      .like("id", "us_acumatica-so\\_%");   // escape underscore so it's literal, not a wildcard
+      .like("id", "us\\_acumatica-%");
     if (error) {
       log("Scoped delete failed", error);
       return { statusCode: 500, body: JSON.stringify({ error: "Scoped delete failed", detail: error.message }) };
@@ -332,43 +540,14 @@ exports.handler = async () => {
     log(`Deleted ${count ?? "?"} prior sync-owned row(s)`);
   }
 
-  // Step 2: build & upsert the new rows. Row shape mirrors the Excel
-  // import as closely as possible so downstream consumers (computeDemand,
-  // Service Usage page, any manual audit) see identical fields — the
-  // only distinguishing marks are:
-  //   - id prefix `us_acumatica-so_` (Excel uses random `us_…`)
-  //   - sourceKey prefix `acumatica-so-` (Excel uses `sales-order-`)
-  //   - reason "…Acumatica sync" (Excel uses "…imported")
-  //   - user "acumatica-sync" (Excel uses "imported")
-  // pn, qty, ts, buildLine ARE identical. computeDemand only cares
-  // about ts/pn/qty so demand math is byte-equivalent to what a fresh
-  // Excel import of the same GI data would produce.
-  const rowsToWrite = [];
-  for (const r of rowsByKey.values()) {
-    rowsToWrite.push({
-      id: `us_acumatica-so_${r.orderNbr}_${r.pn}`,
-      data: {
-        ts: r.ts,
-        pn: r.pn,
-        qty: r.qty,
-        buildLine: "service",
-        reason: "Sales order shipment - Acumatica sync",
-        user: "acumatica-sync",
-        sourceKey: `acumatica-so-${r.orderNbr}-${r.pn}`,
-      },
-    });
-  }
-
   if (rowsToWrite.length === 0) {
-    log("No rows to write after tombstone filter — sync-owned scope is now empty");
+    log("No rows to write after filters — sync-owned scope is now empty");
     return { statusCode: 200, body: JSON.stringify({
-      upserted: 0,
-      deletedPriorSyncRows: "see log",
-      note: "Empty write set after tombstone filter",
+      upserted: 0, directRows: 0, explodedRows: 0,
+      note: "Empty write set after tombstone/catalog filters",
     }) };
   }
 
-  log(`Upserting ${rowsToWrite.length} row(s) into usage table`);
   const BATCH = 500;
   let totalUpserted = 0;
   for (let i = 0; i < rowsToWrite.length; i += BATCH) {
@@ -382,38 +561,46 @@ exports.handler = async () => {
     }
     totalUpserted += batch.length;
   }
-  log(`usage_txns rebuilt: ${totalUpserted} row(s)`);
+  log(`usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded)`);
 
   const elapsedMs = Date.now() - t0;
   log(`Done in ${elapsedMs}ms`);
 
-  // Structured audit — best-effort insert.
   try {
     await supa.from("audit").insert({
       ts: new Date().toISOString(),
       type: "service-usage-sync",
-      msg: `usage_txns rebuilt: ${totalUpserted} Acumatica-sourced row(s) in ${elapsedMs}ms`,
+      msg: `usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded from ${kitSales} kit sales) in ${elapsedMs}ms`,
       detail: {
         entries: entries.length,
         pagesFetched: pageCount,
-        distinctRows: rowsByKey.size,
-        upserted: totalUpserted,
-        tombstoneFiltered,
+        distinctSales: salesByKey.size,
+        directRows,
+        explodedRows,
+        kitSales,
         skipped: {
+          canceled: skippedCanceled,
           noPn: skippedNoPn,
           noQty: skippedNoQty,
           noDate: skippedNoDate,
           noOrder: skippedNoOrder,
-          canceled: skippedCanceled,
+          directTombstone: directSkippedTombstone,
+          directNotInCatalog: directSkippedNotInCatalog,
+          leafTombstone: leafSkippedTombstone,
+          leafNotInCatalog: leafSkippedNotInCatalog,
+          kitNoBom: kitNoBomSkipped,
         },
         detectedFields: {
-          pn: detectedPnField,
-          qty: detectedQtyField,
-          date: detectedDateField,
-          order: detectedOrderField,
-          status: detectedStatusField,
+          pn: detectedPnField, qty: detectedQtyField, date: detectedDateField,
+          order: detectedOrderField, status: detectedStatusField,
         },
-        note: "raw sales rows only — kits NOT exploded by this sync",
+        catalogCounts: {
+          parts: partsItemTypeMap.size,
+          bomLinksParents: bomLinksByParent.size,
+          kitBoms: kitBomsMap.size,
+          tombstones: tombstoned.size,
+        },
+        note: "Kit sales exploded recursively to leaves; row shape mirrors Excel importer's kit-explosion rows",
       },
     });
   } catch (e) {
@@ -422,15 +609,14 @@ exports.handler = async () => {
 
   return { statusCode: 200, body: JSON.stringify({
     upserted: totalUpserted,
+    directRows,
+    explodedRows,
+    kitSales,
     entries: entries.length,
     pagesFetched: pageCount,
-    tombstoneFiltered,
     detectedFields: {
-      pn: detectedPnField,
-      qty: detectedQtyField,
-      date: detectedDateField,
-      order: detectedOrderField,
-      status: detectedStatusField,
+      pn: detectedPnField, qty: detectedQtyField, date: detectedDateField,
+      order: detectedOrderField, status: detectedStatusField,
     },
   }) };
 };
