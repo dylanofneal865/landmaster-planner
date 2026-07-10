@@ -7,11 +7,15 @@
 // Schedule: 06:00 UTC daily (see netlify.toml).
 //
 // Design contract (grep-verifiable):
-//   1. Writes ONLY to Supabase `usage`. Zero calls to _supa.from("parts")
-//      that write (only .select is used to load itemType for a defensive
-//      unmatched-in-catalog skip, mirroring the Excel importer). part.data
-//      is never written. `daily` is never read or written.
-//   2. Sync-owned rows are namespaced by id prefix `us_acumatica-`:
+//   1. Writes to Supabase `usage` (kit-explosion-inclusive raw txns) AND
+//      to Supabase `parts` (part.data.daily for itemType === "service"
+//      parts ONLY — grep the loop-building block below for the guard
+//      `if (existing.itemType !== "service") continue;` which is the
+//      HARD GATE preventing writes to any non-service part).
+//      No other fields on parts.data are written — merge-safe upsert
+//      spreads existing and overrides ONLY the daily field.
+//   2. Sync-owned rows in `usage` are namespaced by id prefix
+//      `us_acumatica-`:
 //        - direct sales:  `us_acumatica-so_<orderNbr>_<pn>`
 //        - kit explosion: `us_acumatica-so-kit_<orderNbr>_<topKitPn>_<leafPn>`
 //      The scoped rebuild (delete + reinsert) only touches these ids, so
@@ -25,6 +29,16 @@
 //      Cycle-guarded via a DFS in-path set. Sums duplicates that would
 //      arrive via multiple sub-tree paths so one leaf per kit sale yields
 //      exactly one row.
+//   4. Service-part daily-rate refresh — after usage writes complete,
+//      the sync scans the FULL `usage` table (all sources — this run's
+//      Acumatica rows + all prior Excel imports + C9 Big Sheet +
+//      manual logs) and computes each part's 180-day rate exactly the
+//      way js/40-demand.js:16-42 computeDemand does. The rate is
+//      merge-safely upserted onto parts.data.daily ONLY when the part
+//      has itemType === "service". Base BOM, options, kit, and untagged
+//      parts are silently skipped and never see a parts upsert. A
+//      service part with zero in-window units gets daily = 0 (correct
+//      drop-off — the manual bulkApplyComputedDaily does the same).
 //
 //      Row shape matches the Excel importer's kit-explosion rows exactly on
 //      the fields that drive demand math (ts, pn, qty, buildLine) — see the
@@ -149,7 +163,7 @@ function makeIsKit(_partsItemTypeMap, resolveKitComponents) {
 //
 // Recursion gate uses `isSubKit`, NOT the broad top-level `isKit`. A component
 // only recurses if it's explicitly tagged itemType === "kit" (in DB.parts /
-// partsItemTypeMap). Rationale:
+// partsMap). Rationale:
 //   - Top-level: broad (any resolvable BOM → explode). Fixes the untagged-
 //     finished-good case (e.g. Acumatica-native kit "16164" not present in
 //     the hand-imported kit_boms table so tagKitsFromKitBoms never tagged it).
@@ -353,7 +367,11 @@ exports.handler = async () => {
   // This is a SELECT — grep the file: no _supa.from("parts").upsert or
   // .from("parts").delete anywhere.
   log("Fetching parts itemType map from Supabase");
-  const partsItemTypeMap = new Map();  // pn → itemType (string or null)
+  // partsMap holds the FULL data blob per pn so the (later) service-part
+  // daily-rate refresh step can merge-safely upsert `{...existing, daily}`
+  // without a second fetch. All prior call sites read only `.itemType` off
+  // this map, so switching from itemType-only storage is a drop-in change.
+  const partsMap = new Map();  // pn → data JSONB blob
   {
     const PAGE = 1000;
     let from = 0;
@@ -364,12 +382,12 @@ exports.handler = async () => {
         return { statusCode: 500, body: JSON.stringify({ error: "parts fetch failed", detail: error.message }) };
       }
       if (!data || data.length === 0) break;
-      for (const row of data) partsItemTypeMap.set(row.pn, (row.data && row.data.itemType) || null);
+      for (const row of data) partsMap.set(row.pn, row.data || {});
       if (data.length < PAGE) break;
       from += PAGE;
     }
   }
-  log(`Loaded ${partsItemTypeMap.size} parts (itemType only)`);
+  log(`Loaded ${partsMap.size} parts (full data)`);
 
   // bom_links — parent → [{child, qty}].
   log("Fetching bom_links");
@@ -419,13 +437,13 @@ exports.handler = async () => {
 
   const resolveKitComponents = makeResolver(bomLinksByParent, kitBomsMap);
   // Broad top-level detection: any sold pn with a resolvable BOM explodes.
-  const isKit = makeIsKit(partsItemTypeMap, resolveKitComponents);
+  const isKit = makeIsKit(partsMap, resolveKitComponents);
   // Strict recursion gate: only recurse into components tagged itemType="kit"
   // AND with resolvable components — prevents drilling into base_bom sub-
   // assemblies that happen to have manufacturing BOMs. See explodeToLeaves.
   const isSubKit = (pn) => {
     if (!pn) return false;
-    if (partsItemTypeMap.get(pn) !== "kit") return false;
+    if ((partsMap.get(pn) || {}).itemType !== "kit") return false;
     return resolveKitComponents(pn).length > 0;
   };
 
@@ -467,7 +485,7 @@ exports.handler = async () => {
       // Even if the direct row is dropped, we still explode the kit — the
       // Excel importer also writes explosion rows independently of the
       // direct row's fate. Keep going.
-    } else if (!partsItemTypeMap.has(sale.pn)) {
+    } else if (!partsMap.has(sale.pn)) {
       directSkippedNotInCatalog++;
     } else {
       rowsToWrite.push({
@@ -497,7 +515,7 @@ exports.handler = async () => {
     }
     for (const [leafPn, totalQty] of leafTotals.entries()) {
       if (tombstoned.has(leafPn)) { leafSkippedTombstone++; continue; }
-      if (!partsItemTypeMap.has(leafPn)) { leafSkippedNotInCatalog++; continue; }
+      if (!partsMap.has(leafPn)) { leafSkippedNotInCatalog++; continue; }
       const roundedQty = Math.round(totalQty);
       if (roundedQty <= 0) continue;
       rowsToWrite.push({
@@ -563,6 +581,126 @@ exports.handler = async () => {
   }
   log(`usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded)`);
 
+  // ── Service-part daily-rate refresh ────────────────────────────────
+  // MATCHES js/40-demand.js:16-42 computeDemand exactly:
+  //   daily = Math.round((units_in_last_180_days / 180) * 1000) / 1000
+  // Includes ALL usage rows (Acumatica-sourced + Excel-imported + manual)
+  // so the sync's part.daily agrees with what the Service Usage page's
+  // "COMPUTED DAILY" column would display after this run — 2-25002
+  // should compute to 0.144 iff its trailing 180-day unit sum ≈ 25.92.
+  //
+  // HARD GATE: writes are strictly limited to itemType === "service".
+  // The gate lives at ONE site — the `if (data.itemType !== "service")
+  // { continue; }` on the loop that builds dailyUpdateRows. Base BOM,
+  // options, kit, and untagged parts NEVER have their daily touched.
+  // Grep-verifiable: no other .from("parts").upsert exists in this file.
+  //
+  // Zero-usage drop-off: a service part with no in-window rows gets
+  // daily = 0. Correct — the part has no measurable service demand and
+  // shouldn't retain a stale rate.
+  log("Recomputing service-part daily rates from full usage table");
+  const DEMAND_WINDOW_DAYS = 180;
+  const cutoffMs = Date.now() - DEMAND_WINDOW_DAYS * 86400000;
+  const unitsBySvcPn = new Map();   // pn → in-window units, service parts only
+
+  {
+    const PAGE = 1000;
+    let from = 0;
+    let usageRowsScanned = 0;
+    let usageInWindow = 0;
+    while (true) {
+      const { data, error } = await supa.from("usage").select("data").range(from, from + PAGE - 1);
+      if (error) {
+        // Non-fatal: log and skip the daily-rate refresh. usage writes
+        // already succeeded; on next run the recompute will retry.
+        log("WARNING: usage recompute fetch failed — skipping daily-rate refresh this run", error);
+        unitsBySvcPn.clear();
+        break;
+      }
+      if (!data || data.length === 0) break;
+      for (const row of data) {
+        usageRowsScanned++;
+        const d = row.data || {};
+        const pn = d.pn;
+        if (!pn) continue;
+        // Skip everything that isn't a service part. Base BOM's daily
+        // is preserved untouched — its usage rows still exist in the
+        // table (contributing to base_bom production math), but they
+        // never influence this sync's daily-rate write.
+        const partData = partsMap.get(pn);
+        if (!partData || partData.itemType !== "service") continue;
+        // computeDemand at js/40-demand.js:30 uses `t > cutoff` (strict).
+        // Match it: skip anything AT or BEFORE cutoff.
+        const tsMs = new Date(d.ts).getTime();
+        if (!isFinite(tsMs) || tsMs <= cutoffMs) continue;
+        const qty = Number(d.qty) || 0;
+        if (qty <= 0) continue;
+        usageInWindow++;
+        unitsBySvcPn.set(pn, (unitsBySvcPn.get(pn) || 0) + qty);
+      }
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+    log(`Scanned ${usageRowsScanned} usage rows; ${usageInWindow} in 180-day window against ${unitsBySvcPn.size} distinct service pns`);
+  }
+
+  // Build merge-safe upsert rows — one per service part. This is the
+  // HARD GATE. Every other itemType is filtered out here. Iterating
+  // partsMap (not unitsBySvcPn) so service parts with ZERO in-window
+  // units get their daily zeroed (drop-off matches manual behavior).
+  const dailyUpdateRows = [];
+  let dailyServiceConsidered = 0;
+  let dailyUpdated = 0;
+  let dailyUnchanged = 0;
+  let dailyServiceZeroed = 0;
+  let dailyNewlyRated = 0;
+  let dailyRefreshed = 0;
+  let dailyTombstoneSkipped = 0;
+  for (const [pn, existing] of partsMap.entries()) {
+    // ★ THE GATE ★ — grep-verify: this is the ONLY predicate protecting
+    // parts.data.daily from non-service writes.
+    if (existing.itemType !== "service") continue;
+    if (tombstoned.has(pn)) { dailyTombstoneSkipped++; continue; }
+    dailyServiceConsidered++;
+
+    const units = unitsBySvcPn.get(pn) || 0;
+    const rawDaily = units / DEMAND_WINDOW_DAYS;
+    const newDaily = Math.round(rawDaily * 1000) / 1000;
+    const oldDaily = Number(existing.daily) || 0;
+    if (newDaily === oldDaily) { dailyUnchanged++; continue; }
+    // Merge-safe: spread existing, override ONLY daily. Every other
+    // field on parts.data — onHand, itemType, moq, cost, supplier, notes,
+    // supersession chain fields — is preserved byte-identically.
+    dailyUpdateRows.push({ pn, data: { ...existing, daily: newDaily } });
+    if (newDaily === 0) dailyServiceZeroed++;
+    else if (oldDaily === 0) dailyNewlyRated++;
+    else dailyRefreshed++;
+    dailyUpdated++;
+  }
+  log(`Service daily: ${dailyServiceConsidered} considered — ${dailyRefreshed} refreshed, ${dailyNewlyRated} newly rated, ${dailyServiceZeroed} zeroed, ${dailyUnchanged} unchanged, ${dailyTombstoneSkipped} tombstoned`);
+
+  let dailyUpserted = 0;
+  if (dailyUpdateRows.length > 0) {
+    const DAILY_BATCH = 500;
+    for (let i = 0; i < dailyUpdateRows.length; i += DAILY_BATCH) {
+      const batch = dailyUpdateRows.slice(i, i + DAILY_BATCH);
+      const { error } = await supa.from("parts").upsert(batch);
+      if (error) {
+        log(`parts daily-batch ${i}-${i + batch.length - 1} upsert failed`, error);
+        return { statusCode: 500, body: JSON.stringify({
+          error: "parts daily upsert failed",
+          detail: error.message,
+          upsertedBefore: dailyUpserted,
+          usageUpserted: totalUpserted,
+        }) };
+      }
+      dailyUpserted += batch.length;
+    }
+    log(`Wrote daily rates on ${dailyUpserted} service parts`);
+  } else {
+    log("No service-part daily rates needed updating");
+  }
+
   const elapsedMs = Date.now() - t0;
   log(`Done in ${elapsedMs}ms`);
 
@@ -570,7 +708,7 @@ exports.handler = async () => {
     await supa.from("audit").insert({
       ts: new Date().toISOString(),
       type: "service-usage-sync",
-      msg: `usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded from ${kitSales} kit sales) in ${elapsedMs}ms`,
+      msg: `usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded from ${kitSales} kit sales) — service daily refreshed on ${dailyUpserted}/${dailyServiceConsidered} in ${elapsedMs}ms`,
       detail: {
         entries: entries.length,
         pagesFetched: pageCount,
@@ -595,12 +733,23 @@ exports.handler = async () => {
           order: detectedOrderField, status: detectedStatusField,
         },
         catalogCounts: {
-          parts: partsItemTypeMap.size,
+          parts: partsMap.size,
           bomLinksParents: bomLinksByParent.size,
           kitBoms: kitBomsMap.size,
           tombstones: tombstoned.size,
         },
-        note: "Kit sales exploded recursively to leaves; row shape mirrors Excel importer's kit-explosion rows",
+        serviceDaily: {
+          considered: dailyServiceConsidered,
+          upserted: dailyUpserted,
+          refreshed: dailyRefreshed,
+          newlyRated: dailyNewlyRated,
+          zeroed: dailyServiceZeroed,
+          unchanged: dailyUnchanged,
+          tombstoneSkipped: dailyTombstoneSkipped,
+          formula: `Math.round((units / ${DEMAND_WINDOW_DAYS}) * 1000) / 1000`,
+          gate: 'existing.itemType === "service"',
+        },
+        note: "Kit sales exploded recursively to leaves; row shape mirrors Excel importer's. Service-part daily rates computed from FULL usage table and written back to parts.data.daily — service parts only.",
       },
     });
   } catch (e) {
@@ -614,6 +763,14 @@ exports.handler = async () => {
     kitSales,
     entries: entries.length,
     pagesFetched: pageCount,
+    serviceDaily: {
+      considered: dailyServiceConsidered,
+      upserted: dailyUpserted,
+      refreshed: dailyRefreshed,
+      newlyRated: dailyNewlyRated,
+      zeroed: dailyServiceZeroed,
+      unchanged: dailyUnchanged,
+    },
     detectedFields: {
       pn: detectedPnField, qty: detectedQtyField, date: detectedDateField,
       order: detectedOrderField, status: detectedStatusField,
