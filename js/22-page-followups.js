@@ -994,13 +994,6 @@ function _chaseSubjectBundle(lineCount, anyOverdue) {
     : `Action needed — ${lineCount} line${lineCount === 1 ? "" : "s"} needing attention (as of ${today})`;
 }
 
-// Effective want-by for compose paths: normal target when set, else
-// TODAY (overdue-only rows have targetArrivalDate === null and their
-// asked delivery is "as soon as possible / right now").
-function _effectiveWantBy(g) {
-  return g.targetArrivalDate || TODAY;
-}
-
 // ── Follow-Ups drafters ─────────────────────────────────────────
 function draftFollowupEmailRow(idx) {
   const fu = (window._FOLLOWUPS || [])[idx];
@@ -1059,17 +1052,140 @@ function draftFollowupEmailSupplier(gidx) {
   _openMailDraft(subject, body);
 }
 
+// ── Expedite helpers (Coverage Gaps only) ───────────────────────
+// The Coverage Gaps expedite email splits from the Follow-Ups chase
+// template in two places: (1) an added "if we don't receive this by
+// <need-by>" line naming the stockout deadline (runout − cushion),
+// and (2) a non-overdue variant that never says "overdue" for rows
+// whose covering PO is still future (pull-in case). Greeting rule,
+// ask, and close are shared with chase — reference the same consts /
+// helpers so any future rewording of shared voice stays in one place.
+
+// Named cushion so the "safety margin" is tunable in one line.
+const STOCKOUT_CUSHION_DAYS = 3;
+
+// Row-level overdue predicate — matches the "PO Nd OVERDUE" pill
+// which fires iff g.overdueRisk exists (see renderCoverageGaps).
+// The pill and the email MUST agree so a supplier never receives a
+// mail claiming a PO is overdue when the UI shows no overdue tag.
+function _isOverdueGap(g) { return !!g.overdueRisk; }
+
+// Runout date — the OUT ON column source: normal gapStart when set,
+// else overdueRisk.runoutDate. Matches effOutOnDate in the row render.
+function _runoutDate(g) {
+  return g.gapStart || (g.overdueRisk && g.overdueRisk.runoutDate) || null;
+}
+
+// Need-by = runoutDate − STOCKOUT_CUSHION_DAYS. Calendar days,
+// preserved as a local Date so downstream _fmtDateForEmail's
+// month-day-year formatting reads the same in every timezone.
+function _needByDate(g) {
+  const runout = _runoutDate(g);
+  if (!runout) return null;
+  const d = new Date(runout.getTime());
+  d.setDate(d.getDate() - STOCKOUT_CUSHION_DAYS);
+  return d;
+}
+
+// Past-date guard for the stockout line. Never print a past need-by:
+// if the calculated date sits at TODAY or earlier the email would
+// name a date the supplier can't hit, so say "immediately" instead.
+// Two indent columns match the surrounding bullet.
+function _needByLine(needBy) {
+  if (!needBy || needBy.getTime() <= TODAY.getTime()) {
+    return "    If we don't receive this immediately we will be out of stock.";
+  }
+  return `    If we don't receive this by ${_fmtDateForEmail(needBy)} we will be out of stock.`;
+}
+
+// Intros — three variants driven by the mix of overdue vs pull-in
+// rows in the outgoing email. Bundle emails that carry BOTH kinds
+// use the neutral intro; each block's date line then carries its
+// own "Originally expected" / "Currently scheduled" status word.
+const EXPEDITE_INTRO_OVERDUE_SINGLE = "This is an automated message. Our system flagged the line below as overdue, and we're following up — a short, quick reply would be great.";
+const EXPEDITE_INTRO_OVERDUE_MULTI  = "This is an automated message. Our system flagged the lines below as overdue, and we're following up — a short, quick reply would be great.";
+const EXPEDITE_INTRO_PULLIN_SINGLE  = "This is an automated message. Our system flagged the line below — we'll run out before your scheduled date, and we're following up — a short, quick reply would be great.";
+const EXPEDITE_INTRO_PULLIN_MULTI   = "This is an automated message. Our system flagged the lines below — we'll run out before your scheduled dates, and we're following up — a short, quick reply would be great.";
+const EXPEDITE_INTRO_MIXED          = "This is an automated message. Our system flagged the lines below and we're following up — a short, quick reply would be great.";
+function _expediteIntro({ multi, anyOverdue, anyPullIn }) {
+  if (anyOverdue && anyPullIn) return EXPEDITE_INTRO_MIXED;
+  if (anyOverdue) return multi ? EXPEDITE_INTRO_OVERDUE_MULTI : EXPEDITE_INTRO_OVERDUE_SINGLE;
+  return multi ? EXPEDITE_INTRO_PULLIN_MULTI : EXPEDITE_INTRO_PULLIN_SINGLE;
+}
+
+// Per-line bullet: 4-line block. Overdue rows say "Originally
+// expected: <date> (<D> days overdue)"; non-overdue rows say
+// "Currently scheduled: <date>" and MUST NOT say "overdue" per the
+// row-level truth check (isOverdue is derived from g.overdueRisk, not
+// from any per-line daysPastDue heuristic).
+function _expediteBulletForLine({ pn, desc, openQty, expectedDate, daysPastDue, isOverdue, needByDate }) {
+  const partLine = `  • Part ${pn}${desc ? ` — ${desc}` : ""}`;
+  const qtyLine  = `    Qty open: ${fmtNum(openQty)}`;
+  const dateLine = isOverdue
+    ? `    Originally expected: ${_fmtDateForEmail(expectedDate)} (${daysPastDue} days overdue)`
+    : `    Currently scheduled: ${_fmtDateForEmail(expectedDate)}`;
+  const nbLine   = _needByLine(needByDate);
+  return [partLine, qtyLine, dateLine, nbLine].join("\n");
+}
+
+function _expeditePOBlock(poNum, lines) {
+  return `PO ${poNum}\n${lines.map(_expediteBulletForLine).join("\n")}`;
+}
+
+// Subject — single-row overdue matches the user's template verbatim.
+// Non-overdue single substitutes "at risk" for "overdue" so the
+// no-lie rule holds. Bundle uses a line-count summary and the
+// earliest need-by across the supplier's rows.
+function _needByForSubject(needBy) {
+  if (!needBy || needBy.getTime() <= TODAY.getTime()) return "ASAP";
+  return _fmtDateForEmail(needBy);
+}
+function _expediteSubjectSingleOverdue(poNum, needBy, pn) {
+  return `Action needed — PO ${poNum} overdue, needed by ${_needByForSubject(needBy)} (Part ${pn})`;
+}
+function _expediteSubjectSinglePullIn(poNum, needBy, pn) {
+  return `Action needed — PO ${poNum} at risk, needed by ${_needByForSubject(needBy)} (Part ${pn})`;
+}
+function _expediteSubjectBundle(lineCount, anyOverdue, anyPullIn, earliestNeedBy) {
+  const today = _fmtDateForEmail(new Date());
+  const nb = _needByForSubject(earliestNeedBy);
+  const plural = lineCount === 1 ? "" : "s";
+  // Mixed rows must not label the whole email "overdue" — some lines
+  // aren't. Fall back to a neutral phrase in that case so the subject
+  // never lies about lines the supplier hasn't missed yet.
+  const label = (anyOverdue && !anyPullIn) ? `overdue line${plural}`
+              : (anyPullIn && !anyOverdue) ? `line${plural} at risk`
+              : `line${plural} needing attention`;
+  return `Action needed — ${lineCount} ${label}, deliver by ${nb} (as of ${today})`;
+}
+
+// Full assembly — reuses greeting rule, ask, and close from chase.
+function _assembleExpediteEmail({ supplier, intro, poBlocks }) {
+  return [
+    _chaseGreeting(supplier),
+    "",
+    intro,
+    "",
+    poBlocks.join("\n\n"),
+    "",
+    CHASE_ASK,
+    "",
+    CHASE_CLOSE,
+  ].join("\n");
+}
+
 // ── Coverage Gaps drafters ──────────────────────────────────────
-// Build normalized chase lines from one gap. Overdue-only rows use
-// overdueLines (literally overdue POs); normal-gap rows use
-// coveringPOs (future-expected, delivery needs pull-in). Overdue
-// takes precedence when both are set — the overdue line IS the
-// covering line and its actual expected date is the truth.
-function _coverageGapChaseLines(g) {
-  const chaseLines = [];
+// Build normalized expedite lines from one gap. Overdue rows walk
+// overdueLines (literally overdue POs); non-overdue rows walk
+// coveringPOs (future-expected, delivery needs pull-in). Each line
+// carries the row-level isOverdue flag and the shared needByDate so
+// the bullet builder has everything it needs.
+function _coverageGapExpediteLines(g) {
+  const lines = [];
+  const isOverdue = _isOverdueGap(g);
+  const needByDate = _needByDate(g);
   const overdueLines = (g.overdueRisk && g.overdueRisk.overdueLines) || [];
-  const wantBy = _effectiveWantBy(g);
-  if (overdueLines.length) {
+  if (isOverdue && overdueLines.length) {
     for (const ol of overdueLines) {
       const exp = ol.expected
         ? (typeof parseDateLocal === "function" ? parseDateLocal(ol.expected) : new Date(ol.expected))
@@ -1077,61 +1193,65 @@ function _coverageGapChaseLines(g) {
       const days = (exp && !isNaN(exp.getTime()))
         ? Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS)
         : 0;
-      chaseLines.push({
+      lines.push({
         poNum: ol.po || "",
         pn: g.part.pn,
         desc: g.part.desc || "",
         openQty: ol.qty || 0,
         expectedDate: exp || ol.expected,
         daysPastDue: days,
-        wantByDate: wantBy,
+        isOverdue: true,
+        needByDate,
       });
     }
   } else {
     for (const c of (g.coveringPOs || [])) {
-      const exp = c.expectedDate;
-      const days = (exp && exp.getTime)
-        ? Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS)
-        : 0;
-      chaseLines.push({
+      lines.push({
         poNum: c.poNum || "",
         pn: g.part.pn,
         desc: g.part.desc || "",
         openQty: c.qty || 0,
-        expectedDate: exp,
-        daysPastDue: days,   // will be <= 0 → pull-in phrasing in the bullet
-        wantByDate: wantBy,
+        expectedDate: c.expectedDate,
+        daysPastDue: 0,
+        isOverdue: false,
+        needByDate,
       });
     }
   }
-  return chaseLines;
+  return lines;
 }
 
 function draftCoverageExpediteRow(idx) {
   const g = (window._COVERAGE_GAPS || [])[idx];
   if (!g) { showToast("Coverage gap not found — refresh the page", "warn"); return; }
-  const chaseLines = _coverageGapChaseLines(g);
-  if (!chaseLines.length) {
+  const expLines = _coverageGapExpediteLines(g);
+  if (!expLines.length) {
     showToast("No PO on this row to reference — nothing to draft", "warn");
     return;
   }
   // Group by PO — a row can carry multiple covering/overdue POs, and
   // grouping keeps each PO's lines clustered under its own header.
   const byPo = new Map();
-  for (const l of chaseLines) {
+  for (const l of expLines) {
     if (!byPo.has(l.poNum)) byPo.set(l.poNum, []);
     byPo.get(l.poNum).push(l);
   }
-  const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _chasePOBlock(poNum, lines));
-  const anyOverdue = chaseLines.some(l => l.daysPastDue > 0);
-  const worstDays = chaseLines.reduce((m, l) => Math.max(m, l.daysPastDue), 0);
-  const firstPo = chaseLines[0].poNum;
+  const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _expeditePOBlock(poNum, lines));
+  // Row-level overdue truth comes from g.overdueRisk (matches the pill)
+  // and is byte-identical across every line of the row. anyPullIn is
+  // false for a single-row draft because a row is uniformly overdue or
+  // uniformly pull-in — the mixed intro is bundle-only.
+  const anyOverdue = _isOverdueGap(g);
+  const anyPullIn  = !anyOverdue;
+  const firstPo    = expLines[0].poNum;
+  const needBy     = expLines[0].needByDate;
   const subject = anyOverdue
-    ? _chaseSubjectSingleOverdue(firstPo, g.part.pn, worstDays)
-    : _chaseSubjectSinglePullIn(firstPo, g.part.pn);
-  const body = _assembleChaseEmail({
+    ? _expediteSubjectSingleOverdue(firstPo, needBy, g.part.pn)
+    : _expediteSubjectSinglePullIn(firstPo, needBy, g.part.pn);
+  const intro = _expediteIntro({ multi: expLines.length > 1, anyOverdue, anyPullIn });
+  const body = _assembleExpediteEmail({
     supplier: g.primarySupplier || "",
-    multi: chaseLines.length > 1,
+    intro,
     poBlocks,
   });
   _openMailDraft(subject, body);
@@ -1166,25 +1286,33 @@ function draftCoverageExpediteAll() {
   }
   let opened = 0;
   for (const [supplier, list] of bySupplier.entries()) {
-    // Flatten every gap for this supplier into chase lines, then
+    // Flatten every gap for this supplier into expedite lines, then
     // group by PO within THIS supplier's email so the same email
-    // never spans multiple suppliers but does cluster multiple
-    // lines under a shared PO header when relevant.
-    const allChaseLines = list.flatMap(_coverageGapChaseLines);
-    if (!allChaseLines.length) continue;
+    // never spans multiple suppliers but does cluster multiple lines
+    // under a shared PO header when relevant. Each line carries its
+    // own row-derived isOverdue + needByDate so the mixed-intro path
+    // and per-block status wording drop out of the data.
+    const allExpLines = list.flatMap(_coverageGapExpediteLines);
+    if (!allExpLines.length) continue;
     const byPo = new Map();
-    for (const l of allChaseLines) {
+    for (const l of allExpLines) {
       if (!byPo.has(l.poNum)) byPo.set(l.poNum, []);
       byPo.get(l.poNum).push(l);
     }
-    const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _chasePOBlock(poNum, lines));
-    const anyOverdue = allChaseLines.some(l => l.daysPastDue > 0);
-    const subject = _chaseSubjectBundle(allChaseLines.length, anyOverdue);
-    const body = _assembleChaseEmail({
-      supplier,
-      multi: allChaseLines.length > 1,
-      poBlocks,
-    });
+    const poBlocks = [...byPo.entries()].map(([poNum, lines]) => _expeditePOBlock(poNum, lines));
+    const anyOverdue = allExpLines.some(l => l.isOverdue);
+    const anyPullIn  = allExpLines.some(l => !l.isOverdue);
+    // Earliest need-by across the supplier's lines drives the
+    // subject. Any missing needByDate collapses to ASAP so the
+    // subject never names a stockout deadline we can't back up.
+    let earliestNeedBy = null;
+    for (const l of allExpLines) {
+      if (!l.needByDate) { earliestNeedBy = null; break; }
+      if (!earliestNeedBy || l.needByDate < earliestNeedBy) earliestNeedBy = l.needByDate;
+    }
+    const subject = _expediteSubjectBundle(allExpLines.length, anyOverdue, anyPullIn, earliestNeedBy);
+    const intro = _expediteIntro({ multi: allExpLines.length > 1, anyOverdue, anyPullIn });
+    const body = _assembleExpediteEmail({ supplier, intro, poBlocks });
     _openMailDraft(subject, body);
     opened++;
   }
@@ -1240,7 +1368,7 @@ function _followupCopyModal(subject, body) {
    / computeCoverageGaps / _COVERAGE_GAP_ITEM_TYPES stay defined above
    as shared engine bits; only this page's render moved. All row
    handlers (draftCoverageExpediteRow, draftCoverageExpediteAll,
-   toggleCoverageGapSent, _chasePoNums, _effectiveWantBy,
+   toggleCoverageGapSent, _chasePoNums,
    _coverageGapLineDescription) also stay shared — they're keyed by
    part PN or by _idx into window._COVERAGE_GAPS, which this route
    populates the same way the old Follow-Ups render did.
