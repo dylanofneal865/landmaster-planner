@@ -803,10 +803,31 @@ function _applyAndRefresh() {
     const main = document.getElementById("main");
     const savedScrollTop = main ? main.scrollTop : 0;
     const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
-    if (currentRoute && typeof navigate === "function") {
-      navigate(currentRoute);
-    } else if (typeof refresh === "function") {
-      refresh();
+    const target = currentRoute
+      || (typeof CURRENT_ROUTE !== "undefined" ? CURRENT_ROUTE : null)
+      || "dashboard";
+    console.log(`[cloud] realtime redraw: ${target}`);
+    // Wrap the actual render call in try/catch. Any throw from the route's
+    // render body (a malformed row, a missing field on a partial write,
+    // etc.) would otherwise be swallowed by the setTimeout runtime and
+    // leave the DOM silently stale — the exact "watchdog reconnects but
+    // page never redraws" symptom this fix targets. Logging with route
+    // context makes the next occurrence visible; the timer itself is
+    // reset on entry so the next realtime event will still schedule
+    // another redraw — a single bad row doesn't permanently silence
+    // the render loop.
+    try {
+      if (currentRoute && typeof navigate === "function") {
+        navigate(currentRoute);
+      } else if (typeof refresh === "function") {
+        refresh();
+      }
+    } catch (e) {
+      console.error(
+        `[cloud] realtime redraw failed on route "${target}":`,
+        (e && e.message) || e,
+        e && e.stack
+      );
     }
     if (main) {
       _scrollRestoreRAF = requestAnimationFrame(() => {
@@ -877,6 +898,17 @@ function _handleRealtimePO(payload) {
     else DB.pos.push(merged);
   }
   _applyAndRefresh();
+  // The full-page redraw above rebuilds #main but does NOT touch a PO
+  // detail drawer overlay. patchOpenPODrawer refreshes the drawer's
+  // sub-line + per-line cells IN PLACE when the drawer is showing the
+  // just-updated PO. It self-guards on (drawer element exists, drawer
+  // is .open, OPEN_PO_ID set, PO exists in DB.pos) — safe to call
+  // unconditionally after every PO event, including DELETE (which
+  // becomes a no-op since the PO is no longer in DB).
+  if (typeof patchOpenPODrawer === "function") {
+    try { patchOpenPODrawer(); }
+    catch (e) { console.error("[cloud] patchOpenPODrawer threw:", e); }
+  }
 }
 
 function _handleRealtimeDraft(payload) {

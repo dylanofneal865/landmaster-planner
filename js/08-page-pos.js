@@ -372,10 +372,17 @@ registerRoute("pos", () => {
 
   if (POS_STATE.search) {
     const q = POS_STATE.search.toLowerCase();
+    // Every access wraps in String(x || "") so a partial-write PO with
+    // a missing num / supplier / lines / line.pn can't throw and kill
+    // the whole render. Prior code assumed every PO row had a full
+    // shape; a realtime UPDATE mid-write occasionally lands with
+    // undefined fields and would crash the .toLowerCase() call.
     pos = pos.filter(p =>
-      p.num.toLowerCase().includes(q) ||
-      p.supplier.toLowerCase().includes(q) ||
-      p.lines.some(l => l.pn.toLowerCase().includes(q))
+      String(p && p.num || "").toLowerCase().includes(q) ||
+      String(p && p.supplier || "").toLowerCase().includes(q) ||
+      (p && Array.isArray(p.lines) ? p.lines : []).some(l =>
+        String(l && l.pn || "").toLowerCase().includes(q)
+      )
     );
   }
 
@@ -481,8 +488,17 @@ registerRoute("pos", () => {
                 No POs match the current filters. Adjust the column dropdowns or tabs above.
               </td></tr>
               ${pos.map(po => {
-                const open = (po.lines || []).filter(l => isLineOpen(po, l));
-                const totalQty = po.lines.reduce((s,l) => s + (l.qty||0), 0);
+              try {
+                // Every field access below fans out from `po`, so a
+                // realtime write that lands mid-flight with a missing
+                // field (`lines`, `num`, `supplier`, blanket linkage
+                // on old-shape rows) can throw and kill the whole
+                // `.map()` — the entire table would go blank. Wrap
+                // each row so a bad PO logs, renders an error stub,
+                // and every other PO still renders.
+                const lines = Array.isArray(po && po.lines) ? po.lines : [];
+                const open = lines.filter(l => isLineOpen(po, l));
+                const totalQty = lines.reduce((s,l) => s + (l && l.qty || 0), 0);
                 const bm = poBlanketMeta(po);
                 // Time-badge helper handles the blanket-vs-normal split:
                 // blankets never show OVERDUE (they're authorizations, not
@@ -512,6 +528,26 @@ registerRoute("pos", () => {
                   <td class="num ${timeBadge.isOverdue ? 'text-crit bold' : 'dim'}">${fmtDate(po.expectedDate)}</td>
                   <td><button class="btn sm" onclick="event.stopPropagation(); openPODetail('${esc(po.id)}')">Open</button></td>
                 </tr>`;
+              } catch (e) {
+                console.error("[pos-render] row failed", {
+                  poId: po && po.id,
+                  poNum: po && po.num,
+                  error: (e && e.message) || e,
+                });
+                // Render a compact error stub so the row is visible in the
+                // table with its PO # / id (whichever survived) — the user
+                // can spot which PO is bad and open the drawer to inspect.
+                // The rest of the table keeps rendering normally.
+                const label = String((po && (po.num || po.id)) || "?");
+                return `
+                  <tr data-pos-row style="opacity:0.75">
+                    <td class="pn">${esc(label)}</td>
+                    <td colspan="9" class="muted">
+                      <span class="pill crit" style="margin-right:8px">RENDER ERROR</span>
+                      This PO row failed to render — see console for details.
+                    </td>
+                  </tr>`;
+              }
               }).join("")}
             </tbody>
           </table></div>
