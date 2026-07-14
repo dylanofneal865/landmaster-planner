@@ -842,6 +842,43 @@ const POLL_SKIP_AFTER_REALTIME_MS = 20000;
 let _pollTimer = null;
 let _pollInFlight = false;
 
+// Deterministic row-content fingerprint for change detection. Naive
+// JSON.stringify is KEY-ORDER SENSITIVE and Postgres JSONB does not
+// preserve insertion order — a fetched row will typically come back
+// with keys in a different order than what the client wrote. Comparing
+// raw JSON.stringify(cloud) vs JSON.stringify(local) then reports a
+// false "changed" on every poll tick, forever. Same class of bug we
+// fixed server-side in acumatica-sync's PO fingerprint.
+//
+// _canonicalize recursively sorts object keys at every depth so two
+// objects with identical content but different key insertion order
+// produce identical JSON. Arrays are preserved (their order IS
+// semantic for our data — e.g., PO lines by lineNbr).
+function _canonicalize(v) {
+  if (v === null || v === undefined) return v;
+  if (Array.isArray(v)) return v.map(_canonicalize);
+  if (typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = _canonicalize(v[k]);
+    return out;
+  }
+  return v;
+}
+function _rowFingerprint(row) { return JSON.stringify(_canonicalize(row)); }
+
+// Phantom-change storm guard. If the same row keeps getting reported
+// as "changed" with the same fingerprint on consecutive ticks —
+// meaning our diff logic is spuriously flagging a stable row — we
+// stop counting it toward the re-render trigger. The data write
+// still happens (harmless: same bytes overwriting the same bytes),
+// but no full navigate() rebuild fires. Prevents unbounded DOM churn
+// even if a future subtle diff bug re-emerges.
+const PHANTOM_STREAK_THRESHOLD = 3;
+const _lastAppliedPartFp = new Map();   // pn → most recent applied fingerprint
+const _lastAppliedPosFp = new Map();    // id → most recent applied fingerprint
+const _phantomPartStreak = new Map();
+const _phantomPosStreak = new Map();
+
 function _startCloudPoll() {
   if (_pollTimer) return;
   _pollTimer = setInterval(_cloudPollTick, POLL_INTERVAL_MS);
@@ -880,44 +917,84 @@ async function _cloudPollTick() {
     let posChanged = 0;
     let partsChanged = 0;
 
-    // ── POs — merge in place, per-row dirty skip ────────────────────
+    // ── POs — canonical-fingerprint diff + phantom-storm guard ──────
+    const posChangedSamples = [];
+    let posPhantomSuppressed = 0;
     if (Array.isArray(cloudPosRows)) {
       const cloudById = new Map();
       for (const r of cloudPosRows) if (r && r.id) cloudById.set(r.id, r);
 
-      // Update / insert rows from cloud when their JSON representation
-      // differs from the local snapshot. Rows in _dirtyPos are skipped
-      // — the local client has an unpushed edit for them and cloud is
-      // stale relative to what the user just did.
       for (const [id, r] of cloudById.entries()) {
         if (_dirtyPos.has(id)) continue;
         const merged = { id, ...r.data };
-        const nextJson = JSON.stringify(merged);
-        const prevJson = _posSnapshot.get(id);
-        if (nextJson !== prevJson) {
-          const i = DB.pos.findIndex(p => p.id === id);
-          if (i >= 0) DB.pos[i] = merged;        // in-place update
-          else DB.pos.push(merged);              // in-place insert
-          _posSnapshot.set(id, nextJson);
-          posChanged++;
+        const i = DB.pos.findIndex(p => p.id === id);
+        const localPo = i >= 0 ? DB.pos[i] : null;
+        const nextFp = _rowFingerprint(merged);
+        const localFp = localPo ? _rowFingerprint(localPo) : null;
+        if (localFp === nextFp) {
+          _phantomPosStreak.delete(id);
+          continue;
+        }
+        const prevAppliedFp = _lastAppliedPosFp.get(id);
+        const isRepeatFp = prevAppliedFp === nextFp;
+        if (isRepeatFp) {
+          const streak = (_phantomPosStreak.get(id) || 0) + 1;
+          _phantomPosStreak.set(id, streak);
+          if (streak >= PHANTOM_STREAK_THRESHOLD) {
+            if (streak === PHANTOM_STREAK_THRESHOLD) {
+              console.warn(
+                `[cloud] phantom-change loop for PO id=${id} — ` +
+                `same fingerprint reported changed ${streak} consecutive ticks. ` +
+                `Suppressing re-render for this row.`,
+                { cloudRow: merged, localRow: localPo, cloudFp: nextFp.slice(0, 400), localFp: (localFp || "").slice(0, 400) }
+              );
+            }
+            if (i >= 0) DB.pos[i] = merged;
+            else DB.pos.push(merged);
+            _posSnapshot.set(id, JSON.stringify(merged));
+            _lastAppliedPosFp.set(id, nextFp);
+            posPhantomSuppressed++;
+            continue;
+          }
+        } else {
+          _phantomPosStreak.delete(id);
+        }
+        if (i >= 0) DB.pos[i] = merged;
+        else DB.pos.push(merged);
+        _posSnapshot.set(id, JSON.stringify(merged));
+        _lastAppliedPosFp.set(id, nextFp);
+        posChanged++;
+        if (posChangedSamples.length < 3) {
+          posChangedSamples.push({
+            id,
+            poNum: merged && merged.num,
+            cloudKeys: Object.keys(merged).sort(),
+            localKeys: localPo ? Object.keys(localPo).sort() : null,
+            cloudFpHead: nextFp.slice(0, 200),
+            localFpHead: (localFp || "").slice(0, 200),
+            cloudRow: merged,
+            localRow: localPo,
+          });
         }
       }
-      // Server-side deletes: a PO that exists locally but not in the
-      // cloud snapshot. Don't touch dirty rows (user just added the PO
-      // locally and it hasn't been pushed yet).
+      // Server-side deletes.
       const idsToDelete = [];
       for (const po of DB.pos) {
         if (!cloudById.has(po.id) && !_dirtyPos.has(po.id)) idsToDelete.push(po.id);
       }
       for (const id of idsToDelete) {
         const i = DB.pos.findIndex(p => p.id === id);
-        if (i >= 0) DB.pos.splice(i, 1);         // in-place delete
+        if (i >= 0) DB.pos.splice(i, 1);
         _posSnapshot.delete(id);
+        _lastAppliedPosFp.delete(id);
+        _phantomPosStreak.delete(id);
         posChanged++;
       }
     }
 
-    // ── Parts — same pattern, plus tombstone filter ─────────────────
+    // ── Parts — canonical-fingerprint diff + phantom-storm guard ────
+    const partsChangedSamples = [];  // first 3 changed rows for diagnostics
+    let partsPhantomSuppressed = 0;
     if (Array.isArray(cloudPartsRows)) {
       const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
       const cloudByPn = new Map();
@@ -927,14 +1004,67 @@ async function _cloudPollTick() {
       for (const [pn, r] of cloudByPn.entries()) {
         if (_dirtyParts.has(pn)) continue;
         const merged = { pn, ...r.data };
-        const nextJson = JSON.stringify(merged);
-        const prevJson = _partsSnapshot.get(pn);
-        if (nextJson !== prevJson) {
-          const i = DB.parts.findIndex(p => p.pn === pn);
-          if (i >= 0) DB.parts[i] = merged;      // in-place update
-          else DB.parts.push(merged);            // in-place insert
-          _partsSnapshot.set(pn, nextJson);
-          partsChanged++;
+        const i = DB.parts.findIndex(p => p.pn === pn);
+        const localPart = i >= 0 ? DB.parts[i] : null;
+        // Canonical fingerprint on BOTH sides. Key-order-insensitive.
+        const nextFp = _rowFingerprint(merged);
+        const localFp = localPart ? _rowFingerprint(localPart) : null;
+        if (localFp === nextFp) {
+          // Genuinely identical content — reset any phantom streak.
+          _phantomPartStreak.delete(pn);
+          continue;
+        }
+        // Phantom detection: if we're being asked to apply the SAME
+        // fingerprint we already applied last tick (or many ticks in
+        // a row), that's a spurious "change" — the row isn't actually
+        // moving. Log at threshold and stop counting toward re-render.
+        const prevAppliedFp = _lastAppliedPartFp.get(pn);
+        const isRepeatFp = prevAppliedFp === nextFp;
+        if (isRepeatFp) {
+          const streak = (_phantomPartStreak.get(pn) || 0) + 1;
+          _phantomPartStreak.set(pn, streak);
+          if (streak >= PHANTOM_STREAK_THRESHOLD) {
+            // Apply-in-place so DB stays byte-consistent, but don't
+            // trigger a full page re-render. Log once at threshold-
+            // cross so the offender is visible without console spam.
+            if (streak === PHANTOM_STREAK_THRESHOLD) {
+              console.warn(
+                `[cloud] phantom-change loop for pn=${pn} — ` +
+                `same fingerprint reported changed ${streak} consecutive ticks. ` +
+                `Suppressing re-render for this row.`,
+                { cloudRow: merged, localRow: localPart, cloudFp: nextFp.slice(0, 400), localFp: (localFp || "").slice(0, 400) }
+              );
+            }
+            if (i >= 0) DB.parts[i] = merged;
+            else DB.parts.push(merged);
+            _partsSnapshot.set(pn, JSON.stringify(merged));
+            _lastAppliedPartFp.set(pn, nextFp);
+            partsPhantomSuppressed++;
+            continue;   // suppressed — no partsChanged bump
+          }
+        } else {
+          _phantomPartStreak.delete(pn);
+        }
+        // Real change (or streak below threshold). Apply, remember fp,
+        // and record a sample for diagnostic logging.
+        if (i >= 0) DB.parts[i] = merged;
+        else DB.parts.push(merged);
+        _partsSnapshot.set(pn, JSON.stringify(merged));
+        _lastAppliedPartFp.set(pn, nextFp);
+        partsChanged++;
+        if (partsChangedSamples.length < 3) {
+          // Keep the sample minimal to avoid flooding the console:
+          // report the differing fields' keys and a short fingerprint
+          // preview. Full objects on demand via cloudRow / localRow.
+          partsChangedSamples.push({
+            pn,
+            cloudKeys: Object.keys(merged).sort(),
+            localKeys: localPart ? Object.keys(localPart).sort() : null,
+            cloudFpHead: nextFp.slice(0, 200),
+            localFpHead: (localFp || "").slice(0, 200),
+            cloudRow: merged,
+            localRow: localPart,
+          });
         }
       }
       // Server-side deletes (also covers newly-tombstoned pns since
@@ -947,6 +1077,8 @@ async function _cloudPollTick() {
         const i = DB.parts.findIndex(p => p.pn === pn);
         if (i >= 0) DB.parts.splice(i, 1);       // in-place delete
         _partsSnapshot.delete(pn);
+        _lastAppliedPartFp.delete(pn);
+        _phantomPartStreak.delete(pn);
         partsChanged++;
       }
     }
@@ -963,9 +1095,20 @@ async function _cloudPollTick() {
       window._lastCloudSyncAt = Date.now();
       if (typeof updateSyncIndicator === "function") updateSyncIndicator();
     }
-    if (posChanged > 0 || partsChanged > 0) {
-      console.log(`[cloud] poll: ${posChanged} pos changed, ${partsChanged} parts changed`);
-      _applyAndRefresh();
+    if (posChanged > 0 || partsChanged > 0 || posPhantomSuppressed > 0 || partsPhantomSuppressed > 0) {
+      // Extended log: how many real changes, how many phantom-suppressed,
+      // plus first 3 samples of each so any lingering phantom or real
+      // data-shape issue is inspectable straight from the console.
+      const suffix = (posPhantomSuppressed > 0 || partsPhantomSuppressed > 0)
+        ? ` (phantom-suppressed: ${posPhantomSuppressed} pos, ${partsPhantomSuppressed} parts)`
+        : "";
+      console.log(
+        `[cloud] poll: ${posChanged} pos changed, ${partsChanged} parts changed${suffix}`,
+        (partsChangedSamples.length || posChangedSamples.length)
+          ? { partsSamples: partsChangedSamples, posSamples: posChangedSamples }
+          : ""
+      );
+      if (posChanged > 0 || partsChanged > 0) _applyAndRefresh();
     }
   } catch (e) {
     // Non-fatal. Log and let the next tick retry. Deliberately don't
@@ -979,56 +1122,109 @@ async function _cloudPollTick() {
 
 let _redrawTimer = null;
 let _scrollRestoreRAF = null;
+// Interaction-defer state. When the user is mid-typing or a drawer /
+// modal is open, we hold the redraw and retry every DEFER_RETRY_MS
+// until they're idle. The pending redraw is NEVER dropped — data
+// mutations already landed in DB, we're only delaying the DOM rebuild.
+// _wasDeferring gates the log so we announce a deferral ONCE per
+// idle-to-active transition instead of every retry tick.
+const DEFER_RETRY_MS = 1000;
+let _wasDeferring = false;
+
+// Returns the "why" of an active interaction, or null when idle:
+//   - "input-focus" : an INPUT / TEXTAREA / SELECT inside #main has focus
+//   - "drawer-open" : #drawer-bd carries the "open" class
+//   - "modal-open"  : #modal-bd carries the "open" class
+// Defers only when at least one signal is active. Any keyboard / mouse
+// activity NOT captured by these three (e.g., pure scrolling, hover)
+// doesn't block redraws — the goal is to protect data-entry contexts,
+// not every incidental touch.
+function _isUserInteracting() {
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT")) {
+    const main = document.getElementById("main");
+    if (main && main.contains(ae)) return "input-focus";
+  }
+  const drawer = document.getElementById("drawer-bd");
+  if (drawer && drawer.classList.contains("open")) return "drawer-open";
+  const modal = document.getElementById("modal-bd");
+  if (modal && modal.classList.contains("open")) return "modal-open";
+  return null;
+}
+
+// The debounced body, hoisted so it can retry-schedule itself when the
+// user is interacting. Runs the actual render inside try/catch so a
+// bad row can't silently kill the redraw path (see the try/catch
+// commentary that used to live inline).
+function _doDebouncedRedraw() {
+  const reason = _isUserInteracting();
+  if (reason) {
+    if (!_wasDeferring) {
+      console.log(`[cloud] redraw deferred — ${reason}`);
+      _wasDeferring = true;
+    }
+    // Reschedule; each new event that arrives while deferred resets
+    // this timer too (via _applyAndRefresh's clearTimeout above), so
+    // the interval never stacks.
+    clearTimeout(_redrawTimer);
+    _redrawTimer = setTimeout(_doDebouncedRedraw, DEFER_RETRY_MS);
+    return;
+  }
+  if (_wasDeferring) {
+    console.log("[cloud] redraw resumed — user idle, rendering now");
+    _wasDeferring = false;
+  }
+
+  // Realtime re-renders shouldn't snap the page back to the top.
+  // navigate() intentionally resets main.scrollTop for user-initiated
+  // route changes, so we capture the position around the call and
+  // restore it once the new DOM is laid out. Cancel any prior pending
+  // restore so a stale snapshot from an earlier burst can't clobber
+  // the user's current scroll position.
+  if (_scrollRestoreRAF !== null) cancelAnimationFrame(_scrollRestoreRAF);
+  const main = document.getElementById("main");
+  const savedScrollTop = main ? main.scrollTop : 0;
+  const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
+  const target = currentRoute
+    || (typeof CURRENT_ROUTE !== "undefined" ? CURRENT_ROUTE : null)
+    || "dashboard";
+  console.log(`[cloud] realtime redraw: ${target}`);
+  // try/catch around the actual render call. Any throw from a route's
+  // render body (a malformed row, a missing field on a partial write,
+  // etc.) would otherwise be swallowed by the setTimeout runtime and
+  // leave the DOM silently stale.
+  try {
+    if (currentRoute && typeof navigate === "function") {
+      navigate(currentRoute);
+    } else if (typeof refresh === "function") {
+      refresh();
+    }
+  } catch (e) {
+    console.error(
+      `[cloud] realtime redraw failed on route "${target}":`,
+      (e && e.message) || e,
+      e && e.stack
+    );
+  }
+  if (main) {
+    _scrollRestoreRAF = requestAnimationFrame(() => {
+      main.scrollTop = savedScrollTop;
+      _scrollRestoreRAF = null;
+    });
+  }
+}
+
 function _applyAndRefresh() {
   _suppressNextLocalChange = true;
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   _suppressNextLocalChange = false;
   if (typeof bumpStatusCache === "function") bumpStatusCache();
-  // Debounce redraws so a burst of realtime events causes one re-render, not many
+  // Debounce redraws so a burst of realtime events causes one re-render, not many.
+  // 150 ms is the coalescing window for realtime bursts; the interaction-defer
+  // loop inside _doDebouncedRedraw can extend the effective wait further when
+  // the user is typing / a drawer is open.
   clearTimeout(_redrawTimer);
-  _redrawTimer = setTimeout(() => {
-    // Realtime re-renders shouldn't snap the page back to the top. navigate()
-    // intentionally resets main.scrollTop for user-initiated route changes,
-    // so we capture the position around the call and restore it once the new
-    // DOM is laid out. Cancel any prior pending restore so a stale snapshot
-    // from an earlier burst can't clobber the user's current scroll position.
-    if (_scrollRestoreRAF !== null) cancelAnimationFrame(_scrollRestoreRAF);
-    const main = document.getElementById("main");
-    const savedScrollTop = main ? main.scrollTop : 0;
-    const currentRoute = document.querySelector(".nav-item.active")?.dataset?.route;
-    const target = currentRoute
-      || (typeof CURRENT_ROUTE !== "undefined" ? CURRENT_ROUTE : null)
-      || "dashboard";
-    console.log(`[cloud] realtime redraw: ${target}`);
-    // Wrap the actual render call in try/catch. Any throw from the route's
-    // render body (a malformed row, a missing field on a partial write,
-    // etc.) would otherwise be swallowed by the setTimeout runtime and
-    // leave the DOM silently stale — the exact "watchdog reconnects but
-    // page never redraws" symptom this fix targets. Logging with route
-    // context makes the next occurrence visible; the timer itself is
-    // reset on entry so the next realtime event will still schedule
-    // another redraw — a single bad row doesn't permanently silence
-    // the render loop.
-    try {
-      if (currentRoute && typeof navigate === "function") {
-        navigate(currentRoute);
-      } else if (typeof refresh === "function") {
-        refresh();
-      }
-    } catch (e) {
-      console.error(
-        `[cloud] realtime redraw failed on route "${target}":`,
-        (e && e.message) || e,
-        e && e.stack
-      );
-    }
-    if (main) {
-      _scrollRestoreRAF = requestAnimationFrame(() => {
-        main.scrollTop = savedScrollTop;
-        _scrollRestoreRAF = null;
-      });
-    }
-  }, 150);
+  _redrawTimer = setTimeout(_doDebouncedRedraw, 150);
 }
 
 function _handleRealtimePart(payload) {
