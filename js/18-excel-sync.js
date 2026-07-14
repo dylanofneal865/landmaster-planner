@@ -360,38 +360,59 @@ function autoSyncExcel() {
   }, 1200);
 }
 
-// Header indicator now reflects the freshness of Acumatica → Supabase syncs.
-// The legacy `state` arg from Excel auto-sync callers is intentionally
-// ignored — Excel sync status now lives on the Settings page panel.
+// Header indicator now reflects when THIS CLIENT last successfully
+// touched Supabase — realtime event, poll tick, cloudInit, or catchup
+// after reconnect. Reads window._lastCloudSyncAt (set in 30-supabase.js)
+// rather than DB.audit, because a disconnected tab must not see another
+// client's server-side sync time and falsely claim SYNCED.
+//
+// Falls back to the audit heuristic only when _lastCloudSyncAt hasn't
+// been set yet (pre-cloudInit / SDK-not-loaded).
+//
+// Thresholds tuned to the 30s poll cadence + realtime:
+//   0 – 90s   → SYNCED · <rel>       (green — 2-3 poll intervals is fine)
+//   90s – 5 m → STALE · <rel>        (amber — a few missed polls)
+//   > 5 min   → SYNC ERROR           (red — user should see the tab is bad)
 function updateSyncIndicator() {
   const el = $("#top-stat-sync");
   if (!el) return;
-  const audit = (typeof DB !== "undefined" && DB && Array.isArray(DB.audit)) ? DB.audit : null;
-  if (!audit) {
+
+  // Preferred source: this client's own most-recent successful cloud touch.
+  let ts = (typeof window !== "undefined" && window._lastCloudSyncAt > 0)
+    ? window._lastCloudSyncAt : 0;
+
+  if (!ts) {
+    // Fallback for the boot window before cloudInit has stamped anything —
+    // use the newest audit row from server-side syncs so the pill isn't
+    // blank on first paint. This branch is only reachable pre-cloudInit;
+    // once cloudInit runs, _lastCloudSyncAt is set and this fallback stops.
+    const audit = (typeof DB !== "undefined" && DB && Array.isArray(DB.audit)) ? DB.audit : null;
+    if (audit) {
+      const last = audit.find(a => a && (a.type === "acumatica-sync" || a.type === "acumatica-po-sync"));
+      if (last && last.ts) ts = new Date(last.ts).getTime();
+    }
+  }
+
+  if (!ts || isNaN(ts)) {
     el.className = "status-pill";
     el.innerHTML = `<span class="dot">○</span> SYNC`;
     return;
   }
-  // DB.audit is kept newest-first by cloudInit + realtime inserts, so .find
-  // returns the most recent acumatica sync entry.
-  const last = audit.find(a => a && (a.type === "acumatica-sync" || a.type === "acumatica-po-sync"));
-  const ts = last && last.ts ? new Date(last.ts).getTime() : NaN;
-  if (isNaN(ts)) {
-    el.className = "status-pill crit";
-    el.innerHTML = `<span class="dot">●</span> SYNC ERROR`;
-    return;
-  }
-  const ageMin = (Date.now() - ts) / 60000;
+
+  const ageMs = Date.now() - ts;
   const rel = _relTimeSince(ts);
-  if (ageMin > 120) {
+  if (ageMs > 5 * 60 * 1000) {
     el.className = "status-pill crit";
-    el.innerHTML = `<span class="dot">●</span> SYNC ERROR`;
-  } else if (ageMin > 30) {
+    el.innerHTML = `<span class="dot">●</span> SYNC ERROR · ${rel}`;
+    el.title = "This tab hasn't successfully synced with the cloud in over 5 minutes — data may be stale. Refresh or check your connection.";
+  } else if (ageMs > 90 * 1000) {
     el.className = "status-pill warn";
     el.innerHTML = `<span class="dot">●</span> STALE · ${rel}`;
+    el.title = "This tab last synced with the cloud more than 90 seconds ago — data may be slightly stale.";
   } else {
     el.className = "status-pill ok";
     el.innerHTML = `<span class="dot">●</span> SYNCED · ${rel}`;
+    el.title = "Data synced with the cloud within the last 90 seconds.";
   }
 }
 

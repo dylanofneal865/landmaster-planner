@@ -524,6 +524,15 @@ async function cloudInit() {
   // near _cloudPollTick for the full change-detection + dirty-skip
   // logic.
   _startCloudPoll();
+  // Initial-fetch confirmation for the header sync indicator. Every
+  // subsequent freshness update (realtime accept, poll success,
+  // catch-up) bumps this the same way.
+  window._lastCloudSyncAt = Date.now();
+  if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+  // Live tick-down for "SYNCED · N min ago" — updates ONLY the indicator
+  // element's text, no page re-render. 15 s cadence is fine: "just now"
+  // rolls to "1 min ago" within a minute of the last cloud touch.
+  _startSyncIndicatorTicker();
 
   // First-class kit migration: tag parts present in kit_boms as itemType="kit".
   // Runs AFTER snapshot priming + _hookSaveDB so the tagged parts are detected
@@ -546,6 +555,18 @@ let _suppressNextLocalChange = false; // prevents echo: don't re-push what we ju
 // the heartbeat + visibility listeners can distinguish "healthy but
 // quiet" from "zombie socket that stopped delivering".
 let _lastRealtimeAt = 0;                  // wall-clock ms of most recent accepted event
+// Separate from _lastRealtimeAt (which is socket-specific): tracks when
+// THIS CLIENT last successfully confirmed data is current. Bumped by:
+//   - every accepted realtime event
+//   - every successful poll tick (even a no-change tick — the check succeeded)
+//   - the initial cloudInit fetch
+//   - _catchupFetch on reconnect
+// The header sync indicator (updateSyncIndicator in 18-excel-sync.js)
+// reads THIS, not the audit table, so a disconnected tab correctly
+// ages out of "SYNCED" instead of showing another client's sync time.
+// Exposed on window so cross-file readers don't rely on classic-script
+// scope sharing.
+window._lastCloudSyncAt = 0;
 let _realtimeBackoffMs = 0;               // grows 1s → 2s → 4s → … → capped 30s
 let _realtimeReconnectTimer = null;       // pending backoff timer, if any
 let _realtimeReconnecting = false;        // reentrancy guard
@@ -565,7 +586,9 @@ function _setupRealtimeSubscriptions() {
   // stopped delivering (Supabase's realtime layer occasionally does this
   // through captive portals and after prolonged idle).
   const wrap = (fn) => (payload) => {
-    _lastRealtimeAt = Date.now();
+    const now = Date.now();
+    _lastRealtimeAt = now;
+    window._lastCloudSyncAt = now;              // header indicator freshness
     fn(payload);
   };
 
@@ -722,6 +745,10 @@ async function _catchupFetch() {
   if (cloudSettings) DB.settings = { ...DB.settings, ...cloudSettings };
 
   _applyAndRefresh();
+  // Freshness — bump AFTER apply so the indicator flips to green right
+  // as the newly-fetched data lands in the DOM.
+  window._lastCloudSyncAt = Date.now();
+  if (typeof updateSyncIndicator === "function") updateSyncIndicator();
   console.log(`[cloud] catch-up fetch complete in ${Date.now() - t0}ms`);
 }
 
@@ -807,14 +834,32 @@ function _startHeartbeat() {
 //   - Emits a log line ONLY when something actually changed.
 // Zero writes anywhere in this loop; grep the block for `.upsert` /
 // `.insert` / `.delete` — none.
-const POLL_INTERVAL_MS = 120000;                 // 2 min — tune here
-const POLL_SKIP_AFTER_REALTIME_MS = 60000;       // if realtime fired < 60s ago, skip this tick
+const POLL_INTERVAL_MS = 30000;                  // 30 s — tune here
+// If realtime delivered anything in the last 20s, skip this tick (poll
+// stays subordinate to realtime whenever the WS is healthy). Value must
+// be < POLL_INTERVAL_MS or every tick short-circuits.
+const POLL_SKIP_AFTER_REALTIME_MS = 20000;
 let _pollTimer = null;
 let _pollInFlight = false;
 
 function _startCloudPoll() {
   if (_pollTimer) return;
   _pollTimer = setInterval(_cloudPollTick, POLL_INTERVAL_MS);
+}
+
+// Lightweight tick-down for the "SYNCED · N min ago" header pill. The
+// indicator's text is derived from window._lastCloudSyncAt; every 15s
+// we re-run updateSyncIndicator() to re-derive the relative-time string
+// and (if the age has crossed a threshold) flip the pill class between
+// ok / warn / crit. This touches ONE DOM node — not a full page render.
+// No effect when the tab is hidden.
+let _syncIndicatorTicker = null;
+function _startSyncIndicatorTicker() {
+  if (_syncIndicatorTicker) return;
+  _syncIndicatorTicker = setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+  }, 15000);
 }
 
 async function _cloudPollTick() {
@@ -906,12 +951,26 @@ async function _cloudPollTick() {
       }
     }
 
+    // Freshness: bump BEFORE the change-count check. A successful fetch
+    // means we've confirmed local data matches (or now matches) cloud —
+    // that's freshness whether zero rows or a thousand rows changed.
+    // Only bumped when neither fetch returned null (both branches above
+    // set the corresponding array; if either was null the try body
+    // will have proceeded on the other, which is still valid confirmation
+    // that we contacted cloud). Kept inside the try/before-catch so a
+    // network error skips the bump and leaves the indicator ageing.
+    if (Array.isArray(cloudPosRows) && Array.isArray(cloudPartsRows)) {
+      window._lastCloudSyncAt = Date.now();
+      if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+    }
     if (posChanged > 0 || partsChanged > 0) {
       console.log(`[cloud] poll: ${posChanged} pos changed, ${partsChanged} parts changed`);
       _applyAndRefresh();
     }
   } catch (e) {
-    // Non-fatal. Log and let the next tick retry.
+    // Non-fatal. Log and let the next tick retry. Deliberately don't
+    // bump _lastCloudSyncAt — the indicator continues to age, which
+    // is exactly the "stale tab" signal we want the user to see.
     console.warn("[cloud] poll tick failed:", (e && e.message) || e);
   } finally {
     _pollInFlight = false;
