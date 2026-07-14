@@ -9,6 +9,14 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 let _supa = null;
 let _cloudReady = false;
 let _lastCloudDraftHash = null;
+// LWW baseline for the draft — the newest updatedAt we've seen (from
+// boot, our own push, or a realtime event we accepted). Every draft
+// realtime event and every draft push compares against this to reject
+// strictly-older writes. A cloud row with no updatedAt (legacy row or
+// a foreign write) is treated as the OLDEST possible value so it can
+// never beat a fresh timestamped write. Null on boot until cloudInit
+// adopts the cloud row's timestamp.
+let _lastDraftUpdatedAt = null;
 let _lastCloudSettingsHash = null;
 let _lastCloudKitBomsHash = null;
 
@@ -362,17 +370,25 @@ async function cloudInit() {
   const cloudDraft = await _fetchCloudDraft();
   if (cloudDraft !== null) {
     if (typeof DRAFT_ORDER !== "undefined") {
-      if (cloudDraft.length === 0 && DRAFT_ORDER.length > 0) {
+      if (cloudDraft.items.length === 0 && DRAFT_ORDER.length > 0) {
+        // Local content, cloud is empty — push local as the first authoritative
+        // write. _pushDraft stamps updatedAt and adopts it into
+        // _lastDraftUpdatedAt on success, so the boot baseline is correct
+        // either way (cloud row or freshly-migrated local).
         await _pushDraft();
-      } else if (cloudDraft.length > 0) {
-        // Replace local with cloud
+      } else if (cloudDraft.items.length > 0) {
         DRAFT_ORDER.length = 0;
-        DRAFT_ORDER.push(...cloudDraft);
+        DRAFT_ORDER.push(...cloudDraft.items);
         if (typeof draftOrderSave === "function") draftOrderSave();
         if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
       }
     }
     _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
+    // Adopt the cloud row's updatedAt as this session's LWW baseline. If
+    // the cloud row was written pre-fix (no updatedAt) or _pushDraft
+    // already stamped one during the migration branch above, prefer the
+    // stamped value; otherwise fall through to cloudDraft.updatedAt.
+    if (!_lastDraftUpdatedAt) _lastDraftUpdatedAt = cloudDraft.updatedAt || null;
   }
 
   // ---- Audit Log ----
@@ -646,13 +662,35 @@ function _handleRealtimePO(payload) {
 function _handleRealtimeDraft(payload) {
   const { new: row } = payload;
   const items = row?.data?.items || [];
+  const incomingUpdatedAt = row?.data?.updatedAt || null;
+
+  // LWW gate — REJECT strictly-older or equal writes. This is the
+  // core protection against a stale writer resurrecting old state:
+  // a long-idle tab that finally pushes will carry an updatedAt <=
+  // whatever fresh writes have already occurred, so its realtime
+  // event is dropped here on every listening tab.
+  //
+  // Rules:
+  //   - both timestamps present: accept iff incoming > mine.
+  //   - incoming has no updatedAt (legacy row / foreign write): can
+  //     never beat a timestamped baseline; drop.
+  //   - neither has a timestamp: fall through to the hash echo-skip
+  //     below (nothing else we can compare on).
+  if (incomingUpdatedAt && _lastDraftUpdatedAt && incomingUpdatedAt <= _lastDraftUpdatedAt) return;
+  if (!incomingUpdatedAt && _lastDraftUpdatedAt) return;
+
   // Echo-skip: if the incoming content hash matches what we just pushed,
   // this event is our own write coming back around — don't re-apply it,
-  // and don't stomp DRAFT_ORDER (a stale out-of-order UPDATE carrying the
-  // pre-clear state was the exact loop this guards against). Mirrors the
-  // content-equality skip in _handleRealtimeFollowMark.
+  // and don't stomp DRAFT_ORDER. Mirrors the content-equality skip in
+  // _handleRealtimeFollowMark. Additive to the LWW gate above: content-
+  // equality on our own push is normal; different content on a strictly-
+  // newer timestamp means someone else wrote a real change.
   const incomingHash = _hashDraft(items);
-  if (incomingHash === _lastCloudDraftHash) return;
+  if (incomingHash === _lastCloudDraftHash) {
+    // Still adopt the incoming updatedAt so future rejections work.
+    if (incomingUpdatedAt) _lastDraftUpdatedAt = incomingUpdatedAt;
+    return;
+  }
   if (typeof DRAFT_ORDER !== "undefined") {
     DRAFT_ORDER.length = 0;
     DRAFT_ORDER.push(...items);
@@ -664,6 +702,7 @@ function _handleRealtimeDraft(payload) {
     if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
   }
   _lastCloudDraftHash = incomingHash;
+  if (incomingUpdatedAt) _lastDraftUpdatedAt = incomingUpdatedAt;
 }
 
 function _handleRealtimeAudit(payload) {
@@ -1110,21 +1149,69 @@ async function _fetchCloudDraft() {
     console.error("[cloud] draft fetch failed:", error);
     return null;
   }
-  return data?.data?.items || null;
+  if (!data?.data) return null;
+  // Return the LWW envelope. A row written before this fix will have no
+  // updatedAt — callers treat null as "oldest possible" so the LWW gate
+  // still functions (a fresh timestamped write always beats a null one).
+  return {
+    items: data.data.items || [],
+    updatedAt: data.data.updatedAt || null,
+  };
 }
 
 async function _pushDraft() {
   if (!_supa) return false;
   const items = (typeof DRAFT_ORDER !== "undefined" && Array.isArray(DRAFT_ORDER)) ? DRAFT_ORDER : [];
+  // Stamp every write. ISO strings are lexicographically comparable at
+  // millisecond precision so simple `>` comparisons on strings act as
+  // chronological ordering for realtime rejection and stale-push guards.
+  const updatedAt = new Date().toISOString();
   const { error } = await _supa.from("draft_order").upsert({
     id: "current",
-    data: { items },
+    data: { items, updatedAt },
   });
   if (error) {
     console.error("[cloud] draft push failed:", error);
     return false;
   }
+  // Adopt AFTER a successful write so a failed push leaves the baseline
+  // untouched — the next attempt still races against whatever the cloud
+  // actually contains, not against a phantom timestamp we never sent.
+  _lastDraftUpdatedAt = updatedAt;
   return true;
+}
+
+// Pre-push staleness gate. Returns true when this client's baseline is
+// current-or-newer than the cloud row (safe to push). Returns false and
+// adopts cloud state into local when this client is stale — the caller
+// SKIPS the push in that case so a long-idle tab can't clobber writes
+// it missed while asleep.
+//
+// A cloud row with no updatedAt (legacy write) is treated as older than
+// any timestamped baseline this client holds — we'll still push over it
+// to migrate it to the new envelope.
+async function _isDraftBaselineCurrent() {
+  const cloud = await _fetchCloudDraft();
+  if (!cloud) return true;             // no cloud row → nothing to be stale against
+  const cloudTs = cloud.updatedAt || "";
+  const mineTs  = _lastDraftUpdatedAt || "";
+  // Strictly newer cloud beats us. Ties (same timestamp) count as current
+  // — that shouldn't happen with sub-millisecond ISO strings unless it's
+  // literally our own write bouncing back.
+  if (!cloudTs) return true;           // untimestamped cloud row → we win
+  if (cloudTs <= mineTs) return true;  // we're current or newer
+  // Stale — adopt cloud state into local, do NOT push.
+  if (typeof DRAFT_ORDER !== "undefined") {
+    DRAFT_ORDER.length = 0;
+    DRAFT_ORDER.push(...cloud.items);
+    _suppressNextLocalChange = true;
+    if (typeof draftOrderSave === "function") draftOrderSave();
+    _suppressNextLocalChange = false;
+    if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+  }
+  _lastDraftUpdatedAt = cloud.updatedAt;
+  _lastCloudDraftHash = _hashDraft(cloud.items);
+  return false;
 }
 
 let _cloudPushTimer = null;
@@ -1182,6 +1269,17 @@ function _scheduleDraftPush() {
   clearTimeout(_draftPushTimer);
   _showCloudIndicator(false, "syncing");
   _draftPushTimer = setTimeout(async () => {
+    // LWW gate: if cloud has a newer updatedAt than our baseline, we're
+    // stale. _isDraftBaselineCurrent() adopts cloud state locally and
+    // returns false — we skip the push so we don't clobber writes we
+    // missed while dozing. The user's in-flight local edit is lost;
+    // that's the LWW trade-off (an idle tab that wakes up and pushes
+    // stale would be worse). A fresh subsequent edit from this tab
+    // will push cleanly.
+    if (!(await _isDraftBaselineCurrent())) {
+      _showCloudIndicator(true);   // successfully re-synced from cloud
+      return;
+    }
     const ok = await _pushDraft();
     if (ok) {
       _lastCloudDraftHash = _hashDraft(typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []);
@@ -1199,9 +1297,17 @@ function _scheduleDraftPush() {
 // pre-clear state. Updates _lastCloudDraftHash BEFORE the write so the
 // realtime event echoing our own push is content-equal and skipped by
 // _handleRealtimeDraft.
+//
+// STILL SUBJECT TO THE LWW GATE. Rationale: a stale tab where the user
+// clicks Clear also shouldn't clobber writes it missed. If cloud is
+// strictly newer we adopt cloud state locally — the clear appears to
+// have "no effect" from the user's view, but the correct fix is to
+// click Clear again on the now-current state. Uniform semantics beat
+// per-path exceptions.
 async function _forcePushDraftNow() {
   if (!_cloudReady) return;
   clearTimeout(_draftPushTimer);
+  if (!(await _isDraftBaselineCurrent())) return;
   _lastCloudDraftHash = _hashDraft(
     typeof DRAFT_ORDER !== "undefined" ? DRAFT_ORDER : []
   );
@@ -1284,15 +1390,18 @@ window.cloudForcePullAudit = async function () {
 
 window.cloudForcePullDraft = async function () {
   if (!_supa) { console.log("Not connected"); return; }
-  const items = await _fetchCloudDraft();
-  if (items === null) { console.log("Pull failed"); return; }
+  const cloud = await _fetchCloudDraft();
+  if (cloud === null) { console.log("Pull failed"); return; }
   if (typeof DRAFT_ORDER !== "undefined") {
     DRAFT_ORDER.length = 0;
-    DRAFT_ORDER.push(...items);
+    DRAFT_ORDER.push(...cloud.items);
     if (typeof draftOrderSave === "function") draftOrderSave();
     if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
     _lastCloudDraftHash = _hashDraft(DRAFT_ORDER);
-    console.log("Pulled " + items.length + " draft items from cloud");
+    // Adopt cloud's updatedAt so future stale-writer checks work
+    // correctly after a manual pull.
+    _lastDraftUpdatedAt = cloud.updatedAt || _lastDraftUpdatedAt;
+    console.log("Pulled " + cloud.items.length + " draft items from cloud");
   }
 };
 
