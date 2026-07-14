@@ -518,6 +518,12 @@ async function cloudInit() {
   // zombie sockets that never fire CLOSED. Both are idempotent one-shots.
   _installConnectionListeners();
   _startHeartbeat();
+  // Polling fallback: re-fetches parts + pos every POLL_INTERVAL_MS
+  // when the tab is visible AND realtime hasn't delivered recently.
+  // Read-only; does not count against realtime quota. See the block
+  // near _cloudPollTick for the full change-detection + dirty-skip
+  // logic.
+  _startCloudPoll();
 
   // First-class kit migration: tag parts present in kit_boms as itemType="kit".
   // Runs AFTER snapshot priming + _hookSaveDB so the tagged parts are detected
@@ -782,6 +788,134 @@ function _startHeartbeat() {
       });
     }
   }, 5 * 60 * 1000);
+}
+
+// ── Polling fallback ────────────────────────────────────────────────
+// Belt-and-suspenders for the case where the realtime subscription is
+// technically live (state === "joined") but the server is not actually
+// delivering events. Every POLL_INTERVAL_MS the poll re-fetches parts
+// and pos, diffs against the local snapshots, and merges in place if
+// anything changed. Cost model:
+//   - Reads via _fetchAllParts / _fetchAllPos (paginated). READS DO NOT
+//     COUNT against the Supabase realtime message quota.
+//   - Skips when the tab is hidden.
+//   - Skips when the last realtime event arrived within
+//     POLL_SKIP_AFTER_REALTIME_MS — realtime is working, poll idle.
+//   - Skips a specific row if the local client has a dirty edit pending
+//     push for it (avoids clobbering a mid-flight local change with the
+//     old server value).
+//   - Emits a log line ONLY when something actually changed.
+// Zero writes anywhere in this loop; grep the block for `.upsert` /
+// `.insert` / `.delete` — none.
+const POLL_INTERVAL_MS = 120000;                 // 2 min — tune here
+const POLL_SKIP_AFTER_REALTIME_MS = 60000;       // if realtime fired < 60s ago, skip this tick
+let _pollTimer = null;
+let _pollInFlight = false;
+
+function _startCloudPoll() {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(_cloudPollTick, POLL_INTERVAL_MS);
+}
+
+async function _cloudPollTick() {
+  if (!_cloudReady || !_supa) return;
+  if (document.visibilityState !== "visible") return;
+  if (_pollInFlight) return;
+  const sinceRealtime = _lastRealtimeAt > 0 ? (Date.now() - _lastRealtimeAt) : Infinity;
+  if (sinceRealtime < POLL_SKIP_AFTER_REALTIME_MS) return;
+
+  _pollInFlight = true;
+  try {
+    // Parallel fetch — READ-ONLY, paginated helpers.
+    const [cloudPosRows, cloudPartsRows] = await Promise.all([
+      _fetchAllPos(),
+      _fetchAllParts(),
+    ]);
+
+    let posChanged = 0;
+    let partsChanged = 0;
+
+    // ── POs — merge in place, per-row dirty skip ────────────────────
+    if (Array.isArray(cloudPosRows)) {
+      const cloudById = new Map();
+      for (const r of cloudPosRows) if (r && r.id) cloudById.set(r.id, r);
+
+      // Update / insert rows from cloud when their JSON representation
+      // differs from the local snapshot. Rows in _dirtyPos are skipped
+      // — the local client has an unpushed edit for them and cloud is
+      // stale relative to what the user just did.
+      for (const [id, r] of cloudById.entries()) {
+        if (_dirtyPos.has(id)) continue;
+        const merged = { id, ...r.data };
+        const nextJson = JSON.stringify(merged);
+        const prevJson = _posSnapshot.get(id);
+        if (nextJson !== prevJson) {
+          const i = DB.pos.findIndex(p => p.id === id);
+          if (i >= 0) DB.pos[i] = merged;        // in-place update
+          else DB.pos.push(merged);              // in-place insert
+          _posSnapshot.set(id, nextJson);
+          posChanged++;
+        }
+      }
+      // Server-side deletes: a PO that exists locally but not in the
+      // cloud snapshot. Don't touch dirty rows (user just added the PO
+      // locally and it hasn't been pushed yet).
+      const idsToDelete = [];
+      for (const po of DB.pos) {
+        if (!cloudById.has(po.id) && !_dirtyPos.has(po.id)) idsToDelete.push(po.id);
+      }
+      for (const id of idsToDelete) {
+        const i = DB.pos.findIndex(p => p.id === id);
+        if (i >= 0) DB.pos.splice(i, 1);         // in-place delete
+        _posSnapshot.delete(id);
+        posChanged++;
+      }
+    }
+
+    // ── Parts — same pattern, plus tombstone filter ─────────────────
+    if (Array.isArray(cloudPartsRows)) {
+      const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
+      const cloudByPn = new Map();
+      for (const r of cloudPartsRows) {
+        if (r && r.pn && !tombs.has(String(r.pn))) cloudByPn.set(r.pn, r);
+      }
+      for (const [pn, r] of cloudByPn.entries()) {
+        if (_dirtyParts.has(pn)) continue;
+        const merged = { pn, ...r.data };
+        const nextJson = JSON.stringify(merged);
+        const prevJson = _partsSnapshot.get(pn);
+        if (nextJson !== prevJson) {
+          const i = DB.parts.findIndex(p => p.pn === pn);
+          if (i >= 0) DB.parts[i] = merged;      // in-place update
+          else DB.parts.push(merged);            // in-place insert
+          _partsSnapshot.set(pn, nextJson);
+          partsChanged++;
+        }
+      }
+      // Server-side deletes (also covers newly-tombstoned pns since
+      // tombs were filtered out of cloudByPn above).
+      const pnsToDelete = [];
+      for (const p of DB.parts) {
+        if (!cloudByPn.has(p.pn) && !_dirtyParts.has(p.pn)) pnsToDelete.push(p.pn);
+      }
+      for (const pn of pnsToDelete) {
+        const i = DB.parts.findIndex(p => p.pn === pn);
+        if (i >= 0) DB.parts.splice(i, 1);       // in-place delete
+        _partsSnapshot.delete(pn);
+        partsChanged++;
+      }
+    }
+
+    if (posChanged > 0 || partsChanged > 0) {
+      console.log(`[cloud] poll: ${posChanged} pos changed, ${partsChanged} parts changed`);
+      _applyAndRefresh();
+    }
+  } catch (e) {
+    // Non-fatal. Log and let the next tick retry.
+    console.warn("[cloud] poll tick failed:", (e && e.message) || e);
+  } finally {
+    _pollInFlight = false;
+  }
 }
 
 let _redrawTimer = null;
