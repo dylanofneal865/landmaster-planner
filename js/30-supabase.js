@@ -745,10 +745,25 @@ async function _catchupFetch() {
   if (cloudSettings) DB.settings = { ...DB.settings, ...cloudSettings };
 
   _applyAndRefresh();
-  // Freshness — bump AFTER apply so the indicator flips to green right
-  // as the newly-fetched data lands in the DOM.
-  window._lastCloudSyncAt = Date.now();
-  if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+  // Freshness — same plausibility guard as _cloudPollTick. Only bump
+  // when the key fetches (parts + pos) actually returned non-null AND,
+  // if we already had local rows, cloud also had rows. A catchup where
+  // every fetch returned null or 0 rows into a populated local means
+  // reconnect saw no data — not a legitimate "everything is fresh"
+  // state. Let the indicator age so the failure is visible.
+  const catchupPosOk   = Array.isArray(cloudPos)   && (cloudPos.length > 0   || DB.pos.length === 0);
+  const catchupPartsOk = Array.isArray(cloudParts) && (cloudParts.length > 0 || DB.parts.length === 0);
+  if (catchupPosOk && catchupPartsOk) {
+    window._lastCloudSyncAt = Date.now();
+    if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+  } else {
+    console.warn(
+      `[cloud] catch-up: fetch returned implausibly empty result — freshness NOT bumped ` +
+      `(cloudPos=${Array.isArray(cloudPos) ? cloudPos.length : "null"}, ` +
+      `cloudParts=${Array.isArray(cloudParts) ? cloudParts.length : "null"}, ` +
+      `DB.pos.length=${DB.pos.length}, DB.parts.length=${DB.parts.length}).`
+    );
+  }
   console.log(`[cloud] catch-up fetch complete in ${Date.now() - t0}ms`);
 }
 
@@ -1083,17 +1098,31 @@ async function _cloudPollTick() {
       }
     }
 
-    // Freshness: bump BEFORE the change-count check. A successful fetch
-    // means we've confirmed local data matches (or now matches) cloud —
-    // that's freshness whether zero rows or a thousand rows changed.
-    // Only bumped when neither fetch returned null (both branches above
-    // set the corresponding array; if either was null the try body
-    // will have proceeded on the other, which is still valid confirmation
-    // that we contacted cloud). Kept inside the try/before-catch so a
-    // network error skips the bump and leaves the indicator ageing.
-    if (Array.isArray(cloudPosRows) && Array.isArray(cloudPartsRows)) {
+    // Freshness: bump ONLY when both fetches returned plausible data.
+    // Array.isArray([]) is truthy for empty arrays, so the old guard
+    // was flashing SYNCED even when Supabase silently returned zero
+    // rows (auth expired, RLS misconfig, table wiped) — the indicator
+    // lied about freshness and hid real problems.
+    //
+    // New rule: fetch must be non-null AND, if this client's local
+    // table currently has data, the cloud fetch must also have data.
+    // A cloud that returns 0 rows while local has hundreds is almost
+    // always a failure, not a legitimate empty state. Legitimate
+    // empty states (fresh install, brand-new DB) still bump because
+    // local is also empty.
+    const posFetchOk   = Array.isArray(cloudPosRows)   && (cloudPosRows.length > 0   || DB.pos.length === 0);
+    const partsFetchOk = Array.isArray(cloudPartsRows) && (cloudPartsRows.length > 0 || DB.parts.length === 0);
+    if (posFetchOk && partsFetchOk) {
       window._lastCloudSyncAt = Date.now();
       if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+    } else {
+      console.warn(
+        `[cloud] poll: fetch returned implausibly empty result — freshness NOT bumped ` +
+        `(cloudPos.length=${Array.isArray(cloudPosRows) ? cloudPosRows.length : "null"}, ` +
+        `cloudParts.length=${Array.isArray(cloudPartsRows) ? cloudPartsRows.length : "null"}, ` +
+        `DB.pos.length=${DB.pos.length}, DB.parts.length=${DB.parts.length}). ` +
+        `Indicator will age into STALE. Check Supabase auth / RLS / connection.`
+      );
     }
     if (posChanged > 0 || partsChanged > 0 || posPhantomSuppressed > 0 || partsPhantomSuppressed > 0) {
       // Extended log: how many real changes, how many phantom-suppressed,
@@ -1122,33 +1151,54 @@ async function _cloudPollTick() {
 
 let _redrawTimer = null;
 let _scrollRestoreRAF = null;
-// Interaction-defer state. When the user is mid-typing or a drawer /
-// modal is open, we hold the redraw and retry every DEFER_RETRY_MS
-// until they're idle. The pending redraw is NEVER dropped — data
-// mutations already landed in DB, we're only delaying the DOM rebuild.
-// _wasDeferring gates the log so we announce a deferral ONCE per
-// idle-to-active transition instead of every retry tick.
+// Interaction-defer state. When the user is mid-typing we hold the
+// redraw and retry every DEFER_RETRY_MS until they blur. The pending
+// redraw is NEVER dropped — data mutations already landed in DB, we're
+// only delaying the DOM rebuild. _wasDeferring gates the log so we
+// announce a deferral ONCE per idle-to-active transition instead of
+// every retry tick. _deferStartAt + _deferCount enforce the hard cap
+// (see MAX_DEFER_TICKS below) so a stuck focus can never hang the
+// tab forever.
 const DEFER_RETRY_MS = 1000;
+// Force a render after this many consecutive deferrals (~30 s at 1 s
+// retries). Belt-and-suspenders: even if a future defer trigger gets
+// stuck, the tab CANNOT go silent for more than 30 seconds. When the
+// cap fires we log the blocking reason so the underlying cause is
+// diagnosable.
+const MAX_DEFER_TICKS = 30;
+// If a defer persists this long, log an escalated warning naming the
+// stuck reason. Separate from MAX_DEFER_TICKS so the user sees the
+// diagnostic BEFORE the force-render kicks in.
+const STUCK_DEFER_LOG_MS = 10000;
 let _wasDeferring = false;
+let _deferCount = 0;
+let _deferStartAt = 0;
+let _stuckLoggedAt = 0;
 
-// Returns the "why" of an active interaction, or null when idle:
-//   - "input-focus" : an INPUT / TEXTAREA / SELECT inside #main has focus
-//   - "drawer-open" : #drawer-bd carries the "open" class
-//   - "modal-open"  : #modal-bd carries the "open" class
-// Defers only when at least one signal is active. Any keyboard / mouse
-// activity NOT captured by these three (e.g., pure scrolling, hover)
-// doesn't block redraws — the goal is to protect data-entry contexts,
-// not every incidental touch.
+// Returns the "why" of an active interaction, or null when idle. Only
+// data-entry contexts trigger a defer:
+//   - "input-focus" : any focused INPUT / TEXTAREA / SELECT in the page
+//
+// DELIBERATELY NO drawer-open / modal-open trigger. Rationale:
+//   navigate() rebuilds #main only. Drawer (#drawer-bd) and modal
+//   (#modal-bd) are separate DOM subtrees — they survive #main
+//   rebuilds untouched. A drawer being merely OPEN (with no focused
+//   input) shouldn't block a redraw of the underlying page. And
+//   because navigate() doesn't clear .open on drawers/modals, an
+//   orphaned .open class would defer the redraw INDEFINITELY —
+//   which is exactly the stall bug this fix is closing.
+//
+// Typing INSIDE a drawer or modal still defers correctly because
+// the input-focus check now looks at any focused input anywhere in
+// the document, not just inside #main.
 function _isUserInteracting() {
   const ae = document.activeElement;
   if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT")) {
-    const main = document.getElementById("main");
-    if (main && main.contains(ae)) return "input-focus";
+    // Any focused text/select input across the whole page — main, drawer,
+    // modal, anywhere. Blurred / no focus → activeElement falls back to
+    // document.body which fails the tag check.
+    return "input-focus";
   }
-  const drawer = document.getElementById("drawer-bd");
-  if (drawer && drawer.classList.contains("open")) return "drawer-open";
-  const modal = document.getElementById("modal-bd");
-  if (modal && modal.classList.contains("open")) return "modal-open";
   return null;
 }
 
@@ -1159,20 +1209,63 @@ function _isUserInteracting() {
 function _doDebouncedRedraw() {
   const reason = _isUserInteracting();
   if (reason) {
+    const now = Date.now();
     if (!_wasDeferring) {
-      console.log(`[cloud] redraw deferred — ${reason}`);
       _wasDeferring = true;
+      _deferCount = 0;
+      _deferStartAt = now;
+      _stuckLoggedAt = 0;
+      console.log(`[cloud] redraw deferred — ${reason}`);
     }
-    // Reschedule; each new event that arrives while deferred resets
-    // this timer too (via _applyAndRefresh's clearTimeout above), so
-    // the interval never stacks.
-    clearTimeout(_redrawTimer);
-    _redrawTimer = setTimeout(_doDebouncedRedraw, DEFER_RETRY_MS);
-    return;
+    _deferCount++;
+
+    // Stuck-defer escalation. Once the defer state has persisted past
+    // STUCK_DEFER_LOG_MS, log a warning with the specific blocking
+    // reason so the underlying cause (usually a stuck focus that some
+    // upstream code forgot to blur) is diagnosable rather than silent.
+    // Repeats every 10 s while stuck so the console shows the ongoing
+    // condition, not just the initial one.
+    if (now - _deferStartAt >= STUCK_DEFER_LOG_MS && now - _stuckLoggedAt >= STUCK_DEFER_LOG_MS) {
+      console.warn(
+        `[cloud] redraw STILL deferred after ${Math.round((now - _deferStartAt) / 1000)}s ` +
+        `— blocked by: ${reason}. ` +
+        `activeElement: <${(document.activeElement && document.activeElement.tagName) || "?"}>` +
+        `${document.activeElement && document.activeElement.id ? ("#" + document.activeElement.id) : ""}. ` +
+        `If this persists, a focus target may be stuck.`
+      );
+      _stuckLoggedAt = now;
+    }
+
+    // Hard cap. If defer has persisted past MAX_DEFER_TICKS retries,
+    // FORCE the render anyway. The user MUST get fresh data eventually
+    // — no interaction state can hang the tab forever. This is the
+    // last-line-of-defense against any future defer trigger that
+    // silently sticks.
+    if (_deferCount >= MAX_DEFER_TICKS) {
+      console.warn(
+        `[cloud] redraw force-rendered after ${_deferCount}s of deferral ` +
+        `(was blocked by: ${reason}) — possible stuck .open class or focus target.`
+      );
+      _wasDeferring = false;
+      _deferCount = 0;
+      _deferStartAt = 0;
+      _stuckLoggedAt = 0;
+      // Fall through to the render body below.
+    } else {
+      // Reschedule; each new event that arrives while deferred resets
+      // this timer too (via _applyAndRefresh's clearTimeout above), so
+      // the interval never stacks.
+      clearTimeout(_redrawTimer);
+      _redrawTimer = setTimeout(_doDebouncedRedraw, DEFER_RETRY_MS);
+      return;
+    }
   }
   if (_wasDeferring) {
     console.log("[cloud] redraw resumed — user idle, rendering now");
     _wasDeferring = false;
+    _deferCount = 0;
+    _deferStartAt = 0;
+    _stuckLoggedAt = 0;
   }
 
   // Realtime re-renders shouldn't snap the page back to the top.
