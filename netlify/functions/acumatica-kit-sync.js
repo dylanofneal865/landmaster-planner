@@ -29,6 +29,33 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+// Decode the five XML entities Acumatica emits in OData text fields
+// (plus numeric char refs). WITHOUT this, a kit desc containing "&"
+// arrives as "&amp;", gets stored that way in Supabase, and every UI
+// renderer that HTML-escapes on output produces "&amp;amp;".
+//
+// ORDER MATTERS: &amp; MUST be replaced LAST. Decoding it first would
+// turn a literal "&amp;lt;" into "&lt;", and a later rule would then
+// decode that AGAIN into "<" — a double-decode. Running &amp; last
+// preserves the intent: "&amp;lt;" survives as literal "&lt;".
+//
+// Numeric char refs use String.fromCodePoint (not fromCharCode) so
+// astral-plane codepoints (>= 0x10000) are handled correctly instead
+// of producing lone surrogates. Hex refs are matched BEFORE decimal
+// so patterns like &#xFF; aren't misinterpreted by the decimal rule.
+function decodeEntities(s) {
+  if (typeof s !== "string") return s;
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d))
+    .replace(/&amp;/g, "&");   // MUST be last
+}
+
 // Shared field extractors for an Acumatica OData Atom-XML <entry>.
 // Mirrors makeFieldGetters() in acumatica-bom-sync.js — kept inline so
 // this function stays self-contained for esbuild bundling.
@@ -40,7 +67,7 @@ function makeFieldGetters(raw) {
     // slip through.
     const re = new RegExp(`<d:${field}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/d:${field}>`, "i");
     const m = raw.match(re);
-    return m ? m[1].trim() : null;
+    return m ? decodeEntities(m[1].trim()) : null;
   };
   const isNull = (field) => {
     const re = new RegExp(`<d:${field}[^>]*m:null="true"`, "i");
