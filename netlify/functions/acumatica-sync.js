@@ -660,8 +660,50 @@ async function runPOSync(ctx) {
   const existingById = new Map(existing.map((r) => [r.id, r.data || {}]));
   log(`PO sync: loaded ${existing.length} existing pos rows`);
 
+  // ── Delta-detection helpers ────────────────────────────────────────
+  // This is the whole realtime-quota fix. Before this guard, runPOSync
+  // upserted every PO in the feed on every 2-minute run — ~700 rows ×
+  // 21,600 runs/month → millions of pos-table events per month, most
+  // of them for POs whose data was byte-identical.
+  //
+  // The comparison MUST NOT be object-identity or naive JSON.stringify:
+  //   - `lines[]` is rebuilt from the feed each run, so identity always
+  //     differs even when content is the same.
+  //   - Object key insertion order in newly-built rows might differ
+  //     from what an older writer left in Supabase, so plain stringify
+  //     of the two objects wouldn't match either.
+  //
+  // _canonicalize sorts every object key alphabetically at every level
+  // and passes primitives through unchanged. _poFingerprint additionally
+  // sorts lines by lineNbr so a feed-order swap between runs doesn't
+  // register as a real change. The result is a deterministic string
+  // representation — any real change to any field on data or any line
+  // still flips the fingerprint, but incidental rebuilds don't.
+  function _canonicalize(v) {
+    if (v === null || v === undefined) return v;
+    if (Array.isArray(v)) return v.map(_canonicalize);
+    if (typeof v === "object") {
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = _canonicalize(v[k]);
+      return out;
+    }
+    return v;
+  }
+  function _poFingerprint(data) {
+    if (!data || typeof data !== "object") return "";
+    const lines = Array.isArray(data.lines) ? [...data.lines] : [];
+    // Sort by lineNbr; null/undefined land last via Infinity sentinel.
+    lines.sort((a, b) => {
+      const an = (a && a.lineNbr != null) ? a.lineNbr : Infinity;
+      const bn = (b && b.lineNbr != null) ? b.lineNbr : Infinity;
+      return an - bn;
+    });
+    return JSON.stringify(_canonicalize({ ...data, lines }));
+  }
+
   // Build nested PO rows.
   const rows = [];
+  let unchanged = 0;
   for (const [num, lines] of byOrder.entries()) {
     const id = "po_" + num;
     const prev = existingById.get(id) || {};
@@ -697,13 +739,29 @@ async function runPOSync(ctx) {
       acumStatus: rollupAcumaticaStatus(lines),
       lines,
     };
+
+    // Delta gate — skip the upsert when the canonical fingerprint of the
+    // newly-built row matches the existing row byte-for-byte. New POs
+    // (no `prev` in existingById) always pass since prev's fingerprint
+    // is a canonicalized empty object.
+    if (existingById.has(id) && _poFingerprint(data) === _poFingerprint(prev)) {
+      unchanged++;
+      continue;
+    }
     rows.push({ id, data });
   }
 
   // Reconciliation (additive, never delete): a PO previously synced from
   // Acumatica that is no longer in the feed and isn't already received is
   // marked received/Completed.
-  const feedIds = new Set(rows.map((r) => r.id));
+  //
+  // feedIds is now sourced from byOrder.keys() (every PO seen in the
+  // feed), NOT from `rows` (which only contains POs that beat the delta
+  // gate). Skipped-as-unchanged POs are still IN the feed — they must
+  // not be mis-classified as "no longer in feed" and reconciled to
+  // received. This is the subtle correctness bug that would fire the
+  // moment delta detection catches anything.
+  const feedIds = new Set([...byOrder.keys()].map((num) => "po_" + num));
   let reconciled = 0;
   for (const r of existing) {
     const d = r.data || {};
@@ -732,12 +790,13 @@ async function runPOSync(ctx) {
         id: auditId,
         ts: new Date().toISOString(),
         type: "acumatica-po-sync",
-        msg: `Acumatica PO sync: ${byOrder.size} POs (${entries.length} lines) upserted, ${reconciled} reconciled closed`,
+        msg: `Acumatica PO sync: ${upserted} upserted, ${unchanged} unchanged (skipped), ${reconciled} reconciled closed (${byOrder.size} POs / ${entries.length} lines in feed)`,
         detail: {
           source: "netlify-scheduled-function",
           posInFeed: byOrder.size,
           linesInFeed: entries.length,
           upserted,
+          unchanged,
           reconciled,
           poTypeField: detectedPOTypeField,
           poTypeRawCounts,
@@ -753,11 +812,12 @@ async function runPOSync(ctx) {
     },
   ]);
 
-  log(`PO sync done: ${byOrder.size} POs upserted, ${reconciled} reconciled`);
+  log(`POs: ${upserted} upserted, ${unchanged} unchanged (skipped), ${reconciled} reconciled`);
   return {
     posInFeed: byOrder.size,
     linesInFeed: entries.length,
     upserted,
+    unchanged,
     reconciled,
     poTypeField: detectedPOTypeField,
     poTypeRawCounts,
