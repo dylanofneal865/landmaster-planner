@@ -84,6 +84,28 @@ const parseDateLocal = (d) => {
   dt.setHours(0, 0, 0, 0);
   return dt;
 };
+// Normalized JOIN key for supplier names. Feeds format the same
+// supplier differently — the parts feed ships "FASTENAL COMPANY"
+// while the POs feed ships "Fastenal" — so any code that keys on
+// the RAW p.supplier / po.supplier drops the join and produces
+// silent zeros. This helper folds casing, strips punctuation, and
+// removes common legal suffixes so both spellings collapse to the
+// same key.
+//
+// FOR JOINING ONLY. Never display this string — the original raw
+// name stays on the record (and on aggregates, as `.name`) for
+// display. Consumers that need to render a supplier keep using
+// the original.
+function supplierKey(name) {
+  if (!name) return "";
+  return String(name)
+    .toLowerCase()
+    .replace(/[.,''`]/g, "")                                     // punctuation
+    .replace(/\b(inc|llc|l l c|corp|corporation|co|company|ltd|limited)\b/g, "")   // legal suffixes
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 const ucFirst = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
 const round = (n, d=0) => Math.round(n * Math.pow(10,d)) / Math.pow(10,d);
 const clamp = (n, mn, mx) => Math.max(mn, Math.min(mx, n));

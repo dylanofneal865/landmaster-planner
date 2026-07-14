@@ -913,20 +913,52 @@ function bumpStatusCache() { _statusCacheVer++; _statusCache = null; }
 // public-facing status is forced to "ok" so they fall out of every alert
 // filter (header counts, dashboard tiles, queues, suggested-order $).
 // Supplier-facing surfaces should read (p._rawStatus || p.status) instead.
+//
+// Comparison uses supplierKey() (js/02-utils.js) on BOTH sides so muting
+// "FASTENAL COMPANY" also mutes parts/POs whose supplier field arrives
+// from Acumatica as "Fastenal" or "Fastenal, Inc." The stored list keeps
+// the ORIGINAL name as entered — normalization is compare-time only, so
+// the Suppliers settings surface can still show the user what they typed.
 function isSupplierMuted(name) {
   if (!name) return false;
   const list = (DB.settings && DB.settings.mutedSuppliers) || [];
-  const n = name.toLowerCase();
-  return list.some(s => (s || "").toLowerCase() === n);
+  const k = supplierKey(name);
+  if (!k) return false;
+  return list.some(s => supplierKey(s) === k);
 }
 
 function toggleSupplierMute(name) {
   if (!name) return;
   if (!Array.isArray(DB.settings.mutedSuppliers)) DB.settings.mutedSuppliers = [];
   const list = DB.settings.mutedSuppliers;
-  const i = list.findIndex(s => (s || "").toLowerCase() === name.toLowerCase());
-  const wasMuted = i >= 0;
-  if (wasMuted) list.splice(i, 1); else list.push(name);
+  // Matching uses supplierKey() on BOTH sides so an unmute click on
+  // "Fastenal" correctly targets a previously-stored "FASTENAL COMPANY"
+  // (or any other spelling that folds to the same key). Without this,
+  // the raw case-insensitive compare would miss and the else-branch
+  // below would APPEND a duplicate — leaving the supplier permanently
+  // muted with a dead unmute button.
+  //
+  // Unmute uses filter() (not splice-at-first-match) so a pre-existing
+  // duplicated state — e.g. ["FASTENAL COMPANY", "Fastenal"] from a
+  // pre-fix era where the buggy toggle appended variants — fully
+  // clears in one click. One user intent = one operation, regardless
+  // of how many equivalent entries were sitting in the list.
+  //
+  // On ADD, we still push the ORIGINAL `name` as entered so the stored
+  // list reflects what the user typed; normalization is compare-time
+  // only. Same rule isSupplierMuted follows.
+  const targetKey = supplierKey(name);
+  const wasMuted = list.some(s => supplierKey(s) === targetKey);
+  if (wasMuted) {
+    // In-place: strip every matching entry so any consumer holding the
+    // array reference stays valid. Mutation invariant matches the rest
+    // of DB.settings.* — assign length + push, never reassign.
+    const kept = list.filter(s => supplierKey(s) !== targetKey);
+    list.length = 0;
+    for (const s of kept) list.push(s);
+  } else {
+    list.push(name);
+  }
   saveDB();
   bumpStatusCache();
   logAudit("settings", `${wasMuted ? "Unmuted" : "Muted"} supplier alerts: ${name}`, { supplier: name });

@@ -173,12 +173,26 @@ function supHeaderDropdown(key, label, rows) {
 
 registerRoute("suppliers", () => {
   const stats = partsWithStatus();
-  // Aggregate by supplier
+  // Aggregate by NORMALIZED supplier key (supplierKey in js/02-utils.js).
+  // Feeds emit the same supplier in different shapes — "FASTENAL COMPANY"
+  // from the parts feed vs "Fastenal" from the pos feed — so keying on
+  // raw p.supplier / po.supplier silently drops the PO join and produces
+  // zero Open POs / $0 rows. Aggregating by supplierKey collapses those.
+  // The original raw name stays on `a.name` for display so the UI keeps
+  // showing the supplier the way the feed wrote it.
+  //
+  // Collision detection: if two DIFFERENT raw part-supplier names
+  // normalize to the same key, log so the normalizer's over-merge risk
+  // is visible.
   const map = new Map();
+  const rawNamesByKey = new Map();   // key → Set of raw part-side names seen
   for (const p of stats) {
-    const key = p.supplier || "—";
+    const raw = p.supplier || "—";
+    const key = supplierKey(raw) || raw.toLowerCase();  // fallback: empty key would collapse everything
+    if (!rawNamesByKey.has(key)) rawNamesByKey.set(key, new Set());
+    rawNamesByKey.get(key).add(raw);
     if (!map.has(key)) map.set(key, {
-      name: key, parts: 0, critical: 0, warning: 0, ohValue: 0, openPOs: 0, openPOValue: 0,
+      name: raw, key, parts: 0, critical: 0, warning: 0, ohValue: 0, openPOs: 0, openPOValue: 0,
       ltSum: 0, ltCount: 0, partsList: [],
     });
     const a = map.get(key);
@@ -203,19 +217,67 @@ registerRoute("suppliers", () => {
     if (p.ltWeeks) { a.ltSum += p.ltWeeks; a.ltCount++; }
     a.partsList.push(p);
   }
+  // Collision warning — surface any keys where multiple distinct raw
+  // part-supplier names collapsed to the same normalized value. Not
+  // fatal (usually the intended behavior), but visible so an over-
+  // aggressive normalizer can be caught.
+  for (const [key, rawSet] of rawNamesByKey.entries()) {
+    if (rawSet.size > 1) {
+      console.warn(
+        `[suppliers] normalizer collision — ${rawSet.size} distinct raw names collapsed to key "${key}":`,
+        [...rawSet]
+      );
+    }
+  }
+
   // Add PO data. Route through isLineOpen so completed/closed POs from the
   // Acumatica feed don't inflate per-supplier open-PO counts or value.
+  //
+  // UNMATCHED tracking: any PO whose normalized supplier key doesn't
+  // match a parts-side aggregate would previously have been silently
+  // dropped (the exact bug this fix targets). Collect them by key so a
+  // visible "UNMATCHED POs" row can render at the table bottom — silent
+  // $0 is precisely the state we're trying to eliminate.
+  const unmatched = new Map();   // key → { names: Set, openPOs: 0, openPOValue: 0 }
   for (const po of DB.pos) {
     const openLines = (po.lines || []).filter(ln => isLineOpen(po, ln));
     if (openLines.length === 0) continue;
-    const a = map.get(po.supplier);
-    if (!a) continue;
+    const poRaw = po.supplier || "—";
+    const key = supplierKey(poRaw) || poRaw.toLowerCase();
+    const a = map.get(key);
+    if (!a) {
+      if (!unmatched.has(key)) unmatched.set(key, { key, names: new Set(), openPOs: 0, openPOValue: 0 });
+      const u = unmatched.get(key);
+      u.names.add(poRaw);
+      u.openPOs++;
+      for (const ln of openLines) {
+        const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
+        u.openPOValue += remaining * (ln.cost || 0);
+      }
+      continue;
+    }
     a.openPOs++;
     for (const ln of openLines) {
       const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
       a.openPOValue += remaining * (ln.cost || 0);
     }
   }
+  if (unmatched.size > 0) {
+    // Surface a compact list so the console has enough context to fix
+    // the underlying feed mismatch (or extend the normalizer).
+    const summary = [...unmatched.values()].map(u => ({
+      key: u.key,
+      poSupplierNames: [...u.names],
+      openPOs: u.openPOs,
+      openPOValue: u.openPOValue,
+    }));
+    console.warn(
+      `[suppliers] ${unmatched.size} PO supplier key(s) with no matching parts-side supplier — ` +
+      `their Open POs/$ are aggregated under the UNMATCHED row.`,
+      summary
+    );
+  }
+
   let suppliers = [...map.values()];
 
   // Render every aggregated supplier; the header hidden filter is applied
@@ -279,6 +341,32 @@ registerRoute("suppliers", () => {
                     </tr>
                   `;
                 }).join("")}
+                ${unmatched.size > 0 ? (() => {
+                  // UNMATCHED row — sum of every PO whose supplier key
+                  // didn't join to a parts-side supplier. Visible failure
+                  // signal: silent $0 was what hid this bug in the first
+                  // place. Distinct raw PO-supplier names go in the title
+                  // attr so a hover reveals exactly which spellings are
+                  // failing to join.
+                  const list = [...unmatched.values()];
+                  const totalOpen = list.reduce((s, u) => s + u.openPOs, 0);
+                  const totalValue = list.reduce((s, u) => s + u.openPOValue, 0);
+                  const allNames = [...new Set(list.flatMap(u => [...u.names]))].sort();
+                  const nameSample = allNames.slice(0, 8).join("; ") + (allNames.length > 8 ? `; …+${allNames.length - 8}` : "");
+                  return `
+                    <tr data-sup-row style="background:var(--warn-soft)" title="Distinct PO-supplier names not matching any parts-side supplier: ${esc(allNames.join("; "))}">
+                      <td class="bold"><span class="pill warn" style="margin-right:8px">UNMATCHED</span><span class="dim tiny">${esc(nameSample)}</span></td>
+                      <td class="right num dim">—</td>
+                      <td class="right dim">—</td>
+                      <td class="right dim">—</td>
+                      <td class="right num dim">—</td>
+                      <td class="right num dim">—</td>
+                      <td class="right num bold">${fmtNum(totalOpen)}</td>
+                      <td class="right num bold">${fmtMoney(totalValue)}</td>
+                      <td></td>
+                    </tr>
+                  `;
+                })() : ""}
               </tbody>
             </table>
           </div>
@@ -292,8 +380,15 @@ registerRoute("suppliers", () => {
 
 function openSupplierDetail(name) {
   const stats = partsWithStatus();
-  const parts = stats.filter(p => p.supplier === name);
-  const pos = DB.pos.filter(p => p.supplier === name).sort((a,b) => new Date(b.createdDate) - new Date(a.createdDate));
+  // Match parts AND POs by normalized supplier key so the drawer counts
+  // agree with the row that just launched it. Prior raw-equality filters
+  // dropped any PO or part whose feed spelled the supplier differently
+  // (e.g. row aggregated "FASTENAL COMPANY" and "Fastenal" together, but
+  // the drawer's === filter only caught one variant). supplierKey lives
+  // in js/02-utils.js — same helper the aggregation uses.
+  const targetKey = supplierKey(name);
+  const parts = stats.filter(p => supplierKey(p.supplier) === targetKey);
+  const pos = DB.pos.filter(p => supplierKey(p.supplier) === targetKey).sort((a,b) => new Date(b.createdDate) - new Date(a.createdDate));
   const ohValue = parts.reduce((s,p) => s + (p.onHand||0)*(p.cost||0), 0);
   // Drawer always shows the TRUE status; muted parts have p.status forced to
   // "ok" but keep their original in p._rawStatus. Reorder-suppressed parts
