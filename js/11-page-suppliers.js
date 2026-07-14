@@ -309,7 +309,18 @@ registerRoute("suppliers", () => {
       <div class="panel">
         <div class="panel-body flush">
           <div class="tbl-wrap">
-            <table class="tbl">
+            <table class="tbl" style="table-layout:fixed; width:100%">
+              <colgroup>
+                <col style="width:32%">
+                <col style="width:6%">
+                <col style="width:8%">
+                <col style="width:8%">
+                <col style="width:8%">
+                <col style="width:12%">
+                <col style="width:8%">
+                <col style="width:12%">
+                <col style="width:6%">
+              </colgroup>
               <thead><tr>
                 ${supHeaderDropdown("name", "Supplier", headerFilterRows)}
                 <th class="right">Parts</th>
@@ -329,7 +340,7 @@ registerRoute("suppliers", () => {
                   const avgLT = a.ltCount > 0 ? round(a.ltSum / a.ltCount, 1) : 0;
                   return `
                     <tr class="clickable" data-sup-row data-su-name="${esc(supHeaderValue(a, "name"))}" onclick="openSupplierDetail('${esc(a.name)}')">
-                      <td class="bold">${esc(a.name)}${isSupplierMuted(a.name) ? ' <span class="pill warn">MUTED</span>' : ''}</td>
+                      <td class="bold" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="${esc(a.name)}">${esc(a.name)}${isSupplierMuted(a.name) ? ' <span class="pill warn">MUTED</span>' : ''}</td>
                       <td class="right num">${fmtNum(a.parts)}</td>
                       <td class="right">${a.critical > 0 ? `<span class="pill crit">${a.critical}</span>` : '<span class="dim">0</span>'}</td>
                       <td class="right">${a.warning > 0 ? `<span class="pill warn">${a.warning}</span>` : '<span class="dim">0</span>'}</td>
@@ -355,7 +366,7 @@ registerRoute("suppliers", () => {
                   const nameSample = allNames.slice(0, 8).join("; ") + (allNames.length > 8 ? `; …+${allNames.length - 8}` : "");
                   return `
                     <tr data-sup-row style="background:var(--warn-soft)" title="Distinct PO-supplier names not matching any parts-side supplier: ${esc(allNames.join("; "))}">
-                      <td class="bold"><span class="pill warn" style="margin-right:8px">UNMATCHED</span><span class="dim tiny">${esc(nameSample)}</span></td>
+                      <td class="bold" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap"><span class="pill warn" style="margin-right:8px">UNMATCHED</span><span class="dim tiny">${esc(nameSample)}</span></td>
                       <td class="right num dim">—</td>
                       <td class="right dim">—</td>
                       <td class="right dim">—</td>
