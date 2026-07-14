@@ -513,6 +513,11 @@ async function cloudInit() {
   _hookDraftSave();
   _showCloudIndicator(true);
   _setupRealtimeSubscriptions();
+  // Watchdog for the realtime socket. visibilitychange/online/focus catch
+  // laptop-wake and network-blip transitions; the interval catches silent
+  // zombie sockets that never fire CLOSED. Both are idempotent one-shots.
+  _installConnectionListeners();
+  _startHeartbeat();
 
   // First-class kit migration: tag parts present in kit_boms as itemType="kit".
   // Runs AFTER snapshot priming + _hookSaveDB so the tagged parts are detected
@@ -526,42 +531,257 @@ async function cloudInit() {
 let _realtimeChannel = null;
 let _suppressNextLocalChange = false; // prevents echo: don't re-push what we just received
 
+// ── Realtime watchdog state ─────────────────────────────────────────
+// Supabase's WebSocket-based realtime channel can die silently on: laptop
+// sleep, mobile background, network blip, server-side idle timeout, or
+// captive-portal hijack. The subscribe() status callback below detects
+// CHANNEL_ERROR / TIMED_OUT / CLOSED and reconnects with exponential
+// backoff. On every accepted realtime event we bump _lastRealtimeAt so
+// the heartbeat + visibility listeners can distinguish "healthy but
+// quiet" from "zombie socket that stopped delivering".
+let _lastRealtimeAt = 0;                  // wall-clock ms of most recent accepted event
+let _realtimeBackoffMs = 0;               // grows 1s → 2s → 4s → … → capped 30s
+let _realtimeReconnectTimer = null;       // pending backoff timer, if any
+let _realtimeReconnecting = false;        // reentrancy guard
+let _heartbeatTimer = null;               // 5-min interval that probes for zombies
+let _connectionListenersInstalled = false; // visibility/online/focus one-shot
+let _hasSubscribedOnce = false;            // guards the catch-up fetch — first
+                                            // SUBSCRIBED is cloudInit's initial
+                                            // fetch; subsequent SUBSCRIBEDs are
+                                            // reconnects and need catch-up.
+
 function _setupRealtimeSubscriptions() {
   if (_realtimeChannel) return; // already subscribed
   if (!_supa) return;
 
+  // Every accepted event stamps _lastRealtimeAt. The heartbeat below
+  // uses this to catch zombie sockets that report "joined" but silently
+  // stopped delivering (Supabase's realtime layer occasionally does this
+  // through captive portals and after prolonged idle).
+  const wrap = (fn) => (payload) => {
+    _lastRealtimeAt = Date.now();
+    fn(payload);
+  };
+
   _realtimeChannel = _supa
     .channel("landmaster-sync")
-    .on("postgres_changes", { event: "*", schema: "public", table: "parts" }, (payload) => {
-      _handleRealtimePart(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "pos" }, (payload) => {
-      _handleRealtimePO(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" }, (payload) => {
-      _handleRealtimeDraft(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "audit" }, (payload) => {
-      _handleRealtimeAudit(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (payload) => {
-      _handleRealtimeSettings(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "usage" }, (payload) => {
-      _handleRealtimeUsage(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" }, (payload) => {
-      _handleRealtimeKitBoms(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" }, (payload) => {
-      _handleRealtimeFollowMark(payload);
-    })
-    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, (payload) => {
-      _handleRealtimeDeletedParts(payload);
-    })
-    .subscribe((status) => {
-      console.log("[cloud] realtime status:", status);
+    .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart))
+    .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO))
+    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft))
+    .on("postgres_changes", { event: "*", schema: "public", table: "audit" },         wrap(_handleRealtimeAudit))
+    .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings))
+    .on("postgres_changes", { event: "*", schema: "public", table: "usage" },         wrap(_handleRealtimeUsage))
+    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" },      wrap(_handleRealtimeKitBoms))
+    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark))
+    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts))
+    .subscribe((status, err) => {
+      console.log("[cloud] realtime status:", status, err || "");
+      if (status === "SUBSCRIBED") {
+        // Healthy — reset backoff and stamp activity. On a RECONNECT
+        // (as opposed to initial subscribe from cloudInit), the socket
+        // does NOT replay missed events, so we also need a catch-up
+        // fetch to sync anything that changed while we were offline.
+        // The initial-boot path already did a full fetch in cloudInit,
+        // so we only catch up on subsequent (re)subscriptions.
+        _realtimeBackoffMs = 0;
+        _lastRealtimeAt = Date.now();
+        _showCloudIndicator(true);
+        if (_hasSubscribedOnce) {
+          _catchupFetch().catch((e) => console.warn("[cloud] catch-up fetch failed", e));
+        }
+        _hasSubscribedOnce = true;
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        console.warn("[cloud] realtime unhealthy — will reconnect", { status, err });
+        _showCloudIndicator(false, "reconnecting");
+        _scheduleRealtimeReconnect();
+      }
     });
+}
+
+// Reconnect the realtime channel from scratch: kill the existing
+// channel (if any), then rebuild via _setupRealtimeSubscriptions. The
+// subscribe() status callback above handles the catch-up fetch on the
+// next SUBSCRIBED.
+async function _reconnectRealtime() {
+  if (_realtimeReconnecting) return;
+  if (!_supa) return;
+  _realtimeReconnecting = true;
+  try {
+    if (_realtimeChannel) {
+      try { await _supa.removeChannel(_realtimeChannel); } catch (e) { /* best-effort */ }
+      _realtimeChannel = null;
+    }
+    _setupRealtimeSubscriptions();
+  } finally {
+    _realtimeReconnecting = false;
+  }
+}
+
+// Exponential backoff scheduler — 1s → 2s → 4s → 8s → 16s → capped 30s.
+// Reset to 0 on a successful SUBSCRIBED. Coalesces if called multiple
+// times before the pending timer fires.
+function _scheduleRealtimeReconnect() {
+  if (_realtimeReconnectTimer) return;
+  _realtimeBackoffMs = Math.min(_realtimeBackoffMs > 0 ? _realtimeBackoffMs * 2 : 1000, 30000);
+  console.log(`[cloud] scheduling realtime reconnect in ${_realtimeBackoffMs}ms`);
+  _realtimeReconnectTimer = setTimeout(() => {
+    _realtimeReconnectTimer = null;
+    _reconnectRealtime();
+  }, _realtimeBackoffMs);
+}
+
+// Catch-up fetch on reconnect. Realtime doesn't replay missed events,
+// so after a disconnect we re-pull every table we subscribe to. Mutate
+// in place (splice/length=0/push, never reassign) so any UI holding a
+// reference to DB.parts / DB.pos / DB.deletedParts / window.followMarks
+// stays valid.
+//
+// Deliberately DOES NOT re-run: SDK init, saveDB hook, draftSave hook,
+// snapshot priming for _detectChanges, kit-migration. Those are one-
+// time setup in cloudInit and reruns would corrupt dirty tracking.
+async function _catchupFetch() {
+  if (!_supa || !_cloudReady) return;
+  const t0 = Date.now();
+
+  // Tombstones first — same order as cloudInit so the parts filter below
+  // sees the current tombstone set.
+  const cloudTombstones = await _fetchAllDeletedParts();
+  if (cloudTombstones !== null) {
+    if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+    DB.deletedParts.clear();
+    for (const row of cloudTombstones) {
+      DB.deletedParts.set(String(row.id), row.data || {});
+    }
+  }
+
+  // Parts. Filter tombstoned pns exactly like cloudInit does.
+  const cloudParts = await _fetchAllParts();
+  if (cloudParts !== null && Array.isArray(cloudParts)) {
+    const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
+    const merged = cloudParts
+      .filter((r) => r && r.pn && !tombs.has(String(r.pn)))
+      .map((r) => ({ pn: r.pn, ...r.data }));
+    DB.parts.length = 0;
+    for (const p of merged) DB.parts.push(p);
+    // Re-prime the dirty-tracking snapshot so subsequent LOCAL edits
+    // still detect properly. Without this, the first local edit after
+    // reconnect would trigger a phantom "changed" upsert on every part.
+    _partsSnapshot.clear();
+    for (const p of DB.parts) _partsSnapshot.set(p.pn, JSON.stringify(p));
+  }
+
+  // POs.
+  const cloudPos = await _fetchAllPos();
+  if (cloudPos !== null) {
+    const merged = cloudPos.map((r) => ({ id: r.id, ...r.data }));
+    DB.pos.length = 0;
+    for (const po of merged) DB.pos.push(po);
+    _posSnapshot.clear();
+    for (const po of DB.pos) _posSnapshot.set(po.id, JSON.stringify(po));
+  }
+
+  // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
+  // our baseline, so a stale-writer's clobber doesn't sneak in via
+  // catch-up. Mirrors _isDraftBaselineCurrent semantics.
+  const cloudDraft = await _fetchCloudDraft();
+  if (cloudDraft && typeof DRAFT_ORDER !== "undefined") {
+    const cloudTs = cloudDraft.updatedAt || "";
+    const mineTs = _lastDraftUpdatedAt || "";
+    if (!mineTs || (cloudTs && cloudTs > mineTs)) {
+      DRAFT_ORDER.length = 0;
+      for (const item of cloudDraft.items) DRAFT_ORDER.push(item);
+      if (typeof draftOrderSave === "function") {
+        _suppressNextLocalChange = true;
+        draftOrderSave();
+        _suppressNextLocalChange = false;
+      }
+      if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+      _lastCloudDraftHash = _hashDraft(cloudDraft.items);
+      if (cloudDraft.updatedAt) _lastDraftUpdatedAt = cloudDraft.updatedAt;
+    }
+  }
+
+  // Follow marks — in-place mutation so any consumer holding the Map ref
+  // stays valid.
+  const fmRows = await _fetchAllFollowMarks();
+  if (Array.isArray(fmRows)) {
+    if (!window.followMarks) window.followMarks = new Map();
+    window.followMarks.clear();
+    for (const r of fmRows) if (r && r.id && r.data) window.followMarks.set(r.id, r.data);
+  }
+
+  // Settings — merge (don't replace) so a client-local setting the
+  // client already tweaked isn't clobbered by an older cloud snapshot.
+  const cloudSettings = await _fetchCloudSettings();
+  if (cloudSettings) DB.settings = { ...DB.settings, ...cloudSettings };
+
+  _applyAndRefresh();
+  console.log(`[cloud] catch-up fetch complete in ${Date.now() - t0}ms`);
+}
+
+// Visibility / focus / online listeners — installed once. Triggered on
+// tab wake-up, network resume, or window refocus. Kicks a reconnect
+// unless the channel is already known-healthy (state === "joined").
+function _installConnectionListeners() {
+  if (_connectionListenersInstalled) return;
+  _connectionListenersInstalled = true;
+
+  const checkAndReconnect = (why) => {
+    if (!_cloudReady) return;
+    const state = _realtimeChannel && _realtimeChannel.state;
+    const staleness = Date.now() - (_lastRealtimeAt || 0);
+    // "joined" is the healthy state string on Supabase's RealtimeChannel.
+    // Any other state (closed, errored, joining, leaving) means we
+    // shouldn't trust the socket. Also reconnect if we haven't seen an
+    // event in >10 minutes — user just woke the tab, get fresh data
+    // regardless of the socket's self-report.
+    if (state !== "joined" || staleness > 10 * 60 * 1000) {
+      console.log(`[cloud] wake check (${why}): state=${state}, staleness=${staleness}ms — reconnecting`);
+      _realtimeBackoffMs = 0;  // user-initiated wake — no throttling
+      _reconnectRealtime();
+    }
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") checkAndReconnect("visibility");
+  });
+  window.addEventListener("online", () => checkAndReconnect("online"));
+  window.addEventListener("focus", () => checkAndReconnect("focus"));
+}
+
+// Heartbeat — every 5 minutes, verify the channel is joined. If not,
+// reconnect. Also probes for zombie sockets: if the channel reports
+// joined but hasn't delivered an event in >10 min AND the tab is
+// visible, fetch a small row (draft_order) to sanity-check. If the
+// probe fails, force a reconnect. Cheap: ~288 wake-cycles/day, at most
+// 1 tiny fetch per zombie-suspicion event.
+function _startHeartbeat() {
+  if (_heartbeatTimer) return;
+  _heartbeatTimer = setInterval(() => {
+    if (!_cloudReady) return;
+    if (document.visibilityState !== "visible") return;   // don't probe from background
+    const state = _realtimeChannel && _realtimeChannel.state;
+    if (state !== "joined") {
+      console.log(`[cloud] heartbeat: state=${state} — reconnecting`);
+      _reconnectRealtime();
+      return;
+    }
+    const staleness = Date.now() - (_lastRealtimeAt || 0);
+    if (staleness > 10 * 60 * 1000) {
+      // Silent socket. Poke via draft_order (tiny, LWW-guarded).
+      _fetchCloudDraft().then((res) => {
+        if (res !== null) {
+          // Fetch worked — connection is fine even though realtime is
+          // quiet. Treat the successful probe as fresh activity so
+          // we don't re-probe every minute.
+          _lastRealtimeAt = Date.now();
+        } else {
+          console.log("[cloud] heartbeat probe failed — reconnecting");
+          _reconnectRealtime();
+        }
+      });
+    }
+  }, 5 * 60 * 1000);
 }
 
 let _redrawTimer = null;
@@ -1324,10 +1544,12 @@ function _showCloudIndicator(ready, state) {
     document.body.appendChild(el);
   }
   let color, label;
-  if (state === "syncing")    { color = "#e6c84f"; label = "Cloud: syncing…"; }
-  else if (state === "error") { color = "#e25555"; label = "Cloud: sync error"; }
-  else if (ready)             { color = "var(--accent)"; label = "Cloud: connected"; }
-  else                        { color = "#777"; label = "Cloud: connecting…"; }
+  if (state === "syncing")           { color = "#e6c84f"; label = "Cloud: syncing…"; }
+  else if (state === "error")        { color = "#e25555"; label = "Cloud: sync error"; }
+  else if (state === "reconnecting") { color = "#e6a04f"; label = "Cloud: realtime reconnecting — data may be stale"; }
+  else if (state === "disconnected") { color = "#e25555"; label = "Cloud: realtime disconnected — data may be stale"; }
+  else if (ready)                    { color = "var(--accent)"; label = "Cloud: connected"; }
+  else                               { color = "#777"; label = "Cloud: connecting…"; }
   el.style.background = color;
   el.style.boxShadow = "0 0 6px " + color;
   el.title = label;
