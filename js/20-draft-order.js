@@ -432,11 +432,24 @@ async function _buildDraftOrderPDF() {
       // Pricing source: orderUnitCost (last PO → stored cost fallback), pulled
       // from draftOrderTotals so the PDF and drawer can't drift apart. No-
       // cost rows render "—" rather than a misleading $0.
-      // Blanket linkage: for release lines, append "↳ Release against {po#}"
+      // Blanket linkage: for release lines, append "Release against {po#}"
       // to the description so the PDF reads as a release, not a fresh order.
+      //
+      // WinAnsi-safe glyphs on this path — jsPDF's default helvetica is
+      // WinAnsi-encoded (the font dict declares /Encoding /WinAnsiEncoding),
+      // and the drawer's "↳" (U+21B3) is unmappable there. When jsPDF
+      // hits the unmappable codepoint it falls into a per-glyph text-
+      // drawing path for the rest of the cell, which renders every
+      // character letter-spaced and the "↳" itself as "!³" (0xB3 = "³"
+      // in WinAnsi). We drop the arrow entirely and use an em-dash
+      // separator (U+2014 → WinAnsi 0x97, verified via a headless jsPDF
+      // 2.5.1 + autoTable 3.8.2 dump) instead of "\n" so the annotation
+      // stays inline and never triggers autoTable's multi-line cell path.
+      // The drawer's HTML template still uses "↳" — that path renders in
+      // the browser font and doesn't have the WinAnsi limitation.
       const desc = part.desc || "";
       const descWithRelease = blanketPoNum
-        ? (desc ? `${desc}\n↳ Release against ${blanketPoNum}` : `↳ Release against ${blanketPoNum}`)
+        ? (desc ? `${desc} — Release against ${blanketPoNum}` : `Release against ${blanketPoNum}`)
         : desc;
       allRows.push([
         supplier,
