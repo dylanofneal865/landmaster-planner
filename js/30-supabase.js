@@ -890,12 +890,73 @@ window._lastCloudSyncAt = 0;
 let _realtimeBackoffMs = 0;               // grows 1s → 2s → 4s → … → capped 30s
 let _realtimeReconnectTimer = null;       // pending backoff timer, if any
 let _realtimeReconnecting = false;        // reentrancy guard
+
+// Reconnect generation. Incremented at the top of every _reconnectRealtime
+// call. Each channel's subscribe() callback captures the generation at
+// channel-creation time and self-ignores any status event where its
+// captured gen != the current _reconnectGen. Effect: only the LATEST
+// reconnect's channels can drive state — every prior channel's straggler
+// events are silenced structurally, regardless of timing. This replaces
+// the reverted _intentionalClose flag (which couldn't distinguish which
+// teardown a CLOSED belonged to).
+let _reconnectGen = 0;
+
+// Coalesce concurrent reconnect requests. If _reconnectRealtime is called
+// while one is already in flight, we don't stack; we mark this flag and
+// the current run's finally re-schedules ONCE at the end.
+let _reconnectAgain = false;
+
+// Backoff-reset dwell timer. Backoff resets to 0 ONLY after the
+// connection has been stably subscribed for BACKOFF_RESET_DWELL_MS.
+// This kills the "stuck at 1000ms" loop where a brief SUBSCRIBED-then-
+// CLOSED cycle would otherwise reset backoff every iteration. Genuine
+// loops now see backoff CLIMB (1s→2s→4s…) until the intervals get
+// long enough to stop hammering. Cancelled on any CLOSED.
+let _backoffResetTimer = null;
+const BACKOFF_RESET_DWELL_MS = 8000;
 let _heartbeatTimer = null;               // 5-min interval that probes for zombies
 let _connectionListenersInstalled = false; // visibility/online/focus one-shot
 let _hasSubscribedOnce = false;            // guards the catch-up fetch — first
                                             // SUBSCRIBED is cloudInit's initial
                                             // fetch; subsequent SUBSCRIBEDs are
                                             // reconnects and need catch-up.
+
+// Shared subscribe/close bookkeeping for both channels. Kept in helpers
+// so the two channels' status-callback bodies stay identical.
+function _onChannelSubscribed() {
+  _lastRealtimeAt = Date.now();
+  // Cancel any pending reconnect timer — we're currently healthy, so
+  // the queued reconnect (originally scheduled while offline) would
+  // now tear down a healthy channel. This is the direct fix for the
+  // "stuck at 1000ms" loop: the stale queued reconnect no longer
+  // fires against a now-subscribed channel.
+  if (_realtimeReconnectTimer) {
+    clearTimeout(_realtimeReconnectTimer);
+    _realtimeReconnectTimer = null;
+    console.log("[cloud] pending reconnect cancelled — channel is healthy");
+  }
+  // Start (or restart) the dwell timer. Backoff only resets after
+  // BACKOFF_RESET_DWELL_MS of continuous subscription — a brief
+  // SUBSCRIBED-then-CLOSED cycle cancels the timer BEFORE reset,
+  // leaving backoff climbing.
+  if (_backoffResetTimer) clearTimeout(_backoffResetTimer);
+  _backoffResetTimer = setTimeout(() => {
+    _backoffResetTimer = null;
+    if (_realtimeBackoffMs > 0) {
+      console.log(`[cloud] backoff reset to 0 after ${BACKOFF_RESET_DWELL_MS}ms stable subscription`);
+      _realtimeBackoffMs = 0;
+    }
+  }, BACKOFF_RESET_DWELL_MS);
+}
+
+function _onChannelClosed() {
+  // Cancel the dwell timer — we're no longer stably subscribed.
+  // Backoff stays at its current climbed value.
+  if (_backoffResetTimer) {
+    clearTimeout(_backoffResetTimer);
+    _backoffResetTimer = null;
+  }
+}
 
 function _setupRealtimeSubscriptions() {
   if (_realtimeChannel) return; // already subscribed
@@ -935,36 +996,47 @@ function _setupRealtimeSubscriptions() {
   // syncs) or client-side without cross-tab-live urgency, and any
   // cross-tab propagation they need is handled by the broadcast delta
   // path (_BROADCAST_FETCHERS covers all three).
-  _realtimeChannel = _supa
+  // Capture gen at channel-creation. The subscribe callback compares
+  // this against _reconnectGen on every status event; a mismatch means
+  // a newer reconnect has superseded us, and we silently ignore.
+  // Effect: only the LATEST reconnect's channel drives state.
+  const capturedGen = _reconnectGen;
+  const chan = _supa
     .channel("landmaster-sync")
     .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart,         "parts"))
     .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO,           "pos"))
     .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft,        null))    // not in _BROADCAST_FETCHERS — no stamp
     .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings,     "settings"))
     .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark,   "follow_marks"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
-    .subscribe((status, err) => {
-      console.log("[cloud] realtime status:", status, err || "");
-      if (status === "SUBSCRIBED") {
-        // Healthy — reset backoff and stamp activity. On a RECONNECT
-        // (as opposed to initial subscribe from cloudInit), the socket
-        // does NOT replay missed events, so we also need a catch-up
-        // fetch to sync anything that changed while we were offline.
-        // The initial-boot path already did a full fetch in cloudInit,
-        // so we only catch up on subsequent (re)subscriptions.
-        _realtimeBackoffMs = 0;
-        _lastRealtimeAt = Date.now();
-        _showCloudIndicator(true);
-        if (_hasSubscribedOnce) {
-          _catchupFetch().catch((e) => console.warn("[cloud] catch-up fetch failed", e));
-        }
-        _hasSubscribedOnce = true;
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-        console.warn("[cloud] realtime unhealthy — will reconnect", { status, err });
-        _showCloudIndicator(false, "reconnecting");
-        _scheduleRealtimeReconnect();
+    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"));
+  _realtimeChannel = chan;
+  chan.subscribe((status, err) => {
+    // Structural stale-channel guard — see _reconnectGen docstring.
+    // Any status event from a channel whose captured gen no longer
+    // matches the current gen is from a superseded reconnect; ignore.
+    if (capturedGen !== _reconnectGen) {
+      console.debug(`[cloud] stale status ${status} from gen-${capturedGen} landmaster-sync (current gen ${_reconnectGen}) — ignoring`);
+      return;
+    }
+    console.log("[cloud] realtime status:", status, err || "");
+    if (status === "SUBSCRIBED") {
+      // Healthy — cancel pending reconnect timer and start dwell for
+      // backoff reset. See _onChannelSubscribed for the rationale.
+      _onChannelSubscribed();
+      _showCloudIndicator(true);
+      // On a RECONNECT (not initial boot subscribe), pull catch-up:
+      // the socket doesn't replay missed events.
+      if (_hasSubscribedOnce) {
+        _catchupFetch().catch((e) => console.warn("[cloud] catch-up fetch failed", e));
       }
-    });
+      _hasSubscribedOnce = true;
+    } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+      console.warn("[cloud] realtime unhealthy — will reconnect", { status, err });
+      _showCloudIndicator(false, "reconnecting");
+      _onChannelClosed();
+      _scheduleRealtimeReconnect();
+    }
+  });
 }
 
 // ── Broadcast channel setup (Phase 2 broadcast migration, Step 2) ─────
@@ -999,7 +1071,11 @@ function _setupBroadcastChannel() {
     fn(payload);
   };
 
-  _broadcastChannel = _supa
+  // Capture gen at channel-creation. See landmaster-sync setup for
+  // rationale. Straggler status events from a superseded broadcast
+  // channel are structurally silenced.
+  const capturedGen = _reconnectGen;
+  const chan = _supa
     .channel("landmaster-broadcast")
     .on("broadcast", { event: "data-changed" }, (msg) => _handleDataChanged(msg && msg.payload))
     // DELETE-only postgres_changes for tables where deletion propagation
@@ -1029,24 +1105,31 @@ function _setupBroadcastChannel() {
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "parts"         }, wrap(_handleRealtimePart,         "parts"))
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "pos"           }, wrap(_handleRealtimePO,           "pos"))
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "follow_marks"  }, wrap(_handleRealtimeFollowMark,   "follow_marks"))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
-    .subscribe((status, err) => {
-      console.log("[cloud] broadcast channel:", status, err || "");
-      if (status === "SUBSCRIBED") {
-        _lastRealtimeAt = Date.now();
-        // No catch-up here. The broadcast channel doesn't replay
-        // missed events either, but reconnect-time catch-up for the
-        // delete stream is a Step 5 concern (when landmaster-sync's
-        // whole-table re-pull is retired). For now the parallel
-        // landmaster-sync catch-up covers everything this channel
-        // would need.
-        return;
-      }
-      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-        console.warn("[cloud] broadcast channel unhealthy — will reconnect", { status, err });
-        _scheduleRealtimeReconnect();
-      }
-    });
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"));
+  _broadcastChannel = chan;
+  chan.subscribe((status, err) => {
+    // Structural stale-channel guard — see landmaster-sync setup.
+    if (capturedGen !== _reconnectGen) {
+      console.debug(`[cloud] stale status ${status} from gen-${capturedGen} landmaster-broadcast (current gen ${_reconnectGen}) — ignoring`);
+      return;
+    }
+    console.log("[cloud] broadcast channel:", status, err || "");
+    if (status === "SUBSCRIBED") {
+      _onChannelSubscribed();
+      // No catch-up here. The broadcast channel doesn't replay
+      // missed events either, but reconnect-time catch-up for the
+      // delete stream is a Step 5 concern (when landmaster-sync's
+      // whole-table re-pull is retired). For now the parallel
+      // landmaster-sync catch-up covers everything this channel
+      // would need.
+      return;
+    }
+    if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+      console.warn("[cloud] broadcast channel unhealthy — will reconnect", { status, err });
+      _onChannelClosed();
+      _scheduleRealtimeReconnect();
+    }
+  });
 }
 
 // Stamp _lastRemoteApplyAt for a single postgres_changes-delivered
@@ -1337,41 +1420,79 @@ async function _flushBroadcastPass() {
 // two channels stay in lockstep, so DELETE events can never lag
 // behind the postgres_changes stream (or vice versa) after a wake.
 async function _reconnectRealtime() {
-  if (_realtimeReconnecting) return;
+  // Single-flight mutex. If a reconnect is already in flight, mark the
+  // "again" flag; the current run's finally will fire one more cycle at
+  // the end. Prevents overlapping rebuilds.
+  if (_realtimeReconnecting) {
+    _reconnectAgain = true;
+    return;
+  }
   if (!_supa) return;
   _realtimeReconnecting = true;
+  // Bump generation BEFORE teardown so status events fired by the OLD
+  // channels' removeChannel (whose subscribe callbacks captured the
+  // previous gen) see mismatched gen and self-ignore. This is the
+  // structural replacement for the reverted _intentionalClose flag.
+  const myGen = ++_reconnectGen;
   try {
-    // landmaster-sync path — teardown → rebuild → (SUBSCRIBED cb fires
-    // _catchupFetch). Byte-for-byte identical to pre-Step-2, so live
-    // sync reconnect timing is preserved. Broadcast handling sits
-    // AFTER this block, off sync's critical path.
+    // Cancel dwell (we're rebuilding — no longer stably subscribed).
+    if (_backoffResetTimer) {
+      clearTimeout(_backoffResetTimer);
+      _backoffResetTimer = null;
+    }
+    // Teardown OLD channels. Null the module refs BEFORE the await so
+    // wake/heartbeat state checks see null (short-circuiting to
+    // "trigger reconnect" which is a no-op via the reentrancy guard),
+    // and so any straggler CLOSED fired after removeChannel resolves
+    // sees module ref !== chan closure (also a mismatch, but the gen
+    // check already covers this — the null is belt-and-suspenders).
     if (_realtimeChannel) {
-      try { await _supa.removeChannel(_realtimeChannel); } catch (e) { /* best-effort */ }
+      const oldRt = _realtimeChannel;
       _realtimeChannel = null;
+      try { await _supa.removeChannel(oldRt); } catch (e) { /* best-effort */ }
+    }
+    if (_broadcastChannel) {
+      const oldBc = _broadcastChannel;
+      _broadcastChannel = null;
+      try { await _supa.removeChannel(oldBc); } catch (e) { /* best-effort */ }
+    }
+    // Defensive: if another reconnect somehow ran between now and our
+    // gen bump (shouldn't happen with the reentrancy guard, but structural),
+    // abort — a newer rebuild has already run and we'd stomp it.
+    if (myGen !== _reconnectGen) {
+      console.log(`[cloud] reconnect gen ${myGen} superseded by ${_reconnectGen} — aborting stale rebuild`);
+      return;
     }
     _setupRealtimeSubscriptions();
-
-    // landmaster-broadcast path — purely additive. Runs after sync has
-    // already begun rebuilding (subscribe is fire-and-forget, so the
-    // sync rebuild is already in flight while we tear down broadcast).
-    // Shared lifecycle is deliberate: any channel unhealthy → both
-    // rebuild, so DELETE stream and postgres_changes update stream can
-    // never drift out of sync after a wake. _catchupFetch is idempotent,
-    // so the extra rebuild on a broadcast-only blip is harmless.
-    if (_broadcastChannel) {
-      try { await _supa.removeChannel(_broadcastChannel); } catch (e) { /* best-effort */ }
-      _broadcastChannel = null;
-    }
     _setupBroadcastChannel();
   } finally {
     _realtimeReconnecting = false;
+    // If a concurrent reconnect request came in during our flight,
+    // fire ONE more cycle now (respecting backoff via schedule).
+    if (_reconnectAgain) {
+      _reconnectAgain = false;
+      _scheduleRealtimeReconnect();
+    }
   }
 }
 
 // Exponential backoff scheduler — 1s → 2s → 4s → 8s → 16s → capped 30s.
-// Reset to 0 on a successful SUBSCRIBED. Coalesces if called multiple
-// times before the pending timer fires.
+// Backoff resets to 0 ONLY after the connection has been stably
+// subscribed for BACKOFF_RESET_DWELL_MS (see _onChannelSubscribed) —
+// a SUBSCRIBED that immediately re-closes does NOT reset backoff, so
+// a real loop CLIMBS toward the cap instead of hammering at 1000ms.
+//
+// N callers within one debounce → ONE pending timer:
+//   - If a reconnect is already running: mark _reconnectAgain; the
+//     current run's finally will schedule ONE more cycle at the end.
+//     Multiple concurrent callers collapse to at most one follow-up.
+//   - If a timer is already pending: no-op (existing coalesce).
+//   - Otherwise: schedule.
 function _scheduleRealtimeReconnect() {
+  if (_realtimeReconnecting) {
+    _reconnectAgain = true;
+    return;
+  }
   if (_realtimeReconnectTimer) return;
   _realtimeBackoffMs = Math.min(_realtimeBackoffMs > 0 ? _realtimeBackoffMs * 2 : 1000, 30000);
   console.log(`[cloud] scheduling realtime reconnect in ${_realtimeBackoffMs}ms`);
