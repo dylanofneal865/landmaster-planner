@@ -49,6 +49,29 @@ const _lastLocalSaveAt = { parts: new Map(), pos: new Map(), settings: 0 };
 // (~200-1000ms) with a wide margin. Too short = race reopens; too long =
 // legitimate cross-user edits get delayed after I stop typing.
 const RECENT_SAVE_MS = 5000;
+
+// ── Broadcast listener state (Phase 2 broadcast migration, Step 2) ────
+// Parallel to postgres_changes: a lightweight broadcast channel where a
+// server- or client-side sync will (in Step 3+) send { tables: [...] }
+// pings. On receipt, each named table gets a delta fetch since its
+// _lastSeenAt cursor, and the resulting rows are applied through the
+// SAME per-table apply logic the postgres_changes handlers use today —
+// same guards, same tombstone check, same recency guard, same echo
+// skip. Nothing sends broadcasts yet; this listener stays INERT until
+// Step 3 wires the senders. The postgres_changes channel remains fully
+// functional in parallel.
+let _broadcastChannel = null;
+// Pending table set is unioned across debounce window. A sync writing
+// parts then pos as two separate pings collapses to one fetch pass.
+const _broadcastPendingTables = new Set();
+let _broadcastTimer = null;
+// Set true for the DURATION of a broadcast flush pass. _applyAndRefresh
+// short-circuits when set, so the N per-table applies inside the pass
+// don't each schedule a debounced redraw — the pass ends with ONE
+// _applyAndRefresh() call. Wrapped in try/finally in the flush so a
+// throw can never leave the flag stuck.
+let _broadcastInProgress = false;
+const BROADCAST_DEBOUNCE_MS = 500;
 const _partsSnapshot = new Map(); // last-pushed snapshot per PN (also stores audit_<id> markers and __settings__ blob)
 const _posSnapshot = new Map();
 const _usageSnapshot = new Map(); // separate to avoid overloading _partsSnapshot
@@ -767,6 +790,10 @@ async function cloudInit() {
   _hookDraftSave();
   _showCloudIndicator(true);
   _setupRealtimeSubscriptions();
+  // Phase 2 broadcast migration, Step 2 — parallel broadcast channel.
+  // Listener is INERT until Step 3 wires senders; the postgres_changes
+  // channel above remains authoritative for now.
+  _setupBroadcastChannel();
   // Watchdog for the realtime socket. visibilitychange/online/focus catch
   // laptop-wake and network-blip transitions; the interval catches silent
   // zombie sockets that never fire CLOSED. Both are idempotent one-shots.
@@ -881,20 +908,234 @@ function _setupRealtimeSubscriptions() {
     });
 }
 
-// Reconnect the realtime channel from scratch: kill the existing
-// channel (if any), then rebuild via _setupRealtimeSubscriptions. The
-// subscribe() status callback above handles the catch-up fetch on the
-// next SUBSCRIBED.
+// ── Broadcast channel setup (Phase 2 broadcast migration, Step 2) ─────
+// Separate channel from "landmaster-sync". This one only listens for
+// broadcast events, not postgres_changes. INERT until Step 3 wires
+// senders — no messages will arrive today. Reconnect logic is deferred
+// to Step 5 (when postgres_changes is retired); until then the parallel
+// postgres_changes channel is authoritative and this listener is
+// additive.
+function _setupBroadcastChannel() {
+  if (_broadcastChannel) return;
+  if (!_supa) return;
+
+  // Same freshness stamping as landmaster-sync's wrap. Any accepted
+  // broadcast payload OR DELETE event bumps _lastRealtimeAt so the
+  // poll's skip-after-realtime gate and the header sync-indicator both
+  // treat it as fresh activity. Kept LOCAL to this setup so the two
+  // channels' setups stay self-contained and mirror each other.
+  const wrap = (fn) => (payload) => {
+    const now = Date.now();
+    _lastRealtimeAt = now;
+    window._lastCloudSyncAt = now;
+    fn(payload);
+  };
+
+  _broadcastChannel = _supa
+    .channel("landmaster-broadcast")
+    .on("broadcast", { event: "data-changed" }, (msg) => _handleDataChanged(msg && msg.payload))
+    // DELETE-only postgres_changes for tables where deletion propagation
+    // matters after landmaster-sync is retired in Step 5. Reuses the
+    // existing handlers' DELETE branches verbatim — each reads only
+    // payload.old.<pk> which REPLICA IDENTITY DEFAULT provides. Skipped:
+    // settings (single-row, no delete concept), draft_order (LWW-managed,
+    // no delete concept), broadcast (not a table). Recency guard NOT
+    // applied on this path — a delete does not race with an in-flight
+    // local save for the same row.
+    //
+    // Billing: only DELIVERED messages count against the realtime quota.
+    // Non-DELETE events on these tables (INSERT/UPDATE) are filtered at
+    // the Realtime server before delivery — zero messages billed on
+    // this channel for the update volume we're trying to eliminate in
+    // Step 5. Deletes are rare, so this cost is bounded.
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "parts"         }, wrap(_handleRealtimePart))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "pos"           }, wrap(_handleRealtimePO))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "usage"         }, wrap(_handleRealtimeUsage))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "kit_boms"      }, wrap(_handleRealtimeKitBoms))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "follow_marks"  }, wrap(_handleRealtimeFollowMark))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "audit"         }, wrap(_handleRealtimeAudit))
+    .subscribe((status, err) => {
+      console.log("[cloud] broadcast channel:", status, err || "");
+      if (status === "SUBSCRIBED") {
+        _lastRealtimeAt = Date.now();
+        // No catch-up here. The broadcast channel doesn't replay
+        // missed events either, but reconnect-time catch-up for the
+        // delete stream is a Step 5 concern (when landmaster-sync's
+        // whole-table re-pull is retired). For now the parallel
+        // landmaster-sync catch-up covers everything this channel
+        // would need.
+        return;
+      }
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        console.warn("[cloud] broadcast channel unhealthy — will reconnect", { status, err });
+        _scheduleRealtimeReconnect();
+      }
+    });
+}
+
+// Dispatch table for the broadcast flush: table name → delta fetcher.
+// Central map so a Step 3 sender emitting an unrecognized table is
+// logged and skipped, not silently applied.
+const _BROADCAST_FETCHERS = {
+  parts:          _fetchPartsSince,
+  pos:            _fetchPosSince,
+  settings:       _fetchSettingsSince,
+  kit_boms:       _fetchKitBomsSince,
+  follow_marks:   _fetchFollowMarksSince,
+  deleted_parts:  _fetchDeletedPartsSince,
+  audit:          _fetchAuditSince,
+  usage:          _fetchUsageSince,
+};
+
+// Dispatch a delta-fetched row through the SAME postgres_changes-handler
+// path the row would take if it had arrived as a realtime event. This is
+// the "reuse existing helpers" contract: every guard (tombstone, recency,
+// dirty, echo-skip) executes identically. Broadcast never delivers a
+// DELETE payload — the delta fetch surfaces updates only. Row deletions
+// are represented as INSERTs in the tombstone table (deleted_parts),
+// which _handleRealtimeDeletedParts already handles by splicing the
+// matching pn out of DB.parts. Table-scoped table deletes (e.g. a
+// deleted follow_mark) are inherently lossy on this path; Step 3 senders
+// can carry an explicit deleted_ids list if that becomes a problem.
+function _applyBroadcastRow(table, row) {
+  switch (table) {
+    case "parts":         _handleRealtimePart({ eventType: "UPDATE", new: row }); break;
+    case "pos":           _handleRealtimePO({ eventType: "UPDATE", new: row }); break;
+    case "settings":      _handleRealtimeSettings({ new: row }); break;
+    case "kit_boms":      _handleRealtimeKitBoms({ eventType: "UPDATE", new: row }); break;
+    case "follow_marks":  _handleRealtimeFollowMark({ eventType: "UPDATE", new: row }); break;
+    case "deleted_parts": _handleRealtimeDeletedParts({ eventType: "UPDATE", new: row }); break;
+    case "audit":         _handleRealtimeAudit({ eventType: "UPDATE", new: row }); break;
+    case "usage":         _handleRealtimeUsage({ eventType: "UPDATE", new: row }); break;
+    default:              console.warn(`[cloud] broadcast: unknown table "${table}" — ignored`);
+  }
+}
+
+// Broadcast-in from Step 3+ senders. Payload shape: { tables: [...] }.
+// Coalesces bursts within BROADCAST_DEBOUNCE_MS by unioning the pending
+// table set — a sync that emits parts then pos as two pings collapses
+// to one fetch pass.
+function _handleDataChanged(payload) {
+  const tables = Array.isArray(payload && payload.tables) ? payload.tables : [];
+  if (tables.length === 0) return;
+  for (const t of tables) _broadcastPendingTables.add(String(t));
+  clearTimeout(_broadcastTimer);
+  _broadcastTimer = setTimeout(_flushBroadcastPass, BROADCAST_DEBOUNCE_MS);
+}
+
+// One flush pass. Runs after debounce quiet-period expires.
+//
+// Tombstone ordering: if the pass includes both "deleted_parts" and
+// "parts", process deleted_parts FIRST. Otherwise the parts delta could
+// re-insert a pn whose tombstone this same pass would then apply on
+// the following iteration — visible flicker + a wasted _applyAndRefresh.
+// Processing tombstones first means _handleRealtimePart's
+// DB.deletedParts.has(pn) guard drops any tombstoned pn from the parts
+// delta on the SAME pass.
+async function _flushBroadcastPass() {
+  _broadcastTimer = null;
+  if (_broadcastPendingTables.size === 0) return;
+
+  // Snapshot + clear so pings arriving DURING the fetch enter a new
+  // pending set (next debounce cycle), not this one.
+  const pending = new Set(_broadcastPendingTables);
+  _broadcastPendingTables.clear();
+
+  // Deterministic order: deleted_parts first, then everything else in
+  // insertion order (parts, pos, settings, ...).
+  const orderedTables = [];
+  if (pending.has("deleted_parts")) orderedTables.push("deleted_parts");
+  for (const t of pending) if (t !== "deleted_parts") orderedTables.push(t);
+
+  let totalApplied = 0;
+  _broadcastInProgress = true;
+  try {
+    for (const table of orderedTables) {
+      const fetcher = _BROADCAST_FETCHERS[table];
+      if (!fetcher) {
+        console.warn(`[cloud] broadcast: no fetcher for table "${table}" — skipped`);
+        continue;
+      }
+      const cursor = _lastSeenAt[table];
+      const { rows, maxSeenAt } = await fetcher(cursor);
+      // rows === null → fetch failed. Do NOT advance the cursor; next
+      // ping (or next boot-time reseeding via _catchupFetch in Step 5)
+      // will retry from the same point.
+      if (rows === null) continue;
+      for (const row of rows) {
+        _applyBroadcastRow(table, row);
+        totalApplied++;
+      }
+      // Only advance the cursor if the fetch actually returned rows.
+      // maxSeenAt is null when the fetcher saw zero new rows — leaving
+      // the cursor exactly where it was, which is correct.
+      if (maxSeenAt) _lastSeenAt[table] = maxSeenAt;
+    }
+  } catch (e) {
+    console.error("[cloud] broadcast flush threw — cursors up to failure point were advanced:", (e && e.stack) || e);
+  } finally {
+    // ALWAYS clear the flag — a stuck-true would suppress every
+    // subsequent postgres_changes-driven redraw.
+    _broadcastInProgress = false;
+  }
+
+  if (totalApplied > 0) {
+    const now = Date.now();
+    // Stamp the realtime freshness clocks so the poll's skip-after-
+    // realtime gate and the header sync-indicator both treat the
+    // broadcast delivery as fresh activity (same as an accepted
+    // postgres_changes event does via wrap()).
+    _lastRealtimeAt = now;
+    window._lastCloudSyncAt = now;
+    console.log(`[cloud] broadcast data-changed: [${orderedTables.join(", ")}] → applied ${totalApplied} rows`);
+    // Single batched redraw + IDB write + statusCache bump for the
+    // entire pass. All the per-table dispatches short-circuited on
+    // _broadcastInProgress; this is the only real call.
+    _applyAndRefresh();
+  }
+}
+
+// Reconnect the realtime channels from scratch: kill BOTH existing
+// channels (landmaster-sync postgres_changes + landmaster-broadcast
+// broadcast/DELETE), then rebuild both. The sync channel's SUBSCRIBED
+// status callback handles the catch-up fetch on the next SUBSCRIBED;
+// the broadcast channel needs no catch-up under Step 2 (see comment
+// in _setupBroadcastChannel's subscribe callback).
+//
+// Both channels teardown together because either one being unhealthy
+// almost always means the underlying WebSocket is unhealthy —
+// Supabase multiplexes multiple channels over one WS. Rebuilding both
+// costs one extra subscribe per reconnect (cheap) and guarantees the
+// two channels stay in lockstep, so DELETE events can never lag
+// behind the postgres_changes stream (or vice versa) after a wake.
 async function _reconnectRealtime() {
   if (_realtimeReconnecting) return;
   if (!_supa) return;
   _realtimeReconnecting = true;
   try {
+    // landmaster-sync path — teardown → rebuild → (SUBSCRIBED cb fires
+    // _catchupFetch). Byte-for-byte identical to pre-Step-2, so live
+    // sync reconnect timing is preserved. Broadcast handling sits
+    // AFTER this block, off sync's critical path.
     if (_realtimeChannel) {
       try { await _supa.removeChannel(_realtimeChannel); } catch (e) { /* best-effort */ }
       _realtimeChannel = null;
     }
     _setupRealtimeSubscriptions();
+
+    // landmaster-broadcast path — purely additive. Runs after sync has
+    // already begun rebuilding (subscribe is fire-and-forget, so the
+    // sync rebuild is already in flight while we tear down broadcast).
+    // Shared lifecycle is deliberate: any channel unhealthy → both
+    // rebuild, so DELETE stream and postgres_changes update stream can
+    // never drift out of sync after a wake. _catchupFetch is idempotent,
+    // so the extra rebuild on a broadcast-only blip is harmless.
+    if (_broadcastChannel) {
+      try { await _supa.removeChannel(_broadcastChannel); } catch (e) { /* best-effort */ }
+      _broadcastChannel = null;
+    }
+    _setupBroadcastChannel();
   } finally {
     _realtimeReconnecting = false;
   }
@@ -1030,15 +1271,20 @@ function _installConnectionListeners() {
 
   const checkAndReconnect = (why) => {
     if (!_cloudReady) return;
-    const state = _realtimeChannel && _realtimeChannel.state;
+    const rtState = _realtimeChannel && _realtimeChannel.state;
+    const bcState = _broadcastChannel && _broadcastChannel.state;
     const staleness = Date.now() - (_lastRealtimeAt || 0);
     // "joined" is the healthy state string on Supabase's RealtimeChannel.
     // Any other state (closed, errored, joining, leaving) means we
-    // shouldn't trust the socket. Also reconnect if we haven't seen an
-    // event in >10 minutes — user just woke the tab, get fresh data
-    // regardless of the socket's self-report.
-    if (state !== "joined" || staleness > 10 * 60 * 1000) {
-      console.log(`[cloud] wake check (${why}): state=${state}, staleness=${staleness}ms — reconnecting`);
+    // shouldn't trust the socket. Both channels are checked because
+    // _reconnectRealtime rebuilds both together — if the broadcast
+    // channel is dead but sync is fine, we still want the broadcast
+    // channel restored so DELETE propagation resumes. Also reconnect
+    // if we haven't seen ANY realtime activity in >10 min — user just
+    // woke the tab, get fresh data regardless of the socket's self-
+    // report.
+    if (rtState !== "joined" || bcState !== "joined" || staleness > 10 * 60 * 1000) {
+      console.log(`[cloud] wake check (${why}): rt=${rtState}, bc=${bcState}, staleness=${staleness}ms — reconnecting`);
       _realtimeBackoffMs = 0;  // user-initiated wake — no throttling
       _reconnectRealtime();
     }
@@ -1062,9 +1308,14 @@ function _startHeartbeat() {
   _heartbeatTimer = setInterval(() => {
     if (!_cloudReady) return;
     if (document.visibilityState !== "visible") return;   // don't probe from background
-    const state = _realtimeChannel && _realtimeChannel.state;
-    if (state !== "joined") {
-      console.log(`[cloud] heartbeat: state=${state} — reconnecting`);
+    // Both channels must be joined. If either dropped, rebuild both —
+    // Step 5 makes the broadcast/delete channel the sole propagation
+    // path for updates AND deletes, so any silent drop there would
+    // stop all cross-user propagation until reload.
+    const rtState = _realtimeChannel && _realtimeChannel.state;
+    const bcState = _broadcastChannel && _broadcastChannel.state;
+    if (rtState !== "joined" || bcState !== "joined") {
+      console.log(`[cloud] heartbeat: rt=${rtState}, bc=${bcState} — reconnecting`);
       _reconnectRealtime();
       return;
     }
@@ -1582,6 +1833,13 @@ function _doDebouncedRedraw() {
 }
 
 function _applyAndRefresh() {
+  // Broadcast-flush batching: while a broadcast pass is applying N rows
+  // through synthetic postgres_changes-handler dispatches, we defer the
+  // redraw + IDB write + statusCache bump. The flush calls this ONCE at
+  // the end of the pass. Guaranteed false outside a flush (the flush's
+  // try/finally resets it), so postgres_changes-driven applies still
+  // refresh immediately as before.
+  if (_broadcastInProgress) return;
   _suppressNextLocalChange = true;
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   _suppressNextLocalChange = false;
