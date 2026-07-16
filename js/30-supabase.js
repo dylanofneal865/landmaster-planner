@@ -924,15 +924,23 @@ function _setupRealtimeSubscriptions() {
     fn(payload);
   };
 
+  // Only tables IN the supabase_realtime publication can be subscribed
+  // via postgres_changes. Current publication: parts, pos, settings,
+  // deleted_parts, follow_marks, draft_order (6 tables). Subscribing to
+  // audit, usage, or kit_boms is REJECTED by the Realtime server with
+  // "Unable to subscribe to changes with given parameters", which
+  // closes the entire channel and triggers a self-feeding reconnect
+  // loop. Those three tables were deliberately dropped from the
+  // publication to save quota — they're written server-side (Netlify
+  // syncs) or client-side without cross-tab-live urgency, and any
+  // cross-tab propagation they need is handled by the broadcast delta
+  // path (_BROADCAST_FETCHERS covers all three).
   _realtimeChannel = _supa
     .channel("landmaster-sync")
     .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart,         "parts"))
     .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO,           "pos"))
     .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft,        null))    // not in _BROADCAST_FETCHERS — no stamp
-    .on("postgres_changes", { event: "*", schema: "public", table: "audit" },         wrap(_handleRealtimeAudit,        "audit"))
     .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings,     "settings"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "usage" },         wrap(_handleRealtimeUsage,        "usage"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" },      wrap(_handleRealtimeKitBoms,      "kit_boms"))
     .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark,   "follow_marks"))
     .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
     .subscribe((status, err) => {
@@ -997,11 +1005,21 @@ function _setupBroadcastChannel() {
     // DELETE-only postgres_changes for tables where deletion propagation
     // matters after landmaster-sync is retired in Step 5. Reuses the
     // existing handlers' DELETE branches verbatim — each reads only
-    // payload.old.<pk> which REPLICA IDENTITY DEFAULT provides. Skipped:
-    // settings (single-row, no delete concept), draft_order (LWW-managed,
-    // no delete concept), broadcast (not a table). Recency guard NOT
-    // applied on this path — a delete does not race with an in-flight
-    // local save for the same row.
+    // payload.old.<pk> which REPLICA IDENTITY DEFAULT provides.
+    //
+    // ONLY tables in the supabase_realtime publication are listed.
+    // audit / usage / kit_boms are NOT in the publication and were
+    // dropped from these DELETE listeners too (subscribing to an
+    // unpublished table is rejected and closes the channel — same
+    // failure mode as the event:"*" mismatch on landmaster-sync). If
+    // any of those three ever needs cross-tab delete propagation, the
+    // broadcast payload's reserved `deleted: {...}` field is the path,
+    // not a postgres_changes subscription.
+    //
+    // Skipped: settings (single-row, no delete concept), draft_order
+    // (LWW-managed, no delete concept), audit/usage/kit_boms (not
+    // published). Recency guard NOT applied on this path — a delete
+    // does not race with an in-flight local save for the same row.
     //
     // Billing: only DELIVERED messages count against the realtime quota.
     // Non-DELETE events on these tables (INSERT/UPDATE) are filtered at
@@ -1010,11 +1028,8 @@ function _setupBroadcastChannel() {
     // Step 5. Deletes are rare, so this cost is bounded.
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "parts"         }, wrap(_handleRealtimePart,         "parts"))
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "pos"           }, wrap(_handleRealtimePO,           "pos"))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "usage"         }, wrap(_handleRealtimeUsage,        "usage"))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "kit_boms"      }, wrap(_handleRealtimeKitBoms,      "kit_boms"))
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "follow_marks"  }, wrap(_handleRealtimeFollowMark,   "follow_marks"))
     .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "audit"         }, wrap(_handleRealtimeAudit,        "audit"))
     .subscribe((status, err) => {
       console.log("[cloud] broadcast channel:", status, err || "");
       if (status === "SUBSCRIBED") {
