@@ -50,6 +50,34 @@ const _lastLocalSaveAt = { parts: new Map(), pos: new Map(), settings: 0 };
 // legitimate cross-user edits get delayed after I stop typing.
 const RECENT_SAVE_MS = 5000;
 
+// Interim double-redraw suppression for Phase 2 Step 3-4. Both propagation
+// paths (postgres_changes + broadcast+delta-fetch) are live and deliver
+// the same change per row. On the receiving client, postgres_changes
+// applies first (~200-400ms after write) and stamps _lastRemoteApplyAt.
+// The broadcast flush arrives second (~700-1100ms after write, incl.
+// debounce + fetch) and would apply the SAME row and trigger a second
+// redraw. Guard: broadcast flush checks this map and skips any row with
+// a recent postgres_changes apply — no re-apply, no re-redraw. Under
+// Step 5 postgres_changes is removed → nothing stamps → guard never
+// fires → broadcast becomes the sole path with a normal single redraw.
+// Self-cleaning.
+//
+// 3s is long enough to cover the typical 400-900ms gap between the two
+// paths delivering the same change (plus jitter), short enough that a
+// row genuinely changed twice within 3s still gets its second apply
+// through — matches the intent of the local-save recency guard.
+const RECENT_REMOTE_APPLY_MS = 3000;
+const _lastRemoteApplyAt = {
+  parts:          new Map(),
+  pos:            new Map(),
+  settings:       0,                 // single-row table, scalar mirror of _lastLocalSaveAt.settings
+  kit_boms:       new Map(),
+  follow_marks:   new Map(),
+  deleted_parts:  new Map(),
+  audit:          new Map(),
+  usage:          new Map(),
+};
+
 // ── Broadcast listener state (Phase 2 broadcast migration, Step 2) ────
 // Parallel to postgres_changes: a lightweight broadcast channel where a
 // server- or client-side sync will (in Step 3+) send { tables: [...] }
@@ -460,6 +488,7 @@ async function upsertFollowMarkCloud(id, data) {
     console.error("[cloud] follow_marks upsert failed:", error);
     return { ok: false, error };
   }
+  _sendDataChanged(["follow_marks"]);
   return { ok: true };
 }
 
@@ -470,6 +499,9 @@ async function deleteFollowMarkCloud(id) {
     console.error("[cloud] follow_marks delete failed:", error);
     return { ok: false, error };
   }
+  // No broadcast send — DELETE-only postgres_changes listener on
+  // landmaster-broadcast (Step 2) fans the row-DELETE out to every
+  // subscribed client.
   return { ok: true };
 }
 
@@ -486,6 +518,7 @@ async function upsertDeletedPartCloud(id, data) {
     console.error("[cloud] deleted_parts upsert failed:", error);
     return { ok: false, error };
   }
+  _sendDataChanged(["deleted_parts"]);
   return { ok: true };
 }
 
@@ -496,6 +529,8 @@ async function deleteDeletedPartCloud(id) {
     console.error("[cloud] deleted_parts delete failed:", error);
     return { ok: false, error };
   }
+  // No broadcast send — DELETE-only postgres_changes listener carries
+  // the tombstone-clear (un-delete) to every subscribed client.
   return { ok: true };
 }
 
@@ -508,6 +543,9 @@ async function deletePartRowCloud(pn) {
     console.error("[cloud] parts row delete failed:", error);
     return { ok: false, error };
   }
+  // No broadcast send — DELETE-only postgres_changes listener carries
+  // the parts row DELETE. (The tombstone row INSERT paired with this
+  // delete is handled by upsertDeletedPartCloud, which does broadcast.)
   return { ok: true };
 }
 
@@ -521,6 +559,7 @@ async function upsertPartCloud(pn, part) {
     console.error("[cloud] parts row upsert failed:", error);
     return { ok: false, error };
   }
+  _sendDataChanged(["parts"]);
   return { ok: true };
 }
 
@@ -866,24 +905,36 @@ function _setupRealtimeSubscriptions() {
   // uses this to catch zombie sockets that report "joined" but silently
   // stopped delivering (Supabase's realtime layer occasionally does this
   // through captive portals and after prolonged idle).
-  const wrap = (fn) => (payload) => {
+  // wrap ALSO stamps _lastRemoteApplyAt for INSERT/UPDATE. Critical:
+  // this stamp lives HERE, NOT inside the handlers. The handlers are
+  // also called by _applyBroadcastRow (bypassing wrap). If the stamp
+  // were in the handler, broadcast dispatches would self-stamp, and
+  // under Step 5 (broadcast-only) two pings for the same row 2s apart
+  // would self-suppress the second apply. Keeping the stamp in wrap
+  // means only real postgres_changes events stamp; broadcast never
+  // does. Under Step 5: no postgres_changes → no stamps → no self-
+  // suppress → rapid successive changes both apply as intended.
+  const wrap = (fn, table) => (payload) => {
     const now = Date.now();
     _lastRealtimeAt = now;
     window._lastCloudSyncAt = now;              // header indicator freshness
+    if (table && payload && payload.eventType !== "DELETE" && payload.new) {
+      _stampRemoteApplyAt(table, payload.new);
+    }
     fn(payload);
   };
 
   _realtimeChannel = _supa
     .channel("landmaster-sync")
-    .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart))
-    .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO))
-    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft))
-    .on("postgres_changes", { event: "*", schema: "public", table: "audit" },         wrap(_handleRealtimeAudit))
-    .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings))
-    .on("postgres_changes", { event: "*", schema: "public", table: "usage" },         wrap(_handleRealtimeUsage))
-    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" },      wrap(_handleRealtimeKitBoms))
-    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark))
-    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts))
+    .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart,         "parts"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO,           "pos"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft,        null))    // not in _BROADCAST_FETCHERS — no stamp
+    .on("postgres_changes", { event: "*", schema: "public", table: "audit" },         wrap(_handleRealtimeAudit,        "audit"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings,     "settings"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "usage" },         wrap(_handleRealtimeUsage,        "usage"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" },      wrap(_handleRealtimeKitBoms,      "kit_boms"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark,   "follow_marks"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
     .subscribe((status, err) => {
       console.log("[cloud] realtime status:", status, err || "");
       if (status === "SUBSCRIBED") {
@@ -924,10 +975,19 @@ function _setupBroadcastChannel() {
   // poll's skip-after-realtime gate and the header sync-indicator both
   // treat it as fresh activity. Kept LOCAL to this setup so the two
   // channels' setups stay self-contained and mirror each other.
-  const wrap = (fn) => (payload) => {
+  //
+  // wrap accepts a `table` arg for symmetry with landmaster-sync, but
+  // the _stampRemoteApplyAt call is DEAD CODE on this channel — the
+  // DELETE-only filter means payload.eventType is always "DELETE" and
+  // the stamp condition never fires. Kept identical to landmaster-
+  // sync's wrap so future changes stay consistent across both.
+  const wrap = (fn, table) => (payload) => {
     const now = Date.now();
     _lastRealtimeAt = now;
     window._lastCloudSyncAt = now;
+    if (table && payload && payload.eventType !== "DELETE" && payload.new) {
+      _stampRemoteApplyAt(table, payload.new);
+    }
     fn(payload);
   };
 
@@ -948,13 +1008,13 @@ function _setupBroadcastChannel() {
     // the Realtime server before delivery — zero messages billed on
     // this channel for the update volume we're trying to eliminate in
     // Step 5. Deletes are rare, so this cost is bounded.
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "parts"         }, wrap(_handleRealtimePart))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "pos"           }, wrap(_handleRealtimePO))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "usage"         }, wrap(_handleRealtimeUsage))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "kit_boms"      }, wrap(_handleRealtimeKitBoms))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "follow_marks"  }, wrap(_handleRealtimeFollowMark))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts))
-    .on("postgres_changes", { event: "DELETE", schema: "public", table: "audit"         }, wrap(_handleRealtimeAudit))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "parts"         }, wrap(_handleRealtimePart,         "parts"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "pos"           }, wrap(_handleRealtimePO,           "pos"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "usage"         }, wrap(_handleRealtimeUsage,        "usage"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "kit_boms"      }, wrap(_handleRealtimeKitBoms,      "kit_boms"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "follow_marks"  }, wrap(_handleRealtimeFollowMark,   "follow_marks"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "audit"         }, wrap(_handleRealtimeAudit,        "audit"))
     .subscribe((status, err) => {
       console.log("[cloud] broadcast channel:", status, err || "");
       if (status === "SUBSCRIBED") {
@@ -972,6 +1032,91 @@ function _setupBroadcastChannel() {
         _scheduleRealtimeReconnect();
       }
     });
+}
+
+// Stamp _lastRemoteApplyAt for a single postgres_changes-delivered
+// row. Called from the wrap() middleware on BOTH channels — but
+// gated by the caller to eventType !== "DELETE". Deliberately NOT
+// called from _applyBroadcastRow: that dispatches handlers directly,
+// bypassing wrap, so broadcast-driven applies do NOT stamp. That's
+// the Step-5 correctness invariant — under broadcast-only, two pings
+// 2s apart for the same row must both apply (nothing to compare
+// against), not have the second suppressed by the first's stamp.
+function _stampRemoteApplyAt(table, row) {
+  if (!table || !row) return;
+  const now = Date.now();
+  if (table === "settings") {
+    _lastRemoteApplyAt.settings = now;
+    return;
+  }
+  const m = _lastRemoteApplyAt[table];
+  if (!m) return;
+  let pk;
+  switch (table) {
+    case "parts":         pk = row.pn; break;
+    case "pos":           pk = row.id; break;
+    case "kit_boms":      pk = row.kit_pn; break;
+    case "follow_marks":  pk = row.id; break;
+    case "deleted_parts": pk = row.id; break;
+    case "audit":         pk = row.id; break;
+    case "usage":         pk = row.id; break;
+    default: return;
+  }
+  if (pk != null) m.set(pk, now);
+}
+
+// PK extractor per table — the delta fetch returns rows shaped
+// { <pkCol>, data, updated_at | created_at }. Used by the flush guards
+// to look up recency stamps for the row about to be dispatched.
+function _broadcastRowPk(table, row) {
+  if (!row) return null;
+  switch (table) {
+    case "parts":         return row.pn;
+    case "pos":           return row.id;
+    case "settings":      return row.id;         // always "current"
+    case "kit_boms":      return row.kit_pn;
+    case "follow_marks":  return row.id;
+    case "deleted_parts": return row.id;
+    case "audit":         return row.id;
+    case "usage":         return row.id;
+    default:              return null;
+  }
+}
+
+// Was this row applied by a postgres_changes handler within the last
+// RECENT_REMOTE_APPLY_MS? If yes, the broadcast flush skips it to
+// suppress the redundant double-apply/double-redraw during Step 3-4.
+// Handlers stamp _lastRemoteApplyAt only when they actually apply
+// (after their own tombstone + recency guards allow it), so a stamp
+// unambiguously means "the store already reflects this remote change".
+function _recentlyRemoteApplied(table, pk) {
+  if (pk == null) return false;
+  if (table === "settings") {
+    const t = _lastRemoteApplyAt.settings || 0;
+    return t > 0 && (Date.now() - t) < RECENT_REMOTE_APPLY_MS;
+  }
+  const m = _lastRemoteApplyAt[table];
+  if (!m) return false;
+  const t = m.get(pk) || 0;
+  return t > 0 && (Date.now() - t) < RECENT_REMOTE_APPLY_MS;
+}
+
+// Did THIS client just save this row locally? If yes, the broadcast
+// flush skips it (self-echo — nothing to apply, our local state is
+// already fresher). The handlers also carry this guard internally as
+// defense-in-depth; short-circuiting at the flush level lets us keep
+// totalApplied honest (don't count as "applied" what the handler is
+// about to skip anyway).
+function _recentlyLocallySaved(table, pk) {
+  if (pk == null) return false;
+  if (table === "settings") {
+    const t = _lastLocalSaveAt.settings || 0;
+    return t > 0 && (Date.now() - t) < RECENT_SAVE_MS;
+  }
+  const m = _lastLocalSaveAt[table];
+  if (!m) return false;
+  const t = m.get(pk) || 0;
+  return t > 0 && (Date.now() - t) < RECENT_SAVE_MS;
 }
 
 // Dispatch table for the broadcast flush: table name → delta fetcher.
@@ -1012,7 +1157,54 @@ function _applyBroadcastRow(table, row) {
   }
 }
 
-// Broadcast-in from Step 3+ senders. Payload shape: { tables: [...] }.
+// Broadcast-out — called after every successful client-side push to
+// notify OTHER browsers that a table changed, so they delta-fetch and
+// apply. Own-echo behavior on THIS browser: the ping fans out to us
+// too; our _handleDataChanged runs, delta-fetches the row we just
+// wrote, dispatches to _handleRealtimePart etc., and the recency guard
+// (_lastLocalSaveAt.<table>, RECENT_SAVE_MS) causes the handler to
+// return without re-applying — no visible effect. Non-blocking: the
+// caller shouldn't need to await this. Errors are logged but never
+// thrown; a failed broadcast is not a user-visible failure because the
+// data is already persisted (and postgres_changes remains a live
+// safety net until Step 5).
+//
+// `deleted` is intentionally unused today. Every table we care about
+// carries deletion via the Step 2 DELETE-only postgres_changes
+// listener on this same channel, so hard-deletes need no help from
+// the broadcast payload. The parameter is in the signature so a
+// future gap (a deletion type the DELETE listener can't cover) can be
+// added without changing every call-site.
+async function _sendDataChanged(tables, deleted) {
+  if (!Array.isArray(tables) || tables.length === 0) return;
+  // Defensive: skip if the broadcast channel hasn't finished subscribing
+  // yet. supabase-js v2 will queue or drop sends on a not-yet-joined
+  // channel depending on internal state; skipping is safer than
+  // guessing. postgres_changes covers propagation in this narrow
+  // pre-subscribe window (also transient — happens only in the first
+  // few hundred ms of boot).
+  if (!_broadcastChannel) return;
+  if (_broadcastChannel.state !== "joined") {
+    console.debug(`[cloud] broadcast send skipped — channel state=${_broadcastChannel.state}`);
+    return;
+  }
+  try {
+    const payload = { tables };
+    if (deleted && typeof deleted === "object" && Object.keys(deleted).length > 0) {
+      payload.deleted = deleted;
+    }
+    await _broadcastChannel.send({
+      type: "broadcast",
+      event: "data-changed",
+      payload,
+    });
+  } catch (e) {
+    console.warn("[cloud] broadcast send failed:", (e && e.message) || e);
+  }
+}
+
+// Broadcast-in from any sender (this browser, other browsers, or a
+// Netlify sync function). Payload shape: { tables: [...] }.
 // Coalesces bursts within BROADCAST_DEBOUNCE_MS by unioning the pending
 // table set — a sync that emits parts then pos as two pings collapses
 // to one fetch pass.
@@ -1064,12 +1256,32 @@ async function _flushBroadcastPass() {
       // will retry from the same point.
       if (rows === null) continue;
       for (const row of rows) {
+        const pk = _broadcastRowPk(table, row);
+        // Guard #1 — postgres_changes just applied this row. During
+        // Step 3-4 dual-run, both paths deliver the same change per
+        // remote save; skipping here suppresses the redundant
+        // second apply and the second _applyAndRefresh redraw.
+        if (_recentlyRemoteApplied(table, pk)) {
+          console.debug(`[cloud] broadcast: skipped ${table} ${pk} — postgres_changes just applied it`);
+          continue;
+        }
+        // Guard #2 — this fetch is our own self-echo. Handler would
+        // skip via its own local-save guard; short-circuiting here
+        // keeps totalApplied honest so we don't fire a redraw for
+        // a save we made ourselves.
+        if (_recentlyLocallySaved(table, pk)) {
+          console.debug(`[cloud] broadcast: skipped ${table} ${pk} — self-echo (recent local save)`);
+          continue;
+        }
         _applyBroadcastRow(table, row);
         totalApplied++;
       }
       // Only advance the cursor if the fetch actually returned rows.
       // maxSeenAt is null when the fetcher saw zero new rows — leaving
-      // the cursor exactly where it was, which is correct.
+      // the cursor exactly where it was, which is correct. Advancing
+      // even when every row was guard-skipped is intentional: we DID
+      // see those rows, we just didn't need to apply them because
+      // postgres_changes or our own save already did.
       if (maxSeenAt) _lastSeenAt[table] = maxSeenAt;
     }
   } catch (e) {
@@ -2197,6 +2409,7 @@ async function _pushSettings() {
   if (!_supa) return false;
   const { error } = await _supa.from("settings").upsert({ id: "current", data: DB.settings || {} });
   if (error) { console.error("[cloud] settings push failed:", error); return false; }
+  _sendDataChanged(["settings"]);
   return true;
 }
 
@@ -2255,6 +2468,7 @@ async function _pushDirtyParts() {
   const { error } = await _supa.from("parts").upsert(rows);
   if (error) { console.error("[cloud] dirty parts push failed:", error); return false; }
   _dirtyParts.clear();
+  _sendDataChanged(["parts"]);
   return true;
 }
 
@@ -2273,6 +2487,7 @@ async function _pushDirtyPos() {
   const { error } = await _supa.from("pos").upsert(rows);
   if (error) { console.error("[cloud] dirty pos push failed:", error); return false; }
   _dirtyPos.clear();
+  _sendDataChanged(["pos"]);
   return true;
 }
 
@@ -2291,6 +2506,7 @@ async function _pushDirtyAudit() {
   const { error } = await _supa.from("audit").upsert(rows);
   if (error) { console.error("[cloud] dirty audit push failed:", error); return false; }
   _dirtyAudit.clear();
+  _sendDataChanged(["audit"]);
   return true;
 }
 
@@ -2309,6 +2525,7 @@ async function _pushDirtyUsage() {
   const { error } = await _supa.from("usage").upsert(rows);
   if (error) { console.error("[cloud] dirty usage push failed:", error); return false; }
   _dirtyUsage.clear();
+  _sendDataChanged(["usage"]);
   return true;
 }
 
@@ -2373,6 +2590,7 @@ async function _pushDirtyKitBoms() {
   const { error } = await _supa.from("kit_boms").upsert(rows);
   if (error) { console.error("[cloud] dirty kit_boms push failed:", error); return false; }
   _dirtyKitBoms.clear();
+  _sendDataChanged(["kit_boms"]);
   return true;
 }
 
@@ -2474,6 +2692,14 @@ async function _pushDraft() {
   // untouched — the next attempt still races against whatever the cloud
   // actually contains, not against a phantom timestamp we never sent.
   _lastDraftUpdatedAt = updatedAt;
+  // No broadcast send for draft_order. It's excluded from
+  // _BROADCAST_FETCHERS (its LWW envelope in data.updatedAt gates
+  // propagation via _handleRealtimeDraft on the postgres_changes
+  // channel already). Sending a "draft_order" ping would cause the
+  // Step 2 listener to log "no fetcher for table 'draft_order'" and
+  // skip. draft_order stays on postgres_changes; Step 5 will decide
+  // whether to fold it into the delta model or keep it on a
+  // per-table LWW channel.
   return true;
 }
 

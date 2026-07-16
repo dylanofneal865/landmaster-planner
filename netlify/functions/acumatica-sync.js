@@ -14,6 +14,43 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+// Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
+// The browser client's landmaster-broadcast channel listens for
+// { event: "data-changed", payload: { tables: [...] } } and delta-
+// fetches each named table. Fire-and-forget: failures are logged but
+// never fail the sync — the postgres_changes path still covers
+// propagation while Phase 2 is running both models in parallel.
+//
+// HTTP (not SDK channel.send()) so this works from Netlify without
+// opening a WebSocket per invocation and is decoupled from the
+// supabase-js version pinned in the function's runtime.
+async function sendBroadcast({ supabaseUrl, serviceKey, tables, log }) {
+  if (!Array.isArray(tables) || tables.length === 0) return;
+  try {
+    const resp = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": serviceKey,
+        "Authorization": `Bearer ${serviceKey}`,
+      },
+      body: JSON.stringify({
+        messages: [{
+          topic: "landmaster-broadcast",
+          event: "data-changed",
+          payload: { tables },
+        }],
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      log(`broadcast send returned ${resp.status}: ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    log(`broadcast send failed: ${(e && e.message) || e}`);
+  }
+}
+
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). WITHOUT this, a supplier like
 // "Briggs & Stratton" arrives as "Briggs &amp; Stratton", gets stored
@@ -286,6 +323,18 @@ exports.handler = async (event) => {
 
   log(`Done. ${totalUpserted} parts updated in ${Date.now() - t0}ms`);
 
+  // Broadcast — ONLY if the delta gate actually let rows through. A
+  // "0 upserted, all unchanged" run is a no-op and shouldn't wake
+  // clients into a wasted delta-fetch pass.
+  if (totalUpserted > 0) {
+    await sendBroadcast({
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SUPABASE_SERVICE_KEY,
+      tables: ["parts"],
+      log,
+    });
+  }
+
   const onHandSummary = {
     partsInFeed: dedupe.size,
     partsInPlanner: existingMap.size,
@@ -302,6 +351,8 @@ exports.handler = async (event) => {
     company,
     username: ACUMATICA_USERNAME,
     password: ACUMATICA_PASSWORD,
+    supabaseUrl: SUPABASE_URL,
+    serviceKey: SUPABASE_SERVICE_KEY,
   });
 
   return {
@@ -361,7 +412,7 @@ function isRealBuyer(b) {
 // objects (the shape the app already consumes), preserves local buyer/notes,
 // upserts to the `pos` table, and reconciles POs that dropped out of the feed.
 async function runPOSync(ctx) {
-  const { supa, log, baseUrl, company, username, password } = ctx;
+  const { supa, log, baseUrl, company, username, password, supabaseUrl, serviceKey } = ctx;
   const PO_GI = "LMInventoryPlannerPOLines";
   const url = `${baseUrl}/OData/${company}/${encodeURIComponent(PO_GI)}`;
   // Paginated fetch — Acumatica OData caps a single response at ~1000 rows
@@ -809,6 +860,14 @@ async function runPOSync(ctx) {
     const { error } = await supa.from("pos").upsert(batch);
     if (error) { log("pos upsert error", error); return { error: "pos upsert failed", detail: error.message, partial: upserted }; }
     upserted += batch.length;
+  }
+
+  // Broadcast — respects the delta gate. `upserted` counts rows that
+  // ACTUALLY passed the fingerprint check upstream (see the delta gate
+  // at line ~773). A "0 upserted" tick means every feed row matched
+  // the stored fingerprint — no client-visible change, no ping.
+  if (upserted > 0) {
+    await sendBroadcast({ supabaseUrl, serviceKey, tables: ["pos"], log });
   }
 
   // Audit.

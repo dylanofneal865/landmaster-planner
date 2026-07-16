@@ -54,6 +54,38 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+// Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
+// The browser client's landmaster-broadcast channel listens for
+// { event: "data-changed", payload: { tables: [...] } } and delta-
+// fetches each named table. Fire-and-forget: failures are logged but
+// never fail the sync.
+async function sendBroadcast({ supabaseUrl, serviceKey, tables, log }) {
+  if (!Array.isArray(tables) || tables.length === 0) return;
+  try {
+    const resp = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": serviceKey,
+        "Authorization": `Bearer ${serviceKey}`,
+      },
+      body: JSON.stringify({
+        messages: [{
+          topic: "landmaster-broadcast",
+          event: "data-changed",
+          payload: { tables },
+        }],
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      log(`broadcast send returned ${resp.status}: ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    log(`broadcast send failed: ${(e && e.message) || e}`);
+  }
+}
+
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). WITHOUT this, a supplier / desc containing
 // "&" arrives as "&amp;", gets stored that way in Supabase, and every
@@ -730,6 +762,24 @@ exports.handler = async () => {
 
   const elapsedMs = Date.now() - t0;
   log(`Done in ${elapsedMs}ms`);
+
+  // Broadcast — union of tables that actually saw writes. Two write
+  // paths: usage_txns rebuild (totalUpserted) and service-part daily
+  // rate refresh (dailyUpserted). Send only the tables that actually
+  // changed so clients that don't need one skip a wasted delta pass.
+  {
+    const tables = [];
+    if (totalUpserted > 0) tables.push("usage");
+    if (dailyUpserted > 0) tables.push("parts");
+    if (tables.length > 0) {
+      await sendBroadcast({
+        supabaseUrl: SUPABASE_URL,
+        serviceKey: SUPABASE_SERVICE_KEY,
+        tables,
+        log,
+      });
+    }
+  }
 
   try {
     await supa.from("audit").insert({

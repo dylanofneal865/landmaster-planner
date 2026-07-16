@@ -29,6 +29,38 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+// Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
+// The browser client's landmaster-broadcast channel listens for
+// { event: "data-changed", payload: { tables: [...] } } and delta-
+// fetches each named table. Fire-and-forget: failures are logged but
+// never fail the sync.
+async function sendBroadcast({ supabaseUrl, serviceKey, tables, log }) {
+  if (!Array.isArray(tables) || tables.length === 0) return;
+  try {
+    const resp = await fetch(`${supabaseUrl}/realtime/v1/api/broadcast`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": serviceKey,
+        "Authorization": `Bearer ${serviceKey}`,
+      },
+      body: JSON.stringify({
+        messages: [{
+          topic: "landmaster-broadcast",
+          event: "data-changed",
+          payload: { tables },
+        }],
+      }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      log(`broadcast send returned ${resp.status}: ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    log(`broadcast send failed: ${(e && e.message) || e}`);
+  }
+}
+
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). WITHOUT this, a kit desc containing "&"
 // arrives as "&amp;", gets stored that way in Supabase, and every UI
@@ -470,6 +502,21 @@ exports.handler = async (event) => {
   const upsertFailed = failedUpsertPns.length;
   const deleteFailed = failedDeletePns.length;
   const anyChunkFailed = upsertFailed > 0 || deleteFailed > 0;
+
+  // Broadcast — only if the delta gate let rows through. Deletions
+  // fanned out via the DELETE-only postgres_changes listener on
+  // landmaster-broadcast (Step 2), so the total-deleted count is
+  // deliberately NOT part of this check — a "0 upserted, N deleted"
+  // run means the DELETE listener carried the change; no delta pass
+  // is needed.
+  if (totalUpserted > 0) {
+    await sendBroadcast({
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SUPABASE_SERVICE_KEY,
+      tables: ["kit_boms"],
+      log,
+    });
+  }
 
   // Audit row — same shape and conventions as bom-sync's audit.
   const auditId = `audit_acumatica_kit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
