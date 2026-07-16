@@ -54,6 +54,37 @@ const _posSnapshot = new Map();
 const _usageSnapshot = new Map(); // separate to avoid overloading _partsSnapshot
 const _kitBomsSnapshot = new Map();
 
+// ── Delta-fetch cursors (Phase 2 broadcast migration, Step 1) ─────────
+// Per-table high-water marks (ISO strings). Seeded at boot from the max
+// updated_at / created_at present after the initial full-scan fetches
+// adopt cloud state; advanced by each successful delta fetch that
+// consumes it. NEVER reset — a stale cursor just yields a slightly
+// larger delta next call, and every apply path is idempotent so a
+// re-processed boundary row is a no-op.
+//
+// Tables using updated_at: parts, pos, settings, kit_boms, follow_marks,
+// deleted_parts (BEFORE UPDATE triggers stamp these server-side, so
+// Acumatica sync writes advance them too).
+//
+// Tables using created_at: audit, usage (append-only, never mutated).
+//
+// draft_order is EXCLUDED: it already has its own LWW envelope
+// (data.updatedAt) with `_lastDraftUpdatedAt` gating; broadcasts won't
+// touch it.
+//
+// Nothing consumes _lastSeenAt yet — Step 1 is add-only. The poll and
+// realtime handlers still run their existing paths.
+const _lastSeenAt = {
+  parts:          null,
+  pos:            null,
+  settings:       null,
+  kit_boms:       null,
+  follow_marks:   null,
+  deleted_parts:  null,
+  audit:          null,   // uses created_at (append-only)
+  usage:          null,   // uses created_at (append-only)
+};
+
 // Wait for the main app to finish booting (DB must exist with parts)
 async function _waitForDB() {
   let tries = 0;
@@ -108,6 +139,202 @@ async function _fetchAllPos() {
     from += PAGE;
   }
   return all;
+}
+
+// ── Generic delta fetcher (Phase 2, Step 1) ─────────────────────────
+// Filters `table` where `tsCol > sinceIso`, orders ASC by tsCol,
+// paginates 1000/page. Returns { rows, maxSeenAt }:
+//   - rows      : the fetched rows (never null on success; [] if none new)
+//   - maxSeenAt : the newest timestamp actually seen in `rows`, or null
+//                 when no rows were returned. The caller uses this to
+//                 advance _lastSeenAt[table] — a no-op assignment when
+//                 null so nothing regresses on an empty tick.
+//
+// Cursor semantics: strict `>` (not `>=`). A stray sub-microsecond tie
+// at the exact cursor boundary would be missed, but Postgres timestamptz
+// has µs precision and every apply path is idempotent — worst case is
+// one skipped apply that a later heart-beat catch-up re-picks up when
+// something else in that row changes.
+//
+// Failure returns { rows: null, maxSeenAt: null } so the caller can
+// distinguish "empty delta" (rows: []) from "fetch failed" (rows: null)
+// and refuse to advance the cursor on failure.
+async function _fetchSince(table, keyCols, tsCol, sinceIso) {
+  if (!_supa) return { rows: [], maxSeenAt: null };
+  if (!sinceIso) {
+    console.warn(`[cloud] _fetchSince(${table}) called without a cursor — returning empty; seed _lastSeenAt.${table} first`);
+    return { rows: [], maxSeenAt: null };
+  }
+  const rows = [];
+  const PAGE = 1000;
+  let from = 0;
+  let maxSeen = sinceIso;
+  while (true) {
+    const { data, error } = await _supa
+      .from(table)
+      .select(`${keyCols}, ${tsCol}`)
+      .gt(tsCol, sinceIso)
+      .order(tsCol, { ascending: true })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error(`[cloud] delta fetch failed for ${table}:`, error);
+      return { rows: null, maxSeenAt: null };
+    }
+    if (!data || data.length === 0) break;
+    rows.push(...data);
+    for (const r of data) {
+      const ts = r && r[tsCol];
+      if (ts && ts > maxSeen) maxSeen = ts;
+    }
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return { rows, maxSeenAt: maxSeen === sinceIso ? null : maxSeen };
+}
+
+async function _fetchPartsSince(sinceIso)        { return _fetchSince("parts",         "pn, data",     "updated_at", sinceIso); }
+async function _fetchPosSince(sinceIso)          { return _fetchSince("pos",           "id, data",     "updated_at", sinceIso); }
+async function _fetchSettingsSince(sinceIso)     { return _fetchSince("settings",      "id, data",     "updated_at", sinceIso); }
+async function _fetchKitBomsSince(sinceIso)      { return _fetchSince("kit_boms",      "kit_pn, data", "updated_at", sinceIso); }
+async function _fetchFollowMarksSince(sinceIso)  { return _fetchSince("follow_marks",  "id, data",     "updated_at", sinceIso); }
+async function _fetchDeletedPartsSince(sinceIso) { return _fetchSince("deleted_parts", "id, data",     "updated_at", sinceIso); }
+async function _fetchAuditSince(sinceIso)        { return _fetchSince("audit",         "id, data",     "created_at", sinceIso); }
+async function _fetchUsageSince(sinceIso)        { return _fetchSince("usage",         "id, data",     "created_at", sinceIso); }
+
+// ── Boot cursor seeder (Phase 2, Step 1) ────────────────────────────
+// One-shot: 8 parallel top-1-desc queries to capture the current max
+// timestamp per table. Called from cloudInit AFTER the boot full-scan
+// fetches complete, so cursors reflect exactly what boot adopted.
+//
+// Empty-table cursor: an empty-at-boot table has no max timestamp to
+// use, so we bootstrap its cursor to the DATABASE clock (via the
+// public.db_now() rpc), NOT the browser clock. The cursor is compared
+// against DB-stamped updated_at / created_at values by _fetchSince;
+// using the browser clock would open a skew window during which rows
+// inserted by another client could carry updated_at < our cursor and
+// be permanently missed by the delta path. That matters most for
+// tombstones and follow_marks, which have no realtime replay and
+// (after Step 5) lose their fast-path propagation entirely — the
+// delta fetch is their only in-session catch-up mechanism.
+//
+// Fallback: if the db_now rpc fails (permission, function missing,
+// network), we DO fall back to new Date().toISOString() so boot never
+// hard-fails, but log a clear warning so the misconfig is visible.
+//
+// Not exported and not called anywhere except cloudInit.
+//
+// Failure-mode notes for this function:
+//   1. cloudInit has no top-level try/catch and is invoked via
+//      setTimeout(cloudInit, 200), which discards its Promise. Any
+//      uncaught throw in this seeder becomes an unhandled rejection
+//      that halts the rest of cloudInit (subscription setup, poll
+//      start, etc). We therefore wrap the WHOLE body in try/catch
+//      so the seeder can never fail cloudInit.
+//   2. supabase-js awaits do not have a built-in timeout. A hung
+//      network request (captive portal, cold-start edge, dropped
+//      keep-alive) makes Promise.all() never resolve, and the
+//      summary log never fires. We wrap every awaited network call
+//      in _withTimeout so a stall becomes a rejection we can log
+//      and fall back from.
+//   3. The final summary log runs in a `finally` block so it fires
+//      regardless of what went wrong — critical for diagnosability
+//      on future boots.
+async function _seedLastSeenCursors() {
+  console.log("[cloud] seeding delta cursors…");
+  try {
+    if (!_supa) {
+      console.warn("[cloud] delta cursor seed: _supa is not initialized — skipping");
+      return;
+    }
+
+    // Per-call timeout wrapper. supabase-js has no native timeout; a
+    // hung fetch would stall Promise.all forever otherwise. 5s is
+    // long enough to survive a slow round-trip and short enough that
+    // boot doesn't feel frozen if Supabase is unreachable.
+    const TIMEOUT_MS = 5000;
+    const _withTimeout = (p, label) => Promise.race([
+      p,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error(`${label} timeout after ${TIMEOUT_MS}ms`)),
+        TIMEOUT_MS
+      )),
+    ]);
+
+    // Get the DB clock ONCE up front. All empty-table branches share
+    // it, so all their cursors sit at the same instant (any inter-
+    // table insert ordering is preserved by the per-row updated_at).
+    let serverNow;
+    try {
+      const { data: serverNowRaw, error } = await _withTimeout(_supa.rpc("db_now"), "db_now rpc");
+      if (error || !serverNowRaw) {
+        console.warn(
+          "[cloud] db_now rpc failed — falling back to browser clock for empty-table cursors; " +
+          "check that public.db_now() exists and is granted to anon/authenticated. " +
+          "Error:", error ? error.message : "empty result"
+        );
+        serverNow = new Date().toISOString();
+      } else {
+        // PostgREST returns timestamptz as an ISO-8601 string. Normalize
+        // through Date so the cursor has the same shape (ms precision,
+        // 'Z' suffix) as timestamps returned in row payloads by
+        // updated_at / created_at selects.
+        serverNow = new Date(serverNowRaw).toISOString();
+      }
+    } catch (e) {
+      console.warn(
+        "[cloud] db_now rpc threw or timed out — falling back to browser clock for empty-table cursors:",
+        (e && e.message) || e
+      );
+      serverNow = new Date().toISOString();
+    }
+
+    const tables = [
+      ["parts",         "updated_at"],
+      ["pos",           "updated_at"],
+      ["settings",      "updated_at"],
+      ["kit_boms",      "updated_at"],
+      ["follow_marks",  "updated_at"],
+      ["deleted_parts", "updated_at"],
+      ["audit",         "created_at"],
+      ["usage",         "created_at"],
+    ];
+    // allSettled instead of all — even if a per-table callback
+    // somehow rejects (it shouldn't, since each has its own try/
+    // catch, but belt-and-suspenders), the summary still runs.
+    await Promise.allSettled(tables.map(async ([table, tsCol]) => {
+      try {
+        const query = _supa
+          .from(table)
+          .select(tsCol)
+          .order(tsCol, { ascending: false })
+          .limit(1);
+        const { data, error } = await _withTimeout(query, `${table} max-ts`);
+        if (error) {
+          // Table-level failure — seed with serverNow so the delta
+          // path still functions once the transient error clears.
+          // Better than leaving null (which would refuse forever).
+          console.warn(`[cloud] cursor seed for ${table} failed — using serverNow as fallback:`, error.message);
+          _lastSeenAt[table] = serverNow;
+          return;
+        }
+        const val = data && data[0] ? data[0][tsCol] : null;
+        // Empty-table branch: fall back to the DB clock, never null.
+        // Non-empty tables use their real max timestamp.
+        _lastSeenAt[table] = val || serverNow;
+      } catch (e) {
+        console.warn(`[cloud] cursor seed for ${table} threw or timed out — using serverNow as fallback:`, (e && e.message) || e);
+        _lastSeenAt[table] = serverNow;
+      }
+    }));
+  } catch (e) {
+    // Belt-and-suspenders: catch any unexpected throw so the seeder
+    // never propagates a rejection into cloudInit.
+    console.error("[cloud] delta cursor seed: unexpected throw — cursors may be incomplete:", (e && e.stack) || e);
+  } finally {
+    // ALWAYS log the resulting cursor state, even after failure — so
+    // the console tells us which keys landed as null vs seeded.
+    console.log("[cloud] delta cursors seeded:", { ..._lastSeenAt });
+  }
 }
 
 // BOM links — read-only from the browser's perspective. Server-side
@@ -530,6 +757,11 @@ async function cloudInit() {
     }
     console.log(`[cloud] loaded ${window.followMarks.size} follow_marks`);
   }
+
+  // Phase 2 broadcast migration, Step 1 — seed the delta cursors after
+  // every boot full-scan has adopted its cloud state. Nothing consumes
+  // these yet; the delta fetchers exist but are unwired.
+  await _seedLastSeenCursors();
 
   _hookSaveDB();
   _hookDraftSave();
@@ -2234,8 +2466,23 @@ window.cloudForcePullKitBoms = async function () {
   console.log("Pulled " + data.length + " kit BOMs from cloud");
 };
 
+// cloudInit is async and returns a Promise. setTimeout discards its
+// return value, so any awaited step that rejects becomes an UNHANDLED
+// promise rejection — the browser logs "Uncaught (in promise)…" but
+// execution of cloudInit stops at the throw point, and every step
+// after it (subscription setup, poll start, indicator wiring) never
+// runs. That's exactly the failure mode where boot silently freezes
+// with no visible cause. Catching the rejection here surfaces the
+// error with a stable prefix so the actual throw point is visible in
+// the console filter next time it happens.
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => setTimeout(cloudInit, 200));
+  document.addEventListener("DOMContentLoaded", () => setTimeout(
+    () => cloudInit().catch(err => console.error("[cloud] cloudInit fatal:", err)),
+    200,
+  ));
 } else {
-  setTimeout(cloudInit, 200);
+  setTimeout(
+    () => cloudInit().catch(err => console.error("[cloud] cloudInit fatal:", err)),
+    200,
+  );
 }

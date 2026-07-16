@@ -316,6 +316,52 @@ exports.handler = async (event) => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
+  // ── Superseded-variant dedup ──────────────────────────────────────
+  // The kit GI occasionally lists both a bare PN ("19568") and its
+  // "-2" replacement ("19568-2") on the same kit. When the bare one
+  // no longer exists in the inventory catalog and the "-2" variant
+  // does, treat the "-2" as the replacement and drop the bare one.
+  //
+  // NARROWLY SCOPED: this only fires when bare is NOT-in-catalog AND
+  // "-2" IS in-catalog. Two in-catalog siblings are NEVER merged —
+  // an intentional dual-listing (rare but legal) survives untouched.
+  const catalogPns = new Set();
+  {
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await supa.from("parts").select("pn").range(from, from + PAGE - 1);
+      if (error) {
+        log("parts catalog select error", error);
+        return { statusCode: 500, body: JSON.stringify({ error: "parts catalog select failed", detail: error.message }) };
+      }
+      if (!data || data.length === 0) break;
+      for (const r of data) catalogPns.add(r.pn);
+      if (data.length < PAGE) break;
+    }
+  }
+  log(`Loaded ${catalogPns.size} in-catalog PNs for superseded-variant check`);
+
+  let supersededDropped = 0;
+  for (const [kit_pn, kit] of kits.entries()) {
+    const pnSet = new Set(kit.components.map(c => c.pn));
+    const kept = [];
+    for (const c of kit.components) {
+      const suffixed = `${c.pn}-2`;
+      if (pnSet.has(suffixed) && !catalogPns.has(c.pn) && catalogPns.has(suffixed)) {
+        log(`${kit_pn}: dropped superseded ${c.pn} (kept ${suffixed})`);
+        supersededDropped++;
+        continue;
+      }
+      kept.push(c);
+    }
+    if (kept.length !== kit.components.length) {
+      kit.components = kept;
+    }
+  }
+  if (supersededDropped > 0) {
+    log(`Superseded-variant dedup: dropped ${supersededDropped} component(s) across all kits`);
+  }
+
   // Page through every existing row. Same paged pattern as bom-sync;
   // note the PK column here is kit_pn, not id (see js/30-supabase.js:855).
   const existing = [];
@@ -452,6 +498,7 @@ exports.handler = async (event) => {
           deleteFailed,
           stockLinksAdded,
           nonStockLinksAdded,
+          supersededDropped,
           rowsSkipped: { kitPnEmpty, bothPnsEmpty },
           detectedFields,
           durationMs: Date.now() - t0,
@@ -479,6 +526,7 @@ exports.handler = async (event) => {
       deleteFailed,
       stockLinksAdded,
       nonStockLinksAdded,
+      supersededDropped,
       rowsSkipped: { kitPnEmpty, bothPnsEmpty },
       detectedFields,
     }),
