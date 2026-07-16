@@ -828,10 +828,12 @@ async function cloudInit() {
   _hookSaveDB();
   _hookDraftSave();
   _showCloudIndicator(true);
-  _setupRealtimeSubscriptions();
-  // Phase 2 broadcast migration, Step 2 — parallel broadcast channel.
-  // Listener is INERT until Step 3 wires senders; the postgres_changes
-  // channel above remains authoritative for now.
+  // Phase 2 broadcast migration, Step 5 — landmaster-sync postgres_changes
+  // INSERT/UPDATE listeners are RETIRED. The only remaining realtime
+  // channel is landmaster-broadcast, which carries broadcast pings for
+  // INSERT/UPDATE + DELETE-only postgres_changes for cross-user delete
+  // propagation. All INSERT/UPDATE propagation now flows through
+  // broadcast → delta-fetch.
   _setupBroadcastChannel();
   // Watchdog for the realtime socket. visibilitychange/online/focus catch
   // laptop-wake and network-blip transitions; the interval catches silent
@@ -863,7 +865,11 @@ async function cloudInit() {
   }
 }
 
-let _realtimeChannel = null;
+// _realtimeChannel (Step 2-4: the landmaster-sync channel) was retired
+// in Step 5. All realtime activity now runs on _broadcastChannel.
+// Variable removed. Remaining `_realtime*` state below (backoff timer,
+// reconnecting guard, _lastRealtimeAt) is still relevant — the broadcast
+// channel uses the same reconnect scheduler and freshness clock.
 let _suppressNextLocalChange = false; // prevents echo: don't re-push what we just received
 
 // ── Realtime watchdog state ─────────────────────────────────────────
@@ -897,75 +903,23 @@ let _hasSubscribedOnce = false;            // guards the catch-up fetch — firs
                                             // fetch; subsequent SUBSCRIBEDs are
                                             // reconnects and need catch-up.
 
-function _setupRealtimeSubscriptions() {
-  if (_realtimeChannel) return; // already subscribed
-  if (!_supa) return;
+// _setupRealtimeSubscriptions (Step 2-4: registered 9 postgres_changes
+// INSERT/UPDATE listeners on the "landmaster-sync" channel) was REMOVED
+// in Step 5. All INSERT/UPDATE propagation is now via broadcast →
+// delta-fetch. See _setupBroadcastChannel below for the sole remaining
+// realtime channel.
 
-  // Every accepted event stamps _lastRealtimeAt. The heartbeat below
-  // uses this to catch zombie sockets that report "joined" but silently
-  // stopped delivering (Supabase's realtime layer occasionally does this
-  // through captive portals and after prolonged idle).
-  // wrap ALSO stamps _lastRemoteApplyAt for INSERT/UPDATE. Critical:
-  // this stamp lives HERE, NOT inside the handlers. The handlers are
-  // also called by _applyBroadcastRow (bypassing wrap). If the stamp
-  // were in the handler, broadcast dispatches would self-stamp, and
-  // under Step 5 (broadcast-only) two pings for the same row 2s apart
-  // would self-suppress the second apply. Keeping the stamp in wrap
-  // means only real postgres_changes events stamp; broadcast never
-  // does. Under Step 5: no postgres_changes → no stamps → no self-
-  // suppress → rapid successive changes both apply as intended.
-  const wrap = (fn, table) => (payload) => {
-    const now = Date.now();
-    _lastRealtimeAt = now;
-    window._lastCloudSyncAt = now;              // header indicator freshness
-    if (table && payload && payload.eventType !== "DELETE" && payload.new) {
-      _stampRemoteApplyAt(table, payload.new);
-    }
-    fn(payload);
-  };
-
-  _realtimeChannel = _supa
-    .channel("landmaster-sync")
-    .on("postgres_changes", { event: "*", schema: "public", table: "parts" },         wrap(_handleRealtimePart,         "parts"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "pos" },           wrap(_handleRealtimePO,           "pos"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "draft_order" },   wrap(_handleRealtimeDraft,        null))    // not in _BROADCAST_FETCHERS — no stamp
-    .on("postgres_changes", { event: "*", schema: "public", table: "audit" },         wrap(_handleRealtimeAudit,        "audit"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "settings" },      wrap(_handleRealtimeSettings,     "settings"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "usage" },         wrap(_handleRealtimeUsage,        "usage"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "kit_boms" },      wrap(_handleRealtimeKitBoms,      "kit_boms"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "follow_marks" },  wrap(_handleRealtimeFollowMark,   "follow_marks"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "deleted_parts" }, wrap(_handleRealtimeDeletedParts, "deleted_parts"))
-    .subscribe((status, err) => {
-      console.log("[cloud] realtime status:", status, err || "");
-      if (status === "SUBSCRIBED") {
-        // Healthy — reset backoff and stamp activity. On a RECONNECT
-        // (as opposed to initial subscribe from cloudInit), the socket
-        // does NOT replay missed events, so we also need a catch-up
-        // fetch to sync anything that changed while we were offline.
-        // The initial-boot path already did a full fetch in cloudInit,
-        // so we only catch up on subsequent (re)subscriptions.
-        _realtimeBackoffMs = 0;
-        _lastRealtimeAt = Date.now();
-        _showCloudIndicator(true);
-        if (_hasSubscribedOnce) {
-          _catchupFetch().catch((e) => console.warn("[cloud] catch-up fetch failed", e));
-        }
-        _hasSubscribedOnce = true;
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-        console.warn("[cloud] realtime unhealthy — will reconnect", { status, err });
-        _showCloudIndicator(false, "reconnecting");
-        _scheduleRealtimeReconnect();
-      }
-    });
-}
-
-// ── Broadcast channel setup (Phase 2 broadcast migration, Step 2) ─────
-// Separate channel from "landmaster-sync". This one only listens for
-// broadcast events, not postgres_changes. INERT until Step 3 wires
-// senders — no messages will arrive today. Reconnect logic is deferred
-// to Step 5 (when postgres_changes is retired); until then the parallel
-// postgres_changes channel is authoritative and this listener is
-// additive.
+// ── Broadcast channel setup (Phase 2 broadcast migration, Step 2/5) ───
+// SOLE remaining realtime channel post-Step 5. Carries:
+//   1) broadcast "data-changed" pings from client push paths and Netlify
+//      sync functions. On receipt, _handleDataChanged debounces + delta-
+//      fetches each named table and applies rows.
+//   2) DELETE-only postgres_changes for the 7 tables where hard-delete
+//      propagation matters (parts, pos, usage, kit_boms, follow_marks,
+//      deleted_parts, audit). INSERT/UPDATE messages on those tables
+//      are FILTERED at the Realtime server before delivery — zero
+//      messages billed for that volume. This is the quota-relief that
+//      justifies the whole Phase 2 migration.
 function _setupBroadcastChannel() {
   if (_broadcastChannel) return;
   if (!_supa) return;
@@ -1018,17 +972,24 @@ function _setupBroadcastChannel() {
     .subscribe((status, err) => {
       console.log("[cloud] broadcast channel:", status, err || "");
       if (status === "SUBSCRIBED") {
+        _realtimeBackoffMs = 0;
         _lastRealtimeAt = Date.now();
-        // No catch-up here. The broadcast channel doesn't replay
-        // missed events either, but reconnect-time catch-up for the
-        // delete stream is a Step 5 concern (when landmaster-sync's
-        // whole-table re-pull is retired). For now the parallel
-        // landmaster-sync catch-up covers everything this channel
-        // would need.
+        _showCloudIndicator(true);
+        // Reconnect catch-up. Broadcast doesn't replay missed events,
+        // so after a disconnect (wifi blip, sleep, mobile background)
+        // we delta-fetch every subscribed table since its cursor. First
+        // SUBSCRIBED after boot is skipped — cloudInit already did a
+        // full-scan boot fetch and seeded cursors. Subsequent
+        // SUBSCRIBEDs are reconnects and need catch-up.
+        if (_hasSubscribedOnce) {
+          _catchupFetch().catch((e) => console.warn("[cloud] catch-up fetch failed", e));
+        }
+        _hasSubscribedOnce = true;
         return;
       }
       if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
         console.warn("[cloud] broadcast channel unhealthy — will reconnect", { status, err });
+        _showCloudIndicator(false, "reconnecting");
         _scheduleRealtimeReconnect();
       }
     });
@@ -1326,23 +1287,9 @@ async function _reconnectRealtime() {
   if (!_supa) return;
   _realtimeReconnecting = true;
   try {
-    // landmaster-sync path — teardown → rebuild → (SUBSCRIBED cb fires
-    // _catchupFetch). Byte-for-byte identical to pre-Step-2, so live
-    // sync reconnect timing is preserved. Broadcast handling sits
-    // AFTER this block, off sync's critical path.
-    if (_realtimeChannel) {
-      try { await _supa.removeChannel(_realtimeChannel); } catch (e) { /* best-effort */ }
-      _realtimeChannel = null;
-    }
-    _setupRealtimeSubscriptions();
-
-    // landmaster-broadcast path — purely additive. Runs after sync has
-    // already begun rebuilding (subscribe is fire-and-forget, so the
-    // sync rebuild is already in flight while we tear down broadcast).
-    // Shared lifecycle is deliberate: any channel unhealthy → both
-    // rebuild, so DELETE stream and postgres_changes update stream can
-    // never drift out of sync after a wake. _catchupFetch is idempotent,
-    // so the extra rebuild on a broadcast-only blip is harmless.
+    // Step 5: broadcast is the SOLE realtime channel. Teardown → rebuild
+    // → (SUBSCRIBED cb fires _catchupFetch). The delta-based catch-up
+    // in the SUBSCRIBED callback closes any gap opened by the drop.
     if (_broadcastChannel) {
       try { await _supa.removeChannel(_broadcastChannel); } catch (e) { /* best-effort */ }
       _broadcastChannel = null;
@@ -1366,112 +1313,133 @@ function _scheduleRealtimeReconnect() {
   }, _realtimeBackoffMs);
 }
 
-// Catch-up fetch on reconnect. Realtime doesn't replay missed events,
-// so after a disconnect we re-pull every table we subscribe to. Mutate
-// in place (splice/length=0/push, never reassign) so any UI holding a
-// reference to DB.parts / DB.pos / DB.deletedParts / window.followMarks
-// stays valid.
+// Catch-up fetch on reconnect. Step 5: DELTA-based, not full-scan.
+// Broadcast doesn't replay missed events, so after a disconnect we
+// pull each table's rows since its _lastSeenAt cursor and apply them
+// through the SAME dispatch + guards used by _flushBroadcastPass.
+// Cursors advance so the next flush picks up from where catch-up
+// left off. Zero snapshot re-priming — the snapshots are for
+// _detectChanges' dirty tracking on LOCAL edits, and catch-up-
+// applied rows are treated identically to broadcast-applied rows.
+//
+// deleted_parts SPECIAL CASE — full re-pull. Delta fetch cannot
+// surface a tombstone that was DELETED (un-delete) while we were
+// disconnected, and DELETE-only postgres_changes on that table
+// doesn't replay either. Re-pulling the tombstone set atomically
+// closes both gaps (missed inserts AND missed deletes) and lets us
+// splice any parts row that got tombstoned during the drop. Cheap
+// — tombstone table is tiny.
+//
+// draft_order — LWW envelope, unchanged.
+//
+// Delete gaps for follow_marks / usage / kit_boms during a drop are
+// accepted: rare events, low blast-radius, cleared by next reload.
+// Adding an explicit deleted-id list to the broadcast payload is the
+// out if it ever becomes a problem — the {deleted: {...}} field is
+// already reserved in _sendDataChanged's signature.
 //
 // Deliberately DOES NOT re-run: SDK init, saveDB hook, draftSave hook,
-// snapshot priming for _detectChanges, kit-migration. Those are one-
-// time setup in cloudInit and reruns would corrupt dirty tracking.
+// snapshot priming, kit-migration. Those are one-time cloudInit setup.
 async function _catchupFetch() {
   if (!_supa || !_cloudReady) return;
   const t0 = Date.now();
 
-  // Tombstones first — same order as cloudInit so the parts filter below
-  // sees the current tombstone set.
-  const cloudTombstones = await _fetchAllDeletedParts();
-  if (cloudTombstones !== null) {
-    if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
-    DB.deletedParts.clear();
-    for (const row of cloudTombstones) {
-      DB.deletedParts.set(String(row.id), row.data || {});
-    }
-  }
-
-  // Parts. Filter tombstoned pns exactly like cloudInit does.
-  const cloudParts = await _fetchAllParts();
-  if (cloudParts !== null && Array.isArray(cloudParts)) {
-    const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
-    const merged = cloudParts
-      .filter((r) => r && r.pn && !tombs.has(String(r.pn)))
-      .map((r) => ({ pn: r.pn, ...r.data }));
-    DB.parts.length = 0;
-    for (const p of merged) DB.parts.push(p);
-    // Re-prime the dirty-tracking snapshot so subsequent LOCAL edits
-    // still detect properly. Without this, the first local edit after
-    // reconnect would trigger a phantom "changed" upsert on every part.
-    _partsSnapshot.clear();
-    for (const p of DB.parts) _partsSnapshot.set(p.pn, JSON.stringify(p));
-  }
-
-  // POs.
-  const cloudPos = await _fetchAllPos();
-  if (cloudPos !== null) {
-    const merged = cloudPos.map((r) => ({ id: r.id, ...r.data }));
-    DB.pos.length = 0;
-    for (const po of merged) DB.pos.push(po);
-    _posSnapshot.clear();
-    for (const po of DB.pos) _posSnapshot.set(po.id, JSON.stringify(po));
-  }
-
-  // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
-  // our baseline, so a stale-writer's clobber doesn't sneak in via
-  // catch-up. Mirrors _isDraftBaselineCurrent semantics.
-  const cloudDraft = await _fetchCloudDraft();
-  if (cloudDraft && typeof DRAFT_ORDER !== "undefined") {
-    const cloudTs = cloudDraft.updatedAt || "";
-    const mineTs = _lastDraftUpdatedAt || "";
-    if (!mineTs || (cloudTs && cloudTs > mineTs)) {
-      DRAFT_ORDER.length = 0;
-      for (const item of cloudDraft.items) DRAFT_ORDER.push(item);
-      if (typeof draftOrderSave === "function") {
-        _suppressNextLocalChange = true;
-        draftOrderSave();
-        _suppressNextLocalChange = false;
+  let applied = 0;
+  let anyFetchFailed = false;
+  _broadcastInProgress = true;
+  try {
+    // ── deleted_parts: FULL re-pull (see rationale above) ───────────
+    const cloudTombstones = await _fetchAllDeletedParts();
+    if (cloudTombstones !== null) {
+      if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+      const cloudTombSet = new Set();
+      for (const row of cloudTombstones) {
+        const pn = String(row.id);
+        cloudTombSet.add(pn);
+        DB.deletedParts.set(pn, row.data || {});
       }
-      if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
-      _lastCloudDraftHash = _hashDraft(cloudDraft.items);
-      if (cloudDraft.updatedAt) _lastDraftUpdatedAt = cloudDraft.updatedAt;
+      // Drop local tombstones the cloud no longer has (un-deletes we
+      // missed during the drop).
+      for (const localPn of [...DB.deletedParts.keys()]) {
+        if (!cloudTombSet.has(localPn)) DB.deletedParts.delete(localPn);
+      }
+      // Purge any parts row that's currently tombstoned.
+      for (let i = DB.parts.length - 1; i >= 0; i--) {
+        if (DB.deletedParts.has(DB.parts[i].pn)) {
+          DB.parts.splice(i, 1);
+          applied++;
+        }
+      }
+    } else {
+      anyFetchFailed = true;
     }
+
+    // ── Delta catch-up for every subscribed table except deleted_parts
+    // (handled above). Iterates _BROADCAST_FETCHERS in insertion order,
+    // so parts / pos / settings run first (heaviest, most-referenced).
+    // Same guards + cursor advance as _flushBroadcastPass — this is
+    // structurally a "catch-up flush" without the debounce.
+    for (const [table, fetcher] of Object.entries(_BROADCAST_FETCHERS)) {
+      if (table === "deleted_parts") continue;
+      const cursor = _lastSeenAt[table];
+      const { rows, maxSeenAt } = await fetcher(cursor);
+      if (rows === null) {
+        anyFetchFailed = true;
+        continue;   // don't advance cursor on failure
+      }
+      for (const row of rows) {
+        const pk = _broadcastRowPk(table, row);
+        if (_recentlyRemoteApplied(table, pk)) continue;
+        if (_recentlyLocallySaved(table, pk)) continue;
+        _applyBroadcastRow(table, row);
+        applied++;
+      }
+      if (maxSeenAt) _lastSeenAt[table] = maxSeenAt;
+    }
+
+    // ── draft_order: LWW envelope, unchanged from pre-Step-5 catchup.
+    const cloudDraft = await _fetchCloudDraft();
+    if (cloudDraft && typeof DRAFT_ORDER !== "undefined") {
+      const cloudTs = cloudDraft.updatedAt || "";
+      const mineTs = _lastDraftUpdatedAt || "";
+      if (!mineTs || (cloudTs && cloudTs > mineTs)) {
+        DRAFT_ORDER.length = 0;
+        for (const item of cloudDraft.items) DRAFT_ORDER.push(item);
+        if (typeof draftOrderSave === "function") {
+          _suppressNextLocalChange = true;
+          draftOrderSave();
+          _suppressNextLocalChange = false;
+        }
+        if (typeof updateDraftOrderPill === "function") updateDraftOrderPill();
+        _lastCloudDraftHash = _hashDraft(cloudDraft.items);
+        if (cloudDraft.updatedAt) _lastDraftUpdatedAt = cloudDraft.updatedAt;
+      }
+    }
+  } catch (e) {
+    console.error("[cloud] catch-up threw:", (e && e.stack) || e);
+    anyFetchFailed = true;
+  } finally {
+    _broadcastInProgress = false;
   }
 
-  // Follow marks — in-place mutation so any consumer holding the Map ref
-  // stays valid.
-  const fmRows = await _fetchAllFollowMarks();
-  if (Array.isArray(fmRows)) {
-    if (!window.followMarks) window.followMarks = new Map();
-    window.followMarks.clear();
-    for (const r of fmRows) if (r && r.id && r.data) window.followMarks.set(r.id, r.data);
+  // Single batched redraw + IDB write + statusCache bump if anything
+  // actually landed. Empty catch-up (nothing changed while offline)
+  // fires no redraw.
+  if (applied > 0) {
+    _applyAndRefresh();
   }
 
-  // Settings — merge (don't replace) so a client-local setting the
-  // client already tweaked isn't clobbered by an older cloud snapshot.
-  const cloudSettings = await _fetchCloudSettings();
-  if (cloudSettings) DB.settings = { ...DB.settings, ...cloudSettings };
-
-  _applyAndRefresh();
-  // Freshness — same plausibility guard as _cloudPollTick. Only bump
-  // when the key fetches (parts + pos) actually returned non-null AND,
-  // if we already had local rows, cloud also had rows. A catchup where
-  // every fetch returned null or 0 rows into a populated local means
-  // reconnect saw no data — not a legitimate "everything is fresh"
-  // state. Let the indicator age so the failure is visible.
-  const catchupPosOk   = Array.isArray(cloudPos)   && (cloudPos.length > 0   || DB.pos.length === 0);
-  const catchupPartsOk = Array.isArray(cloudParts) && (cloudParts.length > 0 || DB.parts.length === 0);
-  if (catchupPosOk && catchupPartsOk) {
+  // Freshness: bump only when no fetch failed. A catchup where any
+  // delta fetch returned null (network/RLS/auth failure) means the
+  // reconnect saw partial data — let the indicator age so the failure
+  // is visible.
+  if (!anyFetchFailed) {
     window._lastCloudSyncAt = Date.now();
     if (typeof updateSyncIndicator === "function") updateSyncIndicator();
   } else {
-    console.warn(
-      `[cloud] catch-up: fetch returned implausibly empty result — freshness NOT bumped ` +
-      `(cloudPos=${Array.isArray(cloudPos) ? cloudPos.length : "null"}, ` +
-      `cloudParts=${Array.isArray(cloudParts) ? cloudParts.length : "null"}, ` +
-      `DB.pos.length=${DB.pos.length}, DB.parts.length=${DB.parts.length}).`
-    );
+    console.warn("[cloud] catch-up: one or more delta fetches failed — freshness NOT bumped");
   }
-  console.log(`[cloud] catch-up fetch complete in ${Date.now() - t0}ms`);
+  console.log(`[cloud] catch-up complete in ${Date.now() - t0}ms — applied ${applied} rows`);
 }
 
 // Visibility / focus / online listeners — installed once. Triggered on
@@ -1483,20 +1451,15 @@ function _installConnectionListeners() {
 
   const checkAndReconnect = (why) => {
     if (!_cloudReady) return;
-    const rtState = _realtimeChannel && _realtimeChannel.state;
+    // Step 5: only the broadcast channel remains. "joined" is the
+    // healthy state; anything else (closed, errored, joining, leaving)
+    // means we shouldn't trust the socket. Also reconnect if we haven't
+    // seen ANY realtime activity in >10 min — user just woke the tab,
+    // get fresh data regardless of the socket's self-report.
     const bcState = _broadcastChannel && _broadcastChannel.state;
     const staleness = Date.now() - (_lastRealtimeAt || 0);
-    // "joined" is the healthy state string on Supabase's RealtimeChannel.
-    // Any other state (closed, errored, joining, leaving) means we
-    // shouldn't trust the socket. Both channels are checked because
-    // _reconnectRealtime rebuilds both together — if the broadcast
-    // channel is dead but sync is fine, we still want the broadcast
-    // channel restored so DELETE propagation resumes. Also reconnect
-    // if we haven't seen ANY realtime activity in >10 min — user just
-    // woke the tab, get fresh data regardless of the socket's self-
-    // report.
-    if (rtState !== "joined" || bcState !== "joined" || staleness > 10 * 60 * 1000) {
-      console.log(`[cloud] wake check (${why}): rt=${rtState}, bc=${bcState}, staleness=${staleness}ms — reconnecting`);
+    if (bcState !== "joined" || staleness > 10 * 60 * 1000) {
+      console.log(`[cloud] wake check (${why}): bc=${bcState}, staleness=${staleness}ms — reconnecting`);
       _realtimeBackoffMs = 0;  // user-initiated wake — no throttling
       _reconnectRealtime();
     }
@@ -1520,14 +1483,13 @@ function _startHeartbeat() {
   _heartbeatTimer = setInterval(() => {
     if (!_cloudReady) return;
     if (document.visibilityState !== "visible") return;   // don't probe from background
-    // Both channels must be joined. If either dropped, rebuild both —
-    // Step 5 makes the broadcast/delete channel the sole propagation
-    // path for updates AND deletes, so any silent drop there would
-    // stop all cross-user propagation until reload.
-    const rtState = _realtimeChannel && _realtimeChannel.state;
+    // Step 5: broadcast is the sole propagation path for updates AND
+    // deletes. Any silent drop there stops all cross-user propagation
+    // until reload — heartbeat catches that even when subscribe's
+    // status callback didn't fire.
     const bcState = _broadcastChannel && _broadcastChannel.state;
-    if (rtState !== "joined" || bcState !== "joined") {
-      console.log(`[cloud] heartbeat: rt=${rtState}, bc=${bcState} — reconnecting`);
+    if (bcState !== "joined") {
+      console.log(`[cloud] heartbeat: bc=${bcState} — reconnecting`);
       _reconnectRealtime();
       return;
     }
@@ -1566,10 +1528,14 @@ function _startHeartbeat() {
 //   - Emits a log line ONLY when something actually changed.
 // Zero writes anywhere in this loop; grep the block for `.upsert` /
 // `.insert` / `.delete` — none.
-const POLL_INTERVAL_MS = 30000;                  // 30 s — tune here
+// Step 5: broadcast is primary. Poll is the backstop for missed pings
+// (broadcast dropped, or a broadcast landed while the tab was hidden
+// and its debounce timer got throttled). Cadence lengthened from 30s
+// to 60s since broadcast is now the fast path.
+const POLL_INTERVAL_MS = 60000;                  // 60 s — Step 5 tuning
 // If realtime delivered anything in the last 20s, skip this tick (poll
-// stays subordinate to realtime whenever the WS is healthy). Value must
-// be < POLL_INTERVAL_MS or every tick short-circuits.
+// stays subordinate to realtime whenever the broadcast channel is
+// healthy). Value must be < POLL_INTERVAL_MS or every tick short-circuits.
 const POLL_SKIP_AFTER_REALTIME_MS = 20000;
 let _pollTimer = null;
 let _pollInFlight = false;
@@ -1631,6 +1597,30 @@ function _startSyncIndicatorTicker() {
   }, 15000);
 }
 
+// Step 5: delta-based poll — the backstop for missed broadcasts.
+//
+// Every POLL_INTERVAL_MS (60s) it delta-fetches every subscribed table
+// since its _lastSeenAt cursor and applies through the same guards +
+// dispatch as _flushBroadcastPass. Because it uses the cursor and
+// applies through the same handlers, a rowfingerprint diff isn't
+// needed — the delta fetch returns only rows whose updated_at
+// genuinely advanced past the cursor. The old canonical-fingerprint +
+// phantom-storm plumbing is no longer required; those maps
+// (_lastAppliedPartFp / _lastAppliedPosFp / _phantom*Streak) sit
+// dormant now but aren't removed in Step 5 to keep the change minimal.
+//
+// Guards on the apply loop:
+//   - _dirtyParts / _dirtyPos: user has a mid-flight local edit; don't
+//     let a poll-fetched row overwrite it.
+//   - _lastLocalSaveAt: race-guard against a save that landed AFTER we
+//     started the fetch — the dirty flag may have cleared by apply
+//     time. Same guard the broadcast flush uses.
+//   - _recentlyRemoteApplied: dormant in Step 5 (no landmaster-sync to
+//     stamp it) but the check is kept so the poll dispatch is
+//     structurally identical to _flushBroadcastPass.
+//
+// Zero writes anywhere in this loop; grep the block for `.upsert` /
+// `.insert` / `.delete` — none.
 async function _cloudPollTick() {
   if (!_cloudReady || !_supa) return;
   if (document.visibilityState !== "visible") return;
@@ -1641,248 +1631,79 @@ async function _cloudPollTick() {
   _pollInFlight = true;
   // Race-guard timestamp — captured BEFORE the fetch begins. Any local
   // save whose _lastLocalSaveAt is >= this value happened during (or
-  // after) our now-stale fetch. The per-row apply loops below reject
-  // such rows even if _dirtyParts.clear() already ran. Closes the poll
-  // half of the save-clobber race (cause #1 in the diagnosis).
+  // after) our now-stale fetch. Same guard as the pre-Step-5 poll and
+  // as _flushBroadcastPass' _recentlyLocallySaved check.
   const fetchStartAt = Date.now();
+
+  let applied = 0;
+  let anyFetchFailed = false;
+  _broadcastInProgress = true;
   try {
-    // Parallel fetch — READ-ONLY, paginated helpers.
-    const [cloudPosRows, cloudPartsRows] = await Promise.all([
-      _fetchAllPos(),
-      _fetchAllParts(),
-    ]);
-
-    let posChanged = 0;
-    let partsChanged = 0;
-
-    // ── POs — canonical-fingerprint diff + phantom-storm guard ──────
-    const posChangedSamples = [];
-    let posPhantomSuppressed = 0;
-    if (Array.isArray(cloudPosRows)) {
-      const cloudById = new Map();
-      for (const r of cloudPosRows) if (r && r.id) cloudById.set(r.id, r);
-
-      for (const [id, r] of cloudById.entries()) {
-        if (_dirtyPos.has(id)) continue;
-        // Second guard: race window between dirty-clear (push commit) and
-        // this stale fetch resolving. If a local save landed at-or-after
-        // fetchStartAt, our in-flight fetch predates it — do NOT apply.
-        if ((_lastLocalSaveAt.pos.get(id) || 0) >= fetchStartAt) {
-          console.debug(`[cloud] skipped stale apply for PO ${id} (local save newer than fetch)`);
-          continue;
-        }
-        const merged = { id, ...r.data };
-        const i = DB.pos.findIndex(p => p.id === id);
-        const localPo = i >= 0 ? DB.pos[i] : null;
-        const nextFp = _rowFingerprint(merged);
-        const localFp = localPo ? _rowFingerprint(localPo) : null;
-        if (localFp === nextFp) {
-          _phantomPosStreak.delete(id);
-          continue;
-        }
-        const prevAppliedFp = _lastAppliedPosFp.get(id);
-        const isRepeatFp = prevAppliedFp === nextFp;
-        if (isRepeatFp) {
-          const streak = (_phantomPosStreak.get(id) || 0) + 1;
-          _phantomPosStreak.set(id, streak);
-          if (streak >= PHANTOM_STREAK_THRESHOLD) {
-            if (streak === PHANTOM_STREAK_THRESHOLD) {
-              console.warn(
-                `[cloud] phantom-change loop for PO id=${id} — ` +
-                `same fingerprint reported changed ${streak} consecutive ticks. ` +
-                `Suppressing re-render for this row.`,
-                { cloudRow: merged, localRow: localPo, cloudFp: nextFp.slice(0, 400), localFp: (localFp || "").slice(0, 400) }
-              );
-            }
-            if (i >= 0) DB.pos[i] = merged;
-            else DB.pos.push(merged);
-            _posSnapshot.set(id, JSON.stringify(merged));
-            _lastAppliedPosFp.set(id, nextFp);
-            posPhantomSuppressed++;
-            continue;
-          }
-        } else {
-          _phantomPosStreak.delete(id);
-        }
-        if (i >= 0) DB.pos[i] = merged;
-        else DB.pos.push(merged);
-        _posSnapshot.set(id, JSON.stringify(merged));
-        _lastAppliedPosFp.set(id, nextFp);
-        posChanged++;
-        if (posChangedSamples.length < 3) {
-          posChangedSamples.push({
-            id,
-            poNum: merged && merged.num,
-            cloudKeys: Object.keys(merged).sort(),
-            localKeys: localPo ? Object.keys(localPo).sort() : null,
-            cloudFpHead: nextFp.slice(0, 200),
-            localFpHead: (localFp || "").slice(0, 200),
-            cloudRow: merged,
-            localRow: localPo,
-          });
-        }
-      }
-      // Server-side deletes.
-      const idsToDelete = [];
-      for (const po of DB.pos) {
-        if (!cloudById.has(po.id) && !_dirtyPos.has(po.id)) idsToDelete.push(po.id);
-      }
-      for (const id of idsToDelete) {
-        const i = DB.pos.findIndex(p => p.id === id);
-        if (i >= 0) DB.pos.splice(i, 1);
-        _posSnapshot.delete(id);
-        _lastAppliedPosFp.delete(id);
-        _phantomPosStreak.delete(id);
-        posChanged++;
-      }
+    // deleted_parts FIRST — same tombstone-precedence rule as
+    // _flushBroadcastPass. Broadcast has an insertion-order iteration
+    // that puts it first; the poll iterates _BROADCAST_FETCHERS in
+    // property order, so we hoist deleted_parts explicitly.
+    const orderedEntries = [];
+    if (_BROADCAST_FETCHERS.deleted_parts) {
+      orderedEntries.push(["deleted_parts", _BROADCAST_FETCHERS.deleted_parts]);
+    }
+    for (const [table, fetcher] of Object.entries(_BROADCAST_FETCHERS)) {
+      if (table !== "deleted_parts") orderedEntries.push([table, fetcher]);
     }
 
-    // ── Parts — canonical-fingerprint diff + phantom-storm guard ────
-    const partsChangedSamples = [];  // first 3 changed rows for diagnostics
-    let partsPhantomSuppressed = 0;
-    if (Array.isArray(cloudPartsRows)) {
-      const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
-      const cloudByPn = new Map();
-      for (const r of cloudPartsRows) {
-        if (r && r.pn && !tombs.has(String(r.pn))) cloudByPn.set(r.pn, r);
+    for (const [table, fetcher] of orderedEntries) {
+      const cursor = _lastSeenAt[table];
+      const { rows, maxSeenAt } = await fetcher(cursor);
+      if (rows === null) {
+        anyFetchFailed = true;
+        continue;   // don't advance cursor on failure
       }
-      for (const [pn, r] of cloudByPn.entries()) {
-        if (_dirtyParts.has(pn)) continue;
-        // Second guard: race window between dirty-clear (push commit) and
-        // this stale fetch resolving. If a local save landed at-or-after
-        // fetchStartAt, our in-flight fetch predates it — do NOT apply.
-        if ((_lastLocalSaveAt.parts.get(pn) || 0) >= fetchStartAt) {
-          console.debug(`[cloud] skipped stale apply for part ${pn} (local save newer than fetch)`);
+      for (const row of rows) {
+        const pk = _broadcastRowPk(table, row);
+        // ─ Dirty-flag guard (parts + pos only — the only tables where
+        //   the browser holds unpushed edits that a poll could clobber).
+        if (table === "parts" && pk != null && _dirtyParts.has(pk)) continue;
+        if (table === "pos"   && pk != null && _dirtyPos.has(pk)) continue;
+        // ─ Race-guard: local save landed after fetch started.
+        if (table === "parts" && pk != null && (_lastLocalSaveAt.parts.get(pk) || 0) >= fetchStartAt) {
+          console.debug(`[cloud] poll: skipped part ${pk} (local save newer than fetch)`);
           continue;
         }
-        const merged = { pn, ...r.data };
-        const i = DB.parts.findIndex(p => p.pn === pn);
-        const localPart = i >= 0 ? DB.parts[i] : null;
-        // Canonical fingerprint on BOTH sides. Key-order-insensitive.
-        const nextFp = _rowFingerprint(merged);
-        const localFp = localPart ? _rowFingerprint(localPart) : null;
-        if (localFp === nextFp) {
-          // Genuinely identical content — reset any phantom streak.
-          _phantomPartStreak.delete(pn);
+        if (table === "pos" && pk != null && (_lastLocalSaveAt.pos.get(pk) || 0) >= fetchStartAt) {
+          console.debug(`[cloud] poll: skipped PO ${pk} (local save newer than fetch)`);
           continue;
         }
-        // Phantom detection: if we're being asked to apply the SAME
-        // fingerprint we already applied last tick (or many ticks in
-        // a row), that's a spurious "change" — the row isn't actually
-        // moving. Log at threshold and stop counting toward re-render.
-        const prevAppliedFp = _lastAppliedPartFp.get(pn);
-        const isRepeatFp = prevAppliedFp === nextFp;
-        if (isRepeatFp) {
-          const streak = (_phantomPartStreak.get(pn) || 0) + 1;
-          _phantomPartStreak.set(pn, streak);
-          if (streak >= PHANTOM_STREAK_THRESHOLD) {
-            // Apply-in-place so DB stays byte-consistent, but don't
-            // trigger a full page re-render. Log once at threshold-
-            // cross so the offender is visible without console spam.
-            if (streak === PHANTOM_STREAK_THRESHOLD) {
-              console.warn(
-                `[cloud] phantom-change loop for pn=${pn} — ` +
-                `same fingerprint reported changed ${streak} consecutive ticks. ` +
-                `Suppressing re-render for this row.`,
-                { cloudRow: merged, localRow: localPart, cloudFp: nextFp.slice(0, 400), localFp: (localFp || "").slice(0, 400) }
-              );
-            }
-            if (i >= 0) DB.parts[i] = merged;
-            else DB.parts.push(merged);
-            _partsSnapshot.set(pn, JSON.stringify(merged));
-            _lastAppliedPartFp.set(pn, nextFp);
-            partsPhantomSuppressed++;
-            continue;   // suppressed — no partsChanged bump
-          }
-        } else {
-          _phantomPartStreak.delete(pn);
-        }
-        // Real change (or streak below threshold). Apply, remember fp,
-        // and record a sample for diagnostic logging.
-        if (i >= 0) DB.parts[i] = merged;
-        else DB.parts.push(merged);
-        _partsSnapshot.set(pn, JSON.stringify(merged));
-        _lastAppliedPartFp.set(pn, nextFp);
-        partsChanged++;
-        if (partsChangedSamples.length < 3) {
-          // Keep the sample minimal to avoid flooding the console:
-          // report the differing fields' keys and a short fingerprint
-          // preview. Full objects on demand via cloudRow / localRow.
-          partsChangedSamples.push({
-            pn,
-            cloudKeys: Object.keys(merged).sort(),
-            localKeys: localPart ? Object.keys(localPart).sort() : null,
-            cloudFpHead: nextFp.slice(0, 200),
-            localFpHead: (localFp || "").slice(0, 200),
-            cloudRow: merged,
-            localRow: localPart,
-          });
-        }
+        // ─ Recency guards (dormant post-Step-5 for remote-apply, live
+        //   for local-save). Same structure as _flushBroadcastPass.
+        if (_recentlyRemoteApplied(table, pk)) continue;
+        if (_recentlyLocallySaved(table, pk)) continue;
+        _applyBroadcastRow(table, row);
+        applied++;
       }
-      // Server-side deletes (also covers newly-tombstoned pns since
-      // tombs were filtered out of cloudByPn above).
-      const pnsToDelete = [];
-      for (const p of DB.parts) {
-        if (!cloudByPn.has(p.pn) && !_dirtyParts.has(p.pn)) pnsToDelete.push(p.pn);
-      }
-      for (const pn of pnsToDelete) {
-        const i = DB.parts.findIndex(p => p.pn === pn);
-        if (i >= 0) DB.parts.splice(i, 1);       // in-place delete
-        _partsSnapshot.delete(pn);
-        _lastAppliedPartFp.delete(pn);
-        _phantomPartStreak.delete(pn);
-        partsChanged++;
-      }
-    }
-
-    // Freshness: bump ONLY when both fetches returned plausible data.
-    // Array.isArray([]) is truthy for empty arrays, so the old guard
-    // was flashing SYNCED even when Supabase silently returned zero
-    // rows (auth expired, RLS misconfig, table wiped) — the indicator
-    // lied about freshness and hid real problems.
-    //
-    // New rule: fetch must be non-null AND, if this client's local
-    // table currently has data, the cloud fetch must also have data.
-    // A cloud that returns 0 rows while local has hundreds is almost
-    // always a failure, not a legitimate empty state. Legitimate
-    // empty states (fresh install, brand-new DB) still bump because
-    // local is also empty.
-    const posFetchOk   = Array.isArray(cloudPosRows)   && (cloudPosRows.length > 0   || DB.pos.length === 0);
-    const partsFetchOk = Array.isArray(cloudPartsRows) && (cloudPartsRows.length > 0 || DB.parts.length === 0);
-    if (posFetchOk && partsFetchOk) {
-      window._lastCloudSyncAt = Date.now();
-      if (typeof updateSyncIndicator === "function") updateSyncIndicator();
-    } else {
-      console.warn(
-        `[cloud] poll: fetch returned implausibly empty result — freshness NOT bumped ` +
-        `(cloudPos.length=${Array.isArray(cloudPosRows) ? cloudPosRows.length : "null"}, ` +
-        `cloudParts.length=${Array.isArray(cloudPartsRows) ? cloudPartsRows.length : "null"}, ` +
-        `DB.pos.length=${DB.pos.length}, DB.parts.length=${DB.parts.length}). ` +
-        `Indicator will age into STALE. Check Supabase auth / RLS / connection.`
-      );
-    }
-    if (posChanged > 0 || partsChanged > 0 || posPhantomSuppressed > 0 || partsPhantomSuppressed > 0) {
-      // Extended log: how many real changes, how many phantom-suppressed,
-      // plus first 3 samples of each so any lingering phantom or real
-      // data-shape issue is inspectable straight from the console.
-      const suffix = (posPhantomSuppressed > 0 || partsPhantomSuppressed > 0)
-        ? ` (phantom-suppressed: ${posPhantomSuppressed} pos, ${partsPhantomSuppressed} parts)`
-        : "";
-      console.log(
-        `[cloud] poll: ${posChanged} pos changed, ${partsChanged} parts changed${suffix}`,
-        (partsChangedSamples.length || posChangedSamples.length)
-          ? { partsSamples: partsChangedSamples, posSamples: posChangedSamples }
-          : ""
-      );
-      if (posChanged > 0 || partsChanged > 0) _applyAndRefresh();
+      if (maxSeenAt) _lastSeenAt[table] = maxSeenAt;
     }
   } catch (e) {
-    // Non-fatal. Log and let the next tick retry. Deliberately don't
-    // bump _lastCloudSyncAt — the indicator continues to age, which
-    // is exactly the "stale tab" signal we want the user to see.
     console.warn("[cloud] poll tick failed:", (e && e.message) || e);
+    anyFetchFailed = true;
   } finally {
+    _broadcastInProgress = false;
     _pollInFlight = false;
+  }
+
+  // Freshness: bump only when every fetch succeeded. A partial-fetch
+  // failure means the poll can't confirm data is current — let the
+  // indicator age so the failure is visible. Empty delta (0 rows) is
+  // a legitimate "everything is fresh" state and DOES bump.
+  if (!anyFetchFailed) {
+    window._lastCloudSyncAt = Date.now();
+    if (typeof updateSyncIndicator === "function") updateSyncIndicator();
+  } else {
+    console.warn("[cloud] poll: one or more delta fetches failed — freshness NOT bumped");
+  }
+
+  if (applied > 0) {
+    console.log(`[cloud] poll: applied ${applied} rows`);
+    _applyAndRefresh();
   }
 }
 
