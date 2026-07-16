@@ -27,6 +27,28 @@ const _dirtyAudit = new Set();    // audit IDs (new entries only — audit is ap
 const _dirtyUsage = new Set();    // usage IDs that changed
 const _dirtyKitBoms = new Set();  // kit_pns that changed
 let _settingsDirty = false;
+
+// Last-local-save timestamps (side channel). Complements the _dirty* sets:
+// _dirtyParts covers the window [set at mutate] → [cleared when push commits].
+// The poll's Promise.all fetch can be in flight during that ENTIRE window
+// AND still be resolving after the dirty flag has been cleared — that's the
+// clobber race (cause #1). This side channel remembers "the last time this
+// key had a local save," so the poll can compare against the moment its
+// fetch started and reject an apply for any row saved after that moment,
+// even if the dirty flag has since been cleared. Same channel is consulted
+// by the realtime handlers to reject a stale echo for a row we just saved
+// (own-echo + cross-user variants of the race). NEVER cleared — a stale
+// timestamp is harmless (guards fail-open once the fetch/echo is newer
+// than the recorded save). Memory footprint tracks part/PO count only.
+const _lastLocalSaveAt = { parts: new Map(), pos: new Map(), settings: 0 };
+
+// Realtime echo of my own recent write can arrive after the push clears the
+// dirty flag. Any inbound realtime event for a row I saved within this
+// window is dropped — my local state is fresher than any echo could carry.
+// 5s covers push RTT (~300ms) + Supabase realtime broadcast latency
+// (~200-1000ms) with a wide margin. Too short = race reopens; too long =
+// legitimate cross-user edits get delayed after I stop typing.
+const RECENT_SAVE_MS = 5000;
 const _partsSnapshot = new Map(); // last-pushed snapshot per PN (also stores audit_<id> markers and __settings__ blob)
 const _posSnapshot = new Map();
 const _usageSnapshot = new Map(); // separate to avoid overloading _partsSnapshot
@@ -922,6 +944,12 @@ async function _cloudPollTick() {
   if (sinceRealtime < POLL_SKIP_AFTER_REALTIME_MS) return;
 
   _pollInFlight = true;
+  // Race-guard timestamp — captured BEFORE the fetch begins. Any local
+  // save whose _lastLocalSaveAt is >= this value happened during (or
+  // after) our now-stale fetch. The per-row apply loops below reject
+  // such rows even if _dirtyParts.clear() already ran. Closes the poll
+  // half of the save-clobber race (cause #1 in the diagnosis).
+  const fetchStartAt = Date.now();
   try {
     // Parallel fetch — READ-ONLY, paginated helpers.
     const [cloudPosRows, cloudPartsRows] = await Promise.all([
@@ -941,6 +969,13 @@ async function _cloudPollTick() {
 
       for (const [id, r] of cloudById.entries()) {
         if (_dirtyPos.has(id)) continue;
+        // Second guard: race window between dirty-clear (push commit) and
+        // this stale fetch resolving. If a local save landed at-or-after
+        // fetchStartAt, our in-flight fetch predates it — do NOT apply.
+        if ((_lastLocalSaveAt.pos.get(id) || 0) >= fetchStartAt) {
+          console.debug(`[cloud] skipped stale apply for PO ${id} (local save newer than fetch)`);
+          continue;
+        }
         const merged = { id, ...r.data };
         const i = DB.pos.findIndex(p => p.id === id);
         const localPo = i >= 0 ? DB.pos[i] : null;
@@ -1018,6 +1053,13 @@ async function _cloudPollTick() {
       }
       for (const [pn, r] of cloudByPn.entries()) {
         if (_dirtyParts.has(pn)) continue;
+        // Second guard: race window between dirty-clear (push commit) and
+        // this stale fetch resolving. If a local save landed at-or-after
+        // fetchStartAt, our in-flight fetch predates it — do NOT apply.
+        if ((_lastLocalSaveAt.parts.get(pn) || 0) >= fetchStartAt) {
+          console.debug(`[cloud] skipped stale apply for part ${pn} (local save newer than fetch)`);
+          continue;
+        }
         const merged = { pn, ...r.data };
         const i = DB.parts.findIndex(p => p.pn === pn);
         const localPart = i >= 0 ? DB.parts[i] : null;
@@ -1335,6 +1377,16 @@ function _handleRealtimePart(payload) {
     if (DB.deletedParts instanceof Map && DB.deletedParts.has(rowPn)) {
       return;   // no _applyAndRefresh — nothing to redraw
     }
+    // Recent-save guard — reject an echo that would overwrite a row we
+    // just saved. Covers own-echo (double-save between dirty-clear and
+    // echo arrival) and cross-user (another user's write echoes while
+    // we're mid-edit). RECENT_SAVE_MS is generous enough to cover push
+    // RTT + realtime broadcast latency for the echo of our own write.
+    const lastSave = _lastLocalSaveAt.parts.get(rowPn) || 0;
+    if (lastSave > 0 && (Date.now() - lastSave) < RECENT_SAVE_MS) {
+      console.debug(`[cloud] skipped stale apply for part ${rowPn} (local save newer than realtime echo)`);
+      return;
+    }
     const merged = { pn: row.pn, ...row.data };
     const i = DB.parts.findIndex(p => p.pn === row.pn);
     if (i >= 0) DB.parts[i] = merged;
@@ -1374,6 +1426,13 @@ function _handleRealtimePO(payload) {
     const i = DB.pos.findIndex(p => p.id === old.id);
     if (i >= 0) DB.pos.splice(i, 1);
   } else {
+    // Recent-save guard — see _handleRealtimePart for rationale.
+    const rowId = row && row.id;
+    const lastSave = rowId ? (_lastLocalSaveAt.pos.get(rowId) || 0) : 0;
+    if (lastSave > 0 && (Date.now() - lastSave) < RECENT_SAVE_MS) {
+      console.debug(`[cloud] skipped stale apply for PO ${rowId} (local save newer than realtime echo)`);
+      return;
+    }
     const merged = { id: row.id, ...row.data };
     const i = DB.pos.findIndex(p => p.id === row.id);
     if (i >= 0) DB.pos[i] = merged;
@@ -1456,6 +1515,15 @@ function _handleRealtimeAudit(payload) {
 function _handleRealtimeSettings(payload) {
   const { new: row } = payload;
   if (row?.data) {
+    // Recent-save guard — same pattern as parts/POs. Settings is a
+    // single-blob table, so one timestamp gates the whole row.
+    // Reassignment of DB.settings on merge is preserved as-is — converting
+    // to in-place mutation is a separate change; the guard just gates
+    // whether the merge runs at all.
+    if (Date.now() - (_lastLocalSaveAt.settings || 0) < RECENT_SAVE_MS) {
+      console.debug("[cloud] skipped stale settings apply (local save newer)");
+      return;
+    }
     DB.settings = { ...DB.settings, ...row.data };
     _lastCloudSettingsHash = _hashSettings(DB.settings);
     _applyAndRefresh();
@@ -1820,10 +1888,12 @@ async function _pushDirtyKitBoms() {
 
 function _detectChanges() {
   // Parts: find pns whose JSON has changed since last push
+  const _detectNow = Date.now();   // one timestamp per detect pass so a burst of edits shares it
   for (const p of DB.parts) {
     const json = JSON.stringify(p);
     if (_partsSnapshot.get(p.pn) !== json) {
       _dirtyParts.add(p.pn);
+      _lastLocalSaveAt.parts.set(p.pn, _detectNow);
       _partsSnapshot.set(p.pn, json);
     }
   }
@@ -1832,6 +1902,7 @@ function _detectChanges() {
     const json = JSON.stringify(po);
     if (_posSnapshot.get(po.id) !== json) {
       _dirtyPos.add(po.id);
+      _lastLocalSaveAt.pos.set(po.id, _detectNow);
       _posSnapshot.set(po.id, json);
     }
   }
@@ -1855,6 +1926,7 @@ function _detectChanges() {
   const settingsJson = JSON.stringify(DB.settings || {});
   if (_partsSnapshot.get("__settings__") !== settingsJson) {
     _settingsDirty = true;
+    _lastLocalSaveAt.settings = _detectNow;
     _partsSnapshot.set("__settings__", settingsJson);
   }
   // Kit BOMs: per-kit JSON comparison
