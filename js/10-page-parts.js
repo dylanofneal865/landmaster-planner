@@ -266,12 +266,20 @@ function renderPartDetail(part) {
   // Status banner — plain-language summary placed above the chart.
   let runwayBanner;
   if (chainInfo) {
-    // CHAIN AWARENESS (Phase B) — this part is in an actively-transitioning
-    // supersession chain. The banner speaks for the CHAIN: primary runout
-    // is chainInfo.chainRunoutDate at the anchor rate, applied to combined
-    // chain inventory. Per-part own runout is shown as a footnote so users
-    // can still see this part's individual position in the chain, but the
-    // primary signal is the chain's story.
+    // CHAIN AWARENESS (Phase B + reorder-by surfacing) — this part is in
+    // an actively-transitioning supersession chain. The banner speaks for
+    // the CHAIN: primary runout is chainInfo.chainRunoutDate at the anchor
+    // rate applied to combined chain inventory; reorder-by is the LAST
+    // calendar day the SUCCESSOR must be ordered so stock lands before
+    // runout. Per-part own runout is shown as a footnote so users can
+    // still see this part's individual position, but the primary signal
+    // is the chain's story.
+    //
+    // Role phrasing (D) is decoupled from status: whether ok/warn/crit
+    // we always name the successor as the part to reorder, never the
+    // anchor. The anchor is phasing out and is never itself reordered —
+    // even when chainStatus is critical, its drawer says "reorder
+    // <successor> by <date>", NOT "<anchor> reorder overdue."
     const chainRunoutTxt = chainInfo.chainRunoutDate
       ? fmtDate(chainInfo.chainRunoutDate)
       : "—";
@@ -281,18 +289,37 @@ function renderPartDetail(part) {
     const chainStatusColor = chainInfo.chainStatus === "ok" ? "var(--ok)"
       : chainInfo.chainStatus === "warning" ? "var(--warn)"
       : "var(--crit)";
+    // Role — status-independent phrasing. Anchor sees "Phasing out —
+    // successor <PN>"; successor sees "Chain successor — <anchor>
+    // phasing out"; middle members (rare) get a neutral label.
+    const successorPnHtml = `<span class="mono">${esc(chainInfo.finalPn)}</span>`;
     const roleTxt = chainInfo.anchorPn === part.pn
-      ? `Phasing out — chain covered by <span class="mono">${esc(chainInfo.finalPn)}</span>`
+      ? `Phasing out — successor ${successorPnHtml}`
       : chainInfo.finalPn === part.pn
         ? `Chain successor — <span class="mono">${esc(chainInfo.anchorPn)}</span> phasing out`
         : `Chain member`;
+    // Reorder-by — always names the SUCCESSOR (finalPn) as the part to
+    // order, on both the anchor's and the successor's drawer. When the
+    // reorder-by day is in the past, the phrase turns red and reads
+    // "ORDER-BY PASSED" — same treatment as the pre-launch order-by pill.
+    const roByDateTxt = chainInfo.chainReorderByDate
+      ? fmtDate(chainInfo.chainReorderByDate)
+      : "—";
+    const roByDaysTxt = chainInfo.chainReorderByDays === Infinity
+      ? "∞"
+      : `${chainInfo.chainReorderByDays}d`;
+    const reorderByHtml = !chainInfo.chainReorderByDate
+      ? `reorder ${successorPnHtml}: no deadline (runout beyond horizon)`
+      : chainInfo.chainReorderByPassed
+        ? `reorder ${successorPnHtml} <span style="color:var(--crit);font-weight:700">by ${roByDateTxt} — ORDER-BY PASSED</span>`
+        : `reorder ${successorPnHtml} by ${roByDateTxt} (${roByDaysTxt})`;
     // Per-part own runout footnote — from the raw partStatus computed above
     // via effectivePart. Meaningful for the anchor (its own stock burning
     // down); for the final it agrees with chain runout already.
     const ownRunoutTxt = Number.isFinite(coverDays)
       ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(coverDays)})</span>`
       : "";
-    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Chain runs out ${chainRunoutTxt} (${chainInfo.chainRunoutDays}d at ${fmtNum(chainInfo.chainRate, 2)}/day across ${fmtNum(chainInfo.chainOnHand)} on-hand + ${fmtNum(chainInfo.chainOnPO)} on PO) — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Chain runs out ${chainRunoutTxt} (${chainInfo.chainRunoutDays}d at ${fmtNum(chainInfo.chainRate, 2)}/day across ${fmtNum(chainInfo.chainOnHand)} on-hand + ${fmtNum(chainInfo.chainOnPO)} on PO) · ${reorderByHtml} — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
   } else if (preLaunch) {
     // Case-A pre-launch: no consumption until transitionStartDate. The
     // runway (chart above) now correctly holds flat at onHand until

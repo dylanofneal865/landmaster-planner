@@ -1112,20 +1112,46 @@ function getChainInfo(pn) {
     }
   }
 
-  // Chain status — applied to the combined runout against the
-  // successor's lead time (that's who we reorder from).
+  // Chain reorder-by point — the LAST calendar day we can place the
+  // successor's order and still have stock arrive before the chain runs
+  // out. Uses the successor's lead time + safety buffer (same shape as
+  // partStatus's reorderBy DURATION, but expressed here as a first-class
+  // calendar DATE so downstream views can surface it directly).
+  //
+  // chainReorderByDays: integer days from today to reorder-by. Negative
+  //   when reorder-by has already passed. Infinity when runout is beyond
+  //   the 365-day horizon (nothing actionable to compute).
+  // chainReorderByDate: matching calendar Date (null when Infinity).
+  // chainReorderByPassed: true when reorder-by day is today or earlier.
   const leadDays = (typeof leadTimeDays === "function")
     ? leadTimeDays(finalMember)
     : 0;
   const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
   const warnDays = (DB.settings && (DB.settings.alertWarning ?? 14)) || 14;
-  const reorderBy = leadDays + safety;
+  const reorderBy = leadDays + safety; // duration, preserved for chainStatusDetail back-compat
+  const chainReorderByDays = (chainRunoutDays === Infinity)
+    ? Infinity
+    : chainRunoutDays - leadDays - safety;
+  const chainReorderByDate = (chainRunoutDate && chainReorderByDays !== Infinity)
+    ? addDays(TODAY, chainReorderByDays)
+    : null;
+  const chainReorderByPassed = chainReorderByDays !== Infinity && chainReorderByDays <= 0;
+
+  // Chain status ladder — expressed directly against chainReorderByDays
+  // so the code matches the mental model: escalate as the last-order
+  // moment approaches, hit CRITICAL when it passes.
+  //   OK       reorder-by is comfortably future     (days > warnDays)
+  //   WARNING  reorder-by is within warn window     (0 < days ≤ warnDays)
+  //   CRITICAL reorder-by has arrived or passed     (days ≤ 0)
+  // Algebraically identical to the older `chainRunoutDays <= leadDays+safety`
+  // test — same output for every input — but the naming makes intent
+  // grep-legible and one-to-one with partStatus's ladder.
   let chainStatus = "ok";
-  if (chainRunoutDays === Infinity) {
+  if (chainReorderByDays === Infinity) {
     chainStatus = "ok";
-  } else if (chainRunoutDays <= reorderBy) {
+  } else if (chainReorderByDays <= 0) {
     chainStatus = "critical";
-  } else if (chainRunoutDays <= reorderBy + warnDays) {
+  } else if (chainReorderByDays <= warnDays) {
     chainStatus = "warning";
   } else {
     chainStatus = "ok";
@@ -1174,6 +1200,9 @@ function getChainInfo(pn) {
     chainPOLines,
     chainRunoutDate,
     chainRunoutDays,
+    chainReorderByDate,
+    chainReorderByDays,
+    chainReorderByPassed,
     chainStatus,
     chainStatusDetail: {
       leadDays,
@@ -1213,6 +1242,7 @@ function _printChainInfo(pn) {
   }
   lines.push(
     `  chainRunoutDate: ${iso(info.chainRunoutDate)} (${info.chainRunoutDays === Infinity ? "∞" : info.chainRunoutDays + "d"})`,
+    `  chainReorderBy:  ${iso(info.chainReorderByDate)} (${info.chainReorderByDays === Infinity ? "∞" : info.chainReorderByDays + "d"})${info.chainReorderByPassed ? " ← PASSED" : ""}`,
     `  chainStatus:     ${info.chainStatus} (leadDays=${info.chainStatusDetail.leadDays}, reorderBy=${info.chainStatusDetail.reorderBy}, warnDays=${info.chainStatusDetail.warnDays})`,
     `  wantByDate:      ${iso(info.wantByDate)}`,
     `  chainShort:      ${info.chainShort}`,
@@ -1237,78 +1267,6 @@ function _printChainInfo(pn) {
 }
 window.getChainInfo = getChainInfo;
 window._printChainInfo = _printChainInfo;
-
-// Console-callable one-shot verifier for the chain-direction fix. Prints
-// the 19961/JP00051 symmetry check + a non-chain control. Safe to call at
-// any time; safe to leave in place — read-only diagnostic.
-window.verifyChainFix = function verifyChainFix() {
-  console.log("=== CHAIN-DIRECTION FIX VERIFICATION ===");
-  const nParts = (DB && DB.parts) ? DB.parts.length : 0;
-  console.log(`DB.parts loaded: ${nParts}`);
-  if (nParts === 0) {
-    console.warn("DB.parts is empty — wait for hydration and re-run verifyChainFix()");
-    return;
-  }
-  const a = getChainInfo("19961");
-  const b = getChainInfo("JP00051");
-  console.log("--- getChainInfo('19961') ---");
-  console.log(a);
-  console.log("--- getChainInfo('JP00051') ---");
-  console.log(b);
-  const same =
-    !!a && !!b &&
-    a.anchorPn === b.anchorPn &&
-    a.finalPn === b.finalPn &&
-    a.chainRate === b.chainRate &&
-    a.chainOnHand === b.chainOnHand &&
-    a.chainOnPO === b.chainOnPO &&
-    a.chainStatus === b.chainStatus &&
-    a.chainShort === b.chainShort &&
-    JSON.stringify(a.chainParts) === JSON.stringify(b.chainParts);
-  console.log(`SYMMETRY: ${same ? "✅ IDENTICAL" : "❌ MISMATCH"}`);
-  if (a) console.log(`  19961     → anchor=${a.anchorPn} rate=${a.chainRate} onHand=${a.chainOnHand} onPO=${a.chainOnPO} status=${a.chainStatus} short=${a.chainShort} parts=[${a.chainParts.join("→")}]`);
-  else    console.log(`  19961     → NULL`);
-  if (b) console.log(`  JP00051   → anchor=${b.anchorPn} rate=${b.chainRate} onHand=${b.chainOnHand} onPO=${b.chainOnPO} status=${b.chainStatus} short=${b.chainShort} parts=[${b.chainParts.join("→")}]`);
-  else    console.log(`  JP00051   → NULL`);
-  // Non-chain control: pick the first part that's neither in the chain
-  // above nor has supersededBy / phasingOut set. Confirms null-fallback
-  // is preserved for normal parts.
-  const control = (DB.parts || []).find(p =>
-    p && p.pn !== "19961" && p.pn !== "JP00051" &&
-    !p.supersededBy && !p.phasingOut
-  );
-  if (control) {
-    const ci = getChainInfo(control.pn);
-    console.log(`NON-CHAIN CONTROL: getChainInfo('${control.pn}') → ${ci === null ? "✅ null (per-part logic applies)" : "❌ unexpected non-null: " + JSON.stringify(ci)}`);
-  } else {
-    console.log("NON-CHAIN CONTROL: no eligible non-chain part found in DB");
-  }
-  console.log("========================================");
-};
-
-// Auto-run once after DB hydrates. Watches for DB.parts to have entries
-// (Supabase fetch is async) — polls every 500ms up to 20s, then fires
-// verifyChainFix() exactly once. Boot-time convenience so you can reload
-// and read the console without typing anything. If DB never hydrates in
-// 20s (offline, no data), we skip silently.
-(function autoVerifyOnBoot() {
-  if (typeof DB === "undefined") return; // schema not ready — bail quietly
-  let fired = false;
-  let ticks = 0;
-  const tick = () => {
-    if (fired) return;
-    ticks++;
-    const ready = DB && Array.isArray(DB.parts) && DB.parts.length > 0;
-    if (ready) {
-      fired = true;
-      try { window.verifyChainFix(); } catch (e) { console.warn("verifyChainFix failed:", e); }
-      return;
-    }
-    if (ticks > 40) return; // ~20s of 500ms polls — give up
-    setTimeout(tick, 500);
-  };
-  setTimeout(tick, 500);
-})();
 
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
