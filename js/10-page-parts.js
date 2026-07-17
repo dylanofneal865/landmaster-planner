@@ -46,6 +46,22 @@ function renderPartDetail(part) {
   // dedicated pre-launch state.
   const preLaunch = (typeof isPreLaunch === "function") && isPreLaunch(part);
   if (preLaunch) status.status = "ok";
+
+  // CHAIN AWARENESS (Phase B): when this part is in an actively-transitioning
+  // chain, the drawer's status pill and primary days-cover reflect the CHAIN,
+  // not this part's isolated per-part runout. Both members of a chain show
+  // the same chainStatus and chainRunout. Per-part own runout is preserved
+  // as a footnote below. The runway CHART stays per-part (each member's own
+  // depletion is meaningful context), but the STATUS PILL and BANNER speak
+  // for the chain.
+  const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(part.pn) : null;
+  if (chainInfo) {
+    status.status = chainInfo.chainStatus;
+    // daysOfCover is used by downstream drawer code; override so the Days
+    // Cover stat cell reads the chain runout, not per-part.
+    status.daysOfCover = chainInfo.chainRunoutDays;
+    status.stockoutDay = chainInfo.chainRunoutDays;
+  }
   const sq = suggestedQty({...part, onPO, daily: part.daily});
 
   // Pricing provenance for the Unit Cost tile. Source resolution lives in
@@ -249,7 +265,35 @@ function renderPartDetail(part) {
 
   // Status banner — plain-language summary placed above the chart.
   let runwayBanner;
-  if (preLaunch) {
+  if (chainInfo) {
+    // CHAIN AWARENESS (Phase B) — this part is in an actively-transitioning
+    // supersession chain. The banner speaks for the CHAIN: primary runout
+    // is chainInfo.chainRunoutDate at the anchor rate, applied to combined
+    // chain inventory. Per-part own runout is shown as a footnote so users
+    // can still see this part's individual position in the chain, but the
+    // primary signal is the chain's story.
+    const chainRunoutTxt = chainInfo.chainRunoutDate
+      ? fmtDate(chainInfo.chainRunoutDate)
+      : "—";
+    const chainStatusTxt = chainInfo.chainStatus === "ok" ? "covered"
+      : chainInfo.chainStatus === "warning" ? "warning"
+      : "critical";
+    const chainStatusColor = chainInfo.chainStatus === "ok" ? "var(--ok)"
+      : chainInfo.chainStatus === "warning" ? "var(--warn)"
+      : "var(--crit)";
+    const roleTxt = chainInfo.anchorPn === part.pn
+      ? `Phasing out — chain covered by <span class="mono">${esc(chainInfo.finalPn)}</span>`
+      : chainInfo.finalPn === part.pn
+        ? `Chain successor — <span class="mono">${esc(chainInfo.anchorPn)}</span> phasing out`
+        : `Chain member`;
+    // Per-part own runout footnote — from the raw partStatus computed above
+    // via effectivePart. Meaningful for the anchor (its own stock burning
+    // down); for the final it agrees with chain runout already.
+    const ownRunoutTxt = Number.isFinite(coverDays)
+      ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(coverDays)})</span>`
+      : "";
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Chain runs out ${chainRunoutTxt} (${chainInfo.chainRunoutDays}d at ${fmtNum(chainInfo.chainRate, 2)}/day across ${fmtNum(chainInfo.chainOnHand)} on-hand + ${fmtNum(chainInfo.chainOnPO)} on PO) — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
+  } else if (preLaunch) {
     // Case-A pre-launch: no consumption until transitionStartDate. The
     // runway (chart above) now correctly holds flat at onHand until
     // launch, then depletes — so coverDays reflects the true runout

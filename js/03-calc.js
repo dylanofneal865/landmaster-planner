@@ -866,6 +866,308 @@ function chainDisplayDaily(part) {
   return chainDisplayDailySource(part).daily;
 }
 
+/* ============================================================
+   getChainInfo(pn) — SUPERSESSION-CHAIN MODEL (PHASE A)
+
+   Single source of truth for chain-aware part numbers. Returns a
+   combined view of a supersession chain's inventory, PO coverage,
+   runout, status, and shortfall. Callers who need chain semantics
+   read from here; callers who see `null` fall through to per-part
+   logic (part is not in an actively-transitioning chain).
+
+   PHASE A IS MODEL ONLY. No caller in the app reads this yet.
+   Phase B will route Coverage Gaps, drawers, queues, dashboard
+   through this function so the four views tell ONE story.
+
+   DESIGN DECISIONS (locked with user):
+     D3 CANONICAL RATE — chainRate = lineage[0].daily (the OLDEST
+        predecessor, which is the part with real usage history and
+        is currently phasing out). The successor's own stored daily
+        is unreliable (little history) and is IGNORED for chain math.
+     D4 ONE CHAIN RUNOUT — total chain supply / chainRate, from
+        TODAY. Per-part per-pn runouts (as chainSequentialView
+        currently produces them for the drawer's own view) are not
+        used here.
+     D2 CHAIN STATUS — applied to the combined chain runout against
+        the SUCCESSOR's lead time (that's who we'll reorder from).
+        A phasing-out predecessor that's covered by successor supply
+        is NOT critical.
+
+   TRAVERSAL: uses supersessionLineage (already in this file), which
+   walks BACKWARD (predecessors via supersededBy pointing at me) and
+   FORWARD (my own supersededBy chain). Any member of the chain
+   returns the SAME chainInfo because the lineage is symmetric.
+
+   ANCHOR IDENTIFICATION: lineage[0] is the oldest predecessor —
+   matches chainSequentialView's existing convention. For a chain
+   where the phasing-out part is NOT the anchor (e.g. mid-position),
+   we still use the anchor's rate. If that's ever a problem in
+   production data, revisit in Phase B.
+
+   MULTI-HOP CHAINS: supported by construction — lineage.length can
+   be > 2 and all members contribute to chainOnHand / chainOnPO.
+
+   PRE-LAUNCH COMPOSITION: for a chain, we do NOT apply the
+   pre-launch flat-hold. The chain is "actively transitioning"
+   only when at least one member has phasingOut === true — meaning
+   the predecessor IS currently consuming demand. Runout math uses
+   TODAY as start regardless of the successor's transitionStartDate.
+   The transitionStartDate is exposed on the returned `preLaunch`
+   field for the drawer's banner text, but doesn't shift chain
+   depletion timing. Standalone pre-launch parts (no phasing-out
+   predecessor) get null from this function and fall through to
+   preLaunchOrderBy(part).
+
+   INVARIANTS:
+     - Reads part.onHand and part.daily only. Never writes.
+     - Reads DB.pos through isLineOpen; never mutates a PO line.
+     - Overdue POs count as coverage (matches the shipped Coverage
+       Gaps fix at commit abdabe9). The timing risk is a separate
+       UI concern.
+
+   RETURN SHAPE:
+     null                        — pn not in a chain / chain not
+                                    actively transitioning
+     {
+       chainParts: [pn, ...],    // ordered anchor → final
+       anchorPn, anchor,         // lineage[0]
+       finalPn, final,           // lineage[last]
+       chainRate,                // anchor.daily
+       chainOnHand,              // Σ max(0, member.onHand)
+       chainOnPO,                // Σ open PO remaining across chain PNs
+       chainPOLines: [           // per-line diagnostic
+         { pn, poNum, poId, remaining, expectedDate, isOverdue }
+       ],
+       chainRunoutDate,          // combined supply / chainRate from today
+       chainRunoutDays,          // calendar days from today (Infinity ok)
+       chainStatus,              // "ok" | "warning" | "critical"
+       chainStatusDetail: {
+         leadDays,               // final member's lead time
+         reorderBy,              // leadDays + safety
+         warnDays,               // settings.alertWarning
+         stockoutDay              // == chainRunoutDays
+       },
+       wantByDate,               // chainRunoutDate − 18 days (or TODAY)
+       chainShort,               // clamped ≥ 0 units short by want-by
+       preLaunch: null | {       // informational only for chains
+         successorPn,
+         transitionStartDate     // Date object
+       }
+     }
+   ============================================================ */
+function getChainInfo(pn) {
+  if (!pn) return null;
+  const target = String(pn).trim();
+  if (!target) return null;
+  const part = (DB.parts || []).find(p => p && p.pn === target);
+  if (!part) return null;
+
+  // Traversal — reuse the existing lineage walker (predecessors
+  // backward via supersededBy pointing at me, successors forward).
+  const lineage = (typeof supersessionLineage === "function")
+    ? supersessionLineage(part.pn)
+    : [];
+  if (!lineage || lineage.length < 2) return null;
+
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const members = lineage.map(mpn => partsByPn.get(mpn)).filter(Boolean);
+  if (members.length < 2) return null;
+
+  // Active-transition gate — matches chainSequentialView's rule.
+  const transitioning = members.some(m => m.phasingOut === true);
+  if (!transitioning) return null;
+
+  const anchor = members[0];
+  const anchorPn = anchor.pn;
+  const chainRate = Number(anchor.daily) || 0;
+  const finalMember = members[members.length - 1];
+  const finalPn = finalMember.pn;
+
+  // Chain on-hand: sum of clamped on-hand across ALL members.
+  // Clamped so a stocked-out (negative) member contributes 0.
+  let chainOnHand = 0;
+  for (const m of members) chainOnHand += Math.max(0, Number(m.onHand) || 0);
+
+  // Chain on-PO: sum of open PO remaining across all chain PNs.
+  // Overdue POs count as coverage (arrive-in-time in the abdabe9
+  // semantic). isOverdue tracked per-line for downstream UI use.
+  const chainPnSet = new Set(lineage);
+  let chainOnPO = 0;
+  const chainPOLines = [];
+  for (const po of (DB.pos || [])) {
+    for (const ln of (po.lines || [])) {
+      if (!ln || !chainPnSet.has(ln.pn)) continue;
+      if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
+      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (remaining <= 0) continue;
+      const expRaw = ln.expectedDate || po.expectedDate;
+      let expectedDate = null;
+      let isOverdue = false;
+      if (expRaw) {
+        const parsed = (typeof parseDateLocal === "function")
+          ? parseDateLocal(expRaw)
+          : new Date(expRaw);
+        if (parsed && !isNaN(parsed.getTime())) {
+          expectedDate = parsed;
+          isOverdue = parsed.getTime() < TODAY.getTime();
+        }
+      }
+      chainOnPO += remaining;
+      chainPOLines.push({
+        pn: ln.pn,
+        poNum: po.num,
+        poId: po.id,
+        remaining,
+        expectedDate,
+        isOverdue,
+      });
+    }
+  }
+
+  // Pre-launch composition (informational only for chains).
+  let preLaunch = null;
+  if (finalMember.transitionStartDate && typeof parseDateLocal === "function") {
+    const s = parseDateLocal(finalMember.transitionStartDate);
+    if (s && s.getTime() > TODAY.getTime()) {
+      preLaunch = {
+        successorPn: finalMember.pn,
+        transitionStartDate: s,
+      };
+      // Note: no runout offset — chain is actively transitioning
+      // (predecessor consuming today). See docstring rationale.
+    }
+  }
+
+  // Chain runout — combined supply at chainRate, from today.
+  const totalSupply = chainOnHand + chainOnPO;
+  let chainRunoutDays = Infinity;
+  let chainRunoutDate = null;
+  if (chainRate <= 0) {
+    chainRunoutDays = Infinity;
+  } else if (totalSupply <= 0) {
+    chainRunoutDays = 0;
+    chainRunoutDate = new Date(TODAY);
+  } else {
+    const coverWorkdays = totalSupply / chainRate;
+    const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
+    chainRunoutDays = cal > 365 ? Infinity : cal;
+    if (chainRunoutDays !== Infinity) {
+      chainRunoutDate = addDays(TODAY, chainRunoutDays);
+    }
+  }
+
+  // Chain status — applied to the combined runout against the
+  // successor's lead time (that's who we reorder from).
+  const leadDays = (typeof leadTimeDays === "function")
+    ? leadTimeDays(finalMember)
+    : 0;
+  const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const warnDays = (DB.settings && (DB.settings.alertWarning ?? 14)) || 14;
+  const reorderBy = leadDays + safety;
+  let chainStatus = "ok";
+  if (chainRunoutDays === Infinity) {
+    chainStatus = "ok";
+  } else if (chainRunoutDays <= reorderBy) {
+    chainStatus = "critical";
+  } else if (chainRunoutDays <= reorderBy + warnDays) {
+    chainStatus = "warning";
+  } else {
+    chainStatus = "ok";
+  }
+
+  // Want-by — 18 days before chain runout, matching Coverage Gaps'
+  // targetArrivalDate convention. If runout is < 18 days out (or
+  // Infinity / unknown), want-by falls back to TODAY.
+  let wantByDate = new Date(TODAY);
+  if (chainRunoutDate && chainRunoutDays >= 18) {
+    wantByDate = addDays(chainRunoutDate, -18);
+  }
+
+  // Chain short — demand accumulated from today through want-by
+  // MINUS (chainOnHand + non-late-arriving coverage). Overdue POs
+  // count as coverage. Clamped ≥ 0.
+  const wpw = (typeof effectiveWorkdaysPerWeek === "function")
+    ? effectiveWorkdaysPerWeek()
+    : 5;
+  const daysUntilWantBy = Math.max(0,
+    Math.round((wantByDate.getTime() - TODAY.getTime()) / DAY_MS)
+  );
+  let workdaysToWantBy = 0;
+  for (let i = 1; i <= daysUntilWantBy; i++) {
+    const d = addDays(TODAY, i);
+    if (typeof isWorkday === "function" && isWorkday(d, wpw)) workdaysToWantBy++;
+  }
+  const demandThroughWantBy = workdaysToWantBy * chainRate;
+  let coverageInTime = 0;
+  for (const l of chainPOLines) {
+    if (l.isOverdue) { coverageInTime += l.remaining; continue; }
+    if (!l.expectedDate) { coverageInTime += l.remaining; continue; }
+    if (l.expectedDate.getTime() <= wantByDate.getTime()) coverageInTime += l.remaining;
+  }
+  const chainShort = Math.max(0, demandThroughWantBy - (chainOnHand + coverageInTime));
+
+  return {
+    chainParts: lineage.slice(),
+    anchorPn,
+    anchor,
+    finalPn,
+    final: finalMember,
+    chainRate,
+    chainOnHand,
+    chainOnPO,
+    chainPOLines,
+    chainRunoutDate,
+    chainRunoutDays,
+    chainStatus,
+    chainStatusDetail: {
+      leadDays,
+      reorderBy,
+      warnDays,
+      stockoutDay: chainRunoutDays,
+    },
+    wantByDate,
+    chainShort,
+    preLaunch,
+  };
+}
+
+// PHASE A verification helper — console-callable to print a chain
+// info block for a given PN. Diagnostic only; NOT read by any
+// render code. Once Gate A passes and Phase B wires views through
+// getChainInfo(), this printer can stay for future debugging.
+function _printChainInfo(pn) {
+  const info = getChainInfo(pn);
+  if (!info) {
+    console.log(`[chain] ${pn}: not in an actively-transitioning chain → per-part logic applies`);
+    return null;
+  }
+  const iso = (d) => d ? d.toISOString().slice(0, 10) : "n/a";
+  const lines = [
+    `[chain] ${pn} (anchor ${info.anchorPn} → final ${info.finalPn}):`,
+    `  chainParts:      [${info.chainParts.join(" → ")}]`,
+    `  chainRate:       ${info.chainRate}/day (anchor ${info.anchorPn}.daily = ${info.anchor.daily})`,
+    `  chainOnHand:     ${info.chainOnHand} (${info.chainParts.map(p => {
+      const m = (DB.parts || []).find(x => x.pn === p);
+      return `${p}=${m ? (m.onHand || 0) : "?"}`;
+    }).join(", ")})`,
+    `  chainOnPO:       ${info.chainOnPO}`,
+  ];
+  for (const l of info.chainPOLines) {
+    lines.push(`     · ${l.pn} PO ${l.poNum}: ${l.remaining} units, exp ${iso(l.expectedDate)}${l.isOverdue ? " [OVERDUE]" : ""}`);
+  }
+  lines.push(
+    `  chainRunoutDate: ${iso(info.chainRunoutDate)} (${info.chainRunoutDays === Infinity ? "∞" : info.chainRunoutDays + "d"})`,
+    `  chainStatus:     ${info.chainStatus} (leadDays=${info.chainStatusDetail.leadDays}, reorderBy=${info.chainStatusDetail.reorderBy}, warnDays=${info.chainStatusDetail.warnDays})`,
+    `  wantByDate:      ${iso(info.wantByDate)}`,
+    `  chainShort:      ${info.chainShort}`,
+    `  preLaunch:       ${info.preLaunch ? `successor ${info.preLaunch.successorPn} phases in ${iso(info.preLaunch.transitionStartDate)}` : "no"}`,
+  );
+  console.log(lines.join("\n"));
+  return info;
+}
+window.getChainInfo = getChainInfo;
+window._printChainInfo = _printChainInfo;
+
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
 // candidates are future/invalid, fall back to newest regardless.
@@ -1040,40 +1342,64 @@ function partsWithStatus() {
     // any future dashboard aggregate) all read the same value from
     // the shared helper. undefined for non-pre-launch parts (0 memory).
     const preLaunchOB = preLaunch ? preLaunchOrderBy(p) : null;
+    // CHAIN AWARENESS (Phase B): if the part is in an actively-
+    // transitioning supersession chain, override status + daysOfCover
+    // with combined chain values from getChainInfo(). Every downstream
+    // consumer reading p.status (queueParts, dashboard KPIs, follow-ups
+    // grouping) and p.daysOfCover automatically becomes chain-aware —
+    // one source of truth, no per-view drift risk. The chain has ONE
+    // status; a phasing-out predecessor covered by its successor is
+    // NOT critical.
+    //
+    // Precedence: mute > chain > pre-launch. Muted is user-explicit
+    // silence and always wins. Chain wins over pre-launch because a
+    // chain is "actively transitioning" — the predecessor is currently
+    // consuming, so the pre-launch flat-hold doesn't apply. Standalone
+    // pre-launch parts (no phasing-out predecessor) return null from
+    // getChainInfo and fall through to preLaunch logic unchanged.
+    const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
     return {
       ...p,
       onPO,
       isKit: isKitVal,
       ...status,
-      // MUTED-supplier override: stashes _rawStatus so supplier-facing
-      // surfaces (Suppliers page row + drawer) can still show the true
-      // live-demand status alongside the muted-in-alerts behavior.
-      // "This part IS at risk; we're intentionally silencing alerts —
-      // but on the supplier drilldown you should still see it as such."
+      // MUTED-supplier override.
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
-      // PRE-LAUNCH override: does NOT stash _rawStatus. Rationale — the
-      // raw live-demand status (from onHand / dailyUse math) is a
-      // hallucination for a part that isn't in live demand yet. Exposing
-      // it on any surface produces the exact contradiction we're
-      // eliminating: Suppliers drawer's pill was reading _rawStatus and
-      // showing WARN for a part whose detail view correctly reads OK.
-      // With _rawStatus unset here, every surface consulting
-      // `p._rawStatus || p.status` (Suppliers row aggregation + drawer
-      // pill) short-circuits to p.status ("ok"), agreeing with the
-      // detail view. Real transition-planning risk (successor supply
-      // won't cover the transition) is captured by the Model Year page's
-      // own status ladder — a completely different computation — so we
-      // aren't suppressing genuine risk, only the false live-demand
-      // signal that shouldn't apply pre-launch.
-      ...(preLaunch ? {
+      // PRE-LAUNCH override — skipped when in an active chain (chain
+      // wins). Standalone pre-launch (no chain) behaves exactly as
+      // before the chain wiring.
+      ...(preLaunch && !chainInfo ? {
         _preLaunch: true,
         status: "ok",
         urgency: 9999,
-        // Surface the computed order-by so any list-level UI can badge
-        // an "ORDER NOW" indicator without recomputing. Values are
-        // { orderByDate: Date, orderByPassed: boolean } | null.
         _preLaunchOrderBy: preLaunchOB && preLaunchOB.orderByDate ? preLaunchOB.orderByDate : null,
         _preLaunchOrderByPassed: !!(preLaunchOB && preLaunchOB.orderByPassed),
+      } : {}),
+      // CHAIN override — the wiring for Phase B. Skipped when muted
+      // (mute wins). Every field consumed by downstream views is
+      // reassigned to the chain-level value; per-part values are
+      // preserved on _perPartStatus / _perPartDaysOfCover for
+      // drawer footnotes.
+      //
+      // Dedupe: _isChainRepresentative marks the successor (final)
+      // as the representative for LIST views (Coverage Gaps). Other
+      // members are silenced there so a chain shows once. Dashboard
+      // counts naturally dedupe via queueParts's !p.phasingOut
+      // filter (predecessors don't reach the queue).
+      ...(chainInfo && !muted ? {
+        _chainInfo: chainInfo,
+        _isChainMember: true,
+        _isChainAnchor: chainInfo.anchorPn === p.pn,
+        _isChainFinal: chainInfo.finalPn === p.pn,
+        _isChainRepresentative: chainInfo.finalPn === p.pn,
+        _perPartStatus: status.status,
+        _perPartDaysOfCover: status.daysOfCover,
+        status: chainInfo.chainStatus,
+        urgency: chainInfo.chainRunoutDays === Infinity ? 9999 : chainInfo.chainRunoutDays,
+        daysOfCover: chainInfo.chainRunoutDays,
+        stockoutDay: chainInfo.chainRunoutDays,
+        leadDays: chainInfo.chainStatusDetail.leadDays,
+        reorderBy: chainInfo.chainStatusDetail.reorderBy,
       } : {}),
       _suggestedQty: suggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),

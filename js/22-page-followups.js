@@ -148,6 +148,75 @@ const OVERDUE_RISK_HORIZON_DAYS = 18;
 // the console shows what was suppressed on this pass — same shape as
 // the transition-suppression log.
 let _overdueHorizonSuppressed = { count: 0, sample: [] };
+
+// Chain-shaped coverage gap for parts in an actively-transitioning
+// supersession chain. Called from computeCoverageGap when part is
+// the chain's representative (successor). Returns null when the
+// chain is fully covered AND has no overdue POs — otherwise returns
+// a gap object with the same shape the render expects, sourced
+// entirely from chainInfo. This is the "single source of truth" —
+// no per-part projection is invoked for chain rows.
+function _chainCoverageGap(part) {
+  const ci = part._chainInfo;
+  if (!ci) return null;
+  const hasOverdue = (ci.chainPOLines || []).some(l => l.isOverdue);
+  // Fully-covered + no overdue exposure → no row. Note we still show
+  // the row when the chain is technically "ok" but has an overdue PO —
+  // the abdabe9 "late-covered stays visible" principle carries over.
+  if (ci.chainStatus === "ok" && (ci.chainShort || 0) === 0 && !hasOverdue) {
+    return null;
+  }
+  // Split PO lines into non-overdue (become coveringPOs) and overdue
+  // (become overdueRisk.overdueLines). Supplier for each looked up
+  // via DB.pos so we don't need to plumb through here.
+  const coveringPOs = [];
+  const overdueLines = [];
+  let worstDaysPastDue = 0;
+  for (const l of (ci.chainPOLines || [])) {
+    const po = (DB.pos || []).find(x => x && x.id === l.poId);
+    const supplier = po ? (po.supplier || "") : "";
+    if (l.isOverdue) {
+      overdueLines.push({
+        pn: l.pn,
+        qty: l.remaining,
+        expected: l.expectedDate ? (l.expectedDate.toISOString ? l.expectedDate.toISOString().slice(0, 10) : String(l.expectedDate)) : null,
+        po: l.poNum,
+      });
+      if (l.expectedDate) {
+        const d = Math.floor((TODAY.getTime() - l.expectedDate.getTime()) / DAY_MS);
+        if (d > worstDaysPastDue) worstDaysPastDue = d;
+      }
+    } else {
+      coveringPOs.push({
+        poId: l.poId,
+        poNum: l.poNum,
+        supplier,
+        qty: l.remaining,
+        expectedDate: l.expectedDate || ci.chainRunoutDate,
+      });
+    }
+  }
+  const primarySupplier = (coveringPOs[0] && coveringPOs[0].supplier)
+    || (overdueLines[0] && ((DB.pos || []).find(x => x && x.num === overdueLines[0].po) || {}).supplier)
+    || part.supplier
+    || "";
+  return {
+    gapStart: ci.chainRunoutDate,       // chain runout as the row's "Out On" reference
+    gapEnd: null,                        // no defined recovery under chain model
+    gapDays: null,                       // renders as "—" (matches abdabe9 pattern)
+    shortfall: ci.chainShort,            // clamped ≥ 0
+    coveringPOs,
+    targetArrivalDate: ci.wantByDate,
+    primarySupplier,
+    overdueRisk: hasOverdue ? {
+      runoutDate: ci.chainRunoutDate,
+      shortfall: ci.chainShort,
+      overdueLines,
+      daysPastDue: worstDaysPastDue,
+    } : null,
+  };
+}
+
 function computeCoverageGap(part, lines) {
   if (!part || !part.pn) return null;
   // Allowlist: only base_bom / options qualify. Anything else (service,
@@ -157,6 +226,19 @@ function computeCoverageGap(part, lines) {
   // surface here either. The aggregator also filters by p.isKit; this
   // catches direct callers (e.g. a future part-drawer hint).
   if (typeof isKit === "function" && isKit(part.pn)) return null;
+
+  // Phase B chain routing: if the part is in an actively-transitioning
+  // chain, delegate to the chain model. Non-representative chain
+  // members (predecessors) return null so we don't list the same
+  // chain twice. The chain's representative (the successor) either
+  // returns a chain-shaped gap or null when the chain is fully covered
+  // AND has no overdue POs (preserves the "late-covered stays visible"
+  // principle from commit abdabe9).
+  if (part._chainInfo) {
+    if (!part._isChainRepresentative) return null;
+    return _chainCoverageGap(part);
+  }
+
   const daily = Number(part.daily) || 0;
   if (daily <= 0) return null;
 
