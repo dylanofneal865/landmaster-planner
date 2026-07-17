@@ -1001,8 +1001,27 @@ function partsWithStatus() {
       onPO,
       isKit: isKitVal,
       ...status,
+      // MUTED-supplier override: stashes _rawStatus so supplier-facing
+      // surfaces (Suppliers page row + drawer) can still show the true
+      // live-demand status alongside the muted-in-alerts behavior.
+      // "This part IS at risk; we're intentionally silencing alerts —
+      // but on the supplier drilldown you should still see it as such."
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
-      ...(preLaunch ? { _preLaunch: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
+      // PRE-LAUNCH override: does NOT stash _rawStatus. Rationale — the
+      // raw live-demand status (from onHand / dailyUse math) is a
+      // hallucination for a part that isn't in live demand yet. Exposing
+      // it on any surface produces the exact contradiction we're
+      // eliminating: Suppliers drawer's pill was reading _rawStatus and
+      // showing WARN for a part whose detail view correctly reads OK.
+      // With _rawStatus unset here, every surface consulting
+      // `p._rawStatus || p.status` (Suppliers row aggregation + drawer
+      // pill) short-circuits to p.status ("ok"), agreeing with the
+      // detail view. Real transition-planning risk (successor supply
+      // won't cover the transition) is captured by the Model Year page's
+      // own status ladder — a completely different computation — so we
+      // aren't suppressing genuine risk, only the false live-demand
+      // signal that shouldn't apply pre-launch.
+      ...(preLaunch ? { _preLaunch: true, status: "ok", urgency: 9999 } : {}),
       _suggestedQty: suggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
