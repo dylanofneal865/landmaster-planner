@@ -342,12 +342,22 @@ function openDraftOrderDrawer() {
 // Render one sub-row inside a cap-and-split. Read-only qty display, indented
 // PN cell with the release target or "new order" tag, dim numeric styling to
 // visually subordinate it to the primary row above. No remove button.
+//
+// Row kind is derived from blanketPoNum, NOT from a `kind` field on the line
+// — draftOrderTotals's grp.lines carries blanketPoNum per slice (null for the
+// balance slice, PO# for release slices) and that's the single source of
+// truth. Deriving here avoids a plumbing bug where a missing `kind` field
+// silently falls back to the "new order" label on release rows (which is
+// what shipped in the previous cut and mislabelled the 150-release row as
+// "new order"). Same signal the PDF uses at line 672, so drawer + PDF now
+// tell exactly the same story.
 function _draftRenderSubLine(part, line, unit, noCost) {
-  const { qty, blanketPoNum, blanketOpenQty, kind } = line;
+  const { qty, blanketPoNum, blanketOpenQty } = line;
   const lineTotal = qty * unit;
-  const tagHtml = kind === "release"
-    ? `<span class="mono">↳ ${fmtNum(qty)} released against ${esc(blanketPoNum)}</span>${qty >= (blanketOpenQty || 0) ? ' <span class="dim">(blanket fully consumed)</span>' : ` <span class="dim">(${fmtNum((blanketOpenQty || 0) - qty)} left after)</span>`}`
-    : `<span class="mono">↳ ${fmtNum(qty)} as new order</span> <span class="dim">(balance beyond blanket capacity)</span>`;
+  const isRelease = !!blanketPoNum;
+  const tagHtml = isRelease
+    ? `<span class="mono">↳ ${fmtNum(qty)} released against ${esc(blanketPoNum)}</span>${qty >= (blanketOpenQty || 0) ? ' <span class="dim">(blanket consumed)</span>' : ` <span class="dim">(${fmtNum((blanketOpenQty || 0) - qty)} left after)</span>`}`
+    : `<span class="mono">↳ ${fmtNum(qty)} new order</span> <span class="dim">(balance beyond blanket)</span>`;
   return `
     <tr data-draft-pn="${esc(part.pn)}" data-draft-sub data-draft-sub-index="${line._splitIndex}">
       <td style="padding-left:32px;background:var(--bg-1)">
