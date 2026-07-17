@@ -296,20 +296,57 @@ function computeCoverageGap(part, lines) {
           }
           // Fall through — overdueRisk stays null.
         } else {
-          // First recovery in the ignore-overdue world (may be -1 if the
-          // part never recovers without the late PO). Shortfall is measured
-          // over the exposed span so it's meaningful whether or not
-          // recovery happens.
-          let odRecoverIdx = -1;
-          for (let i = odZeroIdx + 1; i < odSeries.length; i++) {
-            if (odSeries[i].oh > 0) { odRecoverIdx = i; break; }
+          // OVERDUE-ROW SHORTFALL (Option B): count overdue POs as
+          // coverage. The old formula measured max deficit in the
+          // ignore-overdue projection — but that projection excludes
+          // the overdue PO entirely, so when the overdue PO is the
+          // only coverage, the deficit accumulated over the full
+          // 365-day horizon (producing 1012 / 5858 / 364 — the bug).
+          //
+          // The corrected definition per user:
+          //   SHORT = demand_through_want_by
+          //         − (on_hand + ALL open covering POs incl. overdue),
+          //   clamped at 0.
+          //
+          // The overdue PO's timing risk is separately surfaced by the
+          // OVERDUE badge on the row — SHORT itself assumes the PO
+          // lands. If the PO's qty covers the demand, SHORT is 0.
+          //
+          // want-by for an overdue-risk-only row (no normal gapStart)
+          // matches the render's fallback: `effWantBy = g.targetArrivalDate
+          // || TODAY`. Since these rows don't set targetArrivalDate
+          // (that's only computed in the normal-gap branch), want-by
+          // is TODAY here. daysUntilWantBy = 0 → demand = 0. So the
+          // formula reduces to: SHORT = max(0, 0 − (on_hand + all POs))
+          // = 0 for any part where on_hand + coverage > 0.
+          //
+          // For future maintenance: if a future change ever gives
+          // overdue-risk rows a non-TODAY want-by, the loop below
+          // computes demand accumulation correctly (workday-aware).
+          const wantByDate = TODAY;
+          const daysUntilWantBy = Math.max(0, Math.round((wantByDate.getTime() - TODAY.getTime()) / DAY_MS));
+          const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
+          let workdaysToWantBy = 0;
+          for (let i = 1; i <= daysUntilWantBy; i++) {
+            if (typeof isWorkday === "function" && isWorkday(addDays(TODAY, i), wpw)) workdaysToWantBy++;
           }
-          const end = odRecoverIdx === -1 ? odSeries.length : odRecoverIdx;
-          let odShortfall = 0;
-          for (let i = odZeroIdx; i < end; i++) {
-            const deficit = -odSeries[i].oh;
-            if (deficit > odShortfall) odShortfall = deficit;
+          const daily = Number(part.daily) || 0;
+          const demandThroughWantBy = workdaysToWantBy * daily;
+
+          // Coverage = on-hand + ALL open PO qty on this part, overdue
+          // included. Walks DB.pos with the same isLineOpen gate the
+          // rest of the app uses so a leaked Completed PO can't inflate
+          // coverage.
+          const onHand = Number(part.onHand) || 0;
+          let allPOQty = 0;
+          for (const po of (DB.pos || [])) {
+            for (const ln of (po.lines || [])) {
+              if (ln.pn !== part.pn) continue;
+              if (!isLineOpen(po, ln)) continue;
+              allPOQty += Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+            }
           }
+          const odShortfall = Math.max(0, demandThroughWantBy - (onHand + allPOQty));
           // daysPastDue = worst overdue line across the set. expected can
           // be a YYYY-MM-DD string (local parse) or a full timestamp
           // (UTC parse) — parseDateLocal handles both consistently.
