@@ -220,6 +220,71 @@ function findOpenBlanketForPart(pn) {
   return best;
 }
 
+// ALL open blanket lines for `pn`, sorted by release-priority:
+//   1. earliest-expiring first (use the blanket about to expire before one
+//      with runway — standard procurement priority)
+//   2. blankets with no expiration date sort LAST (undated → treat as latest)
+//   3. tiebreak by largest open (release from the blanket with the most
+//      capacity when expirations tie, so we clear it fastest)
+// Returns an empty array if the part has no open blankets — draft cap-and-
+// split calls this and treats [] as "no blanket, normal order."
+//
+// Multi-blanket support: cap-and-split iterates this list in order, greedily
+// consuming each blanket's open qty until the requested total is filled or
+// the list is exhausted (any remainder goes as a normal order line).
+function findOpenBlanketsForPart(pn) {
+  if (!pn) return [];
+  const target = String(pn).trim();
+  const out = [];
+  for (const po of (DB.pos || [])) {
+    if (!isActivePO(po)) continue;
+    for (const ln of (po.lines || [])) {
+      if (String(ln.pn || "").trim() !== target) continue;
+      if (String(ln.type || "").trim().toLowerCase() !== "blanket") continue;
+      const open = Math.max(0, Number(ln.blanketOpenQty || 0));
+      if (open <= 0) continue;
+      out.push({ po, line: ln, open, blanketExpires: ln.blanketExpires || null });
+    }
+  }
+  out.sort((a, b) => {
+    const aE = a.blanketExpires, bE = b.blanketExpires;
+    if (aE && bE) {
+      if (aE !== bE) return aE < bE ? -1 : 1;
+    } else if (aE && !bE) return -1;
+    else if (!aE && bE) return 1;
+    // same expiration (or both undated) — larger open wins
+    return b.open - a.open;
+  });
+  return out;
+}
+
+// Find an EXHAUSTED blanket line for `pn` — a blanket-type line that matches
+// the part but whose remaining open qty has burned down to zero. Used by the
+// draft-order path to note "POW0001289 fully consumed — ordering normally"
+// so the user can see we DIDN'T just miss the blanket linkage. Returns null
+// when no blanket exists for this part at all (i.e. an ordinary non-blanket
+// part). Prefers the most-recently-expired blanket when several exist.
+function findExhaustedBlanketForPart(pn) {
+  if (!pn) return null;
+  const target = String(pn).trim();
+  let best = null;
+  for (const po of (DB.pos || [])) {
+    if (!isActivePO(po)) continue;
+    for (const ln of (po.lines || [])) {
+      if (String(ln.pn || "").trim() !== target) continue;
+      if (String(ln.type || "").trim().toLowerCase() !== "blanket") continue;
+      const open = Math.max(0, Number(ln.blanketOpenQty || 0));
+      if (open > 0) continue; // caller wants ONLY exhausted lines
+      if (!best) { best = { po, line: ln, open }; continue; }
+      // Prefer the LATER expiration among exhausted blankets — the one
+      // most recently "used up" is the most relevant note.
+      const aE = best.line.blanketExpires, bE = ln.blanketExpires;
+      if (aE && bE && bE > aE) best = { po, line: ln, open };
+    }
+  }
+  return best;
+}
+
 function posLineStatusCellHTML(ln) {
   const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
   return `<span class="pill ${lineStatusClass(ln.status)}">${esc(ln.status)}</span>${remaining > 0 && ln.status !== "received" && ln.status !== "cancelled" ? `<div class="tiny dim mono" style="margin-top:2px">${fmtNum(remaining)} open</div>` : ""}`;

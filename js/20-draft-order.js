@@ -27,25 +27,124 @@ function draftOrderHas(pn) {
   return DRAFT_ORDER.some(d => d.pn === pn);
 }
 
+// Compute the cap-and-split for `pn` at total `qty`. Returns:
+//   { releases: [{ blanketPoNum, releaseQty, blanketOpenQty }], normalQty,
+//     exhaustedBlanketPoNum }
+// - releases: ordered list, each capped at that blanket's blanketOpenQty
+//   (never over-releasing based on the last-synced remaining). Iterates
+//   findOpenBlanketsForPart which orders earliest-expiring first, so the
+//   soonest-expiring blanket is consumed first.
+// - normalQty: whatever's left after all open blankets are exhausted; goes
+//   as a regular (blanket-less) order line. May be 0.
+// - exhaustedBlanketPoNum: if the part has NO open blanket but HAS a blanket
+//   that's fully consumed (open=0), we surface its PO # so the drawer can
+//   say "POW0001289 fully consumed — ordering normally" instead of silently
+//   showing a normal order.
+//
+// Never releases more than blanketOpenQty per blanket — that's the
+// staleness safety per the cap-and-split spec: the synced open number is
+// an authoritative CAP even if it may be a bit stale.
+function _computeBlanketSplit(pn, qty) {
+  const total = Math.max(0, Number(qty) || 0);
+  if (total <= 0) {
+    return { releases: [], normalQty: 0, exhaustedBlanketPoNum: null };
+  }
+  const blankets = (typeof findOpenBlanketsForPart === "function")
+    ? findOpenBlanketsForPart(pn) : [];
+  const releases = [];
+  let remaining = total;
+  for (const b of blankets) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, b.open);
+    if (take > 0) {
+      releases.push({
+        blanketPoNum: b.po.num,
+        releaseQty: take,
+        blanketOpenQty: b.open,
+      });
+      remaining -= take;
+    }
+  }
+  let exhaustedBlanketPoNum = null;
+  if (releases.length === 0 && typeof findExhaustedBlanketForPart === "function") {
+    const ex = findExhaustedBlanketForPart(pn);
+    if (ex && ex.po && ex.po.num) exhaustedBlanketPoNum = ex.po.num;
+  }
+  return { releases, normalQty: remaining, exhaustedBlanketPoNum };
+}
+
+// Normalize a DRAFT_ORDER item to its display lines. Handles the two shapes
+// that can appear on disk:
+//   NEW (post-cap-and-split): item._releases is an array; item._normalQty is
+//                              the balance qty. Emits one line per release +
+//                              one for normal (when > 0).
+//   LEGACY (pre-cap-and-split): item has {blanketPoNum, blanketOpenQty} but
+//                                no _releases. Treated as a single line —
+//                                release-of-full-qty if blanketPoNum set,
+//                                else normal-of-full-qty. This preserves
+//                                already-persisted drafts without migration.
+// Every returned line has: { blanketPoNum, qty, blanketOpenQty, kind }
+// where kind is "release" or "normal".
+function _draftItemLines(item) {
+  if (item && Array.isArray(item._releases)) {
+    const out = item._releases.map(r => ({
+      blanketPoNum: r.blanketPoNum,
+      qty: Number(r.releaseQty || 0),
+      blanketOpenQty: Number(r.blanketOpenQty || 0),
+      kind: "release",
+    }));
+    const normal = Number(item._normalQty || 0);
+    if (normal > 0) {
+      out.push({ blanketPoNum: null, qty: normal, blanketOpenQty: 0, kind: "normal" });
+    }
+    // Handle edge case where total is 0 (item stub): emit a single zero-line
+    // so downstream renderers don't skip the row entirely.
+    if (out.length === 0) {
+      out.push({ blanketPoNum: null, qty: 0, blanketOpenQty: 0, kind: "normal" });
+    }
+    return out;
+  }
+  // Legacy shape.
+  const q = Number((item && item.qty) || 0);
+  const bpn = (item && item.blanketPoNum) || null;
+  return [{
+    blanketPoNum: bpn,
+    qty: q,
+    blanketOpenQty: Number((item && item.blanketOpenQty) || 0),
+    kind: bpn ? "release" : "normal",
+  }];
+}
+
 function draftOrderAdd(pn, qty) {
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
-  // Snapshot the source blanket (if any) at add-time so the draft line, drawer,
-  // and PDF all render as a release against that blanket. Held on the item as
-  // { blanketPoNum, blanketOpenQty } — a null blanketPoNum means "normal order".
-  const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(pn) : null;
-  const blanketPoNum = blk ? blk.po.num : null;
-  const blanketOpenQty = blk ? blk.open : 0;
+  const split = _computeBlanketSplit(pn, qty);
+  const first = split.releases[0] || null;
+  // Legacy top-level fields kept in lockstep so any external reader that
+  // still looks at `blanketPoNum` (e.g. queue "in draft" pill logic, older
+  // realtime sync consumers) sees a coherent primary linkage without
+  // needing to know about _releases.
+  const legacyBlanketPoNum = first ? first.blanketPoNum : null;
+  const legacyBlanketOpenQty = first ? first.blanketOpenQty : 0;
   if (existing) {
+    // In-place mutation only — DRAFT_ORDER identity is preserved so realtime
+    // sync's hash / delta path keeps working.
     existing.qty = qty;
-    // Preserve manual clears: only OVERWRITE the linkage when we actually
-    // resolve a blanket now. If the user later un-blankets (blanket exhausted)
-    // and re-adds, they'll get the new snapshot.
-    if (blanketPoNum) {
-      existing.blanketPoNum = blanketPoNum;
-      existing.blanketOpenQty = blanketOpenQty;
-    }
+    existing.blanketPoNum = legacyBlanketPoNum;
+    existing.blanketOpenQty = legacyBlanketOpenQty;
+    existing._releases = split.releases;
+    existing._normalQty = split.normalQty;
+    existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
   } else {
-    DRAFT_ORDER.push({ pn, qty, addedAt: new Date().toISOString(), blanketPoNum, blanketOpenQty });
+    DRAFT_ORDER.push({
+      pn,
+      qty,
+      addedAt: new Date().toISOString(),
+      blanketPoNum: legacyBlanketPoNum,
+      blanketOpenQty: legacyBlanketOpenQty,
+      _releases: split.releases,
+      _normalQty: split.normalQty,
+      _exhaustedBlanketPoNum: split.exhaustedBlanketPoNum,
+    });
   }
   draftOrderSave();
   updateDraftOrderPill();
@@ -71,6 +170,13 @@ function draftOrderTotals() {
   // Pricing source: orderUnitCost(part) — last PO price → stored cost fallback.
   // Parts with no usable purchase price contribute 0 to subtotals/grand total
   // (they render as "—" in the drawer and PDF rather than a misleading $0).
+  //
+  // Cap-and-split emit shape: one PN entry can yield MULTIPLE lines — one per
+  // release blanket + one balance (normal) line if the request exceeds all
+  // open blanket qty. Each emitted line has its own qty and its own
+  // blanketPoNum (null for normal). ItemCount still increments once per PN
+  // (one DRAFT_ORDER entry = one item, regardless of how many split lines
+  // it renders as).
   const groups = {};
   let itemCount = 0;
   let grandTotal = 0;
@@ -81,17 +187,33 @@ function draftOrderTotals() {
     if (!groups[supplier]) groups[supplier] = { lines: [], subtotal: 0 };
     const noCost = hasNoOrderCost(part);
     const unit = noCost ? 0 : orderUnitCost(part);
-    const lineTotal = (item.qty || 0) * unit;
-    // Pass the blanket linkage through to the drawer/PDF renderers so the line
-    // reads as a release, not a fresh order. Null blanketPoNum = normal.
-    groups[supplier].lines.push({
-      part, qty: item.qty, unit, lineTotal, noCost,
-      blanketPoNum: item.blanketPoNum || null,
-      blanketOpenQty: item.blanketOpenQty || 0,
-    });
-    if (!noCost) {
-      groups[supplier].subtotal += lineTotal;
-      grandTotal += lineTotal;
+    const totalQty = Number(item.qty || 0);
+    const totalLineTotal = totalQty * unit;
+    const parts = _draftItemLines(item);
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      const lineTotal = p.qty * unit;
+      groups[supplier].lines.push({
+        part, qty: p.qty, unit, lineTotal, noCost,
+        blanketPoNum: p.blanketPoNum,
+        blanketOpenQty: p.blanketOpenQty,
+        // Split-awareness for the drawer: the drawer collapses a multi-line
+        // split into one editable primary row + read-only sub-rows so the
+        // math is transparent without duplicating the qty input. The PDF
+        // path iterates every line independently — each split line becomes
+        // its own physical PDF row.
+        _splitIndex: i,
+        _splitCount: parts.length,
+        _splitTotalQty: totalQty,
+        _splitTotalLineTotal: totalLineTotal,
+        _splitIsFirst: i === 0,
+        _splitIsLast: i === parts.length - 1,
+        _exhaustedBlanketPoNum: (i === 0 && item._exhaustedBlanketPoNum) || null,
+      });
+      if (!noCost) {
+        groups[supplier].subtotal += lineTotal;
+        grandTotal += lineTotal;
+      }
     }
     itemCount++;
   }
@@ -154,21 +276,54 @@ function openDraftOrderDrawer() {
               <th></th>
             </tr></thead>
             <tbody>
-              ${grp.lines.map(({ part, qty, unit, lineTotal, noCost, blanketPoNum }) => `
-                <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}">
-                  <td>
-                    <div class="pn">${esc(part.pn)}</div>
-                    <div class="dim tiny">${esc(part.desc || '—')}</div>
-                    ${blanketPoNum ? `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">↳ Release against ${esc(blanketPoNum)}</div>` : ''}
-                  </td>
-                  <td class="right" style="width:90px">
-                    <input class="input num" type="number" min="0" value="${qty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
-                  </td>
-                  <td class="right num">${noCost ? '—' : fmtMoneyDec(unit)}</td>
-                  <td class="right num bold" data-draft-line-total>${noCost ? '—' : fmtMoney(lineTotal)}</td>
-                  <td><button class="btn sm ghost" onclick="draftOrderRemoveLine('${esc(part.pn)}')" title="Remove">×</button></td>
-                </tr>
-              `).join("")}
+              ${grp.lines.map(line => {
+                const { part, qty, unit, lineTotal, noCost, blanketPoNum, blanketOpenQty } = line;
+                const isSplit = line._splitCount > 1;
+                // PRIMARY row — one per PN entry. Rendered on the FIRST split
+                // slice; carries the editable TOTAL qty input and the total
+                // line total. Sub-rows below reference this by data-draft-pn.
+                if (line._splitIsFirst) {
+                  const totalQty = line._splitTotalQty;
+                  const totalLineTotal = line._splitTotalLineTotal;
+                  // Header note under the PN — three shapes:
+                  //   split (2+ lines):    "319 needed · split against blanket + new order"
+                  //   single release:      "↳ Release against POx (Y left after)"
+                  //   normal + exhausted:  "POy fully consumed — ordering normally"
+                  //   normal:              (none)
+                  let releaseNote = "";
+                  if (isSplit) {
+                    releaseNote = `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">${fmtNum(totalQty)} needed · cap-and-split below</div>`;
+                  } else if (blanketPoNum) {
+                    const leftAfter = Math.max(0, (blanketOpenQty || 0) - qty);
+                    const leftTxt = blanketOpenQty > 0
+                      ? (qty >= blanketOpenQty ? " (blanket fully consumed)" : ` (${fmtNum(leftAfter)} left after)`)
+                      : "";
+                    releaseNote = `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">↳ Release against ${esc(blanketPoNum)}${leftTxt}</div>`;
+                  } else if (line._exhaustedBlanketPoNum) {
+                    releaseNote = `<div class="dim tiny" style="margin-top:2px" title="This part has a blanket PO but its authorized qty is fully consumed — this order is being placed normally.">${esc(line._exhaustedBlanketPoNum)} fully consumed — ordering normally</div>`;
+                  }
+                  return `
+                    <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}" data-draft-primary>
+                      <td>
+                        <div class="pn">${esc(part.pn)}</div>
+                        <div class="dim tiny">${esc(part.desc || '—')}</div>
+                        ${releaseNote}
+                      </td>
+                      <td class="right" style="width:90px">
+                        <input class="input num" type="number" min="0" value="${totalQty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
+                      </td>
+                      <td class="right num">${noCost ? '—' : fmtMoneyDec(unit)}</td>
+                      <td class="right num bold" data-draft-line-total>${noCost ? '—' : fmtMoney(totalLineTotal)}</td>
+                      <td><button class="btn sm ghost" onclick="draftOrderRemoveLine('${esc(part.pn)}')" title="Remove">×</button></td>
+                    </tr>
+                    ${isSplit ? _draftRenderSubLine(part, line, unit, noCost) : ""}
+                  `;
+                }
+                // SUB row — subsequent split slices (release-2/3 or the balance
+                // normal line). Non-editable, indented, no remove button. The
+                // primary row above owns editing/removal for the whole entry.
+                return _draftRenderSubLine(part, line, unit, noCost);
+              }).join("")}
             </tbody>
           </table></div>
         `;
@@ -184,22 +339,88 @@ function openDraftOrderDrawer() {
   openDrawer(html, { wide: true });
 }
 
+// Render one sub-row inside a cap-and-split. Read-only qty display, indented
+// PN cell with the release target or "new order" tag, dim numeric styling to
+// visually subordinate it to the primary row above. No remove button.
+function _draftRenderSubLine(part, line, unit, noCost) {
+  const { qty, blanketPoNum, blanketOpenQty, kind } = line;
+  const lineTotal = qty * unit;
+  const tagHtml = kind === "release"
+    ? `<span class="mono">↳ ${fmtNum(qty)} released against ${esc(blanketPoNum)}</span>${qty >= (blanketOpenQty || 0) ? ' <span class="dim">(blanket fully consumed)</span>' : ` <span class="dim">(${fmtNum((blanketOpenQty || 0) - qty)} left after)</span>`}`
+    : `<span class="mono">↳ ${fmtNum(qty)} as new order</span> <span class="dim">(balance beyond blanket capacity)</span>`;
+  return `
+    <tr data-draft-pn="${esc(part.pn)}" data-draft-sub data-draft-sub-index="${line._splitIndex}">
+      <td style="padding-left:32px;background:var(--bg-1)">
+        <div class="tiny" style="color:var(--t2)">${tagHtml}</div>
+      </td>
+      <td class="right num dim" style="background:var(--bg-1)">${fmtNum(qty)}</td>
+      <td class="right num dim" style="background:var(--bg-1)">${noCost ? '—' : fmtMoneyDec(unit)}</td>
+      <td class="right num dim" style="background:var(--bg-1)">${noCost ? '—' : fmtMoney(lineTotal)}</td>
+      <td style="background:var(--bg-1)"></td>
+    </tr>
+  `;
+}
+
 function draftOrderUpdateQty(pn, value) {
   const qty = Math.max(0, parseFloat(value) || 0);
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
   if (!existing) return;
+  // Snapshot the OLD split shape so we can decide whether an in-place DOM
+  // patch preserves the input's focus or we need a full drawer re-render.
+  const oldSplitCount = Array.isArray(existing._releases)
+    ? existing._releases.length + (Number(existing._normalQty || 0) > 0 ? 1 : 0)
+    : (existing.blanketPoNum ? 1 : 1);
+  const oldExhausted = existing._exhaustedBlanketPoNum || null;
+
+  // Recompute the split at the new total. In-place mutation only.
+  const split = _computeBlanketSplit(pn, qty);
+  const first = split.releases[0] || null;
   existing.qty = qty;
+  existing.blanketPoNum = first ? first.blanketPoNum : null;
+  existing.blanketOpenQty = first ? first.blanketOpenQty : 0;
+  existing._releases = split.releases;
+  existing._normalQty = split.normalQty;
+  existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
   draftOrderSave();
 
-  // Patch DOM in place so the input keeps focus.
+  const newSplitCount = split.releases.length + (split.normalQty > 0 ? 1 : 0) || 1;
+  const newExhausted = split.exhaustedBlanketPoNum || null;
+
+  // Split shape changed → sub-row count differs → re-render the drawer.
+  // Accepts focus loss on this edit, but this only fires when the split
+  // topology actually flips (typing through a boundary), not on every
+  // keystroke.
+  if (newSplitCount !== oldSplitCount || newExhausted !== oldExhausted) {
+    openDraftOrderDrawer();
+    updateDraftOrderPill();
+    return;
+  }
+
+  // Same split shape — patch DOM in place so the input keeps focus.
   const part = DB.parts.find(p => p.pn === pn);
   const noCost = part ? hasNoOrderCost(part) : true;
   const unit = (part && !noCost) ? orderUnitCost(part) : 0;
-  const lineTotal = qty * unit;
-  const row = $(`tr[data-draft-pn="${pn}"]`);
+  const totalLineTotal = qty * unit;
+  const row = $(`tr[data-draft-pn="${pn}"][data-draft-primary]`);
   if (row) {
     const cell = row.querySelector("[data-draft-line-total]");
-    if (cell) cell.textContent = noCost ? '—' : fmtMoney(lineTotal);
+    if (cell) cell.textContent = noCost ? '—' : fmtMoney(totalLineTotal);
+  }
+  // If there ARE sub rows, refresh their qty/line-total text in place too.
+  // Iterate DOM sub-rows in order and pair them with the freshly-computed
+  // split slices (same order guaranteed by _computeBlanketSplit + _draftItemLines).
+  const subRows = document.querySelectorAll(`tr[data-draft-pn="${pn}"][data-draft-sub]`);
+  if (subRows.length > 0) {
+    const parts = _draftItemLines(existing);
+    subRows.forEach((sr, i) => {
+      const p = parts[i];
+      if (!p) return;
+      const subLineTotal = p.qty * unit;
+      // 2nd cell = qty, 4th cell = line total (0-indexed: 1 and 3).
+      const cells = sr.querySelectorAll("td");
+      if (cells[1]) cells[1].textContent = fmtNum(p.qty);
+      if (cells[3]) cells[3].textContent = noCost ? '—' : fmtMoney(subLineTotal);
+    });
   }
   const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
   const supplier = row?.dataset.draftSupplier;
