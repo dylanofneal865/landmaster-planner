@@ -459,10 +459,32 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   // flatlines across weekends and the runout lands on the correct calendar
   // date. Receipts still land on their actual calendar offset (PO arrivals are
   // wall-clock). workdaysPerWeek read via the shared helper.
+  //
+  // CASE-A PRE-LAUNCH: if the part has a transitionStartDate in the FUTURE,
+  // the projection HOLDS FLAT at onHand until that date — nothing consumes
+  // the part before it phases in. On/after transitionStartDate, normal
+  // workday depletion resumes. Guard: only fires when transitionStartDate
+  // is set, parses, AND is strictly in the future; otherwise startMs stays
+  // 0 and every existing (non-pre-launch) call path is byte-identical.
+  // NOTE ON THE ONHAND INVARIANT: this function mutates a LOCAL `oh`
+  // variable initialized from part.onHand at the top; it NEVER writes back
+  // to part.onHand. dailyUse is projection-only. Grep confirms zero
+  // `part.onHand = ...` in this file.
+  let startMs = 0;
+  if (part && part.transitionStartDate && typeof parseDateLocal === "function") {
+    const s = parseDateLocal(part.transitionStartDate);
+    if (s && s.getTime() > TODAY.getTime()) startMs = s.getTime();
+  }
   const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
     const d = addDays(TODAY, i);
-    if (i > 0 && isWorkday(d, wpw)) oh -= (part.daily || 0);
+    // Skip depletion until we reach transitionStartDate. Receipts still
+    // land on their real calendar offset — a PO scheduled to arrive
+    // before phase-in bumps the flat pre-launch line up on its arrival
+    // day, which is the correct behavior (stock accumulates before
+    // consumption starts).
+    const consuming = !startMs || d.getTime() >= startMs;
+    if (i > 0 && consuming && isWorkday(d, wpw)) oh -= (part.daily || 0);
     oh += receipts[i];
     series.push({ d, oh: oh, recv: receipts[i] });
   }
@@ -485,9 +507,26 @@ function daysUntilStockout(part, lines) {
   // (onHand / dailyUse) = WORKDAYS of cover. Cap at the 365-day projection
   // horizon so slow movers read as Infinity (status "ok"), matching the
   // receipt-aware branch below.
+  //
+  // CASE-A PRE-LAUNCH: if transitionStartDate is in the future, the cover
+  // runs from THERE, not today. The runway is flat at onHand until launch,
+  // then depletes normally. Result = daysUntilStart + (workday cover
+  // converted starting AT the launch date). Guard: only fires when
+  // transitionStartDate parses AND is strictly in the future. Non-pre-
+  // launch parts (start unset / past / bad) fall through to the original
+  // (cover from TODAY) branch — byte-identical to pre-fix.
   if (incoming <= 0) {
     const coverWorkdays = (Number(part.onHand) || 0) / daily;
-    const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
+    let startD = TODAY;
+    let daysUntilStart = 0;
+    if (part && part.transitionStartDate && typeof parseDateLocal === "function") {
+      const s = parseDateLocal(part.transitionStartDate);
+      if (s && s.getTime() > TODAY.getTime()) {
+        startD = s;
+        daysUntilStart = Math.round((s.getTime() - TODAY.getTime()) / DAY_MS);
+      }
+    }
+    const cal = daysUntilStart + workdaysToCalendarDays(coverWorkdays, startD);
     return cal > 365 ? Infinity : cal;
   }
   // Incoming POs exist → use the receipt-timing-aware projection (which now
@@ -996,6 +1035,11 @@ function partsWithStatus() {
     // part is computed relative to its start date on the Model Year page, not
     // here. Evaluated after mute so either condition silences the part.
     const preLaunch = isPreLaunch(p);
+    // Compute the pre-launch order-by ONCE per pass so downstream
+    // consumers (Parts Catalog row "ORDER NOW" pill, drawer banner,
+    // any future dashboard aggregate) all read the same value from
+    // the shared helper. undefined for non-pre-launch parts (0 memory).
+    const preLaunchOB = preLaunch ? preLaunchOrderBy(p) : null;
     return {
       ...p,
       onPO,
@@ -1021,7 +1065,16 @@ function partsWithStatus() {
       // own status ladder — a completely different computation — so we
       // aren't suppressing genuine risk, only the false live-demand
       // signal that shouldn't apply pre-launch.
-      ...(preLaunch ? { _preLaunch: true, status: "ok", urgency: 9999 } : {}),
+      ...(preLaunch ? {
+        _preLaunch: true,
+        status: "ok",
+        urgency: 9999,
+        // Surface the computed order-by so any list-level UI can badge
+        // an "ORDER NOW" indicator without recomputing. Values are
+        // { orderByDate: Date, orderByPassed: boolean } | null.
+        _preLaunchOrderBy: preLaunchOB && preLaunchOB.orderByDate ? preLaunchOB.orderByDate : null,
+        _preLaunchOrderByPassed: !!(preLaunchOB && preLaunchOB.orderByPassed),
+      } : {}),
       _suggestedQty: suggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
@@ -1089,6 +1142,64 @@ function isPreLaunch(part) {
     : null;
   if (!d) return false;
   return d.getTime() > TODAY.getTime();
+}
+
+// PRE-LAUNCH ORDER-BY — deadline by which a replenishment must be placed
+// for a pre-launch part. min() of two constraints, each conditionally
+// applicable:
+//
+//   C1 (need stock BY launch, transitionStartDate − leadTime):
+//       Applicable when EITHER C1 is still in the future OR on-hand at
+//       launch is zero. If on-hand > 0 and C1 has passed, the part
+//       already has SOME stock at launch — C1 is satisfied trivially
+//       and provides no actionable deadline. Skipped.
+//
+//   C2 (need reorder BEFORE stockout, projectedRunout − leadTime):
+//       Always applicable. Projected runout = transitionStartDate +
+//       workdaysToCalendarDays(onHand / dailyUse, transitionStartDate).
+//       Uses the same workday-conversion the rest of the runway math
+//       uses, so C2's date agrees with the runway chart's slope.
+//
+// Returns { orderByDate, orderByPassed } — the EARLIER of the applicable
+// constraints, and a flag when orderByDate is in the past. Returns null
+// for parts that aren't pre-launch or lack daily/lead data.
+//
+// SINGLE SOURCE OF TRUTH: drawer banner + Parts Catalog "ORDER NOW" pill
+// + partsWithStatus's _preLaunchOrderBy field all call this. Any surface
+// showing a pre-launch order-by MUST come here (grep-verifiable).
+function preLaunchOrderBy(part) {
+  if (!part || !isPreLaunch(part)) return null;
+  const startD = (typeof parseDateLocal === "function")
+    ? parseDateLocal(part.transitionStartDate)
+    : null;
+  if (!startD) return null;
+  const leadDays = leadTimeDays(part);
+  const daily = Number(part.daily) || 0;
+  const onHand = Number(part.onHand) || 0;
+  const nowMs = TODAY.getTime();
+
+  // C1: launch − lead. Actionable when future OR when on-hand at launch
+  // is zero (nothing to bridge from — a fresh order must land ON launch).
+  const c1 = addDays(startD, -leadDays);
+  const c1Actionable = c1.getTime() >= nowMs || onHand <= 0;
+
+  // C2: runout − lead. Requires daily > 0 to compute a finite runout.
+  let c2 = null;
+  if (daily > 0 && onHand > 0) {
+    const coverWorkdays = onHand / daily;
+    const coverCalendar = workdaysToCalendarDays(coverWorkdays, startD);
+    const runoutD = addDays(startD, coverCalendar);
+    c2 = addDays(runoutD, -leadDays);
+  }
+
+  const candidates = [];
+  if (c1Actionable) candidates.push(c1);
+  if (c2) candidates.push(c2);
+  if (candidates.length === 0) return null;
+
+  const orderByDate = candidates.reduce((a, b) => a.getTime() < b.getTime() ? a : b);
+  const orderByPassed = orderByDate.getTime() < nowMs;
+  return { orderByDate, orderByPassed };
 }
 
 // Returns the parts that would appear in an order queue before any

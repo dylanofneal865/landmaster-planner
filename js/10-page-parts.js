@@ -250,14 +250,26 @@ function renderPartDetail(part) {
   // Status banner — plain-language summary placed above the chart.
   let runwayBanner;
   if (preLaunch) {
-    // Pre-launch: this superseding part isn't live yet, so the runout math
-    // would read as a false "STOCKED OUT / reorder overdue". Replace it with
-    // the pre-launch state: phases in <start>, order by <start − lead>.
+    // Case-A pre-launch: no consumption until transitionStartDate. The
+    // runway (chart above) now correctly holds flat at onHand until
+    // launch, then depletes — so coverDays reflects the true runout
+    // counted from launch, not from today. The order-by is the shared
+    // helper's min() of the two constraints (see preLaunchOrderBy in
+    // js/03-calc.js): "have stock by launch" and "reorder before
+    // stockout." order-by-passed is surfaced when the deadline is in
+    // the past — the queue-badge OK doesn't blind us to a missed order
+    // window.
     const startD = parseDateLocal(part.transitionStartDate);
-    const orderByD = startD ? addDays(startD, -leadDays) : null;
+    const ob = (typeof preLaunchOrderBy === "function") ? preLaunchOrderBy(part) : null;
+    const orderByD = ob && ob.orderByDate ? ob.orderByDate : null;
     const orderByTxt = !orderByD ? "—"
-      : (orderByD.getTime() <= TODAY.getTime() ? "now" : fmtDate(orderByD));
-    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--accent);font-weight:600">Pre-launch — phases in ${fmtDate(startD)} · order by ${orderByTxt} (start − ${leadDays}d lead). Not counted as live demand yet.</div>`;
+      : (ob.orderByPassed ? `<span style="color:var(--crit);font-weight:700">now — ORDER-BY PASSED (${fmtDate(orderByD)})</span>` : fmtDate(orderByD));
+    // Projected runout from the fixed coverDays. addDays takes a Date;
+    // TODAY is that Date, coverDays is calendar days from today.
+    const runoutTxt = Number.isFinite(coverDays)
+      ? `Projected runout ${fmtDate(addDays(TODAY, coverDays))} · `
+      : "";
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--accent);font-weight:600">Pre-launch — phases in ${fmtDate(startD)}; no consumption yet. ${runoutTxt}order by ${orderByTxt}. Not counted in live-demand queues.</div>`;
   } else if (!Number.isFinite(coverDays)) {
     runwayBanner = `<div class="dim tiny" style="margin-bottom:8px">No projected stockout at current demand.</div>`;
   } else if (leadDays > coverDays) {
@@ -1129,7 +1141,7 @@ registerRoute("parts", () => {
                 </td></tr>
                 ${parts.slice(0, 500).map(p => `
                   <tr class="clickable" data-parts-row data-pt-pn="${esc(partsHeaderValue(p, "pn"))}" data-pt-desc="${esc(partsHeaderValue(p, "desc"))}" data-pt-supplier="${esc(partsHeaderValue(p, "supplier"))}" data-pt-cls="${esc(partsHeaderValue(p, "cls"))}" data-pt-status="${esc(partsHeaderValue(p, "status"))}" onclick="openPartDetail('${esc(p.pn)}')">
-                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}</td>
+                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${p._preLaunchOrderByPassed ? ' <span class="pill crit" style="font-size:9px;padding:1px 6px;margin-left:4px;letter-spacing:0.04em" title="Pre-launch part — order-by deadline has passed">ORDER NOW</span>' : ''}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
                     <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>
