@@ -959,22 +959,78 @@ function getChainInfo(pn) {
   if (!pn) return null;
   const target = String(pn).trim();
   if (!target) return null;
-  const part = (DB.parts || []).find(p => p && p.pn === target);
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const part = partsByPn.get(target);
   if (!part) return null;
 
-  // Traversal — reuse the existing lineage walker (predecessors
-  // backward via supersededBy pointing at me, successors forward).
-  const lineage = (typeof supersessionLineage === "function")
-    ? supersessionLineage(part.pn)
-    : [];
-  if (!lineage || lineage.length < 2) return null;
+  // BIDIRECTIONAL TRAVERSAL — self-contained here rather than delegating to
+  // supersessionLineage(). Chain detection must resolve the SAME complete
+  // chain from ANY member (anchor, middle, final). Both walks are guarded
+  // by a shared visited-set to prevent infinite loops on data cycles
+  // (A→B→A) or self-loops (A.supersededBy === A).
+  //
+  // Assembly: [oldest predecessor, …, target, …, newest successor].
+  // For 19961→JP00051, getChainInfo("19961") and getChainInfo("JP00051")
+  // both produce ["19961","JP00051"], so anchor + chainRate + chainOnHand
+  // + status are identical no matter which member you query.
+  const visited = new Set([target]);
 
-  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  // Backward: follow (x.supersededBy === current) chain to the oldest.
+  // Compares as strings, tolerating numeric or padded stored values.
+  const back = [];
+  {
+    let cur = target;
+    while (true) {
+      const pred = (DB.parts || []).find(x =>
+        x && x.supersededBy && String(x.supersededBy).trim() === cur
+      );
+      if (!pred) break;
+      if (visited.has(pred.pn)) {
+        console.warn(`[chain] backward cycle at ${pred.pn} from ${target} — stopping walk`);
+        break;
+      }
+      visited.add(pred.pn);
+      back.unshift(pred.pn);
+      cur = pred.pn;
+    }
+  }
+
+  // Forward: follow current.supersededBy → next PN until it dead-ends.
+  const fwd = [];
+  {
+    let cur = target;
+    while (true) {
+      const curPart = partsByPn.get(cur);
+      const nextPn = (curPart && curPart.supersededBy)
+        ? String(curPart.supersededBy).trim() : "";
+      if (!nextPn) break;
+      if (visited.has(nextPn)) {
+        console.warn(`[chain] forward cycle at ${nextPn} from ${target} — stopping walk`);
+        break;
+      }
+      if (!partsByPn.has(nextPn)) break;
+      visited.add(nextPn);
+      fwd.push(nextPn);
+      cur = nextPn;
+    }
+  }
+
+  const lineage = [...back, target, ...fwd];
+  if (lineage.length < 2) return null;
+
   const members = lineage.map(mpn => partsByPn.get(mpn)).filter(Boolean);
   if (members.length < 2) return null;
 
-  // Active-transition gate — matches chainSequentialView's rule.
-  const transitioning = members.some(m => m.phasingOut === true);
+  // Active-transition gate — matches chainSequentialView's rule (truthy,
+  // not strict `=== true`). Handles phasingOut stored as boolean true,
+  // string "true", number 1, or any other truthy shape from legacy data.
+  // The strict === true was the deployed-Phase-B failure mode: a chain
+  // whose phasingOut was truthy-but-not-literal-boolean silently failed
+  // this gate → getChainInfo returned null → status/coverage overrides
+  // no-oped → 19961 stayed falsely CRITICAL. chainSequentialView (the
+  // older API) used a truthy check so the drawer CHART worked while the
+  // status PILL didn't — masking the real cause.
+  const transitioning = members.some(m => !!m.phasingOut);
   if (!transitioning) return null;
 
   const anchor = members[0];
@@ -1163,10 +1219,96 @@ function _printChainInfo(pn) {
     `  preLaunch:       ${info.preLaunch ? `successor ${info.preLaunch.successorPn} phases in ${iso(info.preLaunch.transitionStartDate)}` : "no"}`,
   );
   console.log(lines.join("\n"));
+
+  // Symmetry self-check: every chain member must resolve the SAME chain.
+  // Prints one line per member with its key fields; mismatches jump out.
+  if (Array.isArray(info.chainParts) && info.chainParts.length > 1) {
+    console.log(`[chain] symmetry check — every member should resolve identical values:`);
+    for (const mpn of info.chainParts) {
+      const mi = getChainInfo(mpn);
+      if (!mi) {
+        console.log(`  ${mpn}: NULL  ← BROKEN symmetry`);
+        continue;
+      }
+      console.log(`  ${mpn}: anchor=${mi.anchorPn} rate=${mi.chainRate} onHand=${mi.chainOnHand} onPO=${mi.chainOnPO} status=${mi.chainStatus} short=${mi.chainShort} parts=[${mi.chainParts.join("→")}]`);
+    }
+  }
   return info;
 }
 window.getChainInfo = getChainInfo;
 window._printChainInfo = _printChainInfo;
+
+// Console-callable one-shot verifier for the chain-direction fix. Prints
+// the 19961/JP00051 symmetry check + a non-chain control. Safe to call at
+// any time; safe to leave in place — read-only diagnostic.
+window.verifyChainFix = function verifyChainFix() {
+  console.log("=== CHAIN-DIRECTION FIX VERIFICATION ===");
+  const nParts = (DB && DB.parts) ? DB.parts.length : 0;
+  console.log(`DB.parts loaded: ${nParts}`);
+  if (nParts === 0) {
+    console.warn("DB.parts is empty — wait for hydration and re-run verifyChainFix()");
+    return;
+  }
+  const a = getChainInfo("19961");
+  const b = getChainInfo("JP00051");
+  console.log("--- getChainInfo('19961') ---");
+  console.log(a);
+  console.log("--- getChainInfo('JP00051') ---");
+  console.log(b);
+  const same =
+    !!a && !!b &&
+    a.anchorPn === b.anchorPn &&
+    a.finalPn === b.finalPn &&
+    a.chainRate === b.chainRate &&
+    a.chainOnHand === b.chainOnHand &&
+    a.chainOnPO === b.chainOnPO &&
+    a.chainStatus === b.chainStatus &&
+    a.chainShort === b.chainShort &&
+    JSON.stringify(a.chainParts) === JSON.stringify(b.chainParts);
+  console.log(`SYMMETRY: ${same ? "✅ IDENTICAL" : "❌ MISMATCH"}`);
+  if (a) console.log(`  19961     → anchor=${a.anchorPn} rate=${a.chainRate} onHand=${a.chainOnHand} onPO=${a.chainOnPO} status=${a.chainStatus} short=${a.chainShort} parts=[${a.chainParts.join("→")}]`);
+  else    console.log(`  19961     → NULL`);
+  if (b) console.log(`  JP00051   → anchor=${b.anchorPn} rate=${b.chainRate} onHand=${b.chainOnHand} onPO=${b.chainOnPO} status=${b.chainStatus} short=${b.chainShort} parts=[${b.chainParts.join("→")}]`);
+  else    console.log(`  JP00051   → NULL`);
+  // Non-chain control: pick the first part that's neither in the chain
+  // above nor has supersededBy / phasingOut set. Confirms null-fallback
+  // is preserved for normal parts.
+  const control = (DB.parts || []).find(p =>
+    p && p.pn !== "19961" && p.pn !== "JP00051" &&
+    !p.supersededBy && !p.phasingOut
+  );
+  if (control) {
+    const ci = getChainInfo(control.pn);
+    console.log(`NON-CHAIN CONTROL: getChainInfo('${control.pn}') → ${ci === null ? "✅ null (per-part logic applies)" : "❌ unexpected non-null: " + JSON.stringify(ci)}`);
+  } else {
+    console.log("NON-CHAIN CONTROL: no eligible non-chain part found in DB");
+  }
+  console.log("========================================");
+};
+
+// Auto-run once after DB hydrates. Watches for DB.parts to have entries
+// (Supabase fetch is async) — polls every 500ms up to 20s, then fires
+// verifyChainFix() exactly once. Boot-time convenience so you can reload
+// and read the console without typing anything. If DB never hydrates in
+// 20s (offline, no data), we skip silently.
+(function autoVerifyOnBoot() {
+  if (typeof DB === "undefined") return; // schema not ready — bail quietly
+  let fired = false;
+  let ticks = 0;
+  const tick = () => {
+    if (fired) return;
+    ticks++;
+    const ready = DB && Array.isArray(DB.parts) && DB.parts.length > 0;
+    if (ready) {
+      fired = true;
+      try { window.verifyChainFix(); } catch (e) { console.warn("verifyChainFix failed:", e); }
+      return;
+    }
+    if (ticks > 40) return; // ~20s of 500ms polls — give up
+    setTimeout(tick, 500);
+  };
+  setTimeout(tick, 500);
+})();
 
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
