@@ -1302,7 +1302,14 @@ function getSupplierCycle(supplierName) {
   const anchor = (typeof parseDateLocal === "function") ? parseDateLocal(cfg.anchor) : new Date(cfg.anchor);
   const interval = Math.round(Number(cfg.intervalDays));
   if (!anchor || isNaN(anchor.getTime()) || !Number.isFinite(interval) || interval <= 0) return null;
-  return { anchor, intervalDays: interval, displayName: cfg.displayName || null };
+  // leadInDays: how many days BEFORE the next cycle date the queue-side pill
+  // + filter control should surface. Outside the lead-in window, the cycle
+  // is invisible to the buyer (the queue reads exactly as it does today).
+  // Optional — a supplier with no leadInDays configured yields leadInDays=0,
+  // meaning "never surface." Callers that don't consult leadInDays keep
+  // working; only cycleLeadIn / the future wiring branches on it.
+  const leadIn = Math.max(0, Math.round(Number(cfg.leadInDays) || 0));
+  return { anchor, intervalDays: interval, leadInDays: leadIn, displayName: cfg.displayName || null };
 }
 
 // Next n cycle dates ≥ fromDate. Cycle dates are anchor + k*intervalDays
@@ -1328,6 +1335,96 @@ function nextCycleDates(cycle, fromDate, n) {
   const out = [];
   for (let i = 0; i < count; i++) out.push(new Date(anchorMs + (k + i) * intervalMs));
   return out;
+}
+
+// Lead-in window helper. Returns
+//   {
+//     nextCycleDate,   // first cycle date ≥ today (null when cycle invalid)
+//     daysUntil,       // whole calendar days from today to nextCycleDate
+//                      // (0 when today IS the cycle date; negative should
+//                      // never occur since nextCycleDate is ≥ today)
+//     inLeadIn,        // true when 0 ≤ daysUntil ≤ cycle.leadInDays — the
+//                      // window where the queue-side pill + filter surface.
+//                      // With leadInDays=0 or missing, inLeadIn only fires
+//                      // on the exact cycle date; before that day the queue
+//                      // reads exactly as it does today.
+//   }
+// Wiring rule (Phase B): queue pill + filter render iff inLeadIn === true.
+// Draft/PDF cycle header renders whenever the draft contains cycled parts,
+// regardless of the lead-in window — the buyer already committed to acting.
+// For Sensourcing (leadInDays=11, next cycle 2026-07-24): inLeadIn goes
+// true on 2026-07-13, stays true through 2026-07-24, then flips to false
+// on 2026-07-25 (when nextCycleDate advances to 2026-09-04 and daysUntil
+// jumps to 42, out of window). Same shape every 42-day cycle after that.
+function cycleLeadIn(cycle, today) {
+  if (!cycle) return { nextCycleDate: null, daysUntil: null, inLeadIn: false };
+  const anchorDay = today ? new Date(today.getTime()) : new Date(TODAY.getTime());
+  anchorDay.setHours(0, 0, 0, 0);
+  const upcoming = nextCycleDates(cycle, anchorDay, 1);
+  const nextCycleDate = upcoming[0] || null;
+  if (!nextCycleDate) return { nextCycleDate: null, daysUntil: null, inLeadIn: false };
+  const daysUntil = Math.max(0, Math.round((nextCycleDate.getTime() - anchorDay.getTime()) / DAY_MS));
+  const leadIn = Number(cycle.leadInDays) || 0;
+  const inLeadIn = daysUntil <= leadIn;
+  return { nextCycleDate, daysUntil, inLeadIn };
+}
+
+// Distinguish BEHIND (order it, accept the gap) from UNRECOVERABLE (a cycle
+// order won't save this part — needs expedite / air freight / supplier call).
+// Returns
+//   {
+//     cycleArrivalDate,   // nextCycleDate + leadTimeDays for the ordered
+//                         // part. Chain successors are the parts that get
+//                         // ordered so leadTimeDays(part) is the correct
+//                         // source (same convention used by the PDF's
+//                         // arrival-vs-runout flag).
+//     runoutDate,         // chain-aware, blanket-blind:
+//                         //   chain member → chainInfo.chainRunoutDate
+//                         //   non-chain    → today + partStatus.daysOfCover
+//                         //   no projected stockout → null
+//     gapDays,            // cycleArrivalDate − runoutDate in whole days.
+//                         // Positive = stocked out this many days BEFORE
+//                         // the cycle order arrives. Null when runoutDate
+//                         // is null (nothing to compare).
+//     unrecoverable,      // gapDays > 0. When true, the buyer needs to
+//                         // act OUTSIDE the cycle (the cycle order is too
+//                         // late even if placed on the next cycle date).
+//   }
+// Blanket qty is not counted as inbound supply in either runout path (the
+// isLineOpen chokepoint at ~line 342 filters blanket lines), so a part
+// with 450 blanket units authorized but no scheduled receipts will still
+// show the real runout — matches the semantic "blanket = capacity to
+// release against, not stock arriving."
+function cycleArrivalGap(part, cycle) {
+  if (!part || !cycle) return null;
+  const today = new Date(TODAY.getTime());
+  today.setHours(0, 0, 0, 0);
+  const upcoming = nextCycleDates(cycle, today, 1);
+  const nextCycleDate = upcoming[0] || null;
+  if (!nextCycleDate) return null;
+  const lt = leadTimeDays(part);
+  const cycleArrivalDate = (typeof addDays === "function")
+    ? addDays(nextCycleDate, lt)
+    : new Date(nextCycleDate.getTime() + lt * DAY_MS);
+  // Runout: chain-aware, blanket-blind.
+  const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(part.pn) : null;
+  let runoutDate = null;
+  if (chainInfo && chainInfo.chainRunoutDate) {
+    runoutDate = chainInfo.chainRunoutDate;
+  } else {
+    const stat = (typeof partStatus === "function") ? partStatus(part) : null;
+    if (stat && stat.daysOfCover !== Infinity && Number.isFinite(stat.daysOfCover)) {
+      runoutDate = (typeof addDays === "function")
+        ? addDays(TODAY, stat.daysOfCover)
+        : new Date(TODAY.getTime() + stat.daysOfCover * DAY_MS);
+    }
+  }
+  if (!runoutDate) {
+    return { cycleArrivalDate, runoutDate: null, gapDays: null, unrecoverable: false };
+  }
+  const gapDays = Math.round((cycleArrivalDate.getTime() - runoutDate.getTime()) / DAY_MS);
+  const unrecoverable = gapDays > 0;
+  return { cycleArrivalDate, runoutDate, gapDays, unrecoverable };
 }
 
 // Snap a natural order-by date to the supplier's cycle. Returns
@@ -1478,14 +1575,17 @@ function _printSupplierCycleAudit(supplierName) {
   const targetKey = supplierKey(target);
   const iso = d => d && d.toISOString ? d.toISOString().slice(0, 10) : (d || "-");
   console.log(`=== SUPPLIER CYCLE AUDIT: ${cycle.displayName || target} ===`);
-  console.log(`  key: "${targetKey}" · anchor: ${iso(cycle.anchor)} · intervalDays: ${cycle.intervalDays}`);
+  console.log(`  key: "${targetKey}" · anchor: ${iso(cycle.anchor)} · intervalDays: ${cycle.intervalDays} · leadInDays: ${cycle.leadInDays}`);
   const upcoming = nextCycleDates(cycle, TODAY, 4);
   console.log(`  next cycle dates from today: ${upcoming.map(iso).join(", ")}`);
+  const li = cycleLeadIn(cycle, TODAY);
+  console.log(`  lead-in window: next=${iso(li.nextCycleDate)} · daysUntil=${li.daysUntil} · inLeadIn=${li.inLeadIn} · pill would ${li.inLeadIn ? "SHOW" : "HIDE"} today`);
   const rows = [];
   for (const p of (DB.parts || [])) {
     if (!p || supplierKey(p.supplier) !== targetKey) continue;
     const natural = naturalOrderByForPart(p);
     const snap = natural ? cycleSnapOrderBy(natural, cycle) : null;
+    const arrival = cycleArrivalGap(p, cycle);
     const currentSq = (typeof suggestedQty === "function") ? suggestedQty(p) : 0;
     const cycledSq = cycleAwareSuggestedQty(p);
     rows.push({
@@ -1499,18 +1599,26 @@ function _printSupplierCycleAudit(supplierName) {
       nextCycleDate: snap && snap.nextCycleDate ? iso(snap.nextCycleDate) : "-",
       mustOrderThisCycle: snap ? snap.mustOrderThisCycle : "-",
       missedWindow: snap ? snap.missedWindow : "-",
+      cycleArrivalDate: arrival && arrival.cycleArrivalDate ? iso(arrival.cycleArrivalDate) : "-",
+      runoutDate: arrival && arrival.runoutDate ? iso(arrival.runoutDate) : "-",
+      gapDays: arrival ? (arrival.gapDays == null ? "-" : arrival.gapDays) : "-",
+      unrecoverable: arrival ? arrival.unrecoverable : "-",
       currentSuggestedQty: currentSq,
       cycleAwareQty: cycledSq,
     });
   }
   rows.sort((a, b) => String(a.pn).localeCompare(String(b.pn)));
   console.table(rows);
-  console.log(`  ${rows.length} parts for supplier key "${targetKey}"`);
+  const mustCount = rows.filter(r => r.mustOrderThisCycle === true).length;
+  const shortCount = rows.filter(r => r.mustOrderThisCycle === true && r.unrecoverable === true).length;
+  console.log(`  ${rows.length} parts for supplier key "${targetKey}" · ${mustCount} on upcoming cycle · ${shortCount} unrecoverable (SHORT)`);
   return rows;
 }
 
 window.getSupplierCycle = getSupplierCycle;
 window.nextCycleDates = nextCycleDates;
+window.cycleLeadIn = cycleLeadIn;
+window.cycleArrivalGap = cycleArrivalGap;
 window.cycleSnapOrderBy = cycleSnapOrderBy;
 window.cycleAwareSuggestedQty = cycleAwareSuggestedQty;
 window.naturalOrderByForPart = naturalOrderByForPart;

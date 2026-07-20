@@ -54,6 +54,7 @@ const DEFAULTS = {
       "sensourcing trading": {
         anchor: "2026-07-24",
         intervalDays: 42,
+        leadInDays: 11,   // pill + filter surface this many days before the next cycle date
         displayName: "Sensourcing Trading Co.",
       },
     },
