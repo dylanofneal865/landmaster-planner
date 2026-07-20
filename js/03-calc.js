@@ -1268,6 +1268,239 @@ function _printChainInfo(pn) {
 window.getChainInfo = getChainInfo;
 window._printChainInfo = _printChainInfo;
 
+/* ============================================================
+   SUPPLIER ORDER-CYCLE MODEL (Phase A — model + verification only)
+
+   Some suppliers only accept orders on a fixed cadence (Sensourcing:
+   anchor 2026-07-24, then every 42 days). This model provides the
+   supporting math so downstream views can snap a natural order-by date
+   back to the last eligible cycle date, compute cycle-aware suggested
+   quantities, and flag missed windows — WITHOUT any view/status/qty
+   changes in this pass. Wiring lands in Phase B.
+
+   Config lives on DB.settings.supplierCycles, keyed by supplierKey()
+   (the normalized form that survives capitalization + legal-suffix
+   drift across feeds). Seeded via DEFAULTS.settings in js/01-config.js
+   so a fresh install and a Supabase-hydrated install both see the same
+   entries; org-shared through the same settings-row path (correct —
+   supplier cadence is a fact about the supplier, not per-user).
+   ============================================================ */
+
+// Read supplier-cycle config for a supplier name. Returns
+//   { anchor: Date, intervalDays: number, displayName: string|null }
+// or null when the supplier has no cycle configured (which is >99% of
+// suppliers today). Parses anchor via parseDateLocal so a "2026-07-24"
+// stored string comes back as a local-midnight Date consistent with
+// every other date in the app.
+function getSupplierCycle(supplierName) {
+  const cycles = (DB && DB.settings && DB.settings.supplierCycles) || null;
+  if (!cycles || typeof cycles !== "object") return null;
+  const key = (typeof supplierKey === "function") ? supplierKey(supplierName) : "";
+  if (!key) return null;
+  const cfg = cycles[key];
+  if (!cfg || !cfg.anchor || !cfg.intervalDays) return null;
+  const anchor = (typeof parseDateLocal === "function") ? parseDateLocal(cfg.anchor) : new Date(cfg.anchor);
+  const interval = Math.round(Number(cfg.intervalDays));
+  if (!anchor || isNaN(anchor.getTime()) || !Number.isFinite(interval) || interval <= 0) return null;
+  return { anchor, intervalDays: interval, displayName: cfg.displayName || null };
+}
+
+// Next n cycle dates ≥ fromDate. Cycle dates are anchor + k*intervalDays
+// for k ≥ 0. When fromDate ≤ anchor, the first returned date is the
+// anchor itself. When fromDate falls exactly on a cycle date, that date
+// counts as "eligible" and is included as the first entry. Handles
+// integer overflow by ceil-then-verify rather than trusting floating-
+// point k.
+function nextCycleDates(cycle, fromDate, n) {
+  if (!cycle || !cycle.anchor || !cycle.intervalDays || !fromDate) return [];
+  const count = Math.max(0, Math.floor(Number(n) || 0));
+  if (count === 0) return [];
+  const anchorMs = cycle.anchor.getTime();
+  const fromMs = fromDate.getTime();
+  const intervalMs = cycle.intervalDays * DAY_MS;
+  let k = 0;
+  if (fromMs > anchorMs) {
+    k = Math.ceil((fromMs - anchorMs) / intervalMs);
+    // Correct for float drift — walk forward until the computed date is
+    // genuinely ≥ fromMs.
+    while ((anchorMs + k * intervalMs) < fromMs) k++;
+  }
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(new Date(anchorMs + (k + i) * intervalMs));
+  return out;
+}
+
+// Snap a natural order-by date to the supplier's cycle. Returns
+//   {
+//     snappedDate,          // last cycle date that's ≤ naturalOrderBy AND ≥ today
+//                           // (the LAST opportunity to still meet the deadline);
+//                           // null when no such date exists.
+//     nextCycleDate,        // first cycle date ≥ today (always populated when
+//                           // cycle is valid).
+//     mustOrderThisCycle,   // true when snappedDate === nextCycleDate — the
+//                           // upcoming cycle is the last chance to still meet
+//                           // the natural deadline.
+//     missedWindow,         // true when naturalOrderBy < nextCycleDate — even
+//                           // the next cycle is too late; every choice is
+//                           // expedite territory.
+//   }
+// Edge cases:
+//   - naturalOrderBy exactly ON a cycle date → that date counts as makeable
+//     (≤ comparison) so it can be the snappedDate.
+//   - naturalOrderBy before the anchor → snappedDate = null (no eligible cycle
+//     yet); missedWindow depends on where anchor falls vs naturalOrderBy.
+//   - naturalOrderBy far in the future → snappedDate is the appropriate
+//     later cycle, not the anchor; mustOrderThisCycle = false (multiple
+//     cycles available, not urgent).
+function cycleSnapOrderBy(naturalOrderByDate, cycle) {
+  if (!cycle || !naturalOrderByDate) return null;
+  const today = new Date(TODAY.getTime());
+  today.setHours(0, 0, 0, 0);
+  const upcoming = nextCycleDates(cycle, today, 1);
+  const nextCycleDate = upcoming[0] || null;
+  const naturalMs = naturalOrderByDate.getTime();
+  const missedWindow = !!nextCycleDate && naturalMs < nextCycleDate.getTime();
+
+  let snappedDate = null;
+  if (nextCycleDate && naturalMs >= nextCycleDate.getTime()) {
+    // Walk forward from nextCycleDate as long as the NEXT hop still lands
+    // on-or-before naturalOrderBy; the last valid cursor is the snap point.
+    const intervalMs = cycle.intervalDays * DAY_MS;
+    let cursor = nextCycleDate.getTime();
+    let last = cursor;
+    while ((cursor + intervalMs) <= naturalMs) {
+      cursor += intervalMs;
+      last = cursor;
+    }
+    snappedDate = new Date(last);
+  }
+  const mustOrderThisCycle = !!snappedDate && !!nextCycleDate
+    && snappedDate.getTime() === nextCycleDate.getTime();
+  return { snappedDate, nextCycleDate, mustOrderThisCycle, missedWindow };
+}
+
+// Cycle-aware suggested qty. When the part's supplier has no cycle
+// configured, this returns exactly what suggestedQty() would return —
+// byte-identical fallback for non-cycled suppliers (>99% of parts).
+//
+// When the supplier IS cycled, we swap the 30-day post-arrival horizon
+// for the cycle's intervalDays: an order placed at cycle C arrives at
+// C + leadTime and must cover demand through C + intervalDays + leadTime
+// (i.e. through the NEXT cycle's arrival). Rest of the composition —
+// chain successor's combined on-hand (via _supersessionDemandBoost),
+// pre-launch flat-hold (implicit in the demand rate), phasing-out
+// short-circuit — carries through unchanged from suggestedQty().
+//
+// Not yet consumed by any view; called only from the verification
+// helper below in Phase A. suggestedQty() is untouched.
+function cycleAwareSuggestedQty(part, onPO) {
+  if (part && part.phasingOut) return 0;
+  const cycle = getSupplierCycle(part && part.supplier);
+  if (!cycle) return (typeof suggestedQty === "function") ? suggestedQty(part, onPO) : 0;
+
+  const boost = (typeof _supersessionDemandBoost === "function") ? _supersessionDemandBoost(part) : null;
+  const lt = leadTimeDays(part);
+  const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const horizon = cycle.intervalDays; // ← the only real difference vs suggestedQty
+  const dailyRate = boost
+    ? Math.max(Number(part.daily) || 0, boost.dailyRate)
+    : (Number(part.daily) || 0);
+  const target = (lt + safety + horizon) * dailyRate;
+  const onPOQty = (typeof onPO === "number")
+    ? onPO
+    : ((typeof openPOQty === "function") ? openPOQty(part.pn) : 0);
+  const have = boost
+    ? boost.combinedOnHand + onPOQty
+    : (Number(part.onHand) || 0) + onPOQty;
+  let qty = Math.max(0, Math.ceil(target - have));
+  if (part.moq && qty > 0) qty = Math.max(qty, Number(part.moq));
+  if (part.packSize && qty > 0) qty = Math.ceil(qty / Number(part.packSize)) * Number(part.packSize);
+  return qty;
+}
+
+// Resolve the "natural" order-by date for a part — the pre-cycle
+// deadline that gets fed into cycleSnapOrderBy. Composition priority
+// (matches Phase B's stated composition rules):
+//   1. Chain member with an actively-transitioning chain → the chain's
+//      chainReorderByDate (already computed by getChainInfo). Chain
+//      status math wins because the whole chain shares one deadline.
+//   2. Pre-launch part (no chain) → preLaunchOrderBy(part).orderByDate,
+//      which is min(by-launch, by-runout) with the C1/C2 semantics we
+//      already ship.
+//   3. Regular part → today + daysOfCover − leadTime − safety, computed
+//      from stat.daysOfCover. Returns null when daysOfCover is Infinity
+//      (no projected stockout, no natural deadline).
+function naturalOrderByForPart(part) {
+  if (!part) return null;
+  const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(part.pn) : null;
+  if (chainInfo && chainInfo.chainReorderByDate) return chainInfo.chainReorderByDate;
+  const preLaunch = (typeof isPreLaunch === "function") && isPreLaunch(part);
+  if (preLaunch && typeof preLaunchOrderBy === "function") {
+    const pl = preLaunchOrderBy(part);
+    if (pl && pl.orderByDate) return pl.orderByDate;
+  }
+  const stat = (typeof partStatus === "function") ? partStatus(part) : null;
+  if (!stat || stat.daysOfCover === Infinity) return null;
+  const lt = leadTimeDays(part);
+  const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const daysToReorderBy = stat.daysOfCover - lt - safety;
+  return (typeof addDays === "function") ? addDays(TODAY, daysToReorderBy) : null;
+}
+
+// Console-callable audit for a cycled supplier. Prints:
+//   - the cycle config + next 4 cycle dates from today
+//   - a per-part table for every part whose supplier resolves to the same
+//     supplierKey: pn / desc / naturalOrderBy / snappedDate / nextCycleDate
+//     / mustOrderThisCycle / missedWindow / currentSuggestedQty / cycleAwareQty
+// Read-only. Not consumed by any view. Gate A verification only.
+function _printSupplierCycleAudit(supplierName) {
+  const target = supplierName || "Sensourcing Trading Co.";
+  const cycle = getSupplierCycle(target);
+  if (!cycle) {
+    console.warn(`[cycle] no cycle config for "${target}" — check settings.supplierCycles`);
+    return null;
+  }
+  const targetKey = supplierKey(target);
+  const iso = d => d && d.toISOString ? d.toISOString().slice(0, 10) : (d || "-");
+  console.log(`=== SUPPLIER CYCLE AUDIT: ${cycle.displayName || target} ===`);
+  console.log(`  key: "${targetKey}" · anchor: ${iso(cycle.anchor)} · intervalDays: ${cycle.intervalDays}`);
+  const upcoming = nextCycleDates(cycle, TODAY, 4);
+  console.log(`  next cycle dates from today: ${upcoming.map(iso).join(", ")}`);
+  const rows = [];
+  for (const p of (DB.parts || [])) {
+    if (!p || supplierKey(p.supplier) !== targetKey) continue;
+    const natural = naturalOrderByForPart(p);
+    const snap = natural ? cycleSnapOrderBy(natural, cycle) : null;
+    const currentSq = (typeof suggestedQty === "function") ? suggestedQty(p) : 0;
+    const cycledSq = cycleAwareSuggestedQty(p);
+    rows.push({
+      pn: p.pn,
+      desc: (p.desc || "").slice(0, 30),
+      supplier: p.supplier,
+      onHand: Number(p.onHand) || 0,
+      daily: Number(p.daily) || 0,
+      naturalOrderBy: natural ? iso(natural) : "(none)",
+      snappedDate: snap && snap.snappedDate ? iso(snap.snappedDate) : "-",
+      nextCycleDate: snap && snap.nextCycleDate ? iso(snap.nextCycleDate) : "-",
+      mustOrderThisCycle: snap ? snap.mustOrderThisCycle : "-",
+      missedWindow: snap ? snap.missedWindow : "-",
+      currentSuggestedQty: currentSq,
+      cycleAwareQty: cycledSq,
+    });
+  }
+  rows.sort((a, b) => String(a.pn).localeCompare(String(b.pn)));
+  console.table(rows);
+  console.log(`  ${rows.length} parts for supplier key "${targetKey}"`);
+  return rows;
+}
+
+window.getSupplierCycle = getSupplierCycle;
+window.nextCycleDates = nextCycleDates;
+window.cycleSnapOrderBy = cycleSnapOrderBy;
+window.cycleAwareSuggestedQty = cycleAwareSuggestedQty;
+window.naturalOrderByForPart = naturalOrderByForPart;
+window._printSupplierCycleAudit = _printSupplierCycleAudit;
+
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
 // candidates are future/invalid, fall back to newest regardless.

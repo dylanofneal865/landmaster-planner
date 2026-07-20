@@ -40,6 +40,23 @@ const DEFAULTS = {
     autoSyncExcel: true,     // auto-write linked Excel files on every change
     usageWindowDays: 120,    // how many days of usage history to compute daily-avg from (4 months covers our YTD data)
     mutedSuppliers: [],      // supplier names whose parts are excluded from alert/queue surfaces
+    // Per-supplier order-cycle config — some suppliers only accept orders on
+    // a fixed cadence, so the natural reorder-by must snap back to the last
+    // eligible cycle date. Keys are supplierKey(name) — the normalized form
+    // (js/02-utils.js) that survives capitalization + legal-suffix drift
+    // across feeds. Values: { anchor: "YYYY-MM-DD", intervalDays: number,
+    // displayName?: string }. Seed contains Sensourcing Trading Co.
+    // (supplierKey → "sensourcing trading") on a 42-day cycle anchored at
+    // 2026-07-24. Merged into DB.settings via the same DEFAULTS-merge path
+    // as every other setting; org-shared through Supabase (correct — this
+    // is a fact about the supplier, not a per-user preference).
+    supplierCycles: {
+      "sensourcing trading": {
+        anchor: "2026-07-24",
+        intervalDays: 42,
+        displayName: "Sensourcing Trading Co.",
+      },
+    },
   },
   parts: [],
   pos: [],
