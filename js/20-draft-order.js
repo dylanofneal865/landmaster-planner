@@ -659,7 +659,20 @@ async function _buildDraftOrderPDF() {
     const grp = supplierGroups[supplier];
     for (const { part, qty, unit, lineTotal, noCost, blanketPoNum } of grp.lines) {
       const stat = partStatus(part);
-      const cover = stat.daysOfCover === Infinity ? "—" : `${stat.daysOfCover}d`;
+      // CHAIN-AWARE Days Cover on the PDF — the draft-order path bypasses
+      // partsWithStatus (it looks up parts via DB.parts.find in
+      // draftOrderTotals), so the Phase B chain override never reached
+      // this render. Route through getChainInfo() with a null fallback so
+      // chain successors print the chain's combined-supply runout (same
+      // value the detail drawer shows via its own getChainInfo override
+      // at js/10-page-parts.js:57) and non-chain parts keep the exact
+      // per-part number they had before. For CP00938 this swaps a 77d
+      // per-part pre-launch flat-hold value for the chain's 101d (276
+      // combined on-hand at 3.82/day). Non-chain 19931/19180/18556/CP00238
+      // are untouched.
+      const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(part.pn) : null;
+      const effectiveDaysOfCover = chainInfo ? chainInfo.chainRunoutDays : stat.daysOfCover;
+      const cover = effectiveDaysOfCover === Infinity ? "—" : `${effectiveDaysOfCover}d`;
       // Pricing source: orderUnitCost (last PO → stored cost fallback), pulled
       // from draftOrderTotals so the PDF and drawer can't drift apart. No-
       // cost rows render "—" rather than a misleading $0.
@@ -693,7 +706,15 @@ async function _buildDraftOrderPDF() {
         noCost ? "—" : fmtMoneyDec(unit),
         noCost ? "—" : fmtMoney(lineTotal),
       ]);
-      rowStatuses.push(stat.status);
+      // Chain-aware row coloring — pair with the Days Cover override above.
+      // A chain successor with 0 own on-hand computes per-part status
+      // "critical" (per-part days-cover = 0), which would color the row red
+      // in the approval PDF even though the CHAIN is comfortably covered.
+      // chainInfo?.chainStatus wins when the part is in an actively-
+      // transitioning chain; non-chain parts fall through to stat.status
+      // unchanged. Same accessor the drawer / queues / dashboard use, so
+      // the PDF row colors now agree with every other view.
+      rowStatuses.push(chainInfo ? chainInfo.chainStatus : stat.status);
     }
   }
 
