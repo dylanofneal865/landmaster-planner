@@ -1373,7 +1373,22 @@ function cycleSnapOrderBy(naturalOrderByDate, cycle) {
       last = cursor;
     }
     snappedDate = new Date(last);
+  } else if (missedWindow && nextCycleDate) {
+    // Gate-A fix: a natural order-by that's ALREADY PAST the next cycle
+    // date doesn't disqualify the part — it makes ordering MORE urgent,
+    // not less. The upcoming cycle is still the right place to put it
+    // (there is no earlier eligible option). Without this branch the six
+    // most-overdue parts fall out of cycle selection entirely, which is
+    // exactly backwards. Snap to the next cycle date; missedWindow stays
+    // true as the urgency modifier.
+    snappedDate = new Date(nextCycleDate.getTime());
   }
+  // mustOrderThisCycle now means "belongs on the upcoming cycle order"
+  // (the SELECTION predicate). Fires whenever snappedDate === the next
+  // cycle — either because the natural deadline lands in this cycle
+  // window, OR because we've already missed the window entirely and the
+  // upcoming cycle is the earliest possible ship. missedWindow stays a
+  // separate urgency flag callers can use to escalate display.
   const mustOrderThisCycle = !!snappedDate && !!nextCycleDate
     && snappedDate.getTime() === nextCycleDate.getTime();
   return { snappedDate, nextCycleDate, mustOrderThisCycle, missedWindow };
