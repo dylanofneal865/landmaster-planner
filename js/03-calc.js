@@ -475,18 +475,60 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     const s = parseDateLocal(part.transitionStartDate);
     if (s && s.getTime() > TODAY.getTime()) startMs = s.getTime();
   }
+  // HARD CUT-IN chart mode (opts.hardCutin) — when the caller (drawer chart
+  // for a chain successor) passes hardCutin state, we plot predecessor stock
+  // depleting during phase 1, then strand any leftover at the cut-in day
+  // (visible cliff), then phase 2 depletion of ownStock + own PO receipts.
+  // Absent opts.hardCutin → this branch is inert and behavior is byte-
+  // identical for every other caller.
+  const hardCutin = opts && opts.hardCutin ? opts.hardCutin : null;
+  const cutinMs = hardCutin && hardCutin.hardCutinDate
+    ? hardCutin.hardCutinDate.getTime() : null;
+  const precutinRate = hardCutin ? (Number(hardCutin.chainRate) || 0) : 0;
+  let predStock = hardCutin ? Math.max(0, Number(hardCutin.predecessorStock) || 0) : 0;
   const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
     const d = addDays(TODAY, i);
+    const dMs = d.getTime();
+    const beforeCutin = hardCutin && cutinMs && dMs < cutinMs;
     // Skip depletion until we reach transitionStartDate. Receipts still
     // land on their real calendar offset — a PO scheduled to arrive
     // before phase-in bumps the flat pre-launch line up on its arrival
     // day, which is the correct behavior (stock accumulates before
     // consumption starts).
     const consuming = !startMs || d.getTime() >= startMs;
-    if (i > 0 && consuming && isWorkday(d, wpw)) oh -= (part.daily || 0);
+    if (i > 0 && isWorkday(d, wpw)) {
+      if (beforeCutin && predStock > 0) {
+        // Phase 1: burn predecessor at chainRate (per workday).
+        predStock = Math.max(0, predStock - precutinRate);
+      } else if (consuming) {
+        // Phase 2 or non-hardCutin path: existing per-workday depletion.
+        oh -= (part.daily || 0);
+      }
+    }
     oh += receipts[i];
-    series.push({ d, oh: oh, recv: receipts[i] });
+    // Series `oh` during phase 1 (hardCutin active) — three cases:
+    //   predStock > 0 : predStock + oh  (predecessor is the live coverage;
+    //                    own stock physically present via early receipts is
+    //                    added to the chart honestly. At cut-in predStock
+    //                    drops out and displayOh becomes `oh` — cliff of
+    //                    EXACTLY strandedPredecessorQty.)
+    //   predStock == 0 (predecessor EXHAUSTED PRE-CUT-IN) : 0
+    //                    The chain is out of coverage. Own stock still
+    //                    physically accumulates in `oh` but is not
+    //                    consumable yet — displaying it as coverage would
+    //                    be false (the successor is not live). The runout
+    //                    day, computed independently by _chainHardCutinSupply
+    //                    (workdaysToCalendarDays(predecessorStock/chainRate)),
+    //                    lands on the same day the chart line first touches
+    //                    zero here, so header text and chart agree.
+    //   phase 2 : oh    (successor is live; own + receipts deplete normally)
+    // Non-hardCutin path unchanged because beforeCutin is false — falls
+    // straight through to `oh`.
+    const displayOh = beforeCutin
+      ? (predStock > 0 ? predStock + oh : 0)
+      : oh;
+    series.push({ d, oh: displayOh, recv: receipts[i] });
   }
   // Attach the overdue summary as plain properties on the array. Existing
   // callers (.map / .length / indexing / .findIndex) are unaffected.
@@ -710,6 +752,165 @@ function supersessionLineage(pn) {
 // "Clamped" means a stocked-out predecessor (negative on-hand from a count
 // error) contributes 0 to chain supply, not negative — the predecessor is
 // gone, not somehow worsening the successor's runway.
+// HARD CUT-IN — single source of truth for the "predecessor stock is stranded
+// at transitionStartDate" rule. Both getChainInfo (chain rollup) and
+// chainSequentialView (drawer chart) route through this so status / runout /
+// order-by / suggested-qty / chart all agree.
+//
+// Returns null when the final chain member has no valid transitionStartDate.
+// The null return signals "use legacy fully-combined math, byte-identical to
+// today." A cut-in date that has ALREADY PASSED still applies (predecessor
+// stock stranded from that date on).
+//
+// Otherwise returns:
+//   {
+//     hardCutinDate,              // Date, parsed from finalMember.transitionStartDate
+//     predecessorStock,           // sum of clamped predecessor on-hand (units)
+//     ownStock,                   // finalMember's clamped on-hand (units)
+//     chainRate,                  // anchor.daily (per WORKDAY)
+//     phase1WorkdayCount,         // workdays from tomorrow through cutin-1
+//                                 // (or 0 when cutin has passed)
+//     phase1DemandUnits,          // phase1WorkdayCount * chainRate
+//     predecessorCoversPhase1,    // predecessorStock ≥ phase1DemandUnits
+//     strandedPredecessorQty,     // units left over at cutin (≥ 0). Only >0
+//                                 // when phase 1 was covered.
+//     runoutDate,                 // real chain runout under the cut-in rule.
+//                                 // If predecessor exhausts before cutin →
+//                                 // runout = today + workdaysToCalendarDays(
+//                                 //   predecessorStock/chainRate, TODAY).
+//                                 // If phase 1 covered and ownStock+POs empty
+//                                 //   after cutin → runoutDate = cutin.
+//                                 // Otherwise → walk phase 2 ledger.
+//     runoutDays,                 // integer calendar days from TODAY; Infinity
+//                                 // when beyond the 365-day horizon.
+//   }
+// Never mutates part or member records; never writes to onHand.
+function _chainHardCutinSupply(members, chainOnPOLines) {
+  if (!Array.isArray(members) || members.length < 2) return null;
+  const finalMember = members[members.length - 1];
+  if (!finalMember || !finalMember.transitionStartDate) return null;
+  const parsed = (typeof parseDateLocal === "function")
+    ? parseDateLocal(finalMember.transitionStartDate)
+    : null;
+  if (!parsed || isNaN(parsed.getTime())) return null;
+  // Gate is on presence of a valid transitionStartDate, past OR future — a
+  // cut-in that already happened still strands predecessor stock.
+  const hardCutinDate = new Date(parsed.getTime());
+  hardCutinDate.setHours(0, 0, 0, 0);
+
+  const anchor = members[0] || null;
+  const chainRate = anchor ? (Number(anchor.daily) || 0) : 0;
+  const predecessors = members.slice(0, -1);
+  const predecessorStock = predecessors.reduce(
+    (s, m) => s + Math.max(0, Number(m && m.onHand) || 0), 0
+  );
+  const ownStock = Math.max(0, Number(finalMember.onHand) || 0);
+
+  const today = new Date(TODAY.getTime());
+  today.setHours(0, 0, 0, 0);
+  const wpw = (typeof effectiveWorkdaysPerWeek === "function")
+    ? effectiveWorkdaysPerWeek() : 5;
+
+  // Count workdays in phase 1 — from tomorrow (i=1) up to but not including
+  // hardCutinDate. When cutin is today or past, phase 1 is empty.
+  let phase1WorkdayCount = 0;
+  for (let i = 1; i <= 365; i++) {
+    const d = (typeof addDays === "function")
+      ? addDays(today, i) : new Date(today.getTime() + i * DAY_MS);
+    if (d.getTime() >= hardCutinDate.getTime()) break;
+    if (typeof isWorkday === "function" && isWorkday(d, wpw)) phase1WorkdayCount++;
+  }
+  const phase1DemandUnits = phase1WorkdayCount * chainRate;
+  const predecessorCoversPhase1 = predecessorStock >= phase1DemandUnits;
+
+  // Phase 1 exhaustion → chain runs out during phase 1 at the workday when
+  // predecessor hits zero. workdaysToCalendarDays converts predecessor's own
+  // burn-rate cover to calendar days, matching the projection convention.
+  if (chainRate > 0 && !predecessorCoversPhase1) {
+    const predWorkdayCover = predecessorStock / chainRate;
+    const cal = (typeof workdaysToCalendarDays === "function")
+      ? workdaysToCalendarDays(predWorkdayCover, today)
+      : Math.round(predWorkdayCover);
+    const runoutDays = cal > 365 ? Infinity : cal;
+    const runoutDate = runoutDays === Infinity
+      ? null
+      : ((typeof addDays === "function") ? addDays(today, runoutDays) : new Date(today.getTime() + runoutDays * DAY_MS));
+    return {
+      hardCutinDate, predecessorStock, ownStock, chainRate,
+      phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
+      strandedPredecessorQty: 0,
+      runoutDate, runoutDays,
+    };
+  }
+
+  // Phase 1 covered → strand leftover, transition to phase 2 with ownStock.
+  const strandedPredecessorQty = Math.max(0, predecessorStock - phase1DemandUnits);
+  // Phase 2 ledger: walk day-by-day from cutinDate forward. Add PO receipts
+  // for the final member (blanket-blind, matches isLineOpen filter enforced
+  // by the caller when it built chainOnPOLines). POs arriving BEFORE cutin
+  // still accumulate on ownStock at time 0 — they wait for phase 2
+  // consumption to start.
+  let selfStock = ownStock;
+  const receiptsByDay = new Map();
+  for (const l of (chainOnPOLines || [])) {
+    if (!l || l.pn !== finalMember.pn) continue;
+    const qty = Number(l.remaining) || 0;
+    if (qty <= 0) continue;
+    // Bucket by day offset from today. Undated / overdue clamp to today's
+    // pile (matches projectOnHand's offset=0 clamp for overdue receipts).
+    let offset = 0;
+    if (l.expectedDate) {
+      offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+      if (offset < 0) offset = 0;
+    }
+    if (offset > 365) continue;
+    receiptsByDay.set(offset, (receiptsByDay.get(offset) || 0) + qty);
+  }
+  // Accumulate any POs that arrive before cutin onto selfStock now (they
+  // sit unused until cutin, then consumption starts).
+  const cutinOffset = Math.max(0, Math.round((hardCutinDate.getTime() - today.getTime()) / DAY_MS));
+  for (const [offset, qty] of receiptsByDay.entries()) {
+    if (offset < cutinOffset) selfStock += qty;
+  }
+
+  // Walk from cutinDate forward. Consume on workdays; add PO receipts on
+  // their exact day. Runout = first day selfStock < 0 after consumption.
+  let runoutDays = Infinity;
+  for (let i = cutinOffset; i <= 365; i++) {
+    // PO receipts arrive first (matches projectOnHand's oh += receipts[i]).
+    if (i >= cutinOffset && receiptsByDay.has(i) && i !== cutinOffset) {
+      // (Pre-cutin POs already accumulated above; only add on their true day
+      // for offsets ≥ cutinOffset. Cutin day's own PO already handled by the
+      // pre-loop accumulator if it arrived at exactly cutinOffset — no, wait,
+      // pre-loop accumulator uses `offset < cutinOffset`, so cutinOffset's
+      // arrival IS added here, right on cutin.)
+      selfStock += receiptsByDay.get(i);
+    } else if (i === cutinOffset && receiptsByDay.has(i)) {
+      selfStock += receiptsByDay.get(i);
+    }
+    if (i > 0) {
+      const d = (typeof addDays === "function") ? addDays(today, i) : new Date(today.getTime() + i * DAY_MS);
+      if (typeof isWorkday === "function" && isWorkday(d, wpw)) {
+        selfStock -= chainRate;
+      }
+    }
+    if (selfStock < 0) {
+      runoutDays = i;
+      break;
+    }
+  }
+  const runoutDate = runoutDays === Infinity
+    ? null
+    : ((typeof addDays === "function") ? addDays(today, runoutDays) : new Date(today.getTime() + runoutDays * DAY_MS));
+
+  return {
+    hardCutinDate, predecessorStock, ownStock, chainRate,
+    phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
+    strandedPredecessorQty,
+    runoutDate, runoutDays,
+  };
+}
+
 function chainSequentialView(part) {
   if (!part || !part.pn) return null;
   const lineage = supersessionLineage(part.pn);
@@ -742,6 +943,13 @@ function chainSequentialView(part) {
   let totalChainStockClamped = cumulativeStockThroughThis;
   for (const p of successors) totalChainStockClamped += Math.max(0, Number(p.onHand) || 0);
 
+  // HARD CUT-IN pointer — same helper the getChainInfo rollup uses. When
+  // finalMember has a valid transitionStartDate, this is non-null and carries
+  // hardCutinDate / predecessorStock / ownStock / strandedPredecessorQty for
+  // the drawer's chart-projector. When absent, view stays byte-identical to
+  // its pre-fix shape (every field still populated the same way).
+  const hardCutin = _chainHardCutinSupply(members, null);
+
   return {
     lineage,
     chainRate,
@@ -756,6 +964,7 @@ function chainSequentialView(part) {
     ownClamped,
     cumulativeStockThroughThis,
     totalChainStockClamped,
+    hardCutin,
   };
 }
 
@@ -766,12 +975,27 @@ function chainSequentialView(part) {
 function _supersessionDemandBoost(part) {
   const view = chainSequentialView(part);
   if (!view || !view.isFinal) return null;
+  // HARD CUT-IN: predecessor stock is stranded at transitionStartDate — the
+  // successor's replenishment order can only rely on ownStock + POs after
+  // that date. `have` in suggestedQty (= combinedOnHand + onPO) therefore
+  // drops to ownStock alone when the fix is active, driving the suggested
+  // qty up so the successor covers phase-2 demand from arrival forward.
+  // When there is no transitionStartDate, view.hardCutin is null and
+  // combinedOnHand stays at totalChainStockClamped — byte-identical to today.
+  const combinedOnHand = view.hardCutin
+    ? view.hardCutin.ownStock
+    : view.totalChainStockClamped;
   return {
     dailyRate: view.chainRate,
-    combinedOnHand: view.totalChainStockClamped,
+    combinedOnHand,
     anchorPn: view.anchorPn,
     anchor: view.anchor,
     predecessors: view.predecessors,
+    // Passed through for the drawer's "+X in chain" tile so it can still
+    // display the raw predecessor pool even though the ordering math no
+    // longer credits it. null when no hardCutin — tile fallback path.
+    _hardCutin: view.hardCutin || null,
+    _predecessorStockRaw: view.totalChainStockClamped - view.ownClamped,
   };
 }
 
@@ -1094,21 +1318,34 @@ function getChainInfo(pn) {
     }
   }
 
-  // Chain runout — combined supply at chainRate, from today.
-  const totalSupply = chainOnHand + chainOnPO;
+  // HARD CUT-IN piecewise math when the final member has a transitionStartDate
+  // (past or future). Predecessor stock only counts up to that date; anything
+  // left over strands. Phase 2 starts with own stock + POs. When there is NO
+  // transitionStartDate the helper returns null and we fall through to the
+  // legacy combined runout — byte-identical to today for every non-cut-in part.
+  const hardCutin = _chainHardCutinSupply(members, chainPOLines);
+
+  // Chain runout — piecewise when hardCutin present, else combined at chainRate
+  // from today (legacy).
   let chainRunoutDays = Infinity;
   let chainRunoutDate = null;
-  if (chainRate <= 0) {
-    chainRunoutDays = Infinity;
-  } else if (totalSupply <= 0) {
-    chainRunoutDays = 0;
-    chainRunoutDate = new Date(TODAY);
+  if (hardCutin) {
+    chainRunoutDays = hardCutin.runoutDays;
+    chainRunoutDate = hardCutin.runoutDate;
   } else {
-    const coverWorkdays = totalSupply / chainRate;
-    const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
-    chainRunoutDays = cal > 365 ? Infinity : cal;
-    if (chainRunoutDays !== Infinity) {
-      chainRunoutDate = addDays(TODAY, chainRunoutDays);
+    const totalSupply = chainOnHand + chainOnPO;
+    if (chainRate <= 0) {
+      chainRunoutDays = Infinity;
+    } else if (totalSupply <= 0) {
+      chainRunoutDays = 0;
+      chainRunoutDate = new Date(TODAY);
+    } else {
+      const coverWorkdays = totalSupply / chainRate;
+      const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
+      chainRunoutDays = cal > 365 ? Infinity : cal;
+      if (chainRunoutDays !== Infinity) {
+        chainRunoutDate = addDays(TODAY, chainRunoutDays);
+      }
     }
   }
 
@@ -1129,10 +1366,26 @@ function getChainInfo(pn) {
   const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
   const warnDays = (DB.settings && (DB.settings.alertWarning ?? 14)) || 14;
   const reorderBy = leadDays + safety; // duration, preserved for chainStatusDetail back-compat
-  const chainReorderByDays = (chainRunoutDays === Infinity)
+  // Order-by = min(byCutin, byRunout) − leadDays − safetyDays.
+  //   byRunout: chainRunoutDays (already hardCutin-corrected when applicable)
+  //   byCutin:  days from today to hardCutinDate (only when hardCutin present)
+  // C1 semantics from preLaunchOrderBy: byCutin is applicable when it's still
+  // future OR when ownStock is 0 (no bridge stock at cutin — need supply on
+  // that day). Matches the pattern in preLaunchOrderBy so behavior is
+  // consistent across chain and standalone pre-launch surfaces.
+  const byRunoutDays = (chainRunoutDays === Infinity)
     ? Infinity
     : chainRunoutDays - leadDays - safety;
-  const chainReorderByDate = (chainRunoutDate && chainReorderByDays !== Infinity)
+  let byCutinDays = Infinity;
+  if (hardCutin && hardCutin.hardCutinDate) {
+    const cutinFromToday = Math.round(
+      (hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS
+    );
+    const c1Applicable = cutinFromToday >= 0 || hardCutin.ownStock <= 0;
+    if (c1Applicable) byCutinDays = cutinFromToday - leadDays - safety;
+  }
+  const chainReorderByDays = Math.min(byRunoutDays, byCutinDays);
+  const chainReorderByDate = (chainReorderByDays !== Infinity)
     ? addDays(TODAY, chainReorderByDays)
     : null;
   const chainReorderByPassed = chainReorderByDays !== Infinity && chainReorderByDays <= 0;
@@ -1166,8 +1419,15 @@ function getChainInfo(pn) {
   }
 
   // Chain short — demand accumulated from today through want-by
-  // MINUS (chainOnHand + non-late-arriving coverage). Overdue POs
+  // MINUS (usable stock + non-late-arriving coverage). Overdue POs
   // count as coverage. Clamped ≥ 0.
+  //
+  // HARD CUT-IN: predecessor units that STRAND at the cut-in are not
+  // usable coverage. Effective usable stock is
+  //   (predecessorStock − strandedPredecessorQty) + ownStock
+  // = the predecessor units actually consumed pre-cut-in PLUS the
+  // successor's own on-hand. Falls back to raw chainOnHand when
+  // hardCutin is null (byte-identical to today).
   const wpw = (typeof effectiveWorkdaysPerWeek === "function")
     ? effectiveWorkdaysPerWeek()
     : 5;
@@ -1186,7 +1446,10 @@ function getChainInfo(pn) {
     if (!l.expectedDate) { coverageInTime += l.remaining; continue; }
     if (l.expectedDate.getTime() <= wantByDate.getTime()) coverageInTime += l.remaining;
   }
-  const chainShort = Math.max(0, demandThroughWantBy - (chainOnHand + coverageInTime));
+  const usableChainStock = hardCutin
+    ? Math.max(0, hardCutin.predecessorStock - hardCutin.strandedPredecessorQty) + hardCutin.ownStock
+    : chainOnHand;
+  const chainShort = Math.max(0, demandThroughWantBy - (usableChainStock + coverageInTime));
 
   return {
     chainParts: lineage.slice(),
@@ -1213,6 +1476,11 @@ function getChainInfo(pn) {
     wantByDate,
     chainShort,
     preLaunch,
+    // HARD CUT-IN block — null when the successor has no transitionStartDate
+    // (fully legacy behavior). Non-null when the cut-in rule is active; carries
+    // strandedPredecessorQty for banner display, hardCutinDate for the
+    // reorder-by calculation, and predecessor/own stock split for diagnostics.
+    hardCutin,
   };
 }
 
@@ -1614,6 +1882,259 @@ function _printSupplierCycleAudit(supplierName) {
   console.log(`  ${rows.length} parts for supplier key "${targetKey}" · ${mustCount} on upcoming cycle · ${shortCount} unrecoverable (SHORT)`);
   return rows;
 }
+
+// LEGACY DIAGNOSTIC — combined-runout formula from before the hard-cut-in
+// fix. VERBATIM STRUCTURAL COPY of the pre-fix code block from
+// js/03-calc.js.bak-hardcutin (getChainInfo lines 1097-1113): totalSupply
+// = chainOnHand + chainOnPO, cover in workdays via workdaysToCalendarDays,
+// horizon-capped at 365. Only diffs from pre-fix are param plumbing —
+// values that were closure-scoped in getChainInfo are function params here.
+function _legacyChainCombinedRunout(chainOnHand, chainOnPO, chainRate) {
+  const totalSupply = chainOnHand + chainOnPO;
+  let chainRunoutDays = Infinity;
+  let chainRunoutDate = null;
+  if (chainRate <= 0) {
+    chainRunoutDays = Infinity;
+  } else if (totalSupply <= 0) {
+    chainRunoutDays = 0;
+    chainRunoutDate = new Date(TODAY);
+  } else {
+    const coverWorkdays = totalSupply / chainRate;
+    const cal = workdaysToCalendarDays(coverWorkdays, TODAY);
+    chainRunoutDays = cal > 365 ? Infinity : cal;
+    if (chainRunoutDays !== Infinity) {
+      chainRunoutDate = addDays(TODAY, chainRunoutDays);
+    }
+  }
+  return { runoutDays: chainRunoutDays, runoutDate: chainRunoutDate };
+}
+
+// LEGACY DIAGNOSTIC — status ladder from before the fix. VERBATIM
+// STRUCTURAL COPY of the pre-fix code block from
+// js/03-calc.js.bak-hardcutin (getChainInfo lines 1132-1158): reorder-by
+// duration derived from runoutDays−leadDays−safety, then bucketed against
+// warnDays. Returns the same four fields the pre-fix code produced
+// (chainReorderByDays / chainReorderByDate / chainReorderByPassed /
+// chainStatus), plumbed via function params instead of closure vars.
+function _legacyChainStatus(chainRunoutDays, chainRunoutDate, leadDays, safety, warnDays) {
+  const chainReorderByDays = (chainRunoutDays === Infinity)
+    ? Infinity
+    : chainRunoutDays - leadDays - safety;
+  const chainReorderByDate = (chainRunoutDate && chainReorderByDays !== Infinity)
+    ? addDays(TODAY, chainReorderByDays)
+    : null;
+  const chainReorderByPassed = chainReorderByDays !== Infinity && chainReorderByDays <= 0;
+
+  let chainStatus = "ok";
+  if (chainReorderByDays === Infinity) {
+    chainStatus = "ok";
+  } else if (chainReorderByDays <= 0) {
+    chainStatus = "critical";
+  } else if (chainReorderByDays <= warnDays) {
+    chainStatus = "warning";
+  } else {
+    chainStatus = "ok";
+  }
+  return {
+    status: chainStatus,
+    reorderByDays: chainReorderByDays,
+    reorderByDate: chainReorderByDate,
+    reorderByPassed: chainReorderByPassed,
+  };
+}
+
+// LEGACY DIAGNOSTIC — verbatim byte-for-byte copy of the pre-fix
+// _supersessionDemandBoost body from js/03-calc.js.bak-hardcutin lines
+// 766-776. Only the function name changed to distinguish it. Reads
+// view.totalChainStockClamped which is UNCHANGED on the current
+// chainSequentialView return (the fix added `hardCutin` alongside; the
+// existing fields still compute the same values). This is what the audit
+// audits against — the exact boost the pre-fix code produced.
+function _legacySupersessionDemandBoost(part) {
+  const view = chainSequentialView(part);
+  if (!view || !view.isFinal) return null;
+  return {
+    dailyRate: view.chainRate,
+    combinedOnHand: view.totalChainStockClamped,
+    anchorPn: view.anchorPn,
+    anchor: view.anchor,
+    predecessors: view.predecessors,
+  };
+}
+
+// LEGACY DIAGNOSTIC — verbatim byte-for-byte copy of the pre-fix
+// suggestedQty body from js/03-calc.js.bak-hardcutin lines 587-620. Only
+// two changes: (a) function name, (b) call _legacySupersessionDemandBoost
+// instead of _supersessionDemandBoost (the live one now returns hardCutin-
+// aware combinedOnHand — the whole reason we need a retained copy).
+function _legacyChainSuggestedQty(part, onPO) {
+  if (part && part.phasingOut) return 0;
+
+  const boost = _legacySupersessionDemandBoost(part);
+
+  const lt = leadTimeDays(part);
+  const safety = DB.settings.safetyDays || 0;
+  const horizon = 30; // beyond reorder, target 30 days of stock after arrival
+
+  // Daily rate. Edge case: if the final part already has its own non-zero
+  // usage (real shipments on the new PN already), use the GREATER of
+  // (its own daily, the anchor's copied daily) so we never under-order
+  // during the cutover window.
+  const dailyRate = boost
+    ? Math.max(Number(part.daily) || 0, boost.dailyRate)
+    : (part.daily || 0);
+  const target = (lt + safety + horizon) * dailyRate;
+
+  // Effective supply. When boosted, every predecessor's on-hand counts as
+  // stock we'll consume first — only the final part has open POs that we
+  // count (predecessor POs are excluded per spec; in practice they're
+  // cancelled when a part phases out).
+  const onPOQty = (typeof onPO === "number") ? onPO : openPOQty(part.pn);
+  const have = boost
+    ? boost.combinedOnHand + onPOQty
+    : (part.onHand || 0) + onPOQty;
+
+  let qty = Math.max(0, Math.ceil(target - have));
+  if (part.moq && qty > 0) qty = Math.max(qty, part.moq);
+  if (part.packSize && qty > 0) {
+    qty = Math.ceil(qty / part.packSize) * part.packSize;
+  }
+  return qty;
+}
+
+// HARD-CUTIN IMPACT AUDIT — returns ONE string via .map().join('\n') so
+// DevTools doesn't collapse it. Attached to window because module-scoped
+// functions are unreachable from the console. Header carries
+// DB.settings.safetyDays so the reader can verify the byCutin math has
+// the same safety subtraction as byRunout.
+// Columns: pn | cutinDate | inChain | oldRunout | newRunout | oldOrderBy
+// | newOrderBy | oldStatus | newStatus | oldSuggestedQty | newSuggestedQty
+// | strandedPredecessorQty
+// OLD values come from the retained _legacyChain* helpers above (called
+// against the same chainOnHand+chainOnPO+chainRate the current
+// getChainInfo still exposes). NEW values come from getChainInfo itself.
+function _printHardCutinImpact() {
+  const iso = d => (d && d.toISOString) ? d.toISOString().slice(0, 10) : "-";
+  const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const rows = [];
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.transitionStartDate) continue;
+    const parsed = (typeof parseDateLocal === "function")
+      ? parseDateLocal(p.transitionStartDate) : null;
+    if (!parsed || isNaN(parsed.getTime())) continue;
+    const cutinIso = iso(parsed);
+    const info = getChainInfo(p.pn);
+    const inChain = !!info;
+    // NEW (post-fix) values, straight off getChainInfo.
+    const newRunout = info ? iso(info.chainRunoutDate) : "-";
+    const newOrderBy = info ? iso(info.chainReorderByDate) : "-";
+    const newStatus = info ? info.chainStatus : "-";
+    const strandedQty = info && info.hardCutin
+      ? Math.round(info.hardCutin.strandedPredecessorQty)
+      : 0;
+    // OLD values via retained legacy helpers.
+    let oldRunout = "-", oldOrderBy = "-", oldStatus = "-", oldSuggestedQty = "-";
+    if (info) {
+      const leg = _legacyChainCombinedRunout(info.chainOnHand, info.chainOnPO, info.chainRate);
+      const legSt = _legacyChainStatus(leg.runoutDays, leg.runoutDate, info.chainStatusDetail.leadDays, safety, info.chainStatusDetail.warnDays);
+      oldRunout = iso(leg.runoutDate);
+      oldOrderBy = iso(legSt.reorderByDate);
+      oldStatus = legSt.status;
+      try { oldSuggestedQty = _legacyChainSuggestedQty(p); }
+      catch (e) { oldSuggestedQty = "err"; }
+    }
+    // NEW suggested qty via the live suggestedQty (which now reads the
+    // hardCutin-aware boost). For a non-chain part with no boost, this
+    // returns the same number _legacyChainSuggestedQty would have — the
+    // audit still shows both columns for clarity.
+    let newSuggestedQty = "-";
+    try { newSuggestedQty = suggestedQty(p); } catch (e) { newSuggestedQty = "err"; }
+    if (!info) oldSuggestedQty = newSuggestedQty;
+    rows.push({
+      pn: p.pn, cutinDate: cutinIso, inChain,
+      oldRunout, newRunout, oldOrderBy, newOrderBy,
+      oldStatus, newStatus,
+      oldSuggestedQty, newSuggestedQty,
+      strandedPredecessorQty: strandedQty,
+    });
+  }
+  rows.sort((a, b) => String(a.pn).localeCompare(String(b.pn)));
+  const header = `[hardcutin audit] safetyDays=${safety} · rule: order-by = min(byCutin, byRunout) − leadDays − safetyDays applied to BOTH branches`;
+  const columns = "pn | cutinDate | inChain | oldRunout | newRunout | oldOrderBy | newOrderBy | oldStatus | newStatus | oldSuggestedQty | newSuggestedQty | strandedPredecessorQty";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.cutinDate} | ${r.inChain} | ${r.oldRunout} | ${r.newRunout} | ${r.oldOrderBy} | ${r.newOrderBy} | ${r.oldStatus} | ${r.newStatus} | ${r.oldSuggestedQty} | ${r.newSuggestedQty} | ${r.strandedPredecessorQty}`
+  ).join("\n");
+  return [header, columns, sep, body, `(${rows.length} part(s) with a valid transitionStartDate)`].join("\n");
+}
+window._legacyChainCombinedRunout = _legacyChainCombinedRunout;
+window._legacyChainStatus = _legacyChainStatus;
+window._legacyChainSuggestedQty = _legacyChainSuggestedQty;
+window._legacySupersessionDemandBoost = _legacySupersessionDemandBoost;
+window._printHardCutinImpact = _printHardCutinImpact;
+// DAY_MS is a top-level `const` (js/01-config.js:28); classic scripts do
+// not auto-attach const/let to window. Explicit attach so console snippets
+// referencing `window.DAY_MS` resolve.
+if (typeof DAY_MS === "number") window.DAY_MS = DAY_MS;
+
+// SPOT-CHECK — one part, one string, everything resolved IN-FILE so the
+// console call is just copy(_printChainSpotCheck("JP00021")). Every
+// symbol (DB, suggestedQty, DAY_MS, chainSequentialView, getChainInfo,
+// the three _legacy* helpers) is in this module's scope — no bare-name
+// resolution risk in the console. Returns one string via
+// [...].filter(Boolean).join('\n'). Guards every dereference for null.
+function _printChainSpotCheck(pn) {
+  const target = pn == null ? "" : String(pn).trim();
+  if (!target) return "spot-check: no PN provided";
+  const p = (typeof DB !== "undefined" && DB && Array.isArray(DB.parts))
+    ? DB.parts.find(x => x && x.pn === target) : null;
+  if (!p) return `${target}: not in DB.parts`;
+  const info = getChainInfo(target);
+  if (!info) return `${target}: getChainInfo returned null (no chain)`;
+  const s = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const iso = d => (d && d.toISOString) ? d.toISOString().slice(0, 10) : "-";
+  const detail = info.chainStatusDetail || {};
+  const leg = _legacyChainCombinedRunout(info.chainOnHand, info.chainOnPO, info.chainRate);
+  const legSt = _legacyChainStatus(leg.runoutDays, leg.runoutDate, detail.leadDays, s, detail.warnDays);
+  let legSq = "err", newSq = "err";
+  try { legSq = _legacyChainSuggestedQty(p); } catch (e) { legSq = "err:" + (e && e.message || e); }
+  try { newSq = suggestedQty(p); } catch (e) { newSq = "err:" + (e && e.message || e); }
+  const hc = info.hardCutin || null;
+  // Coverage resume date — first PO landing strictly after chain runout.
+  // chainPOLines element shape (verified from source at getChainInfo
+  // construction): { pn, poNum, poId, remaining, expectedDate, isOverdue }
+  // where expectedDate is Date-or-null. Guarded here for safety.
+  let resumeDate = null;
+  if (hc && info.chainRunoutDate && Array.isArray(info.chainPOLines)) {
+    const rm = info.chainRunoutDate.getTime();
+    for (const l of info.chainPOLines) {
+      if (!l || !l.expectedDate || !l.remaining) continue;
+      const em = l.expectedDate.getTime();
+      if (em <= rm) continue;
+      if (resumeDate === null || em < resumeDate.getTime()) resumeDate = l.expectedDate;
+    }
+  }
+  const gapDays = resumeDate && info.chainRunoutDate
+    ? Math.round((resumeDate.getTime() - info.chainRunoutDate.getTime()) / DAY_MS)
+    : null;
+  const hcLine = hc
+    ? `    cutinDate=${iso(hc.hardCutinDate)} · predecessorStock=${hc.predecessorStock} · ownStock=${hc.ownStock} · strandedPredecessorQty=${Math.round(hc.strandedPredecessorQty)} · predecessorCoversPhase1=${hc.predecessorCoversPhase1}`
+    : "";
+  const resumeLine = resumeDate
+    ? `${iso(resumeDate)} (gap ${gapDays} calendar days)`
+    : "(no PO after runout)";
+  return [
+    `${target} spot-check`,
+    `  safetyDays=${s} · leadDays=${detail.leadDays} · warnDays=${detail.warnDays} · chainRate=${info.chainRate}`,
+    `  chainOnHand=${info.chainOnHand} · chainOnPO=${info.chainOnPO} · chainPOLines.length=${(info.chainPOLines || []).length}`,
+    `  hardCutin: ${hc ? "active" : "null"}`,
+    hcLine,
+    `  OLD: runout=${iso(leg.runoutDate)} · orderBy=${iso(legSt.reorderByDate)} · status=${legSt.status} · sq=${legSq}`,
+    `  NEW: runout=${iso(info.chainRunoutDate)} · orderBy=${iso(info.chainReorderByDate)} · status=${info.chainStatus} · sq=${newSq}`,
+    `  coverage resume: ${resumeLine}`,
+  ].filter(Boolean).join("\n");
+}
+window._printChainSpotCheck = _printChainSpotCheck;
 
 window.getSupplierCycle = getSupplierCycle;
 window.nextCycleDates = nextCycleDates;

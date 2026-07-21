@@ -23,8 +23,24 @@ function renderPartDetail(part) {
   // paragraph that explains the suggested-qty sizing.
   const chainView = (typeof chainSequentialView === "function") ? chainSequentialView(part) : null;
   const chainBoost = (typeof _supersessionDemandBoost === "function") ? _supersessionDemandBoost(part) : null;
+  // HARD CUT-IN chart mode — when the chain has a transitionStartDate, the
+  // chart plots predecessor stock burning down during phase 1, strands the
+  // leftover at cut-in, then shows ownStock + own POs in phase 2. Passed to
+  // projectOnHand below via opts.hardCutin. Absent → legacy chart (flat-hold
+  // of cumulativeStockThroughThis until launch, then depletion) still fires
+  // via the projectOnHand transitionStartDate branch — byte-identical to
+  // today for parts without a chain hard cut-in.
+  const hardCutin = chainView && chainView.hardCutin ? chainView.hardCutin : null;
   const effectivePart = chainView
-    ? { ...part, onHand: chainView.cumulativeStockThroughThis, daily: Math.max(Number(part.daily) || 0, chainView.chainRate) }
+    ? {
+        ...part,
+        // Chart's phase 2 stock is ownStock (successor's own) when hardCutin
+        // is active; predecessor stock is plotted separately by projectOnHand
+        // via opts.hardCutin. Non-hardCutin chains keep the legacy cumulative
+        // input so their chart is unchanged.
+        onHand: hardCutin ? hardCutin.ownStock : chainView.cumulativeStockThroughThis,
+        daily: Math.max(Number(part.daily) || 0, chainView.chainRate),
+      }
     : part;
 
   // Chain-aware daily for the stat cell AND the edit form. Non-anchor members
@@ -88,8 +104,21 @@ function renderPartDetail(part) {
   const leadDays = leadTimeDays(part);
   const finiteCover = Number.isFinite(coverDays) ? coverDays : 0;
   let horizon = Math.max(90, finiteCover + 14, leadDays + 14);
+  // Bump horizon ONLY when hardCutin is active so a chain successor's cut-in
+  // day AND its lead-time-based PO landing are visible in the chart. Chains
+  // without a transitionStartDate keep their pre-fix horizon math (byte-
+  // identical to today).
+  if (hardCutin && hardCutin.hardCutinDate) {
+    const cutinDays = Math.round((hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS);
+    horizon = Math.max(horizon, cutinDays + leadDays + 14);
+    if (chainInfo && Number.isFinite(chainInfo.chainRunoutDays)) {
+      horizon = Math.max(horizon, chainInfo.chainRunoutDays + 14);
+    }
+  }
   horizon = Math.min(horizon, 365);
-  const series = projectOnHand(effectivePart, horizon);
+  // Pass hardCutin opts so projectOnHand plots phase 1 (predecessor burn) →
+  // strand cliff → phase 2 (ownStock + POs). Non-hardCutin path is unchanged.
+  const series = projectOnHand(effectivePart, horizon, undefined, hardCutin ? { hardCutin } : {});
   // Clamp the visual scale to 0..peak so long horizons of deeply negative
   // on-hand don't crush the meaningful band into a sliver. The stockout
   // index is still found on the unclamped series; only the drawn path is
@@ -319,7 +348,47 @@ function renderPartDetail(part) {
     const ownRunoutTxt = Number.isFinite(coverDays)
       ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(coverDays)})</span>`
       : "";
-    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Chain runs out ${chainRunoutTxt} (${chainInfo.chainRunoutDays}d at ${fmtNum(chainInfo.chainRate, 2)}/day across ${fmtNum(chainInfo.chainOnHand)} on-hand + ${fmtNum(chainInfo.chainOnPO)} on PO) · ${reorderByHtml} — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
+    // HARD CUT-IN banner variant — used when the successor has a
+    // transitionStartDate. Reports usable supply and the strand in the SAME
+    // sentence so the header text can never contradict the chart or the
+    // runout.
+    //
+    // COVERAGE RESUME (Item 3, r3): when a PO for the successor lands AFTER
+    // the runout date, tell the reader when coverage resumes and how many
+    // calendar days the gap is. Uses chainInfo.chainPOLines (the same list
+    // getChainInfo already built, blanket-blind via isLineOpen) — the first
+    // PO whose expected date is strictly after chainRunoutDate is the
+    // resume day. Gap is measured in whole CALENDAR days between them.
+    // If no PO lands after the runout, keep the current out-of-coverage
+    // wording. Non-hardCutin chains fall through to the original banner
+    // below, byte-identical to today.
+    if (chainInfo.hardCutin) {
+      const hc = chainInfo.hardCutin;
+      const cutinDateTxt = hc.hardCutinDate ? fmtDate(hc.hardCutinDate) : "—";
+      const strandedTxt = fmtNum(Math.round(hc.strandedPredecessorQty || 0));
+      const rawTotal = Number(chainInfo.chainOnHand) || 0;
+      const ownTxt = fmtNum(Math.round(hc.ownStock || 0));
+      const onPOTxt = fmtNum(chainInfo.chainOnPO);
+      // Find the FIRST covering PO landing after runout. chainPOLines is
+      // sorted by insertion order (walk of DB.pos); we scan and take the
+      // earliest expectedDate strictly > chainRunoutDate.
+      let resumeDate = null;
+      if (chainInfo.chainRunoutDate && Array.isArray(chainInfo.chainPOLines)) {
+        const runoutMs = chainInfo.chainRunoutDate.getTime();
+        for (const l of chainInfo.chainPOLines) {
+          if (!l || !l.expectedDate || !l.remaining) continue;
+          const ems = l.expectedDate.getTime();
+          if (ems <= runoutMs) continue;
+          if (resumeDate === null || ems < resumeDate.getTime()) resumeDate = l.expectedDate;
+        }
+      }
+      const coverageClause = resumeDate
+        ? `no coverage ${chainRunoutTxt} → ${fmtDate(resumeDate)} (${Math.round((resumeDate.getTime() - chainInfo.chainRunoutDate.getTime()) / DAY_MS)} days short)`
+        : `chain out of coverage ${chainRunoutTxt}`;
+      runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Cut-in ${cutinDateTxt}. ${fmtNum(rawTotal)} in chain, ~${strandedTxt} strand at cut-in (unusable on successor). Own stock ${ownTxt} + ${onPOTxt} on PO — ${coverageClause}. ${reorderByHtml} — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
+    } else {
+      runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:${chainStatusColor};font-weight:600">${roleTxt}. Chain runs out ${chainRunoutTxt} (${chainInfo.chainRunoutDays}d at ${fmtNum(chainInfo.chainRate, 2)}/day across ${fmtNum(chainInfo.chainOnHand)} on-hand + ${fmtNum(chainInfo.chainOnPO)} on PO) · ${reorderByHtml} — status ${chainStatusTxt}.${ownRunoutTxt}</div>`;
+    }
   } else if (preLaunch) {
     // Case-A pre-launch: no consumption until transitionStartDate. The
     // runway (chart above) now correctly holds flat at onHand until
@@ -531,7 +600,7 @@ function renderPartDetail(part) {
         <div class="stat">
           <div class="stat-label">On Hand</div>
           <div class="stat-value">${fmtNum(part.onHand)}</div>
-          ${chainBoost && (chainBoost.combinedOnHand - (Number(part.onHand) || 0)) > 0 ? `<div class="dim tiny" style="margin-top:2px">+ ${fmtNum(chainBoost.combinedOnHand - (Number(part.onHand) || 0))} in chain (burning down)</div>` : ''}
+          ${chainBoost && chainBoost._predecessorStockRaw > 0 ? `<div class="dim tiny" style="margin-top:2px">+ ${fmtNum(chainBoost._predecessorStockRaw)} in chain (burning down${chainBoost._hardCutin && chainBoost._hardCutin.strandedPredecessorQty > 0 ? `, strands ~${fmtNum(chainBoost._hardCutin.strandedPredecessorQty)} at cut-in ${chainBoost._hardCutin.hardCutinDate ? fmtDate(chainBoost._hardCutin.hardCutinDate) : ''}` : ''})</div>` : ''}
         </div>
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
         <div class="stat">
