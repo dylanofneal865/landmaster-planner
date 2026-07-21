@@ -221,13 +221,20 @@ function leadTimeDays(part) {
 }
 
 /* ------------------------------------------------------------------
-   WORKDAY → CALENDAR conversion (shared, single source of truth)
+   WORKDAY ⇄ CALENDAR conversion (shared, single source of truth)
 
    dailyUse is a PER-WORKDAY rate (units consumed per working day — the usage
    page divides by workdays, not calendar days). So "(onHand + incoming) /
    dailyUse" is a count of WORKDAYS of cover, and it must be walked across the
    calendar skipping non-workdays to land on the real runout DATE — NOT added
    as calendar days (the bug) and NOT scaled by a 7/5 average (imprecise).
+
+   The INVERSE direction has the SAME anti-average rule: given a calendar-day
+   window (lead + safety + horizon), the workdays of demand it accumulates
+   depends on which weekday the anchor falls on. calendarDaysToWorkdays walks
+   the partial week via isWorkday for exactness — same shape as its forward
+   sibling — so a 30-day horizon starting Tue-Wed and starting Fri-Sat give
+   different (correct) workday counts.
 
    workdaysPerWeek is ALWAYS read from settings through effectiveWorkdaysPerWeek
    — never hardcode 5 — so changing it visibly shifts every runout date.
@@ -266,6 +273,34 @@ function workdaysToCalendarDays(coverWorkdays, startDate = TODAY, wpw = effectiv
     if (isWorkday(addDays(startDate, cursor), wpw)) workdaysLeft -= 1;
   }
   return cursor;
+}
+
+// Convert a number of CALENDAR days (starting from `startDate + 1`, matching
+// workdaysToCalendarDays's cursor convention) into the count of WORKDAYS that
+// fall inside that interval. Same anchor-and-partial-week shape as its
+// sibling: whole 7-day weeks contribute exactly wpw workdays each
+// (independent of phase, because any 7 consecutive calendar days hold wpw
+// workdays), then the remaining ≤6 days are walked via isWorkday. O(1) up
+// to a fixed small constant.
+//
+// Round-trip property: workdaysToCalendarDays(calendarDaysToWorkdays(n)) ≤ n
+// for every n. The equality holds when day n lands on a workday; when day n
+// lands on a weekend the forward sibling snaps back to the nearest earlier
+// workday (never a later day). See _printQtyImpact's round-trip block for
+// the full 1..200 check.
+function calendarDaysToWorkdays(calDays, startDate = TODAY, wpw = effectiveWorkdaysPerWeek()) {
+  if (!Number.isFinite(calDays) || calDays <= 0) return 0;
+  if (wpw >= 7) return Math.floor(calDays);
+  const n = Math.floor(calDays);
+  if (n <= 0) return 0;
+  const fullWeeks = Math.floor(n / 7);
+  let workdays = fullWeeks * wpw;
+  const anchorOffset = fullWeeks * 7;
+  const remainder = n - anchorOffset;   // 0..6
+  for (let i = 1; i <= remainder; i++) {
+    if (isWorkday(addDays(startDate, anchorOffset + i), wpw)) workdays += 1;
+  }
+  return workdays;
 }
 
 // ----- Shared "is this PO line actually open?" gate -------------------------
@@ -613,6 +648,19 @@ function partStatus(part, lines) {
   return { status, urgency, stockoutDay, leadDays: lt, reorderBy, daysOfCover: stockoutDay };
 }
 
+// Shared window→demand conversion. Given a CALENDAR-day window and a
+// PER-WORKDAY consumption rate, returns the units demanded across the
+// window. Calendar days are walked into workdays via calendarDaysToWorkdays
+// so the mixed-units bug (calendar × per-workday) doesn't happen at any
+// call site. suggestedQty and cycleAwareSuggestedQty both call this.
+// startDate defaults to TODAY, matching the runway/days-cover convention.
+function _windowDemandUnits(calendarWindowDays, dailyRatePerWorkday, startDate = TODAY) {
+  const rate = Number(dailyRatePerWorkday) || 0;
+  if (rate <= 0) return 0;
+  const workdays = calendarDaysToWorkdays(calendarWindowDays, startDate);
+  return workdays * rate;
+}
+
 // Suggested order qty: cover lead time + safety + a target horizon (e.g., 30 days more).
 // `onPO` is the optional precomputed open-PO qty — saves an openPOQty scan.
 //
@@ -626,6 +674,14 @@ function partStatus(part, lines) {
 // us the anchor's daily rate and the chain's combined on-hand. We size the
 // order against that combined supply so we don't reorder while a phased-out
 // predecessor still has stock to burn down. See _supersessionDemandBoost.
+//
+// UNITS: (lt + safety + horizon) is CALENDAR days; part.daily / chainRate is
+// PER-WORKDAY. `target = window × rate` is only correct after the calendar
+// window is converted into workdays. _windowDemandUnits does that via
+// calendarDaysToWorkdays (same anchor-and-partial-week walker style as
+// workdaysToCalendarDays). The prior formula multiplied calendar × per-
+// workday directly, inflating every suggested qty by ~7/wpw (~40% at
+// wpw=5) — see _printQtyImpact for the per-part before/after delta.
 function suggestedQty(part, onPO) {
   if (part && part.phasingOut) return 0;
 
@@ -642,7 +698,7 @@ function suggestedQty(part, onPO) {
   const dailyRate = boost
     ? Math.max(Number(part.daily) || 0, boost.dailyRate)
     : (part.daily || 0);
-  const target = (lt + safety + horizon) * dailyRate;
+  const target = _windowDemandUnits(lt + safety + horizon, dailyRate);
 
   // Effective supply. When boosted, every predecessor's on-hand counts as
   // stock we'll consume first — only the final part has open POs that we
@@ -1785,7 +1841,10 @@ function cycleAwareSuggestedQty(part, onPO) {
   const dailyRate = boost
     ? Math.max(Number(part.daily) || 0, boost.dailyRate)
     : (Number(part.daily) || 0);
-  const target = (lt + safety + horizon) * dailyRate;
+  // Calendar-window → workday-demand conversion via the shared helper.
+  // Same fix as suggestedQty — the previous formula multiplied calendar
+  // days × per-workday rate directly, over-ordering by ~7/wpw.
+  const target = _windowDemandUnits(lt + safety + horizon, dailyRate);
   const onPOQty = (typeof onPO === "number")
     ? onPO
     : ((typeof openPOQty === "function") ? openPOQty(part.pn) : 0);
@@ -2135,6 +2194,124 @@ function _printChainSpotCheck(pn) {
   ].filter(Boolean).join("\n");
 }
 window._printChainSpotCheck = _printChainSpotCheck;
+
+// LEGACY DIAGNOSTIC — verbatim byte-for-byte copy of the pre-fix suggestedQty
+// body from js/03-calc.js.bak-workday lines 664-697. Only two changes:
+// (a) function name, (b) internal call to `_supersessionDemandBoost(part)`
+// remains — that live function is UNCHANGED by this workday fix (it still
+// returns `{ dailyRate: view.chainRate, combinedOnHand: view.totalChainStockClamped, ... }`
+// exactly as before), so its output here matches pre-fix output. The
+// hardCutin work made _supersessionDemandBoost's `combinedOnHand` return
+// `hardCutin.ownStock` instead of `totalChainStockClamped` when hardCutin
+// is active, but that's the CORRECT current behavior — the "pre-workday"
+// legacy this helper mirrors is the state right before the workday fix,
+// which was AFTER hardCutin. So this reads live _supersessionDemandBoost.
+function _legacySuggestedQtyPreWorkday(part, onPO) {
+  if (part && part.phasingOut) return 0;
+
+  const boost = _supersessionDemandBoost(part);
+
+  const lt = leadTimeDays(part);
+  const safety = DB.settings.safetyDays || 0;
+  const horizon = 30; // beyond reorder, target 30 days of stock after arrival
+
+  // Daily rate. Edge case: if the final part already has its own non-zero
+  // usage (real shipments on the new PN already), use the GREATER of
+  // (its own daily, the anchor's copied daily) so we never under-order
+  // during the cutover window.
+  const dailyRate = boost
+    ? Math.max(Number(part.daily) || 0, boost.dailyRate)
+    : (part.daily || 0);
+  const target = (lt + safety + horizon) * dailyRate;
+
+  // Effective supply. When boosted, every predecessor's on-hand counts as
+  // stock we'll consume first — only the final part has open POs that we
+  // count (predecessor POs are excluded per spec; in practice they're
+  // cancelled when a part phases out).
+  const onPOQty = (typeof onPO === "number") ? onPO : openPOQty(part.pn);
+  const have = boost
+    ? boost.combinedOnHand + onPOQty
+    : (part.onHand || 0) + onPOQty;
+
+  let qty = Math.max(0, Math.ceil(target - have));
+  if (part.moq && qty > 0) qty = Math.max(qty, part.moq);
+  if (part.packSize && qty > 0) {
+    qty = Math.ceil(qty / part.packSize) * part.packSize;
+  }
+  return qty;
+}
+window._legacySuggestedQtyPreWorkday = _legacySuggestedQtyPreWorkday;
+
+// Impact audit for the calendar→workday fix in suggestedQty. Returns ONE
+// string via .map(...).join('\n'). Every part whose oldQty != newQty
+// (excluding kits and phasing-out returns of 0/0), sorted by absolute delta
+// descending. Also runs a 1..200 round-trip sanity check on
+// calendarDaysToWorkdays↔workdaysToCalendarDays anchored on TODAY, and
+// picks one part whose (lt + safety + horizon) is not a multiple of 7 to
+// verify the walker on a non-aligned window.
+function _printQtyImpact() {
+  const s = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const horizon = 30;
+  const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
+  // Round-trip sanity: 1..200. Report any n where wtc(ctw(n)) > n.
+  const violations = [];
+  for (let n = 1; n <= 200; n++) {
+    const back = workdaysToCalendarDays(calendarDaysToWorkdays(n));
+    if (back > n) violations.push(`n=${n} → ${back}`);
+  }
+  // Non-multiple-of-7 sample: pick the first part whose window is not %7==0.
+  let sampleLine = "  non-multiple-of-7 window: (no candidate part found — all lt+s+h are 7-aligned)";
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    const lt = leadTimeDays(p);
+    const win = lt + s + horizon;
+    if (win % 7 === 0) continue;
+    const wd = calendarDaysToWorkdays(win);
+    const startDow = TODAY.getDay(); // 0=Sun..6=Sat
+    const startName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][startDow];
+    sampleLine =
+      `  non-multiple-of-7 window sample: pn=${p.pn} · ltWeeks=${p.ltWeeks||0} · window=${win} cal (from ${startName}) → workdays=${wd}`;
+    break;
+  }
+  // Per-part impact.
+  const rows = [];
+  let sumOld = 0, sumNew = 0;
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    if (typeof isKit === "function" && isKit(p.pn)) continue;
+    let oldQty, newQty;
+    try { oldQty = _legacySuggestedQtyPreWorkday(p); } catch (e) { oldQty = null; }
+    try { newQty = suggestedQty(p); } catch (e) { newQty = null; }
+    if (oldQty == null || newQty == null) continue;
+    if (oldQty === newQty) continue;
+    rows.push({
+      pn: p.pn,
+      supplier: p.supplier || "",
+      daily: (Number(p.daily) || 0),
+      leadDays: leadTimeDays(p),
+      onHand: Number(p.onHand) || 0,
+      onPO: (typeof openPOQty === "function") ? openPOQty(p.pn) : 0,
+      oldQty, newQty,
+      delta: newQty - oldQty,
+    });
+    sumOld += oldQty;
+    sumNew += newQty;
+  }
+  rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  const columns = "pn | supplier | daily | leadDays | onHand | onPO | oldQty | newQty | delta";
+  const sep = "-".repeat(columns.length);
+  const header = `[qty-impact] safetyDays=${s} · horizon=${horizon} · workdaysPerWeek=${wpw}`;
+  const roundTripLine = violations.length === 0
+    ? `  round-trip 1..200 (wtc∘ctw ≤ n): OK, no violations`
+    : `  round-trip 1..200: ${violations.length} violation(s) — ${violations.slice(0, 5).join(", ")}${violations.length > 5 ? " …" : ""}`;
+  const summary = `(${rows.length} part(s) changed · total oldQty=${sumOld} · total newQty=${sumNew} · net delta=${sumNew - sumOld})`;
+  const body = rows.map(r =>
+    `${r.pn} | ${r.supplier} | ${r.daily} | ${r.leadDays} | ${r.onHand} | ${r.onPO} | ${r.oldQty} | ${r.newQty} | ${r.delta}`
+  ).join("\n");
+  return [header, roundTripLine, sampleLine, columns, sep, body, summary].join("\n");
+}
+window._printQtyImpact = _printQtyImpact;
+window.calendarDaysToWorkdays = calendarDaysToWorkdays;
 
 window.getSupplierCycle = getSupplierCycle;
 window.nextCycleDates = nextCycleDates;
