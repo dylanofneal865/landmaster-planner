@@ -687,7 +687,7 @@ function renderPartDetail(part) {
         </div>
         <div class="field">
           <label>Transition start date</label>
-          <input class="input" type="date" id="pd-transition-start" value="${esc((part.transitionStartDate||"").slice(0,10))}">
+          <input class="input" type="date" id="pd-transition-start" value="${esc((part.transitionStartDate||"").slice(0,10))}" oninput="this.dataset.touched='1'" onchange="this.dataset.touched='1'">
           <div class="muted tiny mt-xs">Cut-in date this part goes live. Before it, the part is pre-launch — excluded from queues &amp; stockout flags; order-by = this date − lead time.</div>
         </div>
         <div class="field">
@@ -809,8 +809,23 @@ function savePartFromDetail(originalPn) {
   // the part's `data` blob to Supabase and survives the Acumatica sync, which
   // only overrides onHand (see netlify/functions/acumatica-sync.js). Stored as
   // a bare "YYYY-MM-DD" string (or null when cleared).
+  //
+  // WRITE ONLY IF TOUCHED — <input type="date"> is unique among the drawer's
+  // inputs: it silently rejects any stored value that isn't strict ISO
+  // YYYY-MM-DD, leaving .value empty. If the save handler unconditionally
+  // wrote transEl.value, an unrelated edit (say a description change) on a
+  // part whose stored cutin was ever non-ISO — OR simply on a part whose
+  // stored value never populated the input — would destroy the cutin. We
+  // guard by setting dataset.touched="1" only from oninput/onchange events,
+  // so absent user interaction we leave part.transitionStartDate exactly
+  // as-is. When the user DOES touch (sets a date or clears one), we honor
+  // the new value: non-empty → the ISO date, empty → null. Every other
+  // input in this drawer is text/number/select, which return their initial
+  // rendered value from .value reliably; only this one needed the guard.
   const transEl = document.getElementById("pd-transition-start");
-  if (transEl) part.transitionStartDate = transEl.value ? transEl.value.slice(0, 10) : null;
+  if (transEl && transEl.dataset.touched === "1") {
+    part.transitionStartDate = transEl.value ? transEl.value.slice(0, 10) : null;
+  }
   part.notes = $("#pd-notes").value.trim();
   // If PN changed, update PO line refs
   if (newPN !== originalPn) {

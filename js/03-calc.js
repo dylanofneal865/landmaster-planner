@@ -2322,6 +2322,287 @@ window.cycleAwareSuggestedQty = cycleAwareSuggestedQty;
 window.naturalOrderByForPart = naturalOrderByForPart;
 window._printSupplierCycleAudit = _printSupplierCycleAudit;
 
+// CYCLE-QTY COMPARE — for every part whose supplier resolves to a
+// getSupplierCycle, print (pn | daily | onHand | onPO | suggestedQty |
+// cycleAwareQty | delta). Sensourcing is the only configured supplier
+// today; any others added later automatically appear. Returns ONE string.
+function _printCycleQtyCompare() {
+  const rows = [];
+  let sumStd = 0, sumCyc = 0;
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    const cyc = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
+    if (!cyc) continue;
+    let sq = "err", cq = "err";
+    try { sq = suggestedQty(p); } catch (e) { sq = "err"; }
+    try { cq = cycleAwareSuggestedQty(p); } catch (e) { cq = "err"; }
+    const delta = (typeof sq === "number" && typeof cq === "number") ? (cq - sq) : "-";
+    if (typeof sq === "number") sumStd += sq;
+    if (typeof cq === "number") sumCyc += cq;
+    rows.push({
+      pn: p.pn,
+      supplier: p.supplier || "",
+      daily: (Number(p.daily) || 0),
+      onHand: Number(p.onHand) || 0,
+      onPO: (typeof openPOQty === "function") ? openPOQty(p.pn) : 0,
+      sq, cq, delta,
+    });
+  }
+  rows.sort((a, b) => {
+    const da = typeof a.delta === "number" ? Math.abs(a.delta) : -1;
+    const db = typeof b.delta === "number" ? Math.abs(b.delta) : -1;
+    return db - da;
+  });
+  const columns = "pn | daily | onHand | onPO | suggestedQty | cycleAwareQty | delta";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.daily} | ${r.onHand} | ${r.onPO} | ${r.sq} | ${r.cq} | ${r.delta}`
+  ).join("\n");
+  const summary = `(${rows.length} cycled-supplier part(s) · total suggestedQty=${sumStd} · total cycleAwareQty=${sumCyc} · net delta=${sumCyc - sumStd})`;
+  return [`[cycle-qty compare]`, columns, sep, body, summary].join("\n");
+}
+window._printCycleQtyCompare = _printCycleQtyCompare;
+
+// DRAFT-QTY AUDIT — every item currently in DRAFT_ORDER, showing
+// storedQty (persisted at add-time) vs currentCycleAwareQty (what a
+// fresh add today would compute). qtySource is "cycle" / "standard" /
+// "legacy" (last for pre-cyclewire items with no qtySource field).
+// Returns ONE string.
+function _printDraftQtyAudit() {
+  const rows = [];
+  const draft = (typeof DRAFT_ORDER !== "undefined") ? DRAFT_ORDER : [];
+  let sumStored = 0, sumCurrent = 0, changedCount = 0;
+  for (const item of draft) {
+    if (!item || !item.pn) continue;
+    const p = (DB.parts || []).find(x => x && x.pn === item.pn);
+    if (!p) continue;
+    let currentCq = "err";
+    try {
+      const forQty = { ...p, onPO: (typeof openPOQty === "function") ? openPOQty(p.pn) : 0, daily: p.daily };
+      currentCq = (typeof cycleAwareSuggestedQty === "function")
+        ? cycleAwareSuggestedQty(forQty)
+        : (typeof suggestedQty === "function" ? suggestedQty(forQty) : 0);
+    } catch (e) { currentCq = "err"; }
+    const storedQty = Number(item.qty) || 0;
+    const delta = typeof currentCq === "number" ? (currentCq - storedQty) : "-";
+    const qtySource = item.qtySource || "legacy";
+    if (typeof currentCq === "number") sumCurrent += currentCq;
+    sumStored += storedQty;
+    if (typeof delta === "number" && delta !== 0) changedCount++;
+    rows.push({
+      pn: item.pn,
+      supplier: p.supplier || "",
+      storedQty,
+      currentCq,
+      delta,
+      qtySource,
+      addedAt: item.addedAt || "(unset)",
+    });
+  }
+  rows.sort((a, b) => {
+    const da = typeof a.delta === "number" ? Math.abs(a.delta) : -1;
+    const db = typeof b.delta === "number" ? Math.abs(b.delta) : -1;
+    return db - da;
+  });
+  const columns = "pn | supplier | storedQty | currentCycleAwareQty | delta | qtySource | addedAt";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.supplier} | ${r.storedQty} | ${r.currentCq} | ${r.delta} | ${r.qtySource} | ${r.addedAt}`
+  ).join("\n");
+  const summary = `(${rows.length} draft item(s) · ${changedCount} differ from current · total stored=${sumStored} · total currentCycleAware=${sumCurrent})`;
+  return [`[draft-qty audit]`, columns, sep, body, summary].join("\n");
+}
+window._printDraftQtyAudit = _printDraftQtyAudit;
+
+// QUEUE FLAG AUDIT — reproduces the RELEASE / NO PO decision the queue row
+// renderer applies at js/07-page-orders.js, per part. Sensourcing scope
+// only (getSupplierCycle non-null). Returns ONE string.
+// Columns: pn | supplier | hasBlanket | blanketCount | openPOQty |
+//   cutinDate | runoutDate | triggerDate | daysToTrigger | flag
+// Trigger date sourcing matches the queue: transitionStartDate wins (past
+// or future); else chain-aware runout via getChainInfo, else per-part
+// runout via partStatus daysOfCover.
+function _printQueueFlagAudit() {
+  const iso = d => (d && d.toISOString) ? d.toISOString().slice(0, 10) : "-";
+  const rows = [];
+  let relCount = 0, noPoCount = 0;
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    const cycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
+    if (!cycle) continue; // Sensourcing-only scope
+    if (typeof isKit === "function" && isKit(p.pn)) continue;
+    const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(p.pn) : null;
+    const blanketCount = (typeof findOpenBlanketsForPart === "function")
+      ? findOpenBlanketsForPart(p.pn).length : 0;
+    const openPO = (typeof openPOQty === "function") ? openPOQty(p.pn) : 0;
+    // Cut-in date (past or future).
+    let cutinDate = null;
+    if (p.transitionStartDate && typeof parseDateLocal === "function") {
+      const parsed = parseDateLocal(p.transitionStartDate);
+      if (parsed && !isNaN(parsed.getTime())) cutinDate = parsed;
+    }
+    // Runout: chain-aware first, then per-part daysOfCover.
+    const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
+    let runoutDate = null;
+    if (chainInfo && chainInfo.chainRunoutDate) {
+      runoutDate = chainInfo.chainRunoutDate;
+    } else {
+      const stat = (typeof partStatus === "function") ? partStatus(p) : null;
+      if (stat && Number.isFinite(stat.daysOfCover) && stat.daysOfCover !== Infinity) {
+        runoutDate = addDays(TODAY, stat.daysOfCover);
+      }
+    }
+    const triggerDate = cutinDate || runoutDate;
+    const daysToTrigger = triggerDate
+      ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+    const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
+    let flag = "none";
+    // Both flags require a valid triggerDate — a Sensourcing part with no
+    // runout and no cutin has no demand signal, so surfacing NO PO on it
+    // is a false positive. Matches the queue row's gate at
+    // js/07-page-orders.js.
+    if (blk && openPO === 0 && inWindow) flag = "RELEASE";
+    else if (!blk && openPO === 0 && triggerDate) flag = "NO PO";
+    if (flag === "RELEASE") relCount++;
+    else if (flag === "NO PO") noPoCount++;
+    rows.push({
+      pn: p.pn,
+      supplier: p.supplier || "",
+      hasBlanket: !!blk,
+      blanketCount,
+      openPOQty: openPO,
+      cutinDate: iso(cutinDate),
+      runoutDate: iso(runoutDate),
+      triggerDate: iso(triggerDate),
+      daysToTrigger: daysToTrigger == null ? "-" : daysToTrigger,
+      flag,
+    });
+  }
+  rows.sort((a, b) => {
+    const rank = f => f === "RELEASE" ? 0 : f === "NO PO" ? 1 : 2;
+    const dr = rank(a.flag) - rank(b.flag);
+    if (dr !== 0) return dr;
+    const at = a.daysToTrigger === "-" ? 9999 : a.daysToTrigger;
+    const bt = b.daysToTrigger === "-" ? 9999 : b.daysToTrigger;
+    return at - bt;
+  });
+  const columns = "pn | supplier | hasBlanket | blanketCount | openPOQty | cutinDate | runoutDate | triggerDate | daysToTrigger | flag";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.supplier} | ${r.hasBlanket} | ${r.blanketCount} | ${r.openPOQty} | ${r.cutinDate} | ${r.runoutDate} | ${r.triggerDate} | ${r.daysToTrigger} | ${r.flag}`
+  ).join("\n");
+  const summary = `(${rows.length} cycled-supplier part(s) · RELEASE=${relCount} · NO PO=${noPoCount} · none=${rows.length - relCount - noPoCount})`;
+  return [`[queue-flag audit]`, columns, sep, body, summary].join("\n");
+}
+window._printQueueFlagAudit = _printQueueFlagAudit;
+
+// MISSING-CUTIN AUDIT — every part that is a chain successor (some other
+// part points at it via supersededBy AND that predecessor has phasingOut
+// truthy) BUT has no valid transitionStartDate. These are the parts most
+// likely to have lost a cutin to the drawer save bug — a chain
+// successor needs a cutin to gate the hard-cutin math; without one, the
+// chain falls back to the pre-fix combined runout. Returns ONE string.
+function _printMissingCutins() {
+  const rows = [];
+  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    // Find any predecessor pointing at THIS part via supersededBy AND
+    // phasingOut truthy — matches the getChainInfo transitioning-chain
+    // gate (line 1246, `!!m.phasingOut`).
+    let phasingPred = null;
+    for (const other of (DB.parts || [])) {
+      if (!other || !other.supersededBy) continue;
+      if (String(other.supersededBy).trim() !== p.pn) continue;
+      if (!other.phasingOut) continue;
+      phasingPred = other;
+      break;
+    }
+    if (!phasingPred) continue;
+    // Does this successor have a valid transitionStartDate?
+    let hasValid = false;
+    if (p.transitionStartDate && typeof parseDateLocal === "function") {
+      const parsed = parseDateLocal(p.transitionStartDate);
+      hasValid = !!(parsed && !isNaN(parsed.getTime()));
+    }
+    if (hasValid) continue;
+    // Anchor for reporting — walk back via supersessionLineage if available.
+    const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
+    rows.push({
+      pn: p.pn,
+      desc: (p.desc || "").slice(0, 40),
+      supplier: p.supplier || "",
+      transitionStartDate: JSON.stringify(p.transitionStartDate),
+      inChain: !!chainInfo,
+      chainAnchor: chainInfo ? chainInfo.anchorPn : phasingPred.pn,
+      phasingOut: !!p.phasingOut,
+    });
+  }
+  rows.sort((a, b) => String(a.pn).localeCompare(String(b.pn)));
+  const columns = "pn | desc | supplier | transitionStartDate | inChain | chainAnchor | phasingOut";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.desc} | ${r.supplier} | ${r.transitionStartDate} | ${r.inChain} | ${r.chainAnchor} | ${r.phasingOut}`
+  ).join("\n");
+  const summary = `(${rows.length} chain successor(s) missing a valid transitionStartDate)`;
+  return [`[missing-cutin audit]`, columns, sep, body, summary].join("\n");
+}
+window._printMissingCutins = _printMissingCutins;
+
+// QUEUE-vs-CYCLE audit — every queued part's OLD (standard suggestedQty)
+// vs NEW (cycleAwareSuggestedQty, now the writer of _suggestedQty).
+// Cycled parts should show a delta; non-cycled parts should show delta=0
+// (byte-identical delegation). Returns ONE string via .map(...).join('\n').
+function _printQueueVsCycle() {
+  const rows = [];
+  let sumOld = 0, sumNew = 0, cycledCount = 0;
+  const stats = (typeof queueParts === "function") ? queueParts() : [];
+  for (const p of stats) {
+    if (!p || !p.pn) continue;
+    const cyc = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
+    const isCycled = !!cyc;
+    // Compute OLD (standard) inline via suggestedQty — the pre-swap writer.
+    // Same onPO the row already carries so both values operate on the same
+    // supply picture. `newQty` = p._suggestedQty, which is now cycle-aware
+    // (Option-A writer swap).
+    const onPO = Number(p.onPO) || 0;
+    let oldQty = "err", newQty = "err";
+    try { oldQty = (typeof suggestedQty === "function") ? suggestedQty(p, onPO) : 0; } catch (e) { oldQty = "err"; }
+    try { newQty = Number(p._suggestedQty) || 0; } catch (e) { newQty = "err"; }
+    if (typeof oldQty === "number") sumOld += oldQty;
+    if (typeof newQty === "number") sumNew += newQty;
+    if (isCycled) cycledCount++;
+    rows.push({
+      pn: p.pn,
+      supplier: p.supplier || "",
+      oldSuggestedQty: oldQty,
+      newSuggestedQty: newQty,
+      isCycled,
+    });
+  }
+  // Sort: cycled first (largest positive delta first), then non-cycled by pn.
+  rows.sort((a, b) => {
+    if (a.isCycled !== b.isCycled) return a.isCycled ? -1 : 1;
+    if (a.isCycled) {
+      const da = (typeof a.newSuggestedQty === "number" && typeof a.oldSuggestedQty === "number")
+        ? Math.abs(a.newSuggestedQty - a.oldSuggestedQty) : -1;
+      const db = (typeof b.newSuggestedQty === "number" && typeof b.oldSuggestedQty === "number")
+        ? Math.abs(b.newSuggestedQty - b.oldSuggestedQty) : -1;
+      return db - da;
+    }
+    return String(a.pn).localeCompare(String(b.pn));
+  });
+  const columns = "pn | supplier | oldSuggestedQty | newSuggestedQty | isCycled";
+  const sep = "-".repeat(columns.length);
+  const body = rows.map(r =>
+    `${r.pn} | ${r.supplier} | ${r.oldSuggestedQty} | ${r.newSuggestedQty} | ${r.isCycled}`
+  ).join("\n");
+  const nonCycledDrift = rows.filter(r => !r.isCycled && typeof r.oldSuggestedQty === "number" && typeof r.newSuggestedQty === "number" && r.oldSuggestedQty !== r.newSuggestedQty).length;
+  const summary = `(${rows.length} queued part(s) · ${cycledCount} cycled · sum old=${sumOld} new=${sumNew} · non-cycled parts with drift=${nonCycledDrift} [must be 0])`;
+  return [`[queue-vs-cycle qty]`, columns, sep, body, summary].join("\n");
+}
+window._printQueueVsCycle = _printQueueVsCycle;
+
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
 // candidates are future/invalid, fall back to newest regardless.
@@ -2555,7 +2836,7 @@ function partsWithStatus() {
         leadDays: chainInfo.chainStatusDetail.leadDays,
         reorderBy: chainInfo.chainStatusDetail.reorderBy,
       } : {}),
-      _suggestedQty: suggestedQty(p, onPO),
+      _suggestedQty: cycleAwareSuggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
   });

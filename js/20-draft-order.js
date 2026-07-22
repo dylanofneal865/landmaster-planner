@@ -115,7 +115,7 @@ function _draftItemLines(item) {
   }];
 }
 
-function draftOrderAdd(pn, qty) {
+function draftOrderAdd(pn, qty, qtySource) {
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
   const split = _computeBlanketSplit(pn, qty);
   const first = split.releases[0] || null;
@@ -125,6 +125,12 @@ function draftOrderAdd(pn, qty) {
   // needing to know about _releases.
   const legacyBlanketPoNum = first ? first.blanketPoNum : null;
   const legacyBlanketOpenQty = first ? first.blanketOpenQty : 0;
+  // qtySource: "cycle" when the qty came from cycleAwareSuggestedQty for a
+  // cycled supplier, "standard" for plain suggestedQty. Persisted per item
+  // so _printDraftQtyAudit can surface pre-cycle-wire items still holding
+  // old quantities. Absent (no arg) → don't touch; defaults to "standard"
+  // for new items and preserves existing on updates.
+  const resolvedQtySource = qtySource || "standard";
   if (existing) {
     // In-place mutation only — DRAFT_ORDER identity is preserved so realtime
     // sync's hash / delta path keeps working.
@@ -134,6 +140,7 @@ function draftOrderAdd(pn, qty) {
     existing._releases = split.releases;
     existing._normalQty = split.normalQty;
     existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
+    if (qtySource) existing.qtySource = qtySource;
   } else {
     DRAFT_ORDER.push({
       pn,
@@ -144,6 +151,7 @@ function draftOrderAdd(pn, qty) {
       _releases: split.releases,
       _normalQty: split.normalQty,
       _exhaustedBlanketPoNum: split.exhaustedBlanketPoNum,
+      qtySource: resolvedQtySource,
     });
   }
   draftOrderSave();
@@ -236,8 +244,20 @@ function quickAddToDraft(pn) {
     showToast(`${pn} is a kit — order its components instead`, "warn", "Can't add kit to draft");
     return;
   }
-  const qty = suggestedQty({ ...part, onPO: openPOQty(pn), daily: part.daily });
-  draftOrderAdd(pn, qty);
+  // Route through cycleAwareSuggestedQty — for cycled suppliers (Sensourcing
+  // today) this returns qty sized for cycle.intervalDays instead of the
+  // 30-day horizon in suggestedQty; for every non-cycled supplier
+  // getSupplierCycle returns null and cycleAwareSuggestedQty delegates to
+  // plain suggestedQty (byte-identical). MOQ / packSize / phasingOut /
+  // boost logic all inherited from the shared helpers, so CP00238's 500
+  // MOQ floor still applies after the swap.
+  const partForQty = { ...part, onPO: openPOQty(pn), daily: part.daily };
+  const qty = (typeof cycleAwareSuggestedQty === "function")
+    ? cycleAwareSuggestedQty(partForQty)
+    : suggestedQty(partForQty);
+  const cycleForPart = (typeof getSupplierCycle === "function") ? getSupplierCycle(part.supplier) : null;
+  const qtySource = cycleForPart ? "cycle" : "standard";
+  draftOrderAdd(pn, qty, qtySource);
   showToast(`${pn} × ${fmtNum(qty)} added to Draft Order`, "ok", "Added");
 }
 

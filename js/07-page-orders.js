@@ -555,24 +555,85 @@ function renderOrderQueueFor(itemType) {
                     // off the row's cached partsWithStatus state — non-final
                     // / non-chain parts get falsy here (zero cost).
                     const risk = (typeof chainTransitionRisk === "function") ? chainTransitionRisk(p) : false;
-                    // Open blanket lookup — only used to decide whether to
-                    // hang a "BLKT" pill on the pn cell (abbreviated from
-                    // "BLANKET AVAIL" so PN + risk + blanket all fit on one
-                    // line in the narrow PART column; full context lives in
-                    // the pill's title tooltip on hover). Everything else
-                    // about the blanket (PO#, remaining qty, release
-                    // guidance) lives in the draft-order drawer + PDF, wired
-                    // via draftOrderAdd → blanketPoNum snapshot at add-time.
-                    // Deliberately no visible guidance on the queue row: the
-                    // Suggest-Qty column is ~5.5% wide, too narrow for any
-                    // caption, and the pill alone is the at-a-glance signal.
+                    // SENSOURCING-SCOPED RELEASE / NO PO FLAGS.
+                    // Scoped via getSupplierCycle (non-null) so no raw-name
+                    // string-match; the rule extends automatically to any
+                    // future cycled supplier. Non-Sensourcing rows fall
+                    // through to the pre-existing BLKT branch below — byte-
+                    // identical to today's rendering.
+                    const supplierCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
+                    const isCycledScope = !!supplierCycle;
+                    // Trigger date rule: presence of transitionStartDate
+                    // (PAST OR FUTURE — same gate as hard-cutin, NOT
+                    // isPreLaunch which is future-only) wins over runout.
+                    // Otherwise fall back to the chain-aware runout, which
+                    // partsWithStatus has already written to p.daysOfCover
+                    // (chainInfo.chainRunoutDays for chain members, per-
+                    // part daysOfCover for standalone parts).
+                    let triggerDate = null;
+                    if (p.transitionStartDate && typeof parseDateLocal === "function") {
+                      const parsed = parseDateLocal(p.transitionStartDate);
+                      if (parsed && !isNaN(parsed.getTime())) triggerDate = parsed;
+                    }
+                    if (!triggerDate && Number.isFinite(p.daysOfCover) && typeof addDays === "function") {
+                      triggerDate = addDays(TODAY, p.daysOfCover);
+                    }
+                    const daysToTrigger = triggerDate
+                      ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+                    const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
+                    // Open blanket lookup (any-scope) — used to decide
+                    // whether to hang a "BLKT" pill on the pn cell for
+                    // non-Sensourcing rows, and to escalate to RELEASE for
+                    // Sensourcing rows meeting the trigger.
                     const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(p.pn) : null;
-                    const blkPill = blk
+                    const openPO = (typeof openPOQty === "function") ? openPOQty(p.pn) : 0;
+                    // Sensourcing-only flags. RELEASE replaces BLKT on
+                    // qualifying rows — same slot, escalated visual. NO PO
+                    // is a distinct warn-level pill for the "no coverage
+                    // at all" case.
+                    let flag = "none";
+                    if (isCycledScope) {
+                      // A valid triggerDate is required for BOTH flags.
+                      // Without a runout (daily=0, no incoming) and without
+                      // a cutin date, there's no demand signal — parts like
+                      // PUTV-00xx spares and 23-8006 correctly fall through
+                      // to "none" instead of surfacing as false-positive
+                      // NO PO alerts.
+                      if (blk && openPO === 0 && inWindow) flag = "RELEASE";
+                      else if (!blk && openPO === 0 && triggerDate) flag = "NO PO";
+                    }
+                    // Enumerate ALL open blankets for the RELEASE tooltip so
+                    // parts with multiple blankets (JP00026/JP00031/JP00032
+                    // each have three) don't hide capacity behind a max-open
+                    // pick. findOpenBlanketsForPart returns all open lines
+                    // sorted earliest-expiring first.
+                    let releaseTooltip = "";
+                    if (flag === "RELEASE") {
+                      const all = (typeof findOpenBlanketsForPart === "function")
+                        ? findOpenBlanketsForPart(p.pn) : [];
+                      const list = all.map(b => `${b.po.num} (${fmtNum(b.open)} open)`).join("; ");
+                      releaseTooltip = `Release against blanket now — open blankets: ${list}. No open normal PO. Trigger date ${triggerDate ? triggerDate.toISOString().slice(0,10) : "n/a"} (${daysToTrigger}d).`;
+                    }
+                    const noPoTooltip = flag === "NO PO"
+                      ? `No open blanket and no open order. Trigger date ${triggerDate ? triggerDate.toISOString().slice(0,10) : "n/a"} (${daysToTrigger}d).`
+                      : "";
+                    // Pill construction. Priority: RELEASE > NO PO > BLKT.
+                    // RELEASE uses .pill.crit (call-to-action weight, same
+                    // as TRANS). NO PO uses .pill.warn. BLKT unchanged from
+                    // pre-flag rendering on rows that don't qualify for
+                    // either Sensourcing flag.
+                    let flagPill = "";
+                    if (flag === "RELEASE") {
+                      flagPill = ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(releaseTooltip)}">RELEASE</span>`;
+                    } else if (flag === "NO PO") {
+                      flagPill = ` <span class="pill warn" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(noPoTooltip)}">NO PO</span>`;
+                    }
+                    const blkPill = (flag === "none" && blk)
                       ? ` <span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:4px;letter-spacing:0.04em" title="Blanket available — open blanket ${esc(blk.po.num)} · ${fmtNum(blk.open)} available to release against">BLKT</span>`
                       : "";
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${blkPill}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPill}${blkPill}</td>
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? ` title="Projected stockout: ${s}"` : ''; })()}>
