@@ -574,37 +574,62 @@ function renderOrderQueueFor(itemType) {
                     // partsWithStatus has already written to p.daysOfCover
                     // (chainInfo.chainRunoutDays for chain members, per-
                     // part daysOfCover for standalone parts).
-                    let triggerDate = null;
+                    // triggerDate = the EARLIER of (runout, transitionStartDate).
+                    // Previously transitionStartDate short-circuited runout; a
+                    // part running dry in 10 days with a far-off transition
+                    // date stayed quiet. Now: if runout comes first, we act on
+                    // runout; if transition comes first, we act on transition;
+                    // if only one exists, we use it.
+                    let runoutDate = null;
+                    if (Number.isFinite(p.daysOfCover) && typeof addDays === "function") {
+                      runoutDate = addDays(TODAY, p.daysOfCover);
+                    }
+                    let transitionDate = null;
                     if (p.transitionStartDate && typeof parseDateLocal === "function") {
                       const parsed = parseDateLocal(p.transitionStartDate);
-                      if (parsed && !isNaN(parsed.getTime())) triggerDate = parsed;
+                      if (parsed && !isNaN(parsed.getTime())) transitionDate = parsed;
                     }
-                    if (!triggerDate && Number.isFinite(p.daysOfCover) && typeof addDays === "function") {
-                      triggerDate = addDays(TODAY, p.daysOfCover);
+                    let triggerDate = null;
+                    if (runoutDate && transitionDate) {
+                      triggerDate = runoutDate.getTime() <= transitionDate.getTime() ? runoutDate : transitionDate;
+                    } else if (runoutDate) {
+                      triggerDate = runoutDate;
+                    } else if (transitionDate) {
+                      triggerDate = transitionDate;
                     }
                     const daysToTrigger = triggerDate
                       ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
                     const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
                     // Open blanket lookup (any-scope) — used to decide
                     // whether to hang a "BLKT" pill on the pn cell for
-                    // non-Sensourcing rows, and to escalate to RELEASE for
-                    // Sensourcing rows meeting the trigger.
+                    // rows without escalation, and to escalate to RELEASE
+                    // for rows meeting the trigger.
                     const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(p.pn) : null;
                     const openPO = (typeof openPOQty === "function") ? openPOQty(p.pn) : 0;
-                    // Sensourcing-only flags. RELEASE replaces BLKT on
-                    // qualifying rows — same slot, escalated visual. NO PO
-                    // is a distinct warn-level pill for the "no coverage
-                    // at all" case.
+                    // Flag scoping (grep-legible). BOTH flags gated to
+                    // base_bom so options / service queue rows never get
+                    // decorated with a base_bom-scoped affordance:
+                    //   RELEASE — base_bom + open blanket + no normal PO
+                    //     + inside the 21-day trigger window. ANY supplier
+                    //     (broadened from Sensourcing-only so a non-cycled
+                    //     base_bom part with a blanket still gets the CTA).
+                    //   NO PO — base_bom + Sensourcing (isCycledScope) +
+                    //     no blanket + no normal PO + valid triggerDate.
+                    //     Sensourcing scope preserved from prior behavior:
+                    //     the cycle-driven "you-should-have-a-PO-by-now"
+                    //     alert is only meaningful for cycled suppliers.
+                    //     Without a runout AND without a cutin date, there's
+                    //     no demand signal — parts like PUTV-00xx spares and
+                    //     23-8006 correctly fall through to "none".
+                    const itemTypeNorm = String(p.itemType || "").toLowerCase().trim();
+                    const isBaseBomScope = itemTypeNorm === "base_bom";
                     let flag = "none";
-                    if (isCycledScope) {
-                      // A valid triggerDate is required for BOTH flags.
-                      // Without a runout (daily=0, no incoming) and without
-                      // a cutin date, there's no demand signal — parts like
-                      // PUTV-00xx spares and 23-8006 correctly fall through
-                      // to "none" instead of surfacing as false-positive
-                      // NO PO alerts.
-                      if (blk && openPO === 0 && inWindow) flag = "RELEASE";
-                      else if (!blk && openPO === 0 && triggerDate) flag = "NO PO";
+                    if (isBaseBomScope) {
+                      if (blk && openPO === 0 && inWindow) {
+                        flag = "RELEASE";
+                      } else if (isCycledScope && !blk && openPO === 0 && triggerDate) {
+                        flag = "NO PO";
+                      }
                     }
                     // Enumerate ALL open blankets for the RELEASE tooltip so
                     // parts with multiple blankets (JP00026/JP00031/JP00032
