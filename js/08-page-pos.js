@@ -148,8 +148,12 @@ function poTimeBadge(po) {
   }
   const bm = poBlanketMeta(po);
   if (bm.kind === "blanket") {
-    const bExp = bm.blanketLine && bm.blanketLine.blanketExpires;
-    if (bExp && new Date(bExp) < TODAY) {
+    // EXPIRED pill fires when ANY blanket line on the PO has lapsed
+    // (conservative — surfaces the closest-to-expiration authorization).
+    // Undated lines never expire. Byte-identical to the pre-rollup single-
+    // line check when the PO has one blanket line.
+    const anyExpired = (bm.blanketLines || []).some(l => l.blanketExpires && new Date(l.blanketExpires) < TODAY);
+    if (anyExpired) {
       return { html: '<span class="pill warn">EXPIRED</span>', isOverdue: false };
     }
     return { html: "", isOverdue: false };
@@ -173,28 +177,67 @@ function posSubLineHTML(po) {
 //   • normal   → neither
 // Returned meta drives both the list-row indicator and the drawer strip
 // so those two surfaces can't drift out of sync.
+//
+// Per-line preservation: `blanketLines` carries EVERY blanket-typed line
+// (sorted earliest-expiring first — undated lines sort last, matching
+// findOpenBlanketsForPart's release-priority order). Consumers must
+// enumerate that array rather than reading `blanketLine`/`open`/`total`
+// as if they represented the whole PO — those fields are the
+// representative-line values, kept for the EXPIRED-pill and Expires-On
+// surfaces where a single date is meaningful, and left alongside for
+// backward-compat with any straggler reader.
 function poBlanketMeta(po) {
   if (!po || !Array.isArray(po.lines)) return { kind: "normal" };
-  let blanketLine = null;
+  const blanketLines = po.lines
+    .filter(l => String(l.type || "").trim().toLowerCase() === "blanket")
+    .slice()
+    .sort((a, b) => {
+      const aE = a.blanketExpires, bE = b.blanketExpires;
+      if (aE && bE) return aE < bE ? -1 : aE > bE ? 1 : 0;
+      if (aE && !bE) return -1;
+      if (!aE && bE) return 1;
+      return 0;
+    });
   let parentBlanketNum = null;
   for (const ln of po.lines) {
-    if (!blanketLine && String(ln.type || "").trim().toLowerCase() === "blanket") {
-      blanketLine = ln;
-    }
-    if (!parentBlanketNum && ln.blanketPoNum) {
+    if (ln.blanketPoNum) {
       parentBlanketNum = String(ln.blanketPoNum).trim() || null;
+      break;
     }
-    if (blanketLine && parentBlanketNum) break;
   }
-  if (blanketLine) {
-    const open = Math.max(0, Number(blanketLine.blanketOpenQty || 0));
-    const total = Math.max(0, Number(blanketLine.qty || 0));
-    return { kind: "blanket", blanketLine, open, total };
+  if (blanketLines.length > 0) {
+    const rep = blanketLines[0];  // earliest-expiring
+    const open = Math.max(0, Number(rep.blanketOpenQty || 0));
+    const total = Math.max(0, Number(rep.qty || 0));
+    return { kind: "blanket", blanketLine: rep, blanketLines, open, total };
   }
   if (parentBlanketNum) {
     return { kind: "release", parentBlanketNum };
   }
   return { kind: "normal" };
+}
+
+// Per-line breakdown string for the drawer banner, list-row indicator,
+// and release-child parent tail. Renders as "N blanket line[s] · a + b + c"
+// so a 3-line PO like POW0001289 (18397=40, 18420=60, 19931=150) shows
+// "3 blanket lines · 40 + 60 + 150" instead of a first-line-only "40".
+// Callers append their own contextual suffix ("open", "left on blanket").
+function fmtBlanketLinesBreakdown(blanketLines) {
+  const n = (blanketLines || []).length;
+  const opens = (blanketLines || []).map(l => fmtNum(Math.max(0, Number(l.blanketOpenQty || 0))));
+  return `${n} blanket line${n === 1 ? "" : "s"} · ${opens.join(" + ")}`;
+}
+
+// Expires clause for the drawer banner. Silent when no dates; renders
+// "expires <date>" when all lines share one expiration; renders "earliest
+// expires <date>" when lines differ, to signal that other authorizations
+// extend past this date.
+function fmtBlanketExpiresClause(blanketLines) {
+  const uniq = [...new Set((blanketLines || []).map(l => l.blanketExpires).filter(Boolean))];
+  if (uniq.length === 0) return "";
+  const earliest = uniq.slice().sort()[0];
+  const label = uniq.length === 1 ? "expires" : "earliest expires";
+  return ` · ${label} <span class="mono">${esc(fmtDate(earliest))}</span>`;
 }
 
 // Find an OPEN blanket PO covering `pn`. Returns { po, line, open } for the
@@ -574,8 +617,10 @@ registerRoute("pos", () => {
                 const timeBadge = poTimeBadge(po);
                 let blanketIndicatorHTML = "";
                 if (bm.kind === "blanket") {
+                  // Per-line breakdown so the row can't hide any specific
+                  // line's remaining coverage. Same shape as the drawer strip.
                   blanketIndicatorHTML = ` <span class="pill info" style="margin-left:4px" title="Blanket order">BLANKET</span>` +
-                    ` <span class="mono dim tiny" style="margin-left:4px">${fmtNum(bm.open)} / ${fmtNum(bm.total)} open</span>`;
+                    ` <span class="mono dim tiny" style="margin-left:4px">${esc(fmtBlanketLinesBreakdown(bm.blanketLines))} open</span>`;
                 } else if (bm.kind === "release") {
                   blanketIndicatorHTML = ` <span class="pill muted" style="margin-left:4px" title="Release against blanket ${esc(bm.parentBlanketNum)}">RELEASE</span>` +
                     ` <span class="mono dim tiny" style="margin-left:4px">↳ ${esc(bm.parentBlanketNum)}</span>`;
@@ -682,17 +727,15 @@ function renderPODetail(po) {
   const bm = poBlanketMeta(po);
   let blanketStripHTML = "";
   if (bm.kind === "blanket") {
-    // Blanket expiration is now sourced from ln.blanketExpires (synced from
-    // Acumatica via BLANKET_EXPIRES_CANDIDATES in acumatica-sync). Clause is
-    // conditionally rendered — pre-expires-sync POs, or a candidate mismatch,
-    // leaves blanketExpires null and the strip omits the clause rather than
-    // showing a wrong fallback date.
-    const bExp = bm.blanketLine && bm.blanketLine.blanketExpires;
-    const expiresClause = bExp ? ` · expires <span class="mono">${esc(fmtDate(bExp))}</span>` : "";
+    // Per-line breakdown — never collapse to a single pooled figure. For
+    // POW0001289 (18397=40, 18420=60, 19931=150) this renders
+    // "3 blanket lines · 40 + 60 + 150 open". Expiration clause names it
+    // "earliest expires" when lines have different expirations so the
+    // remaining runway isn't misrepresented as the earliest one.
     blanketStripHTML = `
       <div style="margin:0 0 14px; padding:10px 12px; background:var(--accent-soft); border-left:3px solid var(--accent-d); border-radius:3px; font-size:12px; color:var(--t1);">
         <span class="pill info" style="margin-right:8px">BLANKET</span>
-        <span>Blanket order · <strong class="mono">${fmtNum(bm.open)}</strong> of <strong class="mono">${fmtNum(bm.total)}</strong> units remaining${expiresClause}</span>
+        <span>Blanket order · <strong class="mono">${esc(fmtBlanketLinesBreakdown(bm.blanketLines))}</strong> open${fmtBlanketExpiresClause(bm.blanketLines)}</span>
       </div>`;
   } else if (bm.kind === "release") {
     // Try to resolve the parent blanket so we can inline its remaining. Match
@@ -702,7 +745,8 @@ function renderPODetail(po) {
     if (parent) {
       const parentMeta = poBlanketMeta(parent);
       if (parentMeta.kind === "blanket") {
-        parentTail = ` <span class="dim">(<span class="mono">${fmtNum(parentMeta.open)}</span> of <span class="mono">${fmtNum(parentMeta.total)}</span> left on blanket)</span>`;
+        // Enumerate parent's blanket lines rather than first-line-only.
+        parentTail = ` <span class="dim">(<span class="mono">${esc(fmtBlanketLinesBreakdown(parentMeta.blanketLines))}</span> left on blanket)</span>`;
       }
     }
     const linkAttrs = parent
