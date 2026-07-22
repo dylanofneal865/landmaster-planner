@@ -2603,6 +2603,43 @@ function _printQueueVsCycle() {
 }
 window._printQueueVsCycle = _printQueueVsCycle;
 
+// PRE-LAUNCH ROLLUP audit — reads the side channel that
+// computeCoverageGaps stashes on window._preLaunchRollupActions. Triggers
+// a fresh aggregator run (computeCoverageGaps) to guarantee the side
+// channel matches the current DB state. Returns ONE string.
+// Columns: suppressedPn | demandMember | overduePoNum | daysPastDue | action
+// where action ∈ { merged, synthesized, "skipped: not in a chain",
+// "skipped: no demand-carrying predecessor", "no overdue lines" }.
+function _printPreLaunchRollup() {
+  if (typeof computeCoverageGaps === "function") {
+    try { computeCoverageGaps(); } catch (e) { /* ignore — audit still prints last */ }
+  }
+  const actions = (typeof window !== "undefined" && Array.isArray(window._preLaunchRollupActions))
+    ? window._preLaunchRollupActions : [];
+  actions.sort((a, b) => {
+    // Merged / synthesized first (real routing), then skipped, then no-overdue.
+    const rank = a => a.action === "merged" ? 0
+      : a.action === "synthesized" ? 1
+      : String(a.action).startsWith("skipped") ? 2
+      : 3;
+    const dr = rank(a) - rank(b);
+    if (dr !== 0) return dr;
+    return String(a.suppressedPn || "").localeCompare(String(b.suppressedPn || ""));
+  });
+  const columns = "suppressedPn | demandMember | overduePoNum | daysPastDue | action";
+  const sep = "-".repeat(columns.length);
+  const body = actions.map(a =>
+    `${a.suppressedPn} | ${a.demandMember} | ${a.overduePoNum} | ${a.daysPastDue} | ${a.action}`
+  ).join("\n");
+  const merged = actions.filter(a => a.action === "merged").length;
+  const synthesized = actions.filter(a => a.action === "synthesized").length;
+  const skipped = actions.filter(a => String(a.action).startsWith("skipped")).length;
+  const noOverdue = actions.filter(a => a.action === "no overdue lines").length;
+  const summary = `(${actions.length} pre-launch part(s) processed · merged=${merged} · synthesized=${synthesized} · skipped=${skipped} · no-overdue=${noOverdue})`;
+  return [`[pre-launch rollup]`, columns, sep, body, summary].join("\n");
+}
+window._printPreLaunchRollup = _printPreLaunchRollup;
+
 // Most recent PO line for this SKU. "Latest" = newest PO createdDate that is
 // NOT in the future (guards the known future-dated createdDate typos); if all
 // candidates are future/invalid, fall back to newest regardless.

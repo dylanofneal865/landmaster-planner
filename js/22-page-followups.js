@@ -239,6 +239,16 @@ function computeCoverageGap(part, lines) {
     return _chainCoverageGap(part);
   }
 
+  // PRE-LAUNCH GATE (defense-in-depth). A pre-launch chain successor
+  // (transitionStartDate in the FUTURE) has no live consumption — its
+  // stored `daily` is a placeholder that misleads the projection into
+  // depleting phantom stock. The aggregator's own gate at
+  // computeCoverageGaps handles the primary suppression + rollup to the
+  // demand-carrying predecessor; this guard catches any direct caller
+  // (a future part-drawer hint, an audit) so no code path can surface a
+  // pre-launch part as its own gap row.
+  if (typeof isPreLaunch === "function" && isPreLaunch(part)) return null;
+
   const daily = Number(part.daily) || 0;
   if (daily <= 0) return null;
 
@@ -467,11 +477,59 @@ function computeCoverageGap(part, lines) {
 // Aggregator: scan partsWithStatus, apply the cheap pre-filters (kits,
 // daily<=0, onPO<=0 — all unconditionally not-exposed), call the detector
 // for each survivor, sort soonest-exposure first with widest-gap as tiebreak.
+// PRE-LAUNCH ROLLUP helper. Given a pre-launch part `p` suppressed by the
+// gate in computeCoverageGaps, returns the overdue PO lines (if any)
+// currently sitting on that part's own pn — for routing to the demand-
+// carrying predecessor. Same isLineOpen gate the rest of the app uses,
+// plus a `expected < TODAY` filter to isolate genuinely overdue lines.
+// Returns { overdueLines: [], daysPastDue: number }. When the part has
+// no overdue lines, both fields are empty/zero and the caller skips it.
+function _collectOverdueLinesForRollup(p) {
+  const overdueLines = [];
+  let worstDaysPastDue = 0;
+  for (const po of (DB.pos || [])) {
+    for (const ln of (po.lines || [])) {
+      if (!ln || ln.pn !== p.pn) continue;
+      if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
+      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (remaining <= 0) continue;
+      const expRaw = ln.expectedDate || po.expectedDate;
+      if (!expRaw) continue;
+      let exp = null;
+      if (typeof expRaw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(expRaw) && typeof parseDateLocal === "function") {
+        exp = parseDateLocal(expRaw);
+      } else {
+        exp = new Date(expRaw);
+        if (exp) exp.setHours(0, 0, 0, 0);
+      }
+      if (!exp || isNaN(exp.getTime())) continue;
+      if (exp.getTime() >= TODAY.getTime()) continue;
+      overdueLines.push({
+        pn: p.pn,             // suppressed part's PN — the render key for "(on <pn>)"
+        qty: remaining,
+        expected: expRaw,
+        po: po.num || null,
+      });
+      const days = Math.floor((TODAY.getTime() - exp.getTime()) / DAY_MS);
+      if (days > worstDaysPastDue) worstDaysPastDue = days;
+    }
+  }
+  return { overdueLines, daysPastDue: worstDaysPastDue };
+}
+
 function computeCoverageGaps() {
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const out = [];
   let transitionSuppressedCount = 0;
   const transitionSuppressedSample = [];
+  // PRE-LAUNCH ROLLUP queue — populated by the pre-launch gate below when a
+  // suppressed pre-launch part has an overdue covering PO. Processed after
+  // the main loop so we can merge into an existing demand-member row when
+  // possible. Also stashed on window._preLaunchRollupActions so the
+  // audit helper can report per-part outcomes (merged / synthesized /
+  // skipped).
+  const rollupQueue = [];
+  const rollupActions = [];
   // Reset the horizon-suppression tracker so its counts are per-pass.
   // computeCoverageGap increments it whenever its overdue-risk branch
   // gets gated for being too far out — the log at the bottom of this
@@ -484,6 +542,25 @@ function computeCoverageGaps() {
     if (p.isKit) continue;
     if ((Number(p.daily) || 0) <= 0) continue;
     if ((Number(p.onPO) || 0) <= 0) continue;
+    // PRE-LAUNCH GATE. A pre-launch part (transitionStartDate in the
+    // FUTURE) has no live consumption; its placeholder daily is a data
+    // artifact, not a demand signal. Instead of surfacing a phantom
+    // self-row, collect any overdue POs for rollup to the demand-
+    // carrying predecessor after this loop. Live parts (no cutin, or
+    // cutin already passed) skip this branch and behave byte-identically
+    // to today.
+    if (typeof isPreLaunch === "function" && isPreLaunch(p)) {
+      const rolled = _collectOverdueLinesForRollup(p);
+      if (rolled.overdueLines.length > 0) {
+        rollupQueue.push({ suppressedPart: p, ...rolled });
+      } else {
+        rollupActions.push({
+          suppressedPn: p.pn, demandMember: "-", overduePoNum: "-",
+          daysPastDue: 0, action: "no overdue lines",
+        });
+      }
+      continue;
+    }
     const gap = computeCoverageGap(p);
     if (!gap) continue;
 
@@ -526,6 +603,145 @@ function computeCoverageGaps() {
 
     out.push({ part: p, ...gap });
   }
+  // PRE-LAUNCH ROLLUP pass. For every pre-launch part suppressed above
+  // that had an overdue covering PO, route the overdue lines to the
+  // demand-carrying predecessor. Resolve via supersessionLineage (walks
+  // both directions unconditionally; no phasingOut gate). The demand
+  // member is the first non-pre-launch lineage member with daily > 0.
+  // MERGE if that member already has a row; SYNTHESIZE otherwise. The
+  // rolled-up overdue line keeps its original .pn (the suppressed
+  // successor), so the render can annotate "(on <successor>)" when
+  // ol.pn !== g.part.pn — the natural signal from the data.
+  if (rollupQueue.length > 0) {
+    const partsByPn = new Map((DB.parts || []).map(x => [x && x.pn, x]));
+    const statsByPn = new Map(stats.map(x => [x && x.pn, x]));
+    for (const rollup of rollupQueue) {
+      const p = rollup.suppressedPart;
+      // FIX A: no supersessionLineage predecessor AND no demand-carrying
+      // member → surface the pre-launch part on its OWN row as a normal
+      // overdue-only row (gapStart null, shortfall 0, overdueRisk
+      // populated). The gate no longer hides a genuinely late PO on a
+      // no-chain pre-launch part — the JP00002/…/JP00023 case where the
+      // overdue PO is the only inbound. Falls through to the same
+      // synthesize-shape block below via a null demandStat sentinel.
+      const lineage = (typeof supersessionLineage === "function") ? supersessionLineage(p.pn) : [];
+      const members = (lineage && lineage.length >= 2)
+        ? lineage.map(pn => partsByPn.get(pn)).filter(Boolean) : [];
+      const demandMember = members.find(m => {
+        if (!m) return false;
+        if (Number(m.daily) <= 0) return false;
+        if (typeof isPreLaunch === "function" && isPreLaunch(m)) return false;
+        return true;
+      });
+      // No demand-carrying predecessor found. Surface the pre-launch
+      // part on its own overdue-only row rather than hide it — a late PO
+      // on a no-chain pre-launch part has nowhere else to route.
+      if (!demandMember) {
+        const suppressedStat = statsByPn.get(p.pn) || p;
+        out.push({
+          part: suppressedStat,
+          gapStart: null,
+          gapEnd: null,
+          gapDays: null,
+          shortfall: 0,
+          coveringPOs: [],
+          targetArrivalDate: null,
+          primarySupplier: suppressedStat.supplier || "",
+          overdueRisk: {
+            runoutDate: new Date(TODAY),
+            shortfall: 0,
+            overdueLines: [...rollup.overdueLines],
+            daysPastDue: rollup.daysPastDue,
+          },
+          _syntheticFromRollup: true,
+        });
+        rollupActions.push({
+          suppressedPn: p.pn,
+          demandMember: "-",
+          overduePoNum: rollup.overdueLines.map(l => l.po).join(","),
+          daysPastDue: rollup.daysPastDue,
+          action: "kept on own row (no demand-carrying predecessor)",
+        });
+        continue;
+      }
+      // The demand member's own enhanced part row (from partsWithStatus) —
+      // that's the one that would appear in `out` if it had a normal gap.
+      const demandStat = statsByPn.get(demandMember.pn) || demandMember;
+      const existingIdx = out.findIndex(r => r.part && r.part.pn === demandMember.pn);
+      if (existingIdx >= 0) {
+        // MERGE. CONFIRM C: distinguish where the existing row came from
+        // so the audit reports the true reason:
+        //   normal-gap → existing.gapStart is non-null (demand member has
+        //     its own coverage gap; the rollup piggybacks on it).
+        //   own overdue-risk → existing has overdueRisk but no gapStart,
+        //     and wasn't synthesized by an earlier rollup this pass
+        //     (demand member itself has a late PO).
+        //   synthesized-earlier → existing._syntheticFromRollup is true
+        //     (a prior rollup this pass created the row; we're adding to it).
+        const existing = out[existingIdx];
+        let mergedFrom;
+        if (existing.gapStart) mergedFrom = "merged: existing normal-gap row";
+        else if (existing._syntheticFromRollup) mergedFrom = "merged: synthesized by earlier rollup";
+        else mergedFrom = "merged: existing overdue-risk on demand member";
+        if (!existing.overdueRisk) {
+          existing.overdueRisk = {
+            runoutDate: new Date(TODAY),
+            shortfall: 0,
+            overdueLines: [],
+            daysPastDue: 0,
+          };
+        }
+        existing.overdueRisk.overdueLines.push(...rollup.overdueLines);
+        existing.overdueRisk.daysPastDue = Math.max(
+          Number(existing.overdueRisk.daysPastDue) || 0,
+          rollup.daysPastDue
+        );
+        rollupActions.push({
+          suppressedPn: p.pn,
+          demandMember: demandMember.pn,
+          overduePoNum: rollup.overdueLines.map(l => l.po).join(","),
+          daysPastDue: rollup.daysPastDue,
+          action: mergedFrom,
+        });
+      } else {
+        // SYNTHESIZE — overdue-only row keyed on the demand member.
+        // gapStart / gapEnd / gapDays: null → renders "-" in the GAP column.
+        // shortfall: 0 → matches the "PO qty covers demand" semantic; the
+        //   OVERDUE badge on the row communicates the timing risk. This
+        //   mirrors CP00663's pre-fix SHORT 0 output but on the correct
+        //   part.
+        // runoutDate: TODAY — for sort placement. Demand member isn't
+        //   actually running out today; this just anchors the row near
+        //   today in the sort order.
+        out.push({
+          part: demandStat,
+          gapStart: null,
+          gapEnd: null,
+          gapDays: null,
+          shortfall: 0,
+          coveringPOs: [],
+          targetArrivalDate: null,
+          primarySupplier: demandStat.supplier || "",
+          overdueRisk: {
+            runoutDate: new Date(TODAY),
+            shortfall: 0,
+            overdueLines: [...rollup.overdueLines],
+            daysPastDue: rollup.daysPastDue,
+          },
+          _syntheticFromRollup: true,
+        });
+        rollupActions.push({
+          suppressedPn: p.pn,
+          demandMember: demandMember.pn,
+          overduePoNum: rollup.overdueLines.map(l => l.po).join(","),
+          daysPastDue: rollup.daysPastDue,
+          action: "synthesized",
+        });
+      }
+    }
+  }
+  // Stash actions for the audit helper. Reset each aggregator pass.
+  if (typeof window !== "undefined") window._preLaunchRollupActions = rollupActions;
   // Sort by gapStart when present, else overdueRisk.runoutDate — so
   // overdue-only rows interleave with normal gaps by their soonest-dry
   // date. Tiebreak by widest gap (null gapDays → 0 for overdue-only, so
@@ -1665,7 +1881,19 @@ function renderCoverageGaps() {
                   const poCell = poId
                     ? `<a href="javascript:void(0)" onclick="event.stopPropagation(); openPODetail('${esc(poId)}')" class="mono" style="color: var(--accent); text-decoration: none">${esc(ol.po || '?')}</a>`
                     : `<span class="mono">${esc(ol.po || '?')}</span>`;
-                  return `<div>${poCell} <span class="dim tiny mono">· ${expDisp}</span></div>`;
+                  // ROLLUP ANNOTATION — when the overdue line's pn differs
+                  // from the row's part.pn, the PO physically sits on a
+                  // (typically pre-launch) chain successor and has been
+                  // rolled up to the demand-carrying predecessor. Show
+                  // "xQTY (on <successorPn>)" so the buyer knows which
+                  // member owns the physical PO AND can distinguish
+                  // multiple lines that share the same PO number (e.g.
+                  // a sample + a production qty on the same POC0007283).
+                  // ASCII only.
+                  const onPnBadge = (ol.pn && g.part && ol.pn !== g.part.pn)
+                    ? ` <span class="dim tiny">x${fmtNum(ol.qty || 0)} (on ${esc(ol.pn)})</span>`
+                    : "";
+                  return `<div>${poCell}${onPnBadge} <span class="dim tiny mono">· ${expDisp}</span></div>`;
                 }).join("");
                 const coveredCell = hasCoveringPO
                   ? g.coveringPOs.map(c =>
