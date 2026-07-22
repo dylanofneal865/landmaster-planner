@@ -386,8 +386,12 @@ function renderOrderQueueFor(itemType) {
   // shared chokepoint (js/03-calc.js) so the dashboard's
   // Critical/Order Today count can't drift from what renders here.
   let stats = partsWithStatus();
-  if (itemType) stats = stats.filter(p => p.itemType === itemType);
-  else stats = stats.filter(p => p.itemType !== "do_not_order");
+  // Route-param compare normalized on both sides so a part tagged "Service"
+  // (capital S) still routes to the Service Queue. Byte-identical to strict
+  // === for the canonical lowercase values used by the app's own writers.
+  const _wantType = String(itemType || "").toLowerCase().trim();
+  if (_wantType) stats = stats.filter(p => String(p.itemType || "").toLowerCase().trim() === _wantType);
+  else stats = stats.filter(p => String(p.itemType || "").toLowerCase().trim() !== "do_not_order");
   stats = stats.filter(p => !p.isKit);
   const needsOrder = queueParts(itemType);
   

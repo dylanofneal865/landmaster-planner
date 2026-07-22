@@ -687,7 +687,7 @@ exports.handler = async () => {
         // table (contributing to base_bom production math), but they
         // never influence this sync's daily-rate write.
         const partData = partsMap.get(pn);
-        if (!partData || partData.itemType !== "service") continue;
+        if (!partData || String(partData.itemType || "").toLowerCase().trim() !== "service") continue;
         // computeDemand at js/40-demand.js:30 uses `t > cutoff` (strict).
         // Match it: skip anything AT or BEFORE cutoff.
         const tsMs = new Date(d.ts).getTime();
@@ -718,7 +718,7 @@ exports.handler = async () => {
   for (const [pn, existing] of partsMap.entries()) {
     // ★ THE GATE ★ — grep-verify: this is the ONLY predicate protecting
     // parts.data.daily from non-service writes.
-    if (existing.itemType !== "service") continue;
+    if (String(existing.itemType || "").toLowerCase().trim() !== "service") continue;
     if (tombstoned.has(pn)) { dailyTombstoneSkipped++; continue; }
     dailyServiceConsidered++;
 
@@ -824,7 +824,7 @@ exports.handler = async () => {
           unchanged: dailyUnchanged,
           tombstoneSkipped: dailyTombstoneSkipped,
           formula: `Math.round((units / ${DEMAND_WINDOW_DAYS}) * 1000) / 1000`,
-          gate: 'existing.itemType === "service"',
+          gate: 'String(existing.itemType || "").toLowerCase().trim() === "service"',
         },
         note: "Kit sales exploded recursively to leaves; row shape mirrors Excel importer's. Service-part daily rates computed from FULL usage table and written back to parts.data.daily — service parts only.",
       },

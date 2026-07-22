@@ -1303,6 +1303,14 @@ registerRoute("service-usage", () => {
 function applyServicePartDaily(pn, newDaily) {
   const part = DB.parts.find(p => p.pn === pn);
   if (!part) return;
+  // Service parts: daily is owned by the 06:00 UTC Acumatica sync, not
+  // by manual overrides. Refuse the write, tell the user why. Non-service
+  // parts fall through to the original path unchanged. Normalization
+  // mirrors the sync's own gate.
+  if (String(part.itemType || "").toLowerCase().trim() === "service") {
+    showToast(`${pn}: service daily is auto-driven from service usage`, "info");
+    return;
+  }
   // Per-row Apply Computed Daily — gated by the same 4616 prompt as
   // delete actions. Still callable from the console after the UI was
   // hidden; the gate stays in front regardless of caller.
@@ -1320,10 +1328,15 @@ function applyServicePartDaily(pn, newDaily) {
 function bulkApplyComputedDaily() {
   // Bulk Apply Computed Daily across every part — gate once before the
   // batch write. Still callable from the console after the UI was hidden.
+  // Service parts are SKIPPED here — their daily is owned by the 06:00
+  // UTC Acumatica sync and must not be overwritten by manual Apply.
+  // Every other itemType behaves exactly as before.
   if (!gateEdit()) return;
   const demand = getAllDemand();
   let updated = 0;
+  let skippedService = 0;
   for (const part of DB.parts) {
+    if (String(part.itemType || "").toLowerCase().trim() === "service") { skippedService++; continue; }
     const d = demand.get(part.pn);
     if (!d) continue;
     const newDaily = d.appliedDaily;
@@ -1334,14 +1347,16 @@ function bulkApplyComputedDaily() {
     }
   }
   if (updated === 0) {
-    showToast("No changes to apply — all daily rates already match", "info");
+    const suffix = skippedService > 0 ? ` (${skippedService} service part${skippedService === 1 ? "" : "s"} auto-driven from service usage)` : "";
+    showToast(`No changes to apply — all daily rates already match${suffix}`, "info");
     return;
   }
-  logAudit("daily-bulk-apply", `Applied 180-day average daily rates to ${updated} parts`, { count: updated });
+  logAudit("daily-bulk-apply", `Applied 180-day average daily rates to ${updated} parts (skipped ${skippedService} service)`, { count: updated, skippedService });
   saveDB();
   bumpStatusCache();
   bumpDemandCache();
-  showToast(`Updated daily rates on ${updated} parts`, "ok");
+  const svcSuffix = skippedService > 0 ? ` (${skippedService} service part${skippedService === 1 ? "" : "s"} skipped — auto-driven)` : "";
+  showToast(`Updated daily rates on ${updated} parts${svcSuffix}`, "ok");
   refresh();
 }
 
@@ -1636,7 +1651,11 @@ function recomputeDailyFromUsage() {
     map[u.pn] = (map[u.pn] || 0) + (u.qty || 0);
   }
   let updated = 0;
+  let skippedService = 0;
   for (const part of DB.parts) {
+    // Service parts: daily is owned by the 06:00 UTC Acumatica sync.
+    // Skip so this bulk recompute can't overwrite the auto-driven value.
+    if (String(part.itemType || "").toLowerCase().trim() === "service") { skippedService++; continue; }
     const total = map[part.pn] || 0;
     const newDaily = round(total / Math.max(1, days), 4);
     if (newDaily > 0 && Math.abs(newDaily - (part.daily || 0)) > 0.005) {
@@ -1644,11 +1663,12 @@ function recomputeDailyFromUsage() {
       updated++;
     }
   }
-  logAudit("daily-recalc", `Recomputed calendar daily-use rates from ${days}-day usage history (${updated} parts updated)`);
+  logAudit("daily-recalc", `Recomputed calendar daily-use rates from ${days}-day usage history (${updated} parts updated, ${skippedService} service skipped)`);
   saveDB();
   bumpStatusCache();
   autoSyncExcel();
-  showToast(`Daily-use rates updated for ${updated} parts based on ${days}-day calendar consumption`, "ok");
+  const svcSuffix = skippedService > 0 ? ` (${skippedService} service part${skippedService === 1 ? "" : "s"} skipped — auto-driven)` : "";
+  showToast(`Daily-use rates updated for ${updated} parts based on ${days}-day calendar consumption${svcSuffix}`, "ok");
   refresh();
 }
 

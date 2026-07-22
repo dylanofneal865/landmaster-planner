@@ -13,7 +13,7 @@ registerRoute("settings", () => {
   const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
   const lastBomSync = (DB.audit || []).find(a => a.type === "acumatica-bom-sync")?.ts || null;
   const lastSvcUsageSync = (DB.audit || []).find(a => a.type === "service-usage-sync")?.ts || null;
-  const servicePartsCount = (DB.parts || []).filter(p => p.itemType === "service").length;
+  const servicePartsCount = (DB.parts || []).filter(p => String(p.itemType || "").toLowerCase().trim() === "service").length;
   // BOM links load asynchronously after first paint; distinguish "not yet
   // arrived" (undefined) from "loaded but empty" (0) so the card doesn't
   // misleadingly show "0 links" during the brief boot window.

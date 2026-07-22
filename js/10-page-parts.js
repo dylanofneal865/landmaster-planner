@@ -51,6 +51,12 @@ function renderPartDetail(part) {
     ? chainDisplayDailySource(part)
     : { daily: Number(part.daily) || 0, anchorPn: null, transitioning: false, isAnchor: false };
   const dailyInherited = dailySrc.transitioning && !dailySrc.isAnchor;
+  // Service parts: part.daily is OWNED by the service-usage feed (the
+  // 06:00 UTC Acumatica sync). The drawer surfaces the stored value
+  // read-only so no one can hand-edit it here — the sync is the single
+  // source. Normalization mirrors the sync's own gate.
+  const _svcOwned = String(part?.itemType || "").toLowerCase().trim() === "service";
+  const _dailyLocked = dailyInherited || _svcOwned;
 
   const status = partStatus(effectivePart);
   // PRE-LAUNCH: a superseding part whose transitionStartDate is still in the
@@ -650,11 +656,15 @@ function renderPartDetail(part) {
         <div class="field"><label>Buyer</label><input class="input" id="pd-buyer" value="${esc(part.buyer||"")}"></div>
         <div class="field"><label>On Hand</label><input class="input num" type="number" min="0" id="pd-oh" value="${part.onHand||0}"></div>
         <div class="field">
-          <label>Daily Use (avg)</label>
+          <label>${_svcOwned && !dailyInherited ? 'Daily use — from service usage (auto)' : 'Daily Use (avg)'}</label>
           <input class="input num" type="number" min="0" step="0.01" id="pd-daily"
             value="${dailyInherited ? fmtNum(dailySrc.daily, 2) : (part.daily||0)}"
-            ${dailyInherited ? 'disabled style="opacity:0.55;cursor:not-allowed"' : ''}>
-          ${dailyInherited ? `<div class="muted tiny mt-xs">inherited from chain anchor ${esc(dailySrc.anchorPn)} — edit there</div>` : ''}
+            ${_dailyLocked ? 'disabled style="opacity:0.55;cursor:not-allowed"' : ''}>
+          ${dailyInherited
+            ? `<div class="muted tiny mt-xs">inherited from chain anchor ${esc(dailySrc.anchorPn)} — edit there</div>`
+            : (_svcOwned
+              ? `<div class="muted tiny mt-xs">auto-computed from sales orders in the last 180 days — see the Service Usage tab</div>`
+              : '')}
         </div>
         <div class="field"><label>Unit Cost</label><input class="input num" type="number" min="0" step="0.01" id="pd-cost" value="${part.cost||0}"></div>
         <div class="field"><label>Lead Time (weeks)</label><input class="input num" type="number" min="0" step="0.5" id="pd-lt" value="${part.ltWeeks||0}"></div>
@@ -671,14 +681,16 @@ function renderPartDetail(part) {
           <input class="input" id="pd-cat" value="${esc(part.category||"")}">
         </div>
         <div class="field"><label>Item Type</label>
+          ${(() => { const _t = String(part.itemType || "").toLowerCase().trim(); return `
           <select class="select" id="pd-itemtype">
-            <option value=""             ${!part.itemType                   ? "selected" : ""}>—</option>
-            <option value="base_bom"     ${part.itemType === "base_bom"     ? "selected" : ""}>Base BOM</option>
-            <option value="options"      ${part.itemType === "options"      ? "selected" : ""}>Options</option>
-            <option value="service"      ${part.itemType === "service"      ? "selected" : ""}>Service</option>
-            <option value="kit"          ${part.itemType === "kit"          ? "selected" : ""}>Kit</option>
-            <option value="do_not_order" ${part.itemType === "do_not_order" ? "selected" : ""}>Do Not Order</option>
+            <option value=""             ${!_t                    ? "selected" : ""}>—</option>
+            <option value="base_bom"     ${_t === "base_bom"      ? "selected" : ""}>Base BOM</option>
+            <option value="options"      ${_t === "options"       ? "selected" : ""}>Options</option>
+            <option value="service"      ${_t === "service"       ? "selected" : ""}>Service</option>
+            <option value="kit"          ${_t === "kit"           ? "selected" : ""}>Kit</option>
+            <option value="do_not_order" ${_t === "do_not_order"  ? "selected" : ""}>Do Not Order</option>
           </select>
+          `; })()}
         </div>
         <div class="field">
           <label>Superseded by</label>

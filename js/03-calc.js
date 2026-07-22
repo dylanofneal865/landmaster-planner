@@ -3022,7 +3022,10 @@ function preLaunchOrderBy(part) {
 // queueParts("service") — same predicate, no untagged leakage.
 function queueParts(itemType) {
   let stats = partsWithStatus();
-  if (itemType) stats = stats.filter(p => p.itemType === itemType);
+  // Route-param compare normalized on both sides so case/whitespace variants
+  // (e.g. a part tagged "Service") still route to the intended queue.
+  const _wantType = String(itemType || "").toLowerCase().trim();
+  if (_wantType) stats = stats.filter(p => String(p.itemType || "").toLowerCase().trim() === _wantType);
   else stats = stats.filter(p => isQueueEligible(p));
   stats = stats.filter(p => !p.isKit);
   return stats.filter(p =>
