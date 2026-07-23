@@ -167,6 +167,10 @@ function draftOrderAdd(pn, qty, qtySource) {
       // Default ON — cap-and-split runs and releases render as today.
       // The user can opt out per-item via the drawer's toggle.
       _releaseAgainstBlanket: true,
+      // Per-line supplier override — null / empty means use the part's
+      // primary supplier (current behavior). Set via the drawer's supplier
+      // input. Never writes back to part.supplier.
+      _supplierOverride: null,
     });
   }
   draftOrderSave();
@@ -206,7 +210,14 @@ function draftOrderTotals() {
   for (const item of DRAFT_ORDER) {
     const part = DB.parts.find(p => p.pn === item.pn);
     if (!part) continue;
-    const supplier = part.supplier || "(No supplier)";
+    // Per-line supplier override: user-chosen supplier wins over the part's
+    // primary. Empty / null / whitespace-only override → fall back to
+    // primary (current behavior). This is the SINGLE resolution site;
+    // drawer group render + PDF row builder both consume groups keyed on
+    // this value, so the override propagates automatically. part.supplier
+    // is NEVER written from here.
+    const override = (item._supplierOverride && String(item._supplierOverride).trim()) || "";
+    const supplier = override || part.supplier || "(No supplier)";
     if (!groups[supplier]) groups[supplier] = { lines: [], subtotal: 0 };
     const noCost = hasNoOrderCost(part);
     const unit = noCost ? 0 : orderUnitCost(part);
@@ -232,6 +243,12 @@ function draftOrderTotals() {
         _splitIsFirst: i === 0,
         _splitIsLast: i === parts.length - 1,
         _exhaustedBlanketPoNum: (i === 0 && item._exhaustedBlanketPoNum) || null,
+        // Supplier-override flag on the emitted line so the drawer's primary
+        // row can render its ↷ indicator + typo-hint without re-looking up
+        // the item. True iff the override resolved to something different
+        // from the part's primary supplier.
+        _supplierOverridden: !!override && override !== (part.supplier || ""),
+        _supplierPrimary: part.supplier || "",
       });
       if (!noCost) {
         groups[supplier].subtotal += lineTotal;
@@ -279,6 +296,11 @@ function quickAddToDraft(pn) {
 function openDraftOrderDrawer() {
   const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
   const supplierKeys = Object.keys(supplierGroups).sort();
+  // Suppliers-list for the per-line datalist combobox. Dedup + sort. Rendered
+  // ONCE at the top of the drawer body; every row's supplier input references
+  // it via list="draft-supplier-list". Native HTML5 combobox — users can pick
+  // an existing supplier or type a new one.
+  const _allSuppliers = [...new Set((DB.parts || []).map(p => p && p.supplier).filter(Boolean))].sort();
 
   const html = `
     <div class="drawer-head">
@@ -290,6 +312,9 @@ function openDraftOrderDrawer() {
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
+      <datalist id="draft-supplier-list">
+        ${_allSuppliers.map(s => `<option value="${esc(s)}"></option>`).join("")}
+      </datalist>
       ${itemCount === 0 ? `
         <div class="empty">
           <div class="empty-title">No items yet</div>
@@ -361,13 +386,42 @@ function openDraftOrderDrawer() {
                         <span class="dim">Release against blanket</span>
                       </label>
                     </div>` : "";
+                  // Supplier override input — datalist combobox. Placeholder
+                  // shows the part's primary supplier as ghost text; empty
+                  // value = use primary. Below it, a typo-hint line surfaces
+                  // when the current override looks like a near-miss for an
+                  // existing supplier. The ↷ indicator on the PN line signals
+                  // an override is active (also colors the group heading via
+                  // being in a different group at all).
+                  const _overrideRaw = _item ? (_item._supplierOverride || "") : "";
+                  const _primary = part.supplier || "";
+                  const _isOverridden = !!(_overrideRaw && _overrideRaw.trim() && _overrideRaw.trim() !== _primary);
+                  const _typoHint = _overrideRaw
+                    ? _draftSupplierTypoHint(_overrideRaw, _allSuppliers)
+                    : null;
+                  const _typoHintHtml = _typoHint
+                    ? `<div class="tiny" style="margin-top:2px;color:var(--warn-d,var(--warn,#c47500))">did you mean <a href="#" onclick="event.preventDefault(); draftOrderSetSupplier('${esc(part.pn)}', ${JSON.stringify(_typoHint).replace(/"/g,'&quot;')})" style="color:inherit;text-decoration:underline">${esc(_typoHint)}</a>?</div>`
+                    : "";
+                  const supplierInputHtml = `
+                    <div class="tiny" style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span class="dim" style="min-width:56px">Supplier:</span>
+                        <input class="input" list="draft-supplier-list" value="${esc(_overrideRaw)}"
+                               placeholder="${esc(_primary || 'no primary supplier')}"
+                               onchange="draftOrderSetSupplier('${esc(part.pn)}', this.value)"
+                               style="max-width:240px;padding:2px 6px;font-size:11px">
+                        ${_isOverridden ? `<span class="pill info" style="font-size:9px;padding:1px 5px;letter-spacing:0.04em" title="Supplier overridden — differs from ${esc(_primary || '(no primary)')}. Cleared by emptying the input.">↷ overridden</span>` : ""}
+                      </div>
+                      ${_typoHintHtml}
+                    </div>`;
                   return `
                     <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}" data-draft-primary>
                       <td>
-                        <div class="pn">${esc(part.pn)}</div>
+                        <div class="pn">${esc(part.pn)}${_isOverridden ? ` <span class="dim tiny" style="font-size:10px" title="Grouped under overridden supplier '${esc(s)}'; part's primary is '${esc(_primary || '(none)')}'">↷</span>` : ""}</div>
                         <div class="dim tiny">${esc(part.desc || '—')}</div>
                         ${releaseNote}
                         ${toggleHtml}
+                        ${supplierInputHtml}
                       </td>
                       <td class="right" style="width:90px">
                         <input class="input num" type="number" min="0" value="${totalQty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
@@ -524,6 +578,72 @@ function draftOrderRemoveLine(pn) {
   // just removed, so its IN DRAFT pill would stay stuck. Flip it back to +Add
   // by re-running the queue renderer (scroll-preserving). No-op off-queue.
   _refreshQueueIfActive();
+}
+
+// Normalization for the supplier typo guard. Lowercase, collapse internal
+// whitespace, trim leading/trailing whitespace and trailing punctuation
+// commonly found in company suffixes. Deliberately basic — any near-miss
+// falls through to the raw-compare below rather than trying to be clever.
+function _normalizeSupplierForCompare(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.,;:!?\s]+$/g, "");
+}
+
+// Typo guard for the per-line supplier input. Returns the closest existing
+// supplier that the user's input probably meant, or null if none matches.
+// Rules (in order):
+//   (1) User's input exactly matches an existing supplier's raw form → no
+//       hint (they picked something valid on purpose).
+//   (2) Normalized user input equals an existing supplier's normalized form
+//       → hint that existing supplier. E.g. "Sensourcing Trading Co" vs
+//       "Sensourcing Trading Co." → matches, hint the canonical form.
+//   (3) Normalized user input is a prefix of an existing supplier
+//       (min 4 chars user input) → hint. Catches "Sensourcing" typed as
+//       a shorthand for "Sensourcing Trading Co."
+//   (4) Otherwise null.
+// Deliberately NOT Levenshtein / fuzzy — the user asked for a basic guard,
+// and false-positive hints on unrelated names would be worse than misses.
+function _draftSupplierTypoHint(value, existingSuppliers) {
+  const raw = String(value || "");
+  if (!raw.trim()) return null;
+  const uNorm = _normalizeSupplierForCompare(raw);
+  if (!uNorm) return null;
+  // (1) Exact raw match → user picked a valid existing supplier, silence.
+  for (const s of existingSuppliers) if (s === raw) return null;
+  // (2) Normalized-equal match.
+  for (const s of existingSuppliers) {
+    if (_normalizeSupplierForCompare(s) === uNorm) return s;
+  }
+  // (3) Prefix match, min 4 chars on the input side.
+  if (uNorm.length >= 4) {
+    for (const s of existingSuppliers) {
+      const sNorm = _normalizeSupplierForCompare(s);
+      if (sNorm.length > uNorm.length && sNorm.startsWith(uNorm)) return s;
+    }
+  }
+  return null;
+}
+
+// Per-line supplier override handler. Sets item._supplierOverride and
+// triggers a full drawer redraw so the line moves to its new supplier
+// group. Empty / whitespace-only value clears the override (revert to
+// primary). part.supplier is NEVER written from here — the override lives
+// only on the draft item.
+function draftOrderSetSupplier(pn, value) {
+  const existing = DRAFT_ORDER.find(d => d.pn === pn);
+  if (!existing) return;
+  const trimmed = String(value || "").trim();
+  existing._supplierOverride = trimmed || null;
+  draftOrderSave();
+  // Full redraw — the row may have moved to a different group, invalidating
+  // the in-place patch paths (data-draft-supplier attribute mismatch,
+  // supplier-subtotal cell lookup, group-header presence). Same pattern
+  // draftOrderToggleRelease uses.
+  openDraftOrderDrawer();
+  updateDraftOrderPill();
 }
 
 // Per-line "Release against blanket" toggle handler. When RE-CHECKED, the
