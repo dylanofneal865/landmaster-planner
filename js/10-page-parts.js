@@ -124,7 +124,15 @@ function renderPartDetail(part) {
   horizon = Math.min(horizon, 365);
   // Pass hardCutin opts so projectOnHand plots phase 1 (predecessor burn) →
   // strand cliff → phase 2 (ownStock + POs). Non-hardCutin path is unchanged.
-  const series = projectOnHand(effectivePart, horizon, undefined, hardCutin ? { hardCutin } : {});
+  //
+  // includeBlanketSupply: true routes the full-scan through
+  // isLineIncomingSupply so Sensourcing blanket lines land as scheduled
+  // receipts on their expectedDate. Non-Sensourcing blankets stay
+  // excluded. Runway chart shows the cliff on the blanket's expected
+  // day; status math (partStatus / daysUntilStockout, computed in
+  // partsWithStatus with the blanket-blind open index) is untouched and
+  // still surfaces a stockout that precedes the blanket arrival.
+  const series = projectOnHand(effectivePart, horizon, undefined, { includeBlanketSupply: true, ...(hardCutin ? { hardCutin } : {}) });
   // Clamp the visual scale to 0..peak so long horizons of deeply negative
   // on-hand don't crush the meaningful band into a sliver. The stockout
   // index is still found on the unclamped series; only the drawn path is

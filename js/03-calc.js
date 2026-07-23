@@ -387,6 +387,98 @@ function isLineOpen(po, ln) {
   return true;
 }
 
+// Sensourcing-blanket supply gate. Same body as isLineOpen except that
+// blanket lines PASS when (a) the PO's supplier is on a cycle (Sensourcing
+// today via getSupplierCycle) AND (b) the line has a valid expectedDate
+// AND (c) the line's blanketOpenQty is > 0. Missing expectedDate is NOT
+// backfilled — we never invent an arrival day for a blanket receipt.
+//
+// This is a SUPPLY gate: it answers "does this line count as incoming
+// stock on a specific day?" NOT "is this a normal PO in flight?" The
+// latter is isLineOpen's job and remains blanket-blind — RELEASE reads
+// openPOQty (isLineOpen) and must keep firing when only a blanket exists.
+//
+// Consumers: projectOnHand (drawer-chart path, opts.includeBlanketSupply)
+// and the blanketIncomingQty() sibling helper that feeds suggestedQty /
+// cycleAwareSuggestedQty's `have`. Nothing else routes through this.
+function isLineIncomingSupply(po, ln) {
+  if (!isActivePO(po)) return false;
+  if (!ln) return false;
+  const lnStatus = String(ln.status || "").toLowerCase().trim();
+  if (_CLOSED_LINE_STATUSES.has(lnStatus)) return false;
+  const lnAcum = String(ln.acumStatus || "").toLowerCase().trim();
+  if (lnAcum && _CLOSED_ACUM_STATUSES.has(lnAcum)) return false;
+  if (isBlanketLine(ln)) {
+    // Sensourcing-only promotion. Non-cycled suppliers' blankets stay
+    // out of every supply consumer (byte-identical to today).
+    const cycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(po.supplier) : null;
+    if (!cycle) return false;
+    if (!ln.expectedDate) return false;   // no invented arrival date
+    if (Math.max(0, Number(ln.blanketOpenQty || 0)) <= 0) return false;
+    return true;
+  }
+  // Normal line — same checks isLineOpen applies past its blanket gate.
+  if (ln.openQty !== undefined && ln.openQty !== null && Number(ln.openQty) <= 0) return false;
+  const qty = Number(ln.qty || 0);
+  if (qty <= 0) return false;
+  const recv = Number(ln.qtyReceived != null ? ln.qtyReceived : (ln.recv != null ? ln.recv : 0));
+  if (recv >= qty) return false;
+  return true;
+}
+
+// Per-line "remaining" resolver for supply consumers. Blanket lines
+// read blanketOpenQty (post-releases remaining); normal lines read the
+// classic qty-minus-qtyReceived delta. Called by _buildSupplyLineIndex
+// and projectOnHand's supply-gate full-scan branch.
+function _lineIncomingRemaining(ln) {
+  if (isBlanketLine(ln)) {
+    return Math.max(0, Number(ln.blanketOpenQty || 0));
+  }
+  return Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+}
+
+// Companion to _buildOpenPOLineIndex for supply-inclusive consumers.
+// Same { ln, remaining, po } shape so callers can pass slices to
+// projectOnHand's precomputed-lines branch without shape adaptation.
+// Sensourcing blanket lines land in this index; every other blanket
+// line stays out, matching isLineIncomingSupply's gate.
+function _buildSupplyLineIndex() {
+  const map = new Map();
+  for (const po of (DB.pos || [])) {
+    for (const ln of (po.lines || [])) {
+      if (!isLineIncomingSupply(po, ln)) continue;
+      const remaining = _lineIncomingRemaining(ln);
+      if (!remaining) continue;
+      let arr = map.get(ln.pn);
+      if (!arr) { arr = []; map.set(ln.pn, arr); }
+      arr.push({ ln, remaining, po });
+    }
+  }
+  return map;
+}
+
+// Sum of Sensourcing-blanket remaining supply for one pn. Feeds
+// suggestedQty / cycleAwareSuggestedQty's `have` — nets the blanket
+// against target-window demand so a blanket-covered Sensourcing part
+// stops asking for a full-size order. NOT time-phased: the netting
+// happens regardless of arrival date. Callers still need to name the
+// stockout-before-arrival gap when reporting the sized qty.
+function blanketIncomingQty(pn) {
+  const target = String(pn || "").trim();
+  if (!target) return 0;
+  let total = 0;
+  for (const po of (DB.pos || [])) {
+    if (!isActivePO(po)) continue;
+    for (const ln of (po.lines || [])) {
+      if (String(ln.pn || "").trim() !== target) continue;
+      if (!isBlanketLine(ln)) continue;
+      if (!isLineIncomingSupply(po, ln)) continue;
+      total += Math.max(0, Number(ln.blanketOpenQty || 0));
+    }
+  }
+  return total;
+}
+
 // Build a per-PN index of open PO lines. Each entry: { ln, remaining, po }.
 // Built once at the top of partsWithStatus so projectOnHand/openPOQty don't
 // rescan DB.pos for every part. External callers don't need this — the public
@@ -480,11 +572,25 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   if (lines) {
     for (const e of lines) accumReceipt(e.ln, e.remaining, e.po);
   } else {
+    // opts.includeBlanketSupply routes the full-scan through
+    // isLineIncomingSupply, which admits Sensourcing blanket lines with
+    // a valid expectedDate and reads their remaining via
+    // _lineIncomingRemaining (blanketOpenQty). Default is
+    // isLineOpen — byte-identical to the pre-split scan so Coverage
+    // Gaps, dashboard KPIs, and every other caller that does NOT set
+    // the opt behave as they did today.
+    const useSupplyGate = !!opts.includeBlanketSupply;
     for (const po of (DB.pos || [])) {
       for (const ln of (po.lines || [])) {
         if (ln.pn !== part.pn) continue;
-        if (!isLineOpen(po, ln)) continue;
-        const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+        if (useSupplyGate) {
+          if (!isLineIncomingSupply(po, ln)) continue;
+        } else {
+          if (!isLineOpen(po, ln)) continue;
+        }
+        const remaining = useSupplyGate
+          ? _lineIncomingRemaining(ln)
+          : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
         if (!remaining) continue;
         accumReceipt(ln, remaining, po);
       }
@@ -705,9 +811,15 @@ function suggestedQty(part, onPO) {
   // count (predecessor POs are excluded per spec; in practice they're
   // cancelled when a part phases out).
   const onPOQty = (typeof onPO === "number") ? onPO : openPOQty(part.pn);
+  // Sensourcing-blanket incoming supply nets into `have` so a
+  // blanket-covered part doesn't get sized for a full order. NOT
+  // time-phased — the blanket qty offsets target-window demand
+  // regardless of arrival date. The stockout-before-arrival gap must
+  // be surfaced separately by any caller reporting the sized qty.
+  const blanketIncoming = (typeof blanketIncomingQty === "function") ? blanketIncomingQty(part.pn) : 0;
   const have = boost
-    ? boost.combinedOnHand + onPOQty
-    : (part.onHand || 0) + onPOQty;
+    ? boost.combinedOnHand + onPOQty + blanketIncoming
+    : (part.onHand || 0) + onPOQty + blanketIncoming;
 
   let qty = Math.max(0, Math.ceil(target - have));
   if (part.moq && qty > 0) qty = Math.max(qty, part.moq);
@@ -1848,9 +1960,14 @@ function cycleAwareSuggestedQty(part, onPO) {
   const onPOQty = (typeof onPO === "number")
     ? onPO
     : ((typeof openPOQty === "function") ? openPOQty(part.pn) : 0);
+  // Sensourcing-blanket incoming supply nets into `have` (same policy
+  // as suggestedQty). This is the production writer of _suggestedQty
+  // via partsWithStatus — so this is the netting the "+ Order N" pill
+  // actually reads. NOT time-phased.
+  const blanketIncoming = (typeof blanketIncomingQty === "function") ? blanketIncomingQty(part.pn) : 0;
   const have = boost
-    ? boost.combinedOnHand + onPOQty
-    : (Number(part.onHand) || 0) + onPOQty;
+    ? boost.combinedOnHand + onPOQty + blanketIncoming
+    : (Number(part.onHand) || 0) + onPOQty + blanketIncoming;
   let qty = Math.max(0, Math.ceil(target - have));
   if (part.moq && qty > 0) qty = Math.max(qty, Number(part.moq));
   if (part.packSize && qty > 0) qty = Math.ceil(qty / Number(part.packSize)) * Number(part.packSize);
