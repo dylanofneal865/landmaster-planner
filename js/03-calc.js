@@ -1543,10 +1543,28 @@ function getChainInfo(pn) {
   let chainOnPO = 0;
   const chainPOLines = [];
   for (const po of (DB.pos || [])) {
+    // Per-PO admission gate: cycled-supplier POs (Sensourcing today) route
+    // through isLineIncomingSupply so their blanket lines land as scheduled
+    // supply on the blanket's expectedDate — same rule that e66ab6c already
+    // applies to projectOnHand and suggestedQty via includeBlanketSupply /
+    // blanketIncomingQty. Non-cycled suppliers stay on isLineOpen — BYTE-
+    // IDENTICAL to production. This closes the gap where the chart credits
+    // a Sensourcing blanket to phase 2 while the chain-runout math ignored
+    // it, producing two runout numbers for one part (e.g. JP00021, CP00945).
+    const _poCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(po.supplier) : null;
+    const _useSupplyGate = !!_poCycle;
     for (const ln of (po.lines || [])) {
       if (!ln || !chainPnSet.has(ln.pn)) continue;
-      if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
-      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (_useSupplyGate) {
+        if (typeof isLineIncomingSupply !== "function" || !isLineIncomingSupply(po, ln)) continue;
+      } else {
+        if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
+      }
+      const remaining = _useSupplyGate
+        ? (typeof _lineIncomingRemaining === "function"
+            ? _lineIncomingRemaining(ln)
+            : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0)))
+        : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
       if (remaining <= 0) continue;
       const expRaw = ln.expectedDate || po.expectedDate;
       let expectedDate = null;
