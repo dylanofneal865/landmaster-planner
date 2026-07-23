@@ -216,6 +216,14 @@ function oqSortHeader(key, dir) {
 // they naturally cluster at the top under ascending sort.
 // Missing cover/reorderBy → +Infinity → sorts to the bottom.
 function oqUrgencyMargin(p) {
+  // Force-admitted RELEASE rows sit at status ok / daysOfCover Infinity —
+  // by cover math they'd sort to the bottom. Rank them by
+  // _forceAdmitDaysToTrigger instead: smaller trigger = more urgent
+  // release. Puts an "in 3 days" RELEASE ahead of a "cover 45d" critical.
+  if (p && p._forceAdmitAsRelease && Number.isFinite(p._forceAdmitDaysToTrigger)) {
+    const reorderBy = Number(p?.reorderBy);
+    return Number(p._forceAdmitDaysToTrigger) - (Number.isFinite(reorderBy) ? reorderBy : 0);
+  }
   const cover = Number(p?.daysOfCover);
   const reorderBy = Number(p?.reorderBy);
   if (!Number.isFinite(cover) || !Number.isFinite(reorderBy)) return Infinity;
@@ -575,14 +583,17 @@ function renderOrderQueueFor(itemType) {
                     // (chainInfo.chainRunoutDays for chain members, per-
                     // part daysOfCover for standalone parts).
                     // triggerDate = the EARLIER of (runout, transitionStartDate).
-                    // Previously transitionStartDate short-circuited runout; a
-                    // part running dry in 10 days with a far-off transition
-                    // date stayed quiet. Now: if runout comes first, we act on
-                    // runout; if transition comes first, we act on transition;
-                    // if only one exists, we use it.
+                    // For force-admitted RELEASE rows the OPEN-index runout
+                    // (p._openDaysOfCover) is the correct "runout" input —
+                    // p.daysOfCover on those rows is Infinity under the
+                    // blanket-aware projection and would suppress the RELEASE
+                    // badge. Non-Sensourcing rows keep reading p.daysOfCover.
+                    const _runoutBasisDays = (p._forceAdmitAsRelease && Number.isFinite(p._openDaysOfCover))
+                      ? p._openDaysOfCover
+                      : p.daysOfCover;
                     let runoutDate = null;
-                    if (Number.isFinite(p.daysOfCover) && typeof addDays === "function") {
-                      runoutDate = addDays(TODAY, p.daysOfCover);
+                    if (Number.isFinite(_runoutBasisDays) && typeof addDays === "function") {
+                      runoutDate = addDays(TODAY, _runoutBasisDays);
                     }
                     let transitionDate = null;
                     if (p.transitionStartDate && typeof parseDateLocal === "function") {
@@ -665,11 +676,22 @@ function renderOrderQueueFor(itemType) {
                       <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPill}${blkPill}</td>
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
-                      <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => { const s = stockoutDateStr(p.daysOfCover); return s ? ` title="Projected stockout: ${s}"` : ''; })()}>
+                      <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {
+                        if (p._forceAdmitAsRelease) return ` title="Blanket-covered but inside the 21-day release trigger — release from blanket now."`;
+                        const s = stockoutDateStr(p.daysOfCover);
+                        return s ? ` title="Projected stockout: ${s}"` : '';
+                      })()}>
+                        ${p._forceAdmitAsRelease ? `
+                        <span class="meter" style="opacity:1">
+                          <span class="meter-bar" style="background:var(--info-soft,#e0eaff);border-color:var(--info,#4a7cff)"><i style="background:var(--info,#4a7cff);width:100%"></i></span>
+                          <span class="num bold" style="color:var(--info-d,var(--info,#2f5edb))">release in ${Number.isFinite(p._forceAdmitDaysToTrigger) ? p._forceAdmitDaysToTrigger + 'd' : '—'}</span>
+                        </span>
+                        ` : `
                         <span class="meter">
                           <span class="meter-bar ${p.status==='critical'?'crit':'warn'}"><i style="width:${clamp((p.daysOfCover/Math.max(p.leadDays+30,30))*100,5,100)}%"></i></span>
                           <span class="num bold ${p.status==='critical'?'text-crit':'text-warn'}">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
                         </span>
+                        `}
                       </td>
                       <td class="right num dim" onclick="openPartDetail('${esc(p.pn)}')">${p.leadDays}d</td>
                       <td class="right num" onclick="openPartDetail('${esc(p.pn)}')">${fmtNum(p.onHand)}</td>

@@ -754,6 +754,106 @@ function partStatus(part, lines) {
   return { status, urgency, stockoutDay, leadDays: lt, reorderBy, daysOfCover: stockoutDay };
 }
 
+// Sensourcing-scoped first-zero variant of daysUntilStockout. Scans the
+// projection day-by-day and returns the FIRST index where on-hand crosses
+// to <= 0, or Infinity if it never does. This is deliberately NOT the
+// lastPositive+1 shape of daysUntilStockout: blanket receipts create
+// gap-then-refill projections (part runs dry, blanket lands, oh recovers),
+// exactly the pattern lastPositive+1 mishandles by reporting the ULTIMATE
+// stockout day and hiding the real gap.
+//
+// Called by partStatusBlanketAware (Sensourcing branch of partsWithStatus)
+// with a supply-inclusive lines slice. daysUntilStockout stays untouched
+// so every other consumer of it (non-Sensourcing parts, Coverage Gaps,
+// dashboard KPIs, drawer, etc.) is byte-identical.
+function daysUntilFirstZero(part, supplyLines) {
+  const daily = Number(part.daily) || 0;
+  if (daily <= 0) return Infinity;
+  // No supply → workday cover from onHand only (byte-identical shape to
+  // daysUntilStockout's no-incoming branch so a Sensourcing part with no
+  // open PO AND no blanket resolves the same way).
+  if (!supplyLines || supplyLines.length === 0) {
+    const coverWorkdays = (Number(part.onHand) || 0) / daily;
+    let startD = TODAY;
+    let daysUntilStart = 0;
+    if (part && part.transitionStartDate && typeof parseDateLocal === "function") {
+      const s = parseDateLocal(part.transitionStartDate);
+      if (s && s.getTime() > TODAY.getTime()) {
+        startD = s;
+        daysUntilStart = Math.round((s.getTime() - TODAY.getTime()) / DAY_MS);
+      }
+    }
+    const cal = daysUntilStart + workdaysToCalendarDays(coverWorkdays, startD);
+    return cal > 365 ? Infinity : cal;
+  }
+  const series = projectOnHand(part, 365, supplyLines);
+  for (let i = 0; i < series.length; i++) {
+    if (series[i].oh <= 0) return i;
+  }
+  return Infinity;
+}
+
+// Sensourcing-scoped status wrapper. Same shape as partStatus (same
+// return fields) but reads daysUntilFirstZero instead of
+// daysUntilStockout so blanket receipts count as supply and gap-then-
+// refill patterns still surface the gap. partStatus stays untouched
+// for every non-Sensourcing caller.
+function partStatusBlanketAware(part, supplyLines) {
+  const lt = leadTimeDays(part);
+  const safety = DB.settings.safetyDays || 0;
+  const warnDays = DB.settings.alertWarning ?? 14;
+  const stockoutDay = daysUntilFirstZero(part, supplyLines);
+  const reorderBy = lt + safety;
+  let status = "ok";
+  let urgency = 9999;
+  if (stockoutDay === Infinity) {
+    status = "ok";
+    urgency = 9999;
+  } else if (stockoutDay <= reorderBy) {
+    status = "critical";
+    urgency = stockoutDay;
+  } else if (stockoutDay <= reorderBy + warnDays) {
+    status = "warning";
+    urgency = stockoutDay;
+  } else {
+    status = "ok";
+    urgency = stockoutDay;
+  }
+  return { status, urgency, stockoutDay, leadDays: lt, reorderBy, daysOfCover: stockoutDay };
+}
+
+// Shared min-triggerDate helper. Extracted from the row-map so
+// partsWithStatus (force-admit predicate) and renderOrderQueueFor
+// (RELEASE badge decision) resolve triggerDate the same way, and any
+// future consumer inherits it. Returns { triggerDate, daysToTrigger,
+// inWindow } given a runoutDaysOfCover (any calendar-days number,
+// finite = a valid runout, Infinity or non-finite = no runout) and
+// an optional transitionStartDate string. inWindow uses the 21-day
+// calendar threshold.
+function _computeTriggerFromRunoutAndTransition(runoutDaysOfCover, transitionStartDate) {
+  let runoutDate = null;
+  if (Number.isFinite(runoutDaysOfCover) && typeof addDays === "function") {
+    runoutDate = addDays(TODAY, runoutDaysOfCover);
+  }
+  let transitionDate = null;
+  if (transitionStartDate && typeof parseDateLocal === "function") {
+    const parsed = parseDateLocal(transitionStartDate);
+    if (parsed && !isNaN(parsed.getTime())) transitionDate = parsed;
+  }
+  let triggerDate = null;
+  if (runoutDate && transitionDate) {
+    triggerDate = runoutDate.getTime() <= transitionDate.getTime() ? runoutDate : transitionDate;
+  } else if (runoutDate) {
+    triggerDate = runoutDate;
+  } else if (transitionDate) {
+    triggerDate = transitionDate;
+  }
+  const daysToTrigger = triggerDate
+    ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+  const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
+  return { triggerDate, daysToTrigger, inWindow };
+}
+
 // Shared window→demand conversion. Given a CALENDAR-day window and a
 // PER-WORKDAY consumption rate, returns the units demanded across the
 // window. Calendar days are walked into workdays via calendarDaysToWorkdays
@@ -2901,10 +3001,18 @@ function partsWithStatus() {
   // Build the per-PN open-PO-line index ONCE and reuse it so we don't
   // rescan DB.pos for every part during the .map below.
   const lineIndex = _buildOpenPOLineIndex();
+  // Sensourcing-blanket-aware supply index — same shape, admits blanket
+  // lines that pass isLineIncomingSupply. Only Sensourcing parts route
+  // through this; non-Sensourcing parts continue to read lineIndex.
+  const supplyIndex = (typeof _buildSupplyLineIndex === "function") ? _buildSupplyLineIndex() : new Map();
   const out = DB.parts.map(p => {
     const lines = lineIndex.get(p.pn);
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
     const isKitVal = typeof isKit === "function" ? isKit(p) : false;
+    // Cycled-supplier scope (Sensourcing today). Non-null → route status
+    // through partStatusBlanketAware; null → byte-identical to production.
+    const _cycleForStatus = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
+    const _supplySlice = _cycleForStatus ? (supplyIndex.get(p.pn) || []) : null;
 
     // Phase 2: every member of an actively-transitioning chain gets an
     // effective view fed to partStatus, so the sequential burn-down shows up
@@ -2916,7 +3024,40 @@ function partsWithStatus() {
     const effectiveForStatus = view
       ? { ...p, onHand: view.cumulativeStockThroughThis, daily: Math.max(Number(p.daily) || 0, view.chainRate) }
       : p;
-    const status = partStatus(effectiveForStatus, lines);
+    // Sensourcing branch: status is computed against the SUPPLY-inclusive
+    // slice, so a blanket landing that keeps oh > 0 through the horizon
+    // yields status OK. Non-Sensourcing branch: partStatus with the OPEN
+    // slice — byte-identical to production. _openStatus is retained on
+    // Sensourcing parts as the pre-blanket runout, used by the force-admit
+    // predicate (a covered part still needs a RELEASE CTA when its raw
+    // runout falls inside the 21-day trigger window).
+    const _openStatus = _cycleForStatus
+      ? partStatus(effectiveForStatus, lines)
+      : null;
+    const status = _cycleForStatus
+      ? partStatusBlanketAware(effectiveForStatus, _supplySlice)
+      : partStatus(effectiveForStatus, lines);
+
+    // Force-admit predicate: a Sensourcing base_bom part that reads OK
+    // under blanket-aware status but whose OPEN-index runout is inside
+    // the 21-day trigger window, has an open blanket, and has NO normal
+    // PO (openPOQty stays blanket-blind). Force-admitted rows appear in
+    // the queue with a distinct RELEASE row treatment so buyers still
+    // see the CTA even though the part is "covered."
+    let _forceAdmitAsRelease = false;
+    let _forceAdmitDaysToTrigger = null;
+    if (_cycleForStatus
+        && String(p.itemType || "").toLowerCase().trim() === "base_bom"
+        && status.status === "ok"
+        && onPO === 0
+        && (typeof findOpenBlanketForPart === "function") && findOpenBlanketForPart(p.pn)) {
+      const openRunout = _openStatus ? _openStatus.daysOfCover : Infinity;
+      const trig = _computeTriggerFromRunoutAndTransition(openRunout, p.transitionStartDate);
+      if (trig.inWindow) {
+        _forceAdmitAsRelease = true;
+        _forceAdmitDaysToTrigger = trig.daysToTrigger;
+      }
+    }
 
     const muted = isSupplierMuted(p.supplier);
     // Pre-launch superseding parts are gated the same way muted-supplier parts
@@ -2952,6 +3093,15 @@ function partsWithStatus() {
       onPO,
       isKit: isKitVal,
       ...status,
+      // Sensourcing force-admit: written for every cycled Sensourcing
+      // part (default false). Read by queueParts to force-admit an OK
+      // row as a RELEASE call-to-action, and by the order-queue row map
+      // to pick the release-styled visual + daysToTrigger display.
+      ...(_cycleForStatus ? {
+        _forceAdmitAsRelease,
+        _forceAdmitDaysToTrigger,
+        _openDaysOfCover: _openStatus ? _openStatus.daysOfCover : null,
+      } : {}),
       // MUTED-supplier override.
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
       // PRE-LAUNCH override — skipped when in an active chain (chain
@@ -3145,8 +3295,14 @@ function queueParts(itemType) {
   if (_wantType) stats = stats.filter(p => String(p.itemType || "").toLowerCase().trim() === _wantType);
   else stats = stats.filter(p => isQueueEligible(p));
   stats = stats.filter(p => !p.isKit);
+  // Admission: critical / warning as always, PLUS Sensourcing base_bom
+  // rows force-admitted as RELEASE (status ok under blanket-aware but
+  // OPEN-index runout sits inside the 21-day trigger with a blanket + no
+  // normal PO). The force-admit branch is populated only for cycled
+  // Sensourcing rows in partsWithStatus; every other supplier resolves
+  // as before.
   return stats.filter(p =>
-    (p.status === "critical" || p.status === "warning") &&
+    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease) &&
     !p.phasingOut
   );
 }
