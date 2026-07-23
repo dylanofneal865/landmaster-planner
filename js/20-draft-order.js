@@ -86,6 +86,16 @@ function _computeBlanketSplit(pn, qty) {
 // Every returned line has: { blanketPoNum, qty, blanketOpenQty, kind }
 // where kind is "release" or "normal".
 function _draftItemLines(item) {
+  // Per-line "Release against blanket" toggle. When explicitly turned OFF
+  // (_releaseAgainstBlanket === false), collapse the whole item to a single
+  // normal line at the stored total qty. Downstream consumers read
+  // blanketPoNum off the emitted line, so annotations, sub-rows, and the
+  // PDF "Release against POx" description suffix all vanish automatically.
+  // Undefined / true → default ON behavior below.
+  if (item && item._releaseAgainstBlanket === false) {
+    const total = Number(item.qty || 0);
+    return [{ blanketPoNum: null, qty: total, blanketOpenQty: 0, kind: "normal" }];
+  }
   if (item && Array.isArray(item._releases)) {
     const out = item._releases.map(r => ({
       blanketPoNum: r.blanketPoNum,
@@ -133,7 +143,9 @@ function draftOrderAdd(pn, qty, qtySource) {
   const resolvedQtySource = qtySource || "standard";
   if (existing) {
     // In-place mutation only — DRAFT_ORDER identity is preserved so realtime
-    // sync's hash / delta path keeps working.
+    // sync's hash / delta path keeps working. _releaseAgainstBlanket is NOT
+    // touched on re-add: if the user already toggled it off, re-adding the
+    // part must not silently flip it back on.
     existing.qty = qty;
     existing.blanketPoNum = legacyBlanketPoNum;
     existing.blanketOpenQty = legacyBlanketOpenQty;
@@ -152,6 +164,9 @@ function draftOrderAdd(pn, qty, qtySource) {
       _normalQty: split.normalQty,
       _exhaustedBlanketPoNum: split.exhaustedBlanketPoNum,
       qtySource: resolvedQtySource,
+      // Default ON — cap-and-split runs and releases render as today.
+      // The user can opt out per-item via the drawer's toggle.
+      _releaseAgainstBlanket: true,
     });
   }
   draftOrderSave();
@@ -305,13 +320,26 @@ function openDraftOrderDrawer() {
                 if (line._splitIsFirst) {
                   const totalQty = line._splitTotalQty;
                   const totalLineTotal = line._splitTotalLineTotal;
-                  // Header note under the PN — three shapes:
-                  //   split (2+ lines):    "319 needed · split against blanket + new order"
+                  // Resolve the underlying draft item to check the release
+                  // toggle and whether the pn actually has an open blanket
+                  // right now (findOpenBlanketForPart is authoritative;
+                  // stored _releases can be stale after a sync). The toggle
+                  // renders only when there's an active blanket to release
+                  // against — exhausted-only rows don't get one.
+                  const _item = DRAFT_ORDER.find(d => d.pn === part.pn);
+                  const _releaseFlag = _item ? (_item._releaseAgainstBlanket !== false) : true;
+                  const _blkNow = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(part.pn) : null;
+                  const _hasBlanketBacking = !!_blkNow;
+                  // Header note under the PN — five shapes (was three):
+                  //   toggle-off:          "will place as new order" (muted)
+                  //   split (2+ lines):    "319 needed · cap-and-split below"
                   //   single release:      "↳ Release against POx (Y left after)"
                   //   normal + exhausted:  "POy fully consumed — ordering normally"
                   //   normal:              (none)
                   let releaseNote = "";
-                  if (isSplit) {
+                  if (_hasBlanketBacking && !_releaseFlag) {
+                    releaseNote = `<div class="dim tiny mono" style="margin-top:2px">will place as new order</div>`;
+                  } else if (isSplit) {
                     releaseNote = `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">${fmtNum(totalQty)} needed · cap-and-split below</div>`;
                   } else if (blanketPoNum) {
                     const leftAfter = Math.max(0, (blanketOpenQty || 0) - qty);
@@ -322,12 +350,24 @@ function openDraftOrderDrawer() {
                   } else if (line._exhaustedBlanketPoNum) {
                     releaseNote = `<div class="dim tiny" style="margin-top:2px" title="This part has a blanket PO but its authorized qty is fully consumed — this order is being placed normally.">${esc(line._exhaustedBlanketPoNum)} fully consumed — ordering normally</div>`;
                   }
+                  // Checkbox: renders only when the pn has an open blanket
+                  // right now. Unchecked = "will place as new order" — the
+                  // draft line becomes a plain standalone PO and no
+                  // "Release against POx" text appears in the drawer or PDF.
+                  const toggleHtml = _hasBlanketBacking ? `
+                    <div class="tiny" style="margin-top:4px">
+                      <label style="cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:6px">
+                        <input type="checkbox" ${_releaseFlag ? "checked" : ""} onchange="draftOrderToggleRelease('${esc(part.pn)}', this.checked)">
+                        <span class="dim">Release against blanket</span>
+                      </label>
+                    </div>` : "";
                   return `
                     <tr data-draft-pn="${esc(part.pn)}" data-draft-supplier="${esc(s)}" data-draft-primary>
                       <td>
                         <div class="pn">${esc(part.pn)}</div>
                         <div class="dim tiny">${esc(part.desc || '—')}</div>
                         ${releaseNote}
+                        ${toggleHtml}
                       </td>
                       <td class="right" style="width:90px">
                         <input class="input num" type="number" min="0" value="${totalQty}" oninput="draftOrderUpdateQty('${esc(part.pn)}', this.value)">
@@ -397,12 +437,22 @@ function draftOrderUpdateQty(pn, value) {
   if (!existing) return;
   // Snapshot the OLD split shape so we can decide whether an in-place DOM
   // patch preserves the input's focus or we need a full drawer re-render.
-  const oldSplitCount = Array.isArray(existing._releases)
-    ? existing._releases.length + (Number(existing._normalQty || 0) > 0 ? 1 : 0)
-    : (existing.blanketPoNum ? 1 : 1);
+  // When the release toggle is OFF, the render collapses to a single line
+  // regardless of what _releases contains — snap split counts to 1 so we
+  // don't force a full redraw on every keystroke against an unchecked item.
+  const releaseFlag = existing._releaseAgainstBlanket !== false;
+  const oldSplitCount = !releaseFlag
+    ? 1
+    : (Array.isArray(existing._releases)
+        ? existing._releases.length + (Number(existing._normalQty || 0) > 0 ? 1 : 0)
+        : (existing.blanketPoNum ? 1 : 1));
   const oldExhausted = existing._exhaustedBlanketPoNum || null;
 
-  // Recompute the split at the new total. In-place mutation only.
+  // Recompute the split at the new total. In-place mutation only. Runs
+  // regardless of the toggle so _releases stays fresh if the user later
+  // re-checks (the re-check handler ALSO recomputes at that moment, but
+  // keeping the stored value fresh here means the drawer redraw path can
+  // display a preview immediately without a fetch).
   const split = _computeBlanketSplit(pn, qty);
   const first = split.releases[0] || null;
   existing.qty = qty;
@@ -413,7 +463,9 @@ function draftOrderUpdateQty(pn, value) {
   existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
   draftOrderSave();
 
-  const newSplitCount = split.releases.length + (split.normalQty > 0 ? 1 : 0) || 1;
+  const newSplitCount = !releaseFlag
+    ? 1
+    : (split.releases.length + (split.normalQty > 0 ? 1 : 0) || 1);
   const newExhausted = split.exhaustedBlanketPoNum || null;
 
   // Split shape changed → sub-row count differs → re-render the drawer.
@@ -472,6 +524,35 @@ function draftOrderRemoveLine(pn) {
   // just removed, so its IN DRAFT pill would stay stuck. Flip it back to +Add
   // by re-running the queue renderer (scroll-preserving). No-op off-queue.
   _refreshQueueIfActive();
+}
+
+// Per-line "Release against blanket" toggle handler. When RE-CHECKED, the
+// cap-and-split is recomputed FRESH against current blanket data — the
+// stored _releases may be stale (nightly sync could have consumed the
+// blanket while the item sat unchecked, and a blind restore would show a
+// release against authorization that no longer exists). Uncheck is
+// simpler: flip the flag; _releases is left in place but ignored by the
+// _draftItemLines collapse. Qty is never modified.
+function draftOrderToggleRelease(pn, checked) {
+  const existing = DRAFT_ORDER.find(d => d.pn === pn);
+  if (!existing) return;
+  existing._releaseAgainstBlanket = !!checked;
+  if (checked) {
+    // Recompute against CURRENT DB.pos blanket state.
+    const split = _computeBlanketSplit(pn, Number(existing.qty || 0));
+    const first = split.releases[0] || null;
+    existing.blanketPoNum = first ? first.blanketPoNum : null;
+    existing.blanketOpenQty = first ? first.blanketOpenQty : 0;
+    existing._releases = split.releases;
+    existing._normalQty = split.normalQty;
+    existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
+  }
+  draftOrderSave();
+  // Full redraw — toggling changes row count (N release rows + 1 balance
+  // row ↔ 1 collapsed normal row), so an in-place patch would fight the
+  // structural shift. Same pattern draftOrderRemoveLine uses.
+  openDraftOrderDrawer();
+  updateDraftOrderPill();
 }
 
 // Re-run the current queue route handler with scroll preservation, but only
