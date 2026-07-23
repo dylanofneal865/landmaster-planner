@@ -1010,6 +1010,25 @@ function partsToggleAllHeaderValues(key, checked) {
   partsRerenderPreservingScroll();
 }
 
+// On Hand column header click. First click sets sortBy=onhand ascending
+// (smallest first, per the buyer's "which parts are lowest on hand" flow).
+// Second click flips direction. Overrides whatever the Sort dropdown was
+// set to. The dropdown's own onchange remains authoritative when the
+// buyer picks a different sort — the caret in the On Hand header is
+// rendered only when sortBy === "onhand", so it auto-hides when the
+// dropdown steers sort elsewhere. Blank/undefined onHand values sort as
+// 0 (handled by the existing (a.onHand || 0) - (b.onHand || 0) shape in
+// the sort switch).
+function partsToggleOnHandSort() {
+  if (PARTS_STATE.sortBy === "onhand") {
+    PARTS_STATE.sortDir = PARTS_STATE.sortDir === "asc" ? "desc" : "asc";
+  } else {
+    PARTS_STATE.sortBy = "onhand";
+    PARTS_STATE.sortDir = "asc";
+  }
+  refresh();
+}
+
 // Re-run the parts route handler in place so header-dropdown changes flow
 // through partsApplyHeaderFilters BEFORE the 500-row slice, then restore the
 // main viewport's scroll so the user doesn't jump to top. We bypass refresh()
@@ -1285,7 +1304,7 @@ registerRoute("parts", () => {
           </select>
           <div class="grow"></div>
           <span class="muted tiny">Sort:</span>
-          <select class="select" onchange="PARTS_STATE.sortBy = this.value; PARTS_STATE.sortDir = (['onhand','value','leadtime'].includes(this.value) ? 'desc' : 'asc'); refresh()">
+          <select class="select" onchange="PARTS_STATE.sortBy = this.value; PARTS_STATE.sortDir = (['value','leadtime'].includes(this.value) ? 'desc' : 'asc'); refresh()">
             <option value="pn" ${PARTS_STATE.sortBy==='pn'?'selected':''}>Part #</option>
             <option value="desc" ${PARTS_STATE.sortBy==='desc'?'selected':''}>Description</option>
             <option value="supplier" ${PARTS_STATE.sortBy==='supplier'?'selected':''}>Supplier</option>
@@ -1302,7 +1321,7 @@ registerRoute("parts", () => {
                 ${partsHeaderDropdown("desc", "Description", headerFilterRows)}
                 ${partsHeaderDropdown("supplier", "Supplier", headerFilterRows)}
                 ${partsHeaderDropdown("cls", "Type", headerFilterRows)}
-                <th class="right">On Hand</th>
+                <th class="right" onclick="partsToggleOnHandSort()" style="cursor:pointer;user-select:none" title="Sort by On Hand">On Hand${PARTS_STATE.sortBy === "onhand" ? ` <span class="dim tiny">${PARTS_STATE.sortDir === "asc" ? "▲" : "▼"}</span>` : ""}</th>
                 <th class="right">On PO</th>
                 <th class="right">Daily</th>
                 <th class="right">Lead</th>
