@@ -2877,6 +2877,54 @@ function lastPOPrice(pn) {
   return pool[0]; // { cost, qty, date, poNum }
 }
 
+// Every vendor that has ever supplied `pn`, from PO history in DB.pos.
+// Mirrors lastPOPrice's walk (all PO statuses — received/closed included
+// via the sync's additive retention; per-supplier future-date guard so a
+// typo-dated PO doesn't crown a vendor's "last cost" with a future date).
+// Returns [{ supplier, lastCost, lastDate, poNum, orderCount }] sorted
+// most-recent-first. Empty array when no PO history exists for the pn.
+//
+// Consumers: draft-order supplier input (per-part datalist + cost-lookup
+// on pick). Nothing else in the app reads this today. Never writes.
+function suppliersForPart(pn) {
+  if (!pn || !Array.isArray(DB.pos)) return [];
+  const groups = new Map();  // supplier → [{cost, qty, date, poNum, status}]
+  for (const po of DB.pos) {
+    const supplier = String(po.supplier || "").trim();
+    if (!supplier) continue;
+    for (const ln of (po.lines || [])) {
+      if (String(ln.pn || "").trim() !== pn) continue;
+      const d = po.createdDate ? new Date(po.createdDate) : null;
+      if (!groups.has(supplier)) groups.set(supplier, []);
+      groups.get(supplier).push({
+        cost: Number(ln.cost) || 0,
+        qty: Number(ln.qty) || 0,
+        date: d,
+        poNum: po.num || po.id,
+        status: po.status || ln.status || "",
+      });
+    }
+  }
+  const results = [];
+  for (const [supplier, cands] of groups.entries()) {
+    // Per-supplier future-date guard: prefer non-future dates when any exist,
+    // fall back to newest regardless when every candidate is future/invalid.
+    const notFuture = cands.filter(c => c.date && !isNaN(c.date) && c.date <= TODAY);
+    const pool = notFuture.length ? notFuture : cands;
+    pool.sort((a, b) => (b.date ? b.date.getTime() : 0) - (a.date ? a.date.getTime() : 0));
+    const latest = pool[0];
+    results.push({
+      supplier,
+      lastCost: latest.cost,
+      lastDate: latest.date,
+      poNum: latest.poNum,
+      orderCount: cands.length,
+    });
+  }
+  results.sort((a, b) => (b.lastDate ? b.lastDate.getTime() : 0) - (a.lastDate ? a.lastDate.getTime() : 0));
+  return results;
+}
+
 // Unit cost decision for SUGGESTED-ORDER pricing. Returns a full provenance
 // record so the part drawer can show *which* side won and why. Two pricing
 // sources compete:

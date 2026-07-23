@@ -171,6 +171,13 @@ function draftOrderAdd(pn, qty, qtySource) {
       // primary supplier (current behavior). Set via the drawer's supplier
       // input. Never writes back to part.supplier.
       _supplierOverride: null,
+      // Per-line vendor-cost override — set at supplier-pick time when the
+      // chosen vendor has PO history (suppliersForPart returns their
+      // lastCost + lastDate). null means use orderUnitCost(part) — the
+      // current cost provenance path (last PO / manual, newer wins). Never
+      // writes back to part.cost.
+      _costOverride: null,
+      _costOverrideDate: null,
     });
   }
   draftOrderSave();
@@ -219,8 +226,16 @@ function draftOrderTotals() {
     const override = (item._supplierOverride && String(item._supplierOverride).trim()) || "";
     const supplier = override || part.supplier || "(No supplier)";
     if (!groups[supplier]) groups[supplier] = { lines: [], subtotal: 0 };
-    const noCost = hasNoOrderCost(part);
-    const unit = noCost ? 0 : orderUnitCost(part);
+    // Per-line vendor-cost override — when the user picked a supplier that
+    // had PO history, _costOverride carries that vendor's lastCost at pick
+    // time. Null → fall through to orderUnitCost(part) (current provenance:
+    // newer of manual cost / last PO, per orderUnitCostSource). part.cost is
+    // NEVER written from here.
+    const hasCostOverride = item._costOverride != null && Number.isFinite(Number(item._costOverride));
+    const noCost = hasCostOverride ? false : hasNoOrderCost(part);
+    const unit = hasCostOverride
+      ? Number(item._costOverride)
+      : (noCost ? 0 : orderUnitCost(part));
     const totalQty = Number(item.qty || 0);
     const totalLineTotal = totalQty * unit;
     const parts = _draftItemLines(item);
@@ -249,6 +264,12 @@ function draftOrderTotals() {
         // from the part's primary supplier.
         _supplierOverridden: !!override && override !== (part.supplier || ""),
         _supplierPrimary: part.supplier || "",
+        // Cost-override provenance on the line. `_costOverridden` fires the
+        // dated cost pill; `_costOverrideDate` sourced from the item at
+        // supplier-pick time so the pill shows the vendor's PO date, not
+        // "now."
+        _costOverridden: hasCostOverride,
+        _costOverrideDate: hasCostOverride ? (item._costOverrideDate || null) : null,
       });
       if (!noCost) {
         groups[supplier].subtotal += lineTotal;
@@ -296,10 +317,11 @@ function quickAddToDraft(pn) {
 function openDraftOrderDrawer() {
   const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
   const supplierKeys = Object.keys(supplierGroups).sort();
-  // Suppliers-list for the per-line datalist combobox. Dedup + sort. Rendered
-  // ONCE at the top of the drawer body; every row's supplier input references
-  // it via list="draft-supplier-list". Native HTML5 combobox — users can pick
-  // an existing supplier or type a new one.
+  // ALL suppliers in DB.parts — used ONLY by the typo-hint guard (scope
+  // choice: catch typos of any known catalog vendor, not just this pn's
+  // historical vendors, since alternate-sourcing means the target vendor
+  // hasn't necessarily supplied THIS pn before). The per-part vendor
+  // datalist below is populated separately from suppliersForPart(pn).
   const _allSuppliers = [...new Set((DB.parts || []).map(p => p && p.supplier).filter(Boolean))].sort();
 
   const html = `
@@ -312,9 +334,6 @@ function openDraftOrderDrawer() {
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
-      <datalist id="draft-supplier-list">
-        ${_allSuppliers.map(s => `<option value="${esc(s)}"></option>`).join("")}
-      </datalist>
       ${itemCount === 0 ? `
         <div class="empty">
           <div class="empty-title">No items yet</div>
@@ -386,13 +405,16 @@ function openDraftOrderDrawer() {
                         <span class="dim">Release against blanket</span>
                       </label>
                     </div>` : "";
-                  // Supplier override input — datalist combobox. Placeholder
-                  // shows the part's primary supplier as ghost text; empty
-                  // value = use primary. Below it, a typo-hint line surfaces
-                  // when the current override looks like a near-miss for an
-                  // existing supplier. The ↷ indicator on the PN line signals
-                  // an override is active (also colors the group heading via
-                  // being in a different group at all).
+                  // Supplier override input — datalist combobox populated
+                  // PER-PART from suppliersForPart(pn) so buyers see vendors
+                  // that have actually supplied this pn, with each option
+                  // labeled by lastCost + PO-date. Free text still works for
+                  // vendors with no history. The typo-hint runs against the
+                  // full DB.parts supplier list (option b) — catches typos of
+                  // any known catalog vendor, which is the whole alternate-
+                  // sourcing case. The ↷ indicator on the PN line signals a
+                  // supplier override is active; a separate dated cost pill
+                  // fires when a picked vendor's lastCost lands on the line.
                   const _overrideRaw = _item ? (_item._supplierOverride || "") : "";
                   const _primary = part.supplier || "";
                   const _isOverridden = !!(_overrideRaw && _overrideRaw.trim() && _overrideRaw.trim() !== _primary);
@@ -402,15 +424,45 @@ function openDraftOrderDrawer() {
                   const _typoHintHtml = _typoHint
                     ? `<div class="tiny" style="margin-top:2px;color:var(--warn-d,var(--warn,#c47500))">did you mean <a href="#" onclick="event.preventDefault(); draftOrderSetSupplier('${esc(part.pn)}', ${JSON.stringify(_typoHint).replace(/"/g,'&quot;')})" style="color:inherit;text-decoration:underline">${esc(_typoHint)}</a>?</div>`
                     : "";
+                  // Per-part vendor history — powers the per-row datalist and
+                  // is also used to render the dated cost pill format.
+                  const _vendorHistory = (typeof suppliersForPart === "function")
+                    ? suppliersForPart(part.pn) : [];
+                  const _datalistId = `draft-supplier-list-${part.pn}`;
+                  const _fmtDateShort = (d) => {
+                    if (!d) return "?";
+                    const dd = d instanceof Date ? d : new Date(d);
+                    if (isNaN(dd)) return "?";
+                    return dd.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+                  };
+                  // Per-part datalist. Option label = "SUPPLIER — $X.XX (Mon
+                  // YYYY)" so the buyer sees each vendor's last-cost + date
+                  // inline in the combobox suggestions. `value` remains the
+                  // canonical supplier string so exact-match cost lookup at
+                  // pick time succeeds.
+                  const _datalistHtml = `<datalist id="${esc(_datalistId)}">${
+                    _vendorHistory.map(h => {
+                      const label = `${h.supplier} — $${Number(h.lastCost).toFixed(2)} (${_fmtDateShort(h.lastDate)})`;
+                      return `<option value="${esc(h.supplier)}" label="${esc(label)}"></option>`;
+                    }).join("")
+                  }</datalist>`;
+                  // Cost-override pill — fires when _costOverride landed on
+                  // the line (vendor with PO history was picked). Shows the
+                  // dated cost so a two-year-old price looks two years old.
+                  const _costPillHtml = line._costOverridden
+                    ? `<span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:6px;letter-spacing:0.04em" title="Line unit cost overridden from ${esc(_overrideRaw)}'s last PO (${line._costOverrideDate ? _fmtDateShort(line._costOverrideDate) : "?"}). Cleared by clearing the supplier input.">↷ $${Number(unit).toFixed(2)} (${line._costOverrideDate ? _fmtDateShort(line._costOverrideDate) : "?"})</span>`
+                    : "";
                   const supplierInputHtml = `
+                    ${_datalistHtml}
                     <div class="tiny" style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
-                      <div style="display:flex;align-items:center;gap:6px">
+                      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                         <span class="dim" style="min-width:56px">Supplier:</span>
-                        <input class="input" list="draft-supplier-list" value="${esc(_overrideRaw)}"
+                        <input class="input" list="${esc(_datalistId)}" value="${esc(_overrideRaw)}"
                                placeholder="${esc(_primary || 'no primary supplier')}"
                                onchange="draftOrderSetSupplier('${esc(part.pn)}', this.value)"
                                style="max-width:240px;padding:2px 6px;font-size:11px">
                         ${_isOverridden ? `<span class="pill info" style="font-size:9px;padding:1px 5px;letter-spacing:0.04em" title="Supplier overridden — differs from ${esc(_primary || '(no primary)')}. Cleared by emptying the input.">↷ overridden</span>` : ""}
+                        ${_costPillHtml}
                       </div>
                       ${_typoHintHtml}
                     </div>`;
@@ -627,16 +679,39 @@ function _draftSupplierTypoHint(value, existingSuppliers) {
   return null;
 }
 
-// Per-line supplier override handler. Sets item._supplierOverride and
-// triggers a full drawer redraw so the line moves to its new supplier
-// group. Empty / whitespace-only value clears the override (revert to
-// primary). part.supplier is NEVER written from here — the override lives
-// only on the draft item.
+// Per-line supplier override handler. Sets item._supplierOverride and,
+// when the chosen vendor has PO history for this pn, sets _costOverride
+// to that vendor's lastCost + lastDate. Free-text / unknown vendor
+// clears _costOverride so the line keeps orderUnitCost(part). Empty /
+// whitespace-only value clears both. part.supplier and part.cost are
+// NEVER written from here — the overrides live only on the draft item.
 function draftOrderSetSupplier(pn, value) {
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
   if (!existing) return;
   const trimmed = String(value || "").trim();
-  existing._supplierOverride = trimmed || null;
+  if (!trimmed) {
+    // Clear both — reverts to part primary + orderUnitCost.
+    existing._supplierOverride = null;
+    existing._costOverride = null;
+    existing._costOverrideDate = null;
+  } else {
+    existing._supplierOverride = trimmed;
+    // Look up the chosen vendor in this pn's PO history. Match on exact
+    // supplier name (case-sensitive — dropdown values are the canonical
+    // po.supplier strings the sync writes). Free-text vendors won't match
+    // → _costOverride stays null → line keeps the current cost provenance.
+    const history = (typeof suppliersForPart === "function") ? suppliersForPart(pn) : [];
+    const match = history.find(h => h.supplier === trimmed);
+    if (match && Number.isFinite(Number(match.lastCost)) && match.lastCost > 0) {
+      existing._costOverride = Number(match.lastCost);
+      existing._costOverrideDate = match.lastDate ? (match.lastDate instanceof Date ? match.lastDate.toISOString() : String(match.lastDate)) : null;
+    } else {
+      // Free-text or historical vendor with zero cost — leave the line's
+      // cost on orderUnitCost(part). No dated pill fires.
+      existing._costOverride = null;
+      existing._costOverrideDate = null;
+    }
+  }
   draftOrderSave();
   // Full redraw — the row may have moved to a different group, invalidating
   // the in-place patch paths (data-draft-supplier attribute mismatch,
