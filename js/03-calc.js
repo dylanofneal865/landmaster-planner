@@ -1266,6 +1266,66 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
   };
 }
 
+// Gather PO lines for a chain — the single source of truth for what
+// `_chainHardCutinSupply` sees. Two callers (chainSequentialView and
+// getChainInfo) previously inlined this logic; when getChainInfo grew a
+// cycled-supplier gate and later credited predecessor POs into phase 1,
+// chainSequentialView's copy silently drifted (passed null and lost the
+// credit → the drawer chart still dipped at day 66 while chainRunoutDays
+// already read the corrected 73). This helper prevents that drift by
+// giving both callers one gather.
+//
+// Per-PO admission: cycled suppliers (Sensourcing today) route through
+// isLineIncomingSupply so blanket lines land as scheduled supply on the
+// blanket's expectedDate. Non-cycled suppliers stay on isLineOpen. Return
+// shape matches what _chainHardCutinSupply and getChainInfo already
+// expect: [{ pn, poNum, poId, remaining, expectedDate, isOverdue, isBlanket }].
+function _gatherChainPOLines(lineage) {
+  if (!Array.isArray(lineage) || !lineage.length) return [];
+  const chainPnSet = new Set(lineage);
+  const out = [];
+  for (const po of (DB.pos || [])) {
+    const _poCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(po.supplier) : null;
+    const _useSupplyGate = !!_poCycle;
+    for (const ln of (po.lines || [])) {
+      if (!ln || !chainPnSet.has(ln.pn)) continue;
+      if (_useSupplyGate) {
+        if (typeof isLineIncomingSupply !== "function" || !isLineIncomingSupply(po, ln)) continue;
+      } else {
+        if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
+      }
+      const remaining = _useSupplyGate
+        ? (typeof _lineIncomingRemaining === "function"
+            ? _lineIncomingRemaining(ln)
+            : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0)))
+        : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (remaining <= 0) continue;
+      const expRaw = ln.expectedDate || po.expectedDate;
+      let expectedDate = null;
+      let isOverdue = false;
+      if (expRaw) {
+        const parsed = (typeof parseDateLocal === "function")
+          ? parseDateLocal(expRaw)
+          : new Date(expRaw);
+        if (parsed && !isNaN(parsed.getTime())) {
+          expectedDate = parsed;
+          isOverdue = parsed.getTime() < TODAY.getTime();
+        }
+      }
+      out.push({
+        pn: ln.pn,
+        poNum: po.num,
+        poId: po.id,
+        remaining,
+        expectedDate,
+        isOverdue,
+        isBlanket: (typeof isBlanketLine === "function") ? isBlanketLine(ln) : false,
+      });
+    }
+  }
+  return out;
+}
+
 function chainSequentialView(part) {
   if (!part || !part.pn) return null;
   const lineage = supersessionLineage(part.pn);
@@ -1298,12 +1358,15 @@ function chainSequentialView(part) {
   let totalChainStockClamped = cumulativeStockThroughThis;
   for (const p of successors) totalChainStockClamped += Math.max(0, Number(p.onHand) || 0);
 
-  // HARD CUT-IN pointer — same helper the getChainInfo rollup uses. When
-  // finalMember has a valid transitionStartDate, this is non-null and carries
-  // hardCutinDate / predecessorStock / ownStock / strandedPredecessorQty for
-  // the drawer's chart-projector. When absent, view stays byte-identical to
-  // its pre-fix shape (every field still populated the same way).
-  const hardCutin = _chainHardCutinSupply(members, null);
+  // HARD CUT-IN pointer — same helper the getChainInfo rollup uses. Gathers
+  // chainPOLines via _gatherChainPOLines so the drawer's hardCutin object
+  // has the SAME predecessor-PO credit that getChainInfo sees. Passing null
+  // here (pre-fix) silently no-oped the phase-1 predecessor-PO credit added
+  // in 4eea9f6 — the drawer chart kept dipping at day 66 while
+  // chainRunoutDays already read the corrected 73. Route both callers
+  // through the helper so they can't drift again.
+  const chainPOLines = _gatherChainPOLines(lineage);
+  const hardCutin = _chainHardCutinSupply(members, chainPOLines);
 
   return {
     lineage,
@@ -1623,64 +1686,16 @@ function getChainInfo(pn) {
   let chainOnHand = 0;
   for (const m of members) chainOnHand += Math.max(0, Number(m.onHand) || 0);
 
-  // Chain on-PO: sum of open PO remaining across all chain PNs.
+  // Chain on-PO: gathered via the shared helper (see _gatherChainPOLines
+  // for the cycled-supplier gate + isBlanket flag rationale). Both this
+  // caller and chainSequentialView route through the helper so
+  // _chainHardCutinSupply sees the same PO set from both entry points —
+  // otherwise the drawer's chart and chainRunoutDays drift, as they did
+  // between 4eea9f6 (which credited predecessor POs) and this refactor.
   // Overdue POs count as coverage (arrive-in-time in the abdabe9
   // semantic). isOverdue tracked per-line for downstream UI use.
-  const chainPnSet = new Set(lineage);
-  let chainOnPO = 0;
-  const chainPOLines = [];
-  for (const po of (DB.pos || [])) {
-    // Per-PO admission gate: cycled-supplier POs (Sensourcing today) route
-    // through isLineIncomingSupply so their blanket lines land as scheduled
-    // supply on the blanket's expectedDate — same rule that e66ab6c already
-    // applies to projectOnHand and suggestedQty via includeBlanketSupply /
-    // blanketIncomingQty. Non-cycled suppliers stay on isLineOpen — BYTE-
-    // IDENTICAL to production. This closes the gap where the chart credits
-    // a Sensourcing blanket to phase 2 while the chain-runout math ignored
-    // it, producing two runout numbers for one part (e.g. JP00021, CP00945).
-    const _poCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(po.supplier) : null;
-    const _useSupplyGate = !!_poCycle;
-    for (const ln of (po.lines || [])) {
-      if (!ln || !chainPnSet.has(ln.pn)) continue;
-      if (_useSupplyGate) {
-        if (typeof isLineIncomingSupply !== "function" || !isLineIncomingSupply(po, ln)) continue;
-      } else {
-        if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
-      }
-      const remaining = _useSupplyGate
-        ? (typeof _lineIncomingRemaining === "function"
-            ? _lineIncomingRemaining(ln)
-            : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0)))
-        : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
-      if (remaining <= 0) continue;
-      const expRaw = ln.expectedDate || po.expectedDate;
-      let expectedDate = null;
-      let isOverdue = false;
-      if (expRaw) {
-        const parsed = (typeof parseDateLocal === "function")
-          ? parseDateLocal(expRaw)
-          : new Date(expRaw);
-        if (parsed && !isNaN(parsed.getTime())) {
-          expectedDate = parsed;
-          isOverdue = parsed.getTime() < TODAY.getTime();
-        }
-      }
-      chainOnPO += remaining;
-      chainPOLines.push({
-        pn: ln.pn,
-        poNum: po.num,
-        poId: po.id,
-        remaining,
-        expectedDate,
-        isOverdue,
-        // Plumbing for _chainHardCutinSupply's ownStockAtCutinBlanketOnly
-        // computation: byCutin's C1 rule needs to know which pre-cutin
-        // receipts are blanket-type so it credits Sensourcing blanket
-        // supply against the "successor has no bridge stock at cutin" test.
-        isBlanket: (typeof isBlanketLine === "function") ? isBlanketLine(ln) : false,
-      });
-    }
-  }
+  const chainPOLines = _gatherChainPOLines(lineage);
+  const chainOnPO = chainPOLines.reduce((s, l) => s + (Number(l.remaining) || 0), 0);
 
   // Pre-launch composition (informational only for chains).
   let preLaunch = null;
