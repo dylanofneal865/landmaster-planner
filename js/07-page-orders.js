@@ -224,6 +224,12 @@ function oqUrgencyMargin(p) {
     const reorderBy = Number(p?.reorderBy);
     return Number(p._forceAdmitDaysToTrigger) - (Number.isFinite(reorderBy) ? reorderBy : 0);
   }
+  // Planning-tier rows sort below RELEASE but above OK-status rows.
+  // Rank by days-to-cutin; smaller = more urgent to plan.
+  if (p && p._forceAdmitAsPlanning && Number.isFinite(p._forceAdmitPlanningDaysToTrigger)) {
+    const reorderBy = Number(p?.reorderBy);
+    return Number(p._forceAdmitPlanningDaysToTrigger) - (Number.isFinite(reorderBy) ? reorderBy : 0);
+  }
   const cover = Number(p?.daysOfCover);
   const reorderBy = Number(p?.reorderBy);
   if (!Number.isFinite(cover) || !Number.isFinite(reorderBy)) return Infinity;
@@ -634,39 +640,50 @@ function renderOrderQueueFor(itemType) {
                     //     23-8006 correctly fall through to "none".
                     const itemTypeNorm = String(p.itemType || "").toLowerCase().trim();
                     const isBaseBomScope = itemTypeNorm === "base_bom";
+                    // Flag decision — read force-admit flags from
+                    // partsWithStatus (single source of truth). RELEASE and
+                    // PLANNING are decided upstream. NO PO stays row-local
+                    // (needs live triggerDate).
                     let flag = "none";
-                    if (isBaseBomScope) {
-                      if (blk && openPO === 0 && inWindow) {
-                        flag = "RELEASE";
-                      } else if (isCycledScope && !blk && openPO === 0 && triggerDate) {
-                        flag = "NO PO";
-                      }
+                    if (p._forceAdmitAsRelease) {
+                      flag = "RELEASE";
+                    } else if (p._forceAdmitAsPlanning) {
+                      flag = "PLANNING";
+                    } else if (isBaseBomScope && isCycledScope && !blk && openPO === 0 && triggerDate) {
+                      flag = "NO PO";
                     }
-                    // Enumerate ALL open blankets for the RELEASE tooltip so
-                    // parts with multiple blankets (JP00026/JP00031/JP00032
-                    // each have three) don't hide capacity behind a max-open
-                    // pick. findOpenBlanketsForPart returns all open lines
-                    // sorted earliest-expiring first.
+                    // Enumerate ALL open blankets for the tooltips so parts
+                    // with multiple blankets don't hide capacity.
+                    const _allBlankets = (typeof findOpenBlanketsForPart === "function")
+                      ? findOpenBlanketsForPart(p.pn) : [];
+                    const _blanketList = _allBlankets.map(b => `${b.po.num} (${fmtNum(b.open)} open)`).join("; ");
                     let releaseTooltip = "";
                     if (flag === "RELEASE") {
-                      const all = (typeof findOpenBlanketsForPart === "function")
-                        ? findOpenBlanketsForPart(p.pn) : [];
-                      const list = all.map(b => `${b.po.num} (${fmtNum(b.open)} open)`).join("; ");
-                      releaseTooltip = `Release against blanket now — open blankets: ${list}. No open normal PO. Trigger date ${triggerDate ? triggerDate.toISOString().slice(0,10) : "n/a"} (${daysToTrigger}d).`;
+                      releaseTooltip = `Release against blanket now — open blankets: ${_blanketList}. No open normal PO. Trigger date ${triggerDate ? triggerDate.toISOString().slice(0,10) : "n/a"} (${daysToTrigger}d).`;
+                    }
+                    let planningTooltip = "";
+                    let planningCutinDateStr = "";
+                    if (flag === "PLANNING") {
+                      const _cutinD = (p.transitionStartDate && typeof parseDateLocal === "function")
+                        ? parseDateLocal(p.transitionStartDate) : null;
+                      planningCutinDateStr = _cutinD ? (typeof fmtDate === "function" ? fmtDate(_cutinD) : _cutinD.toISOString().slice(0,10)) : "?";
+                      planningTooltip = `Plan to release blanket ahead of cut-in ${planningCutinDateStr} (${p._forceAdmitPlanningDaysToTrigger}d). Open blankets: ${_blanketList}. Escalates to RELEASE at 21 days before cut-in.`;
                     }
                     const noPoTooltip = flag === "NO PO"
                       ? `No open blanket and no open order. Trigger date ${triggerDate ? triggerDate.toISOString().slice(0,10) : "n/a"} (${daysToTrigger}d).`
                       : "";
-                    // Pill construction. Priority: RELEASE > NO PO > BLKT.
-                    // RELEASE uses .pill.crit (call-to-action weight, same
-                    // as TRANS). NO PO uses .pill.warn. BLKT unchanged from
-                    // pre-flag rendering on rows that don't qualify for
-                    // either Sensourcing flag.
+                    // Pill construction. Priority: RELEASE > NO PO > PLANNING > BLKT.
+                    // RELEASE uses .pill.crit (call-to-action). PLANNING uses
+                    // .pill.warn with a distinct label ("PLAN RELEASE") —
+                    // yellow-warn tier signals "plan now, not yet urgent."
+                    // NO PO uses .pill.warn. BLKT unchanged (info-blue).
                     let flagPill = "";
                     if (flag === "RELEASE") {
                       flagPill = ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(releaseTooltip)}">RELEASE</span>`;
                     } else if (flag === "NO PO") {
                       flagPill = ` <span class="pill warn" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(noPoTooltip)}">NO PO</span>`;
+                    } else if (flag === "PLANNING") {
+                      flagPill = ` <span class="pill warn" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(planningTooltip)}">PLAN RELEASE</span>`;
                     }
                     const blkPill = (flag === "none" && blk)
                       ? ` <span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:4px;letter-spacing:0.04em" title="Blanket available — open blanket ${esc(blk.po.num)} · ${fmtNum(blk.open)} available to release against">BLKT</span>`
@@ -678,6 +695,7 @@ function renderOrderQueueFor(itemType) {
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {
                         if (p._forceAdmitAsRelease) return ` title="Blanket-covered but inside the 21-day release trigger — release from blanket now."`;
+                        if (p._forceAdmitAsPlanning) return ` title="Blanket-covered with cut-in approaching — plan release now. Escalates to RELEASE 21 days before cut-in."`;
                         const s = stockoutDateStr(p.daysOfCover);
                         return s ? ` title="Projected stockout: ${s}"` : '';
                       })()}>
@@ -685,6 +703,11 @@ function renderOrderQueueFor(itemType) {
                         <span class="meter" style="opacity:1">
                           <span class="meter-bar" style="background:var(--info-soft,#e0eaff);border-color:var(--info,#4a7cff)"><i style="background:var(--info,#4a7cff);width:100%"></i></span>
                           <span class="num bold" style="color:var(--info-d,var(--info,#2f5edb))">release in ${Number.isFinite(p._forceAdmitDaysToTrigger) ? p._forceAdmitDaysToTrigger + 'd' : '—'}</span>
+                        </span>
+                        ` : p._forceAdmitAsPlanning ? `
+                        <span class="meter" style="opacity:1">
+                          <span class="meter-bar warn"><i style="width:100%"></i></span>
+                          <span class="num bold text-warn">plan by ${planningCutinDateStr || (Number.isFinite(p._forceAdmitPlanningDaysToTrigger) ? p._forceAdmitPlanningDaysToTrigger + 'd' : '—')}</span>
                         </span>
                         ` : `
                         <span class="meter">

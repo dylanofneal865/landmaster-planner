@@ -1079,6 +1079,27 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
   const wpw = (typeof effectiveWorkdaysPerWeek === "function")
     ? effectiveWorkdaysPerWeek() : 5;
 
+  const cutinOffset = Math.max(0, Math.round((hardCutinDate.getTime() - today.getTime()) / DAY_MS));
+
+  // Pre-cutin BLANKET-only receipts on the final member. Feeds getChainInfo's
+  // byCutin C1 rule (Sensourcing branch): a Sensourcing part with a blanket
+  // landing before cut-in has bridge stock at cut-in day → byCutin does not
+  // fire. Blanket-blind non-Sensourcing chainPOLines carry isBlanket=false
+  // for every entry (blanket lines never get through their branch of the
+  // gather in getChainInfo), so this sum is 0 → ownStockAtCutinBlanketOnly
+  // = ownStock, byte-identical to production behavior on that path.
+  let ownStockAtCutinBlanketOnly = ownStock;
+  for (const l of (chainOnPOLines || [])) {
+    if (!l || l.pn !== finalMember.pn) continue;
+    if (!l.isBlanket) continue;
+    if (!l.expectedDate) continue;
+    const qty = Number(l.remaining) || 0;
+    if (qty <= 0) continue;
+    const offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    if (offset < 0 || offset >= cutinOffset) continue;
+    ownStockAtCutinBlanketOnly += qty;
+  }
+
   // Count workdays in phase 1 — from tomorrow (i=1) up to but not including
   // hardCutinDate. When cutin is today or past, phase 1 is empty.
   let phase1WorkdayCount = 0;
@@ -1108,6 +1129,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
       phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
       strandedPredecessorQty: 0,
       runoutDate, runoutDays,
+      ownStockAtCutinBlanketOnly,
     };
   }
 
@@ -1135,8 +1157,8 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     receiptsByDay.set(offset, (receiptsByDay.get(offset) || 0) + qty);
   }
   // Accumulate any POs that arrive before cutin onto selfStock now (they
-  // sit unused until cutin, then consumption starts).
-  const cutinOffset = Math.max(0, Math.round((hardCutinDate.getTime() - today.getTime()) / DAY_MS));
+  // sit unused until cutin, then consumption starts). cutinOffset was
+  // computed earlier for the ownStockAtCutinBlanketOnly accumulator.
   for (const [offset, qty] of receiptsByDay.entries()) {
     if (offset < cutinOffset) selfStock += qty;
   }
@@ -1176,6 +1198,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
     strandedPredecessorQty,
     runoutDate, runoutDays,
+    ownStockAtCutinBlanketOnly,
   };
 }
 
@@ -1586,6 +1609,11 @@ function getChainInfo(pn) {
         remaining,
         expectedDate,
         isOverdue,
+        // Plumbing for _chainHardCutinSupply's ownStockAtCutinBlanketOnly
+        // computation: byCutin's C1 rule needs to know which pre-cutin
+        // receipts are blanket-type so it credits Sensourcing blanket
+        // supply against the "successor has no bridge stock at cutin" test.
+        isBlanket: (typeof isBlanketLine === "function") ? isBlanketLine(ln) : false,
       });
     }
   }
@@ -1667,7 +1695,22 @@ function getChainInfo(pn) {
     const cutinFromToday = Math.round(
       (hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS
     );
-    const c1Applicable = cutinFromToday >= 0 || hardCutin.ownStock <= 0;
+    // C1 applicability — Sensourcing-scoped rewrite.
+    //   Cycled supplier (Sensourcing): byCutin fires only when the
+    //     successor has NO bridge stock at cut-in — INCLUDING pre-cutin
+    //     Sensourcing blanket receipts (ownStockAtCutinBlanketOnly).
+    //     Closes the JP00021-style false-PASSED alerts when a blanket
+    //     lands before cut-in.
+    //   Non-cycled: preserved bit-for-bit — the `cutinFromToday >= 0`
+    //     short-circuit stays (documented as a separate ticket; scope-
+    //     preserved this pass).
+    const _finalCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(finalMember.supplier) : null;
+    let c1Applicable;
+    if (_finalCycle) {
+      c1Applicable = (Number(hardCutin.ownStockAtCutinBlanketOnly) || 0) <= 0;
+    } else {
+      c1Applicable = cutinFromToday >= 0 || hardCutin.ownStock <= 0;
+    }
     if (c1Applicable) byCutinDays = cutinFromToday - leadDays - safety;
   }
   const chainReorderByDays = Math.min(byRunoutDays, byCutinDays);
@@ -3104,24 +3147,51 @@ function partsWithStatus() {
       ? partStatusBlanketAware(effectiveForStatus, _supplySlice)
       : partStatus(effectiveForStatus, lines);
 
-    // Force-admit predicate: a Sensourcing base_bom part that reads OK
-    // under blanket-aware status but whose OPEN-index runout is inside
-    // the 21-day trigger window, has an open blanket, and has NO normal
-    // PO (openPOQty stays blanket-blind). Force-admitted rows appear in
-    // the queue with a distinct RELEASE row treatment so buyers still
-    // see the CTA even though the part is "covered."
+    // Force-admit predicates: Sensourcing base_bom parts with an open
+    // blanket and no normal PO. Two tiers:
+    //   RELEASE:  fires within 21d of min(cut-in, blanket-aware runout).
+    //             Trigger basis for chain parts is chainRunoutDays
+    //             (blanket-aware post commit acc3321), not _openDaysOfCover
+    //             (which for a chain successor reads predecessor stock and
+    //             misrepresents the buyer's actual coverage horizon).
+    //   PLANNING: fires when we're at/past (cut-in - leadDays - safety) —
+    //             the "release-by-planning" deadline — but cut-in is still
+    //             ahead AND RELEASE hasn't fired yet. Closes the silence
+    //             gap when the byCutin C1 fix pushes the chain out of
+    //             critical status while cut-in is still weeks away.
     let _forceAdmitAsRelease = false;
     let _forceAdmitDaysToTrigger = null;
+    let _forceAdmitAsPlanning = false;
+    let _forceAdmitPlanningDaysToTrigger = null;
     if (_cycleForStatus
         && String(p.itemType || "").toLowerCase().trim() === "base_bom"
         && status.status === "ok"
         && onPO === 0
         && (typeof findOpenBlanketForPart === "function") && findOpenBlanketForPart(p.pn)) {
-      const openRunout = _openStatus ? _openStatus.daysOfCover : Infinity;
-      const trig = _computeTriggerFromRunoutAndTransition(openRunout, p.transitionStartDate);
+      const _chainInfoForForceAdmit = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
+      // Runout basis: chain parts use blanket-aware chainRunoutDays; non-
+      // chain parts fall back to _openDaysOfCover (blanket-blind — matches
+      // pre-fix single-part semantic).
+      const runoutBasis = (_chainInfoForForceAdmit && Number.isFinite(_chainInfoForForceAdmit.chainRunoutDays))
+        ? _chainInfoForForceAdmit.chainRunoutDays
+        : (_openStatus ? _openStatus.daysOfCover : Infinity);
+      const trig = _computeTriggerFromRunoutAndTransition(runoutBasis, p.transitionStartDate);
       if (trig.inWindow) {
         _forceAdmitAsRelease = true;
         _forceAdmitDaysToTrigger = trig.daysToTrigger;
+      } else if (p.transitionStartDate && typeof parseDateLocal === "function") {
+        // Planning tier: cut-in - leadDays - safety <= 0 AND cut-in still ahead.
+        const cutinDate = parseDateLocal(p.transitionStartDate);
+        if (cutinDate && !isNaN(cutinDate.getTime())) {
+          const cutinFromToday = Math.round((cutinDate.getTime() - TODAY.getTime()) / DAY_MS);
+          const leadDaysForPlan = (typeof leadTimeDays === "function") ? leadTimeDays(p) : 0;
+          const safetyDaysForPlan = (DB.settings && Number(DB.settings.safetyDays)) || 0;
+          const planningDaysToDeadline = cutinFromToday - leadDaysForPlan - safetyDaysForPlan;
+          if (planningDaysToDeadline <= 0 && cutinFromToday >= 0) {
+            _forceAdmitAsPlanning = true;
+            _forceAdmitPlanningDaysToTrigger = cutinFromToday;
+          }
+        }
       }
     }
 
@@ -3166,6 +3236,8 @@ function partsWithStatus() {
       ...(_cycleForStatus ? {
         _forceAdmitAsRelease,
         _forceAdmitDaysToTrigger,
+        _forceAdmitAsPlanning,
+        _forceAdmitPlanningDaysToTrigger,
         _openDaysOfCover: _openStatus ? _openStatus.daysOfCover : null,
       } : {}),
       // MUTED-supplier override.
@@ -3362,14 +3434,15 @@ function queueParts(itemType) {
   else stats = stats.filter(p => isQueueEligible(p));
   stats = stats.filter(p => !p.isKit);
   // Admission: critical / warning as always, PLUS Sensourcing base_bom
-  // rows force-admitted as RELEASE (status ok under blanket-aware but
-  // OPEN-index runout sits inside the 21-day trigger with a blanket + no
-  // normal PO). The force-admit branch is populated only for cycled
-  // Sensourcing rows in partsWithStatus; every other supplier resolves
-  // as before.
+  // rows force-admitted as RELEASE (blanket-aware runout inside 21d
+  // trigger, blanket present, no normal PO) or as PLANNING (cut-in
+  // - lead - safety already passed, cut-in still ahead — planning window
+  // for the buyer to release the blanket before cut-in). Both flags are
+  // populated only for cycled Sensourcing rows in partsWithStatus.
   return stats.filter(p =>
-    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease) &&
-    !p.phasingOut
+    (p.status === "critical" || p.status === "warning"
+      || p._forceAdmitAsRelease || p._forceAdmitAsPlanning)
+    && !p.phasingOut
   );
 }
 
