@@ -165,7 +165,14 @@ function renderPartDetail(part) {
   // PL=90 gives the y-axis its own column so the peak/0 numbers, the today
   // line, the today label, and the overdue dot don't pile in the same gutter.
   const W = 720, PL = 90, PR = 80, PT = 24;
-  const hasGap = Number.isFinite(coverDays) && leadDays > coverDays;
+  // Gap band shades days between the plotted line's first zero-crossing
+  // and the lead-time landing. Anchored on `stockoutIdx` (derived from
+  // series.oh, which IS the displayed value — displayOh from projectOnHand
+  // includes predStock during phase 1). Previously anchored on `coverDays`
+  // (from daysUntilStockout on effectivePart), which for a phasingOut
+  // chain member reads the SUCCESSOR's onHand and returned 0 →
+  // false red strip from day 0 while the yellow line was still 180+.
+  const hasGap = stockoutIdx >= 0 && leadDays > stockoutIdx;
   const _denom = Math.max(1, series.length - 1);
   const stockoutInLeftZone = stockoutIdx >= 0 && stockoutIdx / _denom < 0.25;
   const leadInLeftZone = leadDays > 0 && leadDays / _denom < 0.25;
@@ -219,7 +226,7 @@ function renderPartDetail(part) {
   // mode it appears in the label stack, in normal mode the strip + lead /
   // stockout markers carry the meaning.
   const gapBand = hasGap ? `
-    <rect x="${xS(coverDays)}" y="${yS(0) - 3}" width="${xS(leadDays) - xS(coverDays)}" height="6" fill="var(--crit)" opacity="0.5"/>
+    <rect x="${xS(stockoutIdx)}" y="${yS(0) - 3}" width="${xS(leadDays) - xS(stockoutIdx)}" height="6" fill="var(--crit)" opacity="0.5"/>
   ` : "";
 
   // Y-axis: exactly two right-anchored labels in the left gutter — peak and 0.
@@ -265,7 +272,7 @@ function renderPartDetail(part) {
       <text x="${stackX}" y="${sy + 14}" fill="var(--crit)" font-size="10" font-family="var(--f-mono)">out of stock</text>
       <text x="${stackX}" y="${sy + 26}" fill="var(--crit)" font-size="9" font-family="var(--f-mono)">day ${stockoutIdx} · ${stockoutDateStr(stockoutIdx)}</text>
       <text x="${stackX}" y="${sy + 40}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">order today → arrives day ${leadDays}</text>
-      <text x="${stackX}" y="${sy + 52}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">${leadDays - coverDays}-day gap</text>
+      <text x="${stackX}" y="${sy + 52}" fill="var(--warn)" font-size="9" font-family="var(--f-mono)">${leadDays - stockoutIdx}-day gap</text>
     `;
   } else {
     // Compute stockout label anchor first so the lead label can co-locate.
@@ -356,12 +363,43 @@ function renderPartDetail(part) {
       : chainInfo.chainReorderByPassed
         ? `reorder ${successorPnHtml} <span style="color:var(--crit);font-weight:700">by ${roByDateTxt} — ORDER-BY PASSED</span>`
         : `reorder ${successorPnHtml} by ${roByDateTxt} (${roByDaysTxt})`;
-    // Per-part own runout footnote — from the raw partStatus computed above
-    // via effectivePart. Meaningful for the anchor (its own stock burning
-    // down); for the final it agrees with chain runout already.
-    const ownRunoutTxt = Number.isFinite(coverDays)
-      ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(coverDays)})</span>`
-      : "";
+    // Per-part own runout footnote — with anchor-only gate on actively-
+    // transitioning hardCutin chains.
+    //
+    // BUG the gate fixes: effectivePart.onHand for hardCutin chain drawers
+    // is overwritten with hardCutin.ownStock, which is the FINAL member's
+    // onHand — not the current drawer's part.onHand. `coverDays` computed
+    // from effectivePart therefore lies for non-final chain members:
+    // 18167 (phasingOut anchor, real onHand 180) shows coverDays=0 →
+    // "runs out STOCKED OUT" because hardCutin.ownStock is CP00937's zero.
+    //
+    // Rule:
+    //   hardCutin chain + drawer part IS the anchor  → render footnote,
+    //     value computed from raw part {onHand, daily} (not effectivePart).
+    //     The anchor's solo runway is the buyer's planning number.
+    //   hardCutin chain + mid-chain or final         → skip footnote.
+    //     Mid-chain is operationally meaningless. Final is redundant with
+    //     the primary chain banner.
+    //   Non-hardCutin chain / non-chain              → existing render.
+    //     Byte-identical to today; effectivePart there reduces to part-
+    //     equivalent values (chainView cumulative or raw part).
+    const ownRunoutTxt = (() => {
+      if (chainInfo && chainInfo.hardCutin) {
+        if (part.pn !== chainInfo.anchorPn) return "";
+        // Anchor of a hardCutin chain: compute footnote value from RAW
+        // part supply, bypassing effectivePart's successor-onHand override.
+        const anchorRawCover = (typeof daysUntilStockout === "function")
+          ? daysUntilStockout({ ...part, onHand: Number(part.onHand) || 0, daily: Number(part.daily) || 0 })
+          : NaN;
+        return Number.isFinite(anchorRawCover)
+          ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(anchorRawCover)})</span>`
+          : "";
+      }
+      // Non-hardCutin chain / non-chain — existing behavior, unchanged.
+      return Number.isFinite(coverDays)
+        ? ` <span class="dim">(this part alone: runs out ${stockoutDateStr(coverDays)})</span>`
+        : "";
+    })();
     // HARD CUT-IN banner variant — used when the successor has a
     // transitionStartDate. Reports usable supply and the strand in the SAME
     // sentence so the header text can never contradict the chart or the
