@@ -3147,31 +3147,20 @@ function partsWithStatus() {
       ? partStatusBlanketAware(effectiveForStatus, _supplySlice)
       : partStatus(effectiveForStatus, lines);
 
-    // Force-admit predicates: Sensourcing base_bom parts with an open
-    // blanket and no normal PO. Two tiers:
-    //   RELEASE:  fires within 21d of min(cut-in, blanket-aware runout).
-    //             Trigger basis for chain parts is chainRunoutDays
-    //             (blanket-aware post commit acc3321), not _openDaysOfCover
-    //             (which for a chain successor reads predecessor stock and
-    //             misrepresents the buyer's actual coverage horizon).
-    //   PLANNING: fires when we're at/past (cut-in - leadDays - safety) —
-    //             the "release-by-planning" deadline — but cut-in is still
-    //             ahead AND RELEASE hasn't fired yet. Closes the silence
-    //             gap when the byCutin C1 fix pushes the chain out of
-    //             critical status while cut-in is still weeks away.
+    // Force-admit predicate: Sensourcing base_bom parts with an open
+    // blanket and no normal PO. Fires within 21d of min(cut-in,
+    // blanket-aware runout). Trigger basis for chain parts is
+    // chainRunoutDays (blanket-aware post commit acc3321), not
+    // _openDaysOfCover (which for a chain successor reads predecessor
+    // stock and misrepresents the buyer's actual coverage horizon).
     let _forceAdmitAsRelease = false;
     let _forceAdmitDaysToTrigger = null;
-    let _forceAdmitAsPlanning = false;
-    let _forceAdmitPlanningDaysToTrigger = null;
     if (_cycleForStatus
         && String(p.itemType || "").toLowerCase().trim() === "base_bom"
         && status.status === "ok"
         && onPO === 0
         && (typeof findOpenBlanketForPart === "function") && findOpenBlanketForPart(p.pn)) {
       const _chainInfoForForceAdmit = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
-      // Runout basis: chain parts use blanket-aware chainRunoutDays; non-
-      // chain parts fall back to _openDaysOfCover (blanket-blind — matches
-      // pre-fix single-part semantic).
       const runoutBasis = (_chainInfoForForceAdmit && Number.isFinite(_chainInfoForForceAdmit.chainRunoutDays))
         ? _chainInfoForForceAdmit.chainRunoutDays
         : (_openStatus ? _openStatus.daysOfCover : Infinity);
@@ -3179,19 +3168,6 @@ function partsWithStatus() {
       if (trig.inWindow) {
         _forceAdmitAsRelease = true;
         _forceAdmitDaysToTrigger = trig.daysToTrigger;
-      } else if (p.transitionStartDate && typeof parseDateLocal === "function") {
-        // Planning tier: cut-in - leadDays - safety <= 0 AND cut-in still ahead.
-        const cutinDate = parseDateLocal(p.transitionStartDate);
-        if (cutinDate && !isNaN(cutinDate.getTime())) {
-          const cutinFromToday = Math.round((cutinDate.getTime() - TODAY.getTime()) / DAY_MS);
-          const leadDaysForPlan = (typeof leadTimeDays === "function") ? leadTimeDays(p) : 0;
-          const safetyDaysForPlan = (DB.settings && Number(DB.settings.safetyDays)) || 0;
-          const planningDaysToDeadline = cutinFromToday - leadDaysForPlan - safetyDaysForPlan;
-          if (planningDaysToDeadline <= 0 && cutinFromToday >= 0) {
-            _forceAdmitAsPlanning = true;
-            _forceAdmitPlanningDaysToTrigger = cutinFromToday;
-          }
-        }
       }
     }
 
@@ -3236,8 +3212,6 @@ function partsWithStatus() {
       ...(_cycleForStatus ? {
         _forceAdmitAsRelease,
         _forceAdmitDaysToTrigger,
-        _forceAdmitAsPlanning,
-        _forceAdmitPlanningDaysToTrigger,
         _openDaysOfCover: _openStatus ? _openStatus.daysOfCover : null,
       } : {}),
       // MUTED-supplier override.
@@ -3435,13 +3409,12 @@ function queueParts(itemType) {
   stats = stats.filter(p => !p.isKit);
   // Admission: critical / warning as always, PLUS Sensourcing base_bom
   // rows force-admitted as RELEASE (blanket-aware runout inside 21d
-  // trigger, blanket present, no normal PO) or as PLANNING (cut-in
-  // - lead - safety already passed, cut-in still ahead — planning window
-  // for the buyer to release the blanket before cut-in). Both flags are
-  // populated only for cycled Sensourcing rows in partsWithStatus.
+  // trigger, blanket present, no normal PO). Force-admit is populated
+  // only for cycled Sensourcing rows in partsWithStatus. Blanket-covered
+  // Sensourcing parts outside the 21d window stay SILENT — the drawer's
+  // chain-reorder-by copy is the only signal until RELEASE fires.
   return stats.filter(p =>
-    (p.status === "critical" || p.status === "warning"
-      || p._forceAdmitAsRelease || p._forceAdmitAsPlanning)
+    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease)
     && !p.phasingOut
   );
 }
