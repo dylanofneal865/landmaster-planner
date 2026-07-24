@@ -579,20 +579,36 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     // isLineOpen — byte-identical to the pre-split scan so Coverage
     // Gaps, dashboard KPIs, and every other caller that does NOT set
     // the opt behave as they did today.
-    const useSupplyGate = !!opts.includeBlanketSupply;
-    for (const po of (DB.pos || [])) {
-      for (const ln of (po.lines || [])) {
-        if (ln.pn !== part.pn) continue;
-        if (useSupplyGate) {
-          if (!isLineIncomingSupply(po, ln)) continue;
-        } else {
-          if (!isLineOpen(po, ln)) continue;
+    //
+    // HARD CUT-IN predecessor skip: when the drawer is showing a chain
+    // predecessor member (part.pn ∈ hardCutin.predecessorPns), that
+    // part's own POs are already credited into the boosted predStock via
+    // hardCutin.predecessorEffectiveStock. Admitting them here would
+    // double-count during phase 1 (inflating the plotted line by 2× the
+    // receipt) and would also add stranded stock into `oh` post-cutin
+    // that the chain never consumes. Skip the receipts scan entirely for
+    // predecessor parts. Non-hardCutin callers and the successor path
+    // are unaffected.
+    const _hcOptsCheck = opts && opts.hardCutin ? opts.hardCutin : null;
+    const _isPredecessorInHardCutin = _hcOptsCheck
+      && Array.isArray(_hcOptsCheck.predecessorPns)
+      && _hcOptsCheck.predecessorPns.indexOf(part.pn) >= 0;
+    if (!_isPredecessorInHardCutin) {
+      const useSupplyGate = !!opts.includeBlanketSupply;
+      for (const po of (DB.pos || [])) {
+        for (const ln of (po.lines || [])) {
+          if (ln.pn !== part.pn) continue;
+          if (useSupplyGate) {
+            if (!isLineIncomingSupply(po, ln)) continue;
+          } else {
+            if (!isLineOpen(po, ln)) continue;
+          }
+          const remaining = useSupplyGate
+            ? _lineIncomingRemaining(ln)
+            : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+          if (!remaining) continue;
+          accumReceipt(ln, remaining, po);
         }
-        const remaining = useSupplyGate
-          ? _lineIncomingRemaining(ln)
-          : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
-        if (!remaining) continue;
-        accumReceipt(ln, remaining, po);
       }
     }
   }
@@ -626,7 +642,15 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   const cutinMs = hardCutin && hardCutin.hardCutinDate
     ? hardCutin.hardCutinDate.getTime() : null;
   const precutinRate = hardCutin ? (Number(hardCutin.chainRate) || 0) : 0;
-  let predStock = hardCutin ? Math.max(0, Number(hardCutin.predecessorStock) || 0) : 0;
+  // predecessorEffectiveStock (raw predecessor onHand-sum + pre-cutin
+  // predecessor POs) is the correct phase-1 starting pool now that
+  // _chainHardCutinSupply credits predecessor POs. The `??` fallback to
+  // predecessorStock preserves behavior for callers that stub hardCutin
+  // objects without the newer field. Non-hardCutin path unchanged
+  // (hardCutin=null → predStock=0).
+  let predStock = hardCutin
+    ? Math.max(0, Number(hardCutin.predecessorEffectiveStock ?? hardCutin.predecessorStock) || 0)
+    : 0;
   const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
     const d = addDays(TODAY, i);
@@ -1100,27 +1124,61 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     ownStockAtCutinBlanketOnly += qty;
   }
 
-  // Count workdays in phase 1 — from tomorrow (i=1) up to but not including
-  // hardCutinDate. When cutin is today or past, phase 1 is empty.
+  // Pre-cutin predecessor PO receipts. Bucketed by day offset from today.
+  // Drops overdue (offset < 0) and post-cutin (offset >= cutinOffset) —
+  // predecessor POs landing after cut-in are stranded (chain no longer
+  // consumes the predecessor part), matching the ownStockAtCutinBlanketOnly
+  // convention above.
+  const predecessorPns = predecessors.map(m => m && m.pn).filter(Boolean);
+  const predPnSet = new Set(predecessorPns);
+  const predReceiptsByDay = new Map();
+  let predPOsPreCutin = 0;
+  for (const l of (chainOnPOLines || [])) {
+    if (!l || !predPnSet.has(l.pn)) continue;
+    if (!l.expectedDate) continue;
+    const qty = Number(l.remaining) || 0;
+    if (qty <= 0) continue;
+    const offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    if (offset < 0 || offset >= cutinOffset) continue;
+    predReceiptsByDay.set(offset, (predReceiptsByDay.get(offset) || 0) + qty);
+    predPOsPreCutin += qty;
+  }
+  const predecessorEffectiveStock = predecessorStock + predPOsPreCutin;
+
+  // Phase 1 day-by-day walk. Predecessor stock starts at onHand-sum and gets
+  // credited with predecessor POs on their arrival day (receipts first, then
+  // depletion — matches the phase-2 walk's ordering). If predStock crosses
+  // zero mid-walk, the chain runs out that day (late PO couldn't bridge the
+  // gap). If the walk completes with predStock ≥ 0, phase 1 is covered and
+  // whatever remains is strandedPredecessorQty.
+  //
+  // Pre-fix: this was a closed-form pool test (predecessorStock >=
+  // phase1DemandUnits) with runout computed as predecessorStock/chainRate.
+  // Correct when there are no predecessor POs (production had none until
+  // this fix), but timing-blind once we credit them: a late-arriving PO
+  // whose pool total covers demand could still leave a real stockout gap.
+  // The day-walk is the honest model.
   let phase1WorkdayCount = 0;
-  for (let i = 1; i <= 365; i++) {
+  let predStockWalking = predecessorStock;
+  let phase1RunoutDay = -1;
+  for (let i = 0; i < cutinOffset; i++) {
     const d = (typeof addDays === "function")
       ? addDays(today, i) : new Date(today.getTime() + i * DAY_MS);
-    if (d.getTime() >= hardCutinDate.getTime()) break;
-    if (typeof isWorkday === "function" && isWorkday(d, wpw)) phase1WorkdayCount++;
+    if (predReceiptsByDay.has(i)) predStockWalking += predReceiptsByDay.get(i);
+    if (i > 0 && typeof isWorkday === "function" && isWorkday(d, wpw)) {
+      predStockWalking -= chainRate;
+      phase1WorkdayCount++;
+    }
+    if (chainRate > 0 && predStockWalking < 0 && phase1RunoutDay < 0) {
+      phase1RunoutDay = i;
+      break;
+    }
   }
   const phase1DemandUnits = phase1WorkdayCount * chainRate;
-  const predecessorCoversPhase1 = predecessorStock >= phase1DemandUnits;
+  const predecessorCoversPhase1 = phase1RunoutDay < 0;
 
-  // Phase 1 exhaustion → chain runs out during phase 1 at the workday when
-  // predecessor hits zero. workdaysToCalendarDays converts predecessor's own
-  // burn-rate cover to calendar days, matching the projection convention.
   if (chainRate > 0 && !predecessorCoversPhase1) {
-    const predWorkdayCover = predecessorStock / chainRate;
-    const cal = (typeof workdaysToCalendarDays === "function")
-      ? workdaysToCalendarDays(predWorkdayCover, today)
-      : Math.round(predWorkdayCover);
-    const runoutDays = cal > 365 ? Infinity : cal;
+    const runoutDays = phase1RunoutDay > 365 ? Infinity : phase1RunoutDay;
     const runoutDate = runoutDays === Infinity
       ? null
       : ((typeof addDays === "function") ? addDays(today, runoutDays) : new Date(today.getTime() + runoutDays * DAY_MS));
@@ -1128,13 +1186,18 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
       hardCutinDate, predecessorStock, ownStock, chainRate,
       phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
       strandedPredecessorQty: 0,
+      predPOsPreCutin, predecessorEffectiveStock, predecessorPns,
       runoutDate, runoutDays,
       ownStockAtCutinBlanketOnly,
     };
   }
 
-  // Phase 1 covered → strand leftover, transition to phase 2 with ownStock.
-  const strandedPredecessorQty = Math.max(0, predecessorStock - phase1DemandUnits);
+  // Phase 1 covered → strand leftover from the walk's final predStock,
+  // transition to phase 2 with ownStock. HARD CONSTRAINT: predecessor state
+  // does NOT cross into phase 2 — the phase-2 walk below starts fresh from
+  // ownStock + successor POs only. A predecessor PO can extend predecessor
+  // runway to (or past) cut-in but can never mask an empty successor.
+  const strandedPredecessorQty = Math.max(0, predStockWalking);
   // Phase 2 ledger: walk day-by-day from cutinDate forward. Add PO receipts
   // for the final member (blanket-blind, matches isLineOpen filter enforced
   // by the caller when it built chainOnPOLines). POs arriving BEFORE cutin
@@ -1197,6 +1260,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     hardCutinDate, predecessorStock, ownStock, chainRate,
     phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
     strandedPredecessorQty,
+    predPOsPreCutin, predecessorEffectiveStock, predecessorPns,
     runoutDate, runoutDays,
     ownStockAtCutinBlanketOnly,
   };
