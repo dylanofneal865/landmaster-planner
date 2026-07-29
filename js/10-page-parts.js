@@ -31,7 +31,51 @@ function renderPartDetail(part) {
   // via the projectOnHand transitionStartDate branch — byte-identical to
   // today for parts without a chain hard cut-in.
   const hardCutin = chainView && chainView.hardCutin ? chainView.hardCutin : null;
-  const effectivePart = chainView
+
+  // Days-to-cutin, hoisted for two uses below: horizon extension AND the
+  // OWN-VIEW trigger. Null when no hardCutin is active (non-chain or
+  // supersession without a transitionStartDate).
+  const cutinDays = (hardCutin && hardCutin.hardCutinDate)
+    ? Math.round((hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS)
+    : null;
+
+  // OWN-VIEW trigger. A phasing-out chain member (predecessor OR anchor)
+  // whose own stock alone lasts past cut-in never actually runs dry — the
+  // chain-view series plotting (successor's ownStock=0 as `oh`, plus the
+  // predecessor pool cliff at cut-in) produces a false "out of stock" dot
+  // right on the handoff date. Own-view instead plots the raw part's own
+  // stock declining at the CHAIN RATE (see the series call below) and
+  // draws cut-in as a HANDOFF marker.
+  //
+  // Trigger and plot MUST use the same depletion rate — otherwise a
+  // member could pass the trigger under one rate and show a stockout
+  // dot under the other, contradicting the trigger's premise. Both use
+  // chainView.chainRate: `{...part, daily: chainRate}` with `[]` for
+  // lines forces daysUntilStockout's no-incoming branch (openPOQty of
+  // an empty list is 0), giving `onHand / chainRate → calendar`. Asks:
+  // "does THIS PN's own on-hand ALONE last past cut-in under CHAIN
+  // demand?" Own POs are excluded from this bridge test on purpose —
+  // an incoming PO extends runway technically but on a phasing-out
+  // predecessor strands at cutin regardless; if own stock alone can't
+  // cover the bridge, we fall through to chain-view (its existing
+  // cliff/dot semantics handle the shortfall).
+  //
+  // 18167: own 174 / chainRate 3.82 = 45.5 workdays → ~64 calendar days;
+  // 64 < ~73 cutin → trigger fails → stays chain-view, preserving its
+  // real day-73 stockout marker from 4eea9f6+3e0eae9.
+  // CP00666: own 481 / chainRate 3.54 = 136 workdays → ~190 calendar
+  // days > 69 cutin → trigger fires → own-view, handoff marker at cutin.
+  const _ownRunout = chainView
+    ? daysUntilStockout({...part, daily: chainView.chainRate}, [])
+    : Infinity;
+  const plotAsOwnView =
+       !!chainView
+    && !chainView.isFinal
+    && !!part.phasingOut
+    && cutinDays != null
+    && _ownRunout > cutinDays;
+
+  const effectivePart = (chainView && !plotAsOwnView)
     ? {
         ...part,
         // Chart's phase 2 stock is ownStock (successor's own) when hardCutin
@@ -113,17 +157,29 @@ function renderPartDetail(part) {
   // Bump horizon ONLY when hardCutin is active so a chain successor's cut-in
   // day AND its lead-time-based PO landing are visible in the chart. Chains
   // without a transitionStartDate keep their pre-fix horizon math (byte-
-  // identical to today).
-  if (hardCutin && hardCutin.hardCutinDate) {
-    const cutinDays = Math.round((hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS);
+  // identical to today). Own-view members reuse the SAME extension so the
+  // handoff marker at cutin stays visible on their own-curve chart.
+  if (cutinDays != null) {
     horizon = Math.max(horizon, cutinDays + leadDays + 14);
     if (chainInfo && Number.isFinite(chainInfo.chainRunoutDays)) {
       horizon = Math.max(horizon, chainInfo.chainRunoutDays + 14);
     }
   }
   horizon = Math.min(horizon, 365);
-  // Pass hardCutin opts so projectOnHand plots phase 1 (predecessor burn) →
-  // strand cliff → phase 2 (ownStock + POs). Non-hardCutin path is unchanged.
+  // Chain-view: pass hardCutin opts so projectOnHand plots phase 1
+  // (predecessor burn) → strand cliff → phase 2 (ownStock + POs).
+  // Own-view (plotAsOwnView): drop hardCutin opts and plot the member's
+  // OWN onHand + OWN POs, but deplete at the CHAIN RATE, not the member's
+  // own daily. Rationale: a phasing-out predecessor's stock is consumed
+  // by the chain (at chainRate) until cut-in, not by its own tiny per-
+  // PN daily. Plotting at own daily produces a nearly-flat line that
+  // hides both the real strand-at-cutin quantity and the possibility of
+  // running dry before handoff. Chain-rate depletion on OWN stock makes
+  // both signals visible — the line shape naturally reveals the strand
+  // (~318 remaining at 10/5 for CP00666) and would drop to zero pre-cutin
+  // if own supply couldn't cover chain-rate demand (real gap-alarm case).
+  // Own POs still credit on their expectedDate — a mid-window replenish-
+  // ment appears as a step-up, same visual mechanic as a normal part.
   //
   // includeBlanketSupply: true routes the full-scan through
   // isLineIncomingSupply so Sensourcing blanket lines land as scheduled
@@ -132,7 +188,9 @@ function renderPartDetail(part) {
   // day; status math (partStatus / daysUntilStockout, computed in
   // partsWithStatus with the blanket-blind open index) is untouched and
   // still surfaces a stockout that precedes the blanket arrival.
-  const series = projectOnHand(effectivePart, horizon, undefined, { includeBlanketSupply: true, ...(hardCutin ? { hardCutin } : {}) });
+  const series = plotAsOwnView
+    ? projectOnHand({...part, daily: chainView.chainRate}, horizon, undefined, { includeBlanketSupply: true })
+    : projectOnHand(effectivePart, horizon, undefined, { includeBlanketSupply: true, ...(hardCutin ? { hardCutin } : {}) });
   // Clamp the visual scale to 0..peak so long horizons of deeply negative
   // on-hand don't crush the meaningful band into a sliver. The stockout
   // index is still found on the unclamped series; only the drawn path is
@@ -188,6 +246,25 @@ function renderPartDetail(part) {
   const areaPath = `${linePath} L${xS(series.length-1)},${H-PB} L${xS(0)},${H-PB} Z`;
   const todayMark = `<line x1="${xS(0)}" y1="${PT}" x2="${xS(0)}" y2="${H-PB}" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>`;
   const zeroLine = `<line x1="${PL}" y1="${yS(0)}" x2="${W-PR}" y2="${yS(0)}" class="spark-zero"/>`;
+
+  // HANDOFF marker — vertical dashed line at cut-in for own-view members
+  // (chain predecessor/anchor whose own supply lasts past handoff). Uses
+  // a neutral t3 color, distinct from lead (warn) and stockout (crit), so
+  // it reads as informational, not alarming. Successor PN pulled from
+  // chainView.successors[0] (the next member in the lineage). Absent
+  // (`""`) for every non-own-view drawer so nothing else in this file
+  // sees a marker it doesn't know about.
+  let handoffMarker = "";
+  if (plotAsOwnView && cutinDays != null && cutinDays >= 0 && cutinDays <= horizon) {
+    const hx = xS(cutinDays);
+    const successorPn = (chainView && chainView.successors && chainView.successors[0])
+      ? chainView.successors[0].pn : "successor";
+    handoffMarker = `
+      <line x1="${hx}" y1="${PT}" x2="${hx}" y2="${H-PB}" stroke="var(--t3)" stroke-width="1" stroke-dasharray="4 2" opacity="0.7"/>
+      <text x="${hx + 4}" y="${PT + 10}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">hands off to ${esc(successorPn)}</text>
+      <text x="${hx + 4}" y="${PT + 22}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtDate(hardCutin.hardCutinDate)}</text>
+    `;
+  }
 
   // PO receipt dots + labels. Two crowding rules:
   //   (a) if a dot is within 55px of the left gutter, anchor the label start
@@ -673,6 +750,7 @@ function renderPartDetail(part) {
           ${zeroLine}
           ${todayMark}
           ${leadLine}
+          ${handoffMarker}
           <path d="${areaPath}" class="spark-area" style="fill-opacity:0.08"/>
           ${gapBand}
           <path d="${linePath}" class="spark-line"/>
