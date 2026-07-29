@@ -149,9 +149,9 @@ function updateNavBadges() {
   const poBadge = $("#badge-pos");
   if (poBadge) poBadge.textContent = openPOs;
 
-  // Follow-Ups badge — late open-PO lines (overdue > threshold). Uses the same
-  // computeFollowUps predicate as the Follow-Ups page so the badge equals the
-  // page header count.
+  // Follow-Ups badge — overdue open-PO lines (daysPastDue > 1). Same
+  // computeFollowUps predicate and same fixed floor as the Follow-Ups
+  // page (both pass 1), so badge === page header count by construction.
   const fuBadge = $("#badge-followups");
   if (fuBadge) {
     const late = (typeof followUpCount === "function") ? followUpCount() : 0;

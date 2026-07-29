@@ -25,9 +25,10 @@
 function computeFollowUps(minDays) {
   // minDays is the strict-greater-than floor for daysPastDue (matches the
   // legacy `> FOLLOWUP_DAYS` semantics — a line at exactly minDays is
-  // NOT included). Defaults to FOLLOWUP_DAYS (10) so the nav badge and
-  // any no-arg caller keep the same behavior. The Follow-Ups page passes
-  // FOLLOWUP_STATE.minDaysLate so the user can widen or tighten the view.
+  // NOT included). Defaults to FOLLOWUP_DAYS (10) so no-arg callers keep
+  // the same behavior — currently the dashboard panel's inline scan.
+  // The Follow-Ups page AND the sidebar badge both pass an explicit 1
+  // ("overdue = >1 day late") so they can't drift.
   const floor = (typeof minDays === "number" && isFinite(minDays)) ? minDays : FOLLOWUP_DAYS;
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const statsByPn = new Map(stats.map(p => [p.pn, p]));
@@ -72,9 +73,14 @@ function computeFollowUps(minDays) {
   return followUps;
 }
 
-// Nav-badge count — same predicate as the page, so badge === page header.
+// Nav-badge count — overdue open-PO lines (daysPastDue > 1). Uses the same
+// computeFollowUps predicate as the Follow-Ups page (which also passes 1
+// after the "Days late >" toolbar input was removed), so badge === page
+// header count by construction. FOLLOWUP_DAYS stays untouched — it still
+// drives the dashboard panel filter/label (js/06-page-dashboard.js:109,
+// :294) intentionally, on its own separate threshold.
 function followUpCount() {
-  try { return computeFollowUps().length; } catch (e) { return 0; }
+  try { return computeFollowUps(1).length; } catch (e) { return 0; }
 }
 
 // Group flat follow-ups by supplier. Lines sorted worst-first within a group;
@@ -1078,23 +1084,14 @@ window.isMarkActive = isMarkActive;
 /* ============================================================
    PAGE
    ============================================================ */
-// Per-browser persisted display filter (days-late floor). NOT synced to
-// Supabase — this is a personal viewing preference, not a shared setting.
-// localStorage matches the pattern used for landmaster.lastRoute and the
-// sidebar-expanded flag in 05-ui-shell.js. Chased state is completely
-// independent: it lives in follow_marks keyed by part+PO, so a line
-// filtered out here and later brought back stays marked chased.
-const FOLLOWUP_MIN_DAYS_KEY = "landmaster.followups.minDaysLate";
-function _followupMinDaysInit() {
-  try {
-    const raw = localStorage.getItem(FOLLOWUP_MIN_DAYS_KEY);
-    if (raw == null) return FOLLOWUP_DAYS;
-    const n = parseInt(raw, 10);
-    if (!isFinite(n) || n < 0) return FOLLOWUP_DAYS;
-    return n;
-  } catch (e) { return FOLLOWUP_DAYS; }
-}
-let FOLLOWUP_STATE = { search: "", sort: "worst", hideChased: false, hideSentGaps: false, minDaysLate: _followupMinDaysInit() };
+// Follow-Ups page state. `minDaysLate` was previously a user-tunable field
+// (persisted via localStorage `landmaster.followups.minDaysLate`) driving
+// a "Days late >" toolbar input; removed because Dylan's rule pinned
+// overdue = >1 day late for both the page AND the sidebar badge. Any
+// pre-existing localStorage value under that key is now orphaned and
+// ignored — harmless (no code path reads it). Chased state is unaffected;
+// it lives in follow_marks keyed by part+PO independently.
+let FOLLOWUP_STATE = { search: "", sort: "worst", hideChased: false, hideSentGaps: false };
 
 // Debounced supplier filter that keeps input focus across the re-render
 // (same pattern as the Service Usage search box).
@@ -1109,31 +1106,16 @@ function _followupSearchInput(value) {
   }, 200);
 }
 
-// Days-late floor input — debounced so typing "12" doesn't refresh twice
-// mid-keystroke and clobber focus. Persists to localStorage on every
-// accepted value, so a reload restores the same view. NEVER touches
-// follow_marks — this is pure display.
-let _followupMinDaysTimer = null;
-function _followupMinDaysInput(value) {
-  const n = parseInt(String(value || "").trim(), 10);
-  if (!isFinite(n) || n < 0) return;                        // keep old value on garbage input
-  FOLLOWUP_STATE.minDaysLate = n;
-  try { localStorage.setItem(FOLLOWUP_MIN_DAYS_KEY, String(n)); } catch (e) {}
-  clearTimeout(_followupMinDaysTimer);
-  _followupMinDaysTimer = setTimeout(() => {
-    refresh();
-    const inp = document.getElementById("followup-mindays");
-    if (inp) inp.focus();
-  }, 200);
-}
-
 function renderFollowUps() {
   // Under the unified handled-mark model a line is "chased" iff its
   // (pn, po.id) is handled by ANY active mark — new-canonical handled,
   // or legacy sent/chased. No pre-built Map here; isPartPoHandled does
   // the lookup and is cheap for the row count we're dealing with.
-  const all = computeFollowUps(FOLLOWUP_STATE.minDaysLate);
-  const total = all.length;                 // header count (respects the user's days-late floor)
+  // Overdue = daysPastDue > 1. Pinned floor (previously user-tunable via
+  // the removed "Days late >" toolbar input) — matches followUpCount()
+  // exactly so the sidebar badge and this header can never drift.
+  const all = computeFollowUps(1);
+  const total = all.length;
   const chasedCount = all.reduce((n, fu) => n + (isPartPoHandled(fu.pn, fu.po.id) ? 1 : 0), 0);
 
   // Working set: optional hide-chased, then supplier search.
@@ -1154,7 +1136,7 @@ function renderFollowUps() {
       <div class="page-head">
         <div>
           <div class="page-title">Supplier Follow-Ups</div>
-          <div class="page-sub mono">${total} LATE LINE${total === 1 ? "" : "S"} · OVERDUE &gt; ${FOLLOWUP_STATE.minDaysLate}D${chasedCount ? ` · ${chasedCount} CHASED THIS SESSION` : ""}</div>
+          <div class="page-sub mono">${total} LATE LINE${total === 1 ? "" : "S"} · OVERDUE &gt; 1D${chasedCount ? ` · ${chasedCount} CHASED THIS SESSION` : ""}</div>
         </div>
         <div class="page-actions">
           <button class="btn" onclick="navigate('pos')">All POs →</button>
@@ -1170,10 +1152,6 @@ function renderFollowUps() {
             <option value="worst"    ${FOLLOWUP_STATE.sort === "worst"    ? "selected" : ""}>Sort: worst days-late</option>
             <option value="supplier" ${FOLLOWUP_STATE.sort === "supplier" ? "selected" : ""}>Sort: supplier name</option>
           </select>
-          <label class="row" style="gap:6px; align-items:center" title="Show only lines whose days-late is greater than this value. Chased marks are unaffected — filtered-out lines stay chased when brought back into view.">
-            <span class="muted tiny">Days late &gt;</span>
-            <input type="number" min="0" step="1" class="input" id="followup-mindays" value="${FOLLOWUP_STATE.minDaysLate}" style="width:64px; text-align:center" oninput="_followupMinDaysInput(this.value)">
-          </label>
           <label class="row" style="gap:6px; align-items:center; cursor:pointer" title="Hide lines marked chased this session">
             <input type="checkbox" class="chk" ${FOLLOWUP_STATE.hideChased ? "checked" : ""} onchange="FOLLOWUP_STATE.hideChased = this.checked; refresh()">
             <span class="muted tiny">Hide chased</span>
