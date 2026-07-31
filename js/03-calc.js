@@ -379,7 +379,22 @@ function isLineOpen(po, ln) {
   if (_CLOSED_LINE_STATUSES.has(lnStatus)) return false;
   const lnAcum = String(ln.acumStatus || "").toLowerCase().trim();
   if (lnAcum && _CLOSED_ACUM_STATUSES.has(lnAcum)) return false;
-  if (ln.openQty !== undefined && ln.openQty !== null && Number(ln.openQty) <= 0) return false;
+  // openQty is authoritative when present. The sync writes it verbatim
+  // from Acumatica's "Open Qty" column and Acumatica keeps it fresh even
+  // when qtyReceived lags (audited 2026-07-31: 868 lines currently show
+  // open under the old (qty - qtyReceived) rule but Acumatica reports
+  // openQty=0 — 710 Closed + 93 Completed + 65 other = legitimately done
+  // per the source of truth. Data quality: 0 of 7821 lines missing
+  // openQty at time of the audit, so the fallback below is defensive
+  // only). openQty > 0 ⇒ open, openQty <= 0 ⇒ closed, regardless of
+  // (qty - qtyReceived). Blanket lines are gated out above at the
+  // isBlanketLine() check; this branch is normal-lines-only.
+  if (ln.openQty !== undefined && ln.openQty !== null) {
+    return Number(ln.openQty) > 0;
+  }
+  // Legacy fallback for rows synced before openQty existed (or manually
+  // created lines that never received an openQty). Preserves the pre-fix
+  // qty-minus-qtyReceived shape so those rows keep working unchanged.
   const qty = Number(ln.qty || 0);
   if (qty <= 0) return false;
   const recv = Number(ln.qtyReceived != null ? ln.qtyReceived : (ln.recv != null ? ln.recv : 0));
@@ -642,20 +657,30 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   const cutinMs = hardCutin && hardCutin.hardCutinDate
     ? hardCutin.hardCutinDate.getTime() : null;
   const precutinRate = hardCutin ? (Number(hardCutin.chainRate) || 0) : 0;
-  // predecessorEffectiveStock (raw predecessor onHand-sum + pre-cutin
-  // predecessor POs) is the correct phase-1 starting pool now that
-  // _chainHardCutinSupply credits predecessor POs. The `??` fallback to
-  // predecessorStock preserves behavior for callers that stub hardCutin
-  // objects without the newer field. Non-hardCutin path unchanged
-  // (hardCutin=null → predStock=0).
-  let predStock = hardCutin
-    ? Math.max(0, Number(hardCutin.predecessorEffectiveStock ?? hardCutin.predecessorStock) || 0)
-    : 0;
+  // predStock starts at the RAW predecessorStock (onHand-sum). Pre-cutin
+  // predecessor POs are NOT front-loaded here — they land on their
+  // expectedDate via hardCutin.predReceiptsByDay inside the day-walk
+  // below, matching the phase-2 receipts-first convention. Front-loading
+  // (a prior form of this fix) started the plotted curve at raw+POs on
+  // day 0, misrepresenting timing and hiding real gaps on faster-
+  // depleting predecessors whose PO wouldn't arrive in time.
+  // Non-hardCutin path unchanged (hardCutin=null → predStock=0).
+  let predStock = hardCutin ? Math.max(0, Number(hardCutin.predecessorStock) || 0) : 0;
+  const predReceiptsByDay = (hardCutin && hardCutin.predReceiptsByDay) || null;
   const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
     const d = addDays(TODAY, i);
     const dMs = d.getTime();
     const beforeCutin = hardCutin && cutinMs && dMs < cutinMs;
+    // Predecessor PO receipt on this day (pre-cutin only — the Map keys
+    // are pre-filtered by _chainHardCutinSupply with offset < cutinOffset,
+    // so post-cutin days never hit). Applied BEFORE depletion so the
+    // plotted line jumps +qty on the arrival day and depletion resumes
+    // from the boosted level — same order the phase-1 walk in
+    // _chainHardCutinSupply uses to compute predStockWalking.
+    if (predReceiptsByDay && predReceiptsByDay.has(i)) {
+      predStock += predReceiptsByDay.get(i);
+    }
     // Skip depletion until we reach transitionStartDate. Receipts still
     // land on their real calendar offset — a PO scheduled to arrive
     // before phase-in bumps the flat pre-launch line up on its arrival
@@ -1186,7 +1211,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
       hardCutinDate, predecessorStock, ownStock, chainRate,
       phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
       strandedPredecessorQty: 0,
-      predPOsPreCutin, predecessorEffectiveStock, predecessorPns,
+      predPOsPreCutin, predecessorEffectiveStock, predecessorPns, predReceiptsByDay,
       runoutDate, runoutDays,
       ownStockAtCutinBlanketOnly,
     };
@@ -1260,7 +1285,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     hardCutinDate, predecessorStock, ownStock, chainRate,
     phase1WorkdayCount, phase1DemandUnits, predecessorCoversPhase1,
     strandedPredecessorQty,
-    predPOsPreCutin, predecessorEffectiveStock, predecessorPns,
+    predPOsPreCutin, predecessorEffectiveStock, predecessorPns, predReceiptsByDay,
     runoutDate, runoutDays,
     ownStockAtCutinBlanketOnly,
   };
