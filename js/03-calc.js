@@ -352,6 +352,136 @@ function isActivePO(po) {
   return true;
 }
 
+// Set of blanket PO numbers that have at least one release pulled
+// against them (a normal PO line carries blanketPoNum === thisBlanket.num).
+// Once a blanket has been released, delivery-tracking moves to the
+// release PO — the blanket becomes an authorization-history record.
+// Memoized on DB.pos identity; identity changes on full-DB replacement
+// via cloud sync. In-place mutations that add a new release would stale
+// the cache for one render pass — acceptable trade-off for the per-render
+// perf win (avoids re-scanning DB.pos in every isPOEffectivelyClosed call
+// on a tab render). Rebuilds on next identity change.
+let _blanketReleaseParentsCache = null;
+let _blanketReleaseParentsCacheSource = null;
+function _blanketReleaseParents() {
+  const src = (typeof DB !== "undefined" && Array.isArray(DB.pos)) ? DB.pos : [];
+  if (_blanketReleaseParentsCache && _blanketReleaseParentsCacheSource === src) {
+    return _blanketReleaseParentsCache;
+  }
+  const set = new Set();
+  for (const p of src) {
+    for (const l of (p.lines || [])) {
+      const bpn = String(l.blanketPoNum || "").trim();
+      if (bpn) set.add(bpn);
+    }
+  }
+  _blanketReleaseParentsCache = set;
+  _blanketReleaseParentsCacheSource = src;
+  return set;
+}
+
+// Reality-consistent "is this PO effectively closed?" — combines the
+// header check (isActivePO), the line-level truth scan, and blanket-
+// release detection. A PO is closed iff EITHER:
+//   (a) the header is explicitly closed (isActivePO false), OR
+//   (b) every line is "done" per its own openness rule:
+//       - Normal line → isLineOpen(po, ln) === false (openQty-authoritative post-ad85c2f).
+//       - Blanket line → blanketOpenQty <= 0 (no authorization remaining) OR the
+//         blanket has been RELEASED (a normal PO line references it via
+//         blanketPoNum — the release PO now carries delivery-tracking; the
+//         blanket becomes a history record). Both signals mean the blanket
+//         is "done for buyer-visible purposes" and the PO should classify
+//         CLOSED for tabs/badge/KPI.
+//
+// The blanket carve-out matters because a blanket line's `openQty` is
+// always 0 (or absent) — blankets don't schedule receipts. Blankets get
+// their own gates: blanketOpenQty for authorization remaining, plus the
+// release-parent index for "someone pulled a release against this."
+//
+// IMPORTANT — RELEASE force-admit path is UNAFFECTED. This function is
+// consumed by poState → tab classification / dashboard KPI / row badge.
+// The RELEASE queue-admission logic in partsWithStatus reads
+// findOpenBlanketForPart which has its own blanketOpenQty > 0 gate and
+// does NOT consult isPOEffectivelyClosed. Blanket supply math
+// (openPOQty, blanketIncomingQty, isLineIncomingSupply) also independent.
+//
+// NEVER call from inside isLineOpen / isActivePO / _buildOpenPOLineIndex
+// or supply-math primitives — those must stay header-only.
+function isPOEffectivelyClosed(po) {
+  if (!po) return true;
+  if (!isActivePO(po)) return true;                           // (a) header-closed
+  if (!Array.isArray(po.lines) || po.lines.length === 0) return true;
+  // Precompute release status ONCE per PO (avoid re-checking per blanket line).
+  const hasBlanket = po.lines.some(isBlanketLine);
+  const isReleased = hasBlanket
+    && _blanketReleaseParents().has(String(po.num || "").trim());
+  return !po.lines.some(l => {
+    if (isBlanketLine(l)) {
+      // Released blanket line: closed regardless of blanketOpenQty (the
+      // release PO tracks delivery from here; this blanket is done).
+      if (isReleased) return false;
+      // Unreleased blanket line: still doing if authorization remains.
+      return Math.max(0, Number(l.blanketOpenQty || 0)) > 0;
+    }
+    // Normal line (including release-PO normal lines that carry
+    // blanketPoNum): standard isLineOpen check. A release PO's normal
+    // lines have blanketPoNum set but ln.type is "Normal" — they route
+    // through isLineOpen just like any other normal line.
+    return isLineOpen(po, l);
+  });
+}
+
+// Single source of truth for PO overall state. Returns:
+//   { closed, active, overdue, open, onhold, pending }
+// Every consumer that classifies PO state — filter tabs (posMatchesTab),
+// PO-list row badge (poTimeBadge), drawer per-line label
+// (posLineStatusCellHTML routes through isLineOpen separately),
+// dashboard "Open POs" KPI + "N overdue" tile, PO nav badge,
+// "Receive all open" button visibility — MUST derive from this. No
+// ad-hoc parallel logic. This eliminates the whack-a-mole where
+// POC0004348 showed "received" in the drawer but landed in the Overdue
+// tab and inflated the dashboard tile.
+//
+// Precedence + orthogonality:
+//   - `closed` wins over everything (no active flags fire when closed).
+//   - Within active: `onhold`, `pending`, `open` are Acumatica-lifecycle
+//     sub-states derived from po.acumStatus (fallback to po.status when
+//     acumStatus absent). MUTUALLY EXCLUSIVE among themselves.
+//   - `overdue` is an INDEPENDENT flag — a PO can be simultaneously
+//     `open: true, overdue: true` (which is why the Overdue tab can
+//     pull rows also visible in the Open tab). Blanket-inclusive POs
+//     (any Blanket-type line) never fire overdue — authorizations, not
+//     scheduled deliveries — matching poTimeBadge's pre-existing
+//     blanket suppression. Release POs (Normal lines linked to a
+//     parent blanket via blanketPoNum) DO fire overdue if past date —
+//     they're real deliveries.
+function poState(po) {
+  const closed = isPOEffectivelyClosed(po);
+  if (closed) {
+    return { closed: true, active: false, overdue: false, open: false, onhold: false, pending: false };
+  }
+  const a = String((po && po.acumStatus) || "").trim();
+  const isPending = a === "Pending Approval" || a === "Pending Printing" || a === "Pending Email" || a === "Awaiting Link";
+  const isOnHold = a === "On Hold";
+  // Fallback: no acumStatus but po.status looks active (older data or
+  // Acumatica sync that didn't set acumStatus). Mirrors posMatchesTab's
+  // pre-consolidation `fbActive` gate.
+  const fbActive = !a && po && (po.status === "submitted" || po.status === "in_transit");
+  // Blanket-inclusive PO (ANY Blanket-type line on the PO) — matches
+  // poBlanketMeta's kind:"blanket" logic. Overdue is suppressed for
+  // these — same as the pre-consolidation behavior in poTimeBadge.
+  const anyBlanket = Array.isArray(po.lines) && po.lines.some(isBlanketLine);
+  const overdue = !anyBlanket && !!(po.expectedDate && new Date(po.expectedDate) < TODAY);
+  return {
+    closed: false,
+    active: true,
+    overdue,
+    open: (a === "Open" || fbActive) && !isOnHold && !isPending,
+    onhold: isOnHold,
+    pending: isPending,
+  };
+}
+
 // Blanket PO lines are release-against authorizations, not scheduled
 // receipts. Acumatica's PO Line Type column carries "Normal" vs "Blanket";
 // the sync writes it verbatim (title-cased) into ln.type. Only an EXPLICIT

@@ -143,23 +143,23 @@ function posDisplayStatus(po) {
 // Returns { html: string, isOverdue: boolean } — isOverdue drives the
 // expected-date column's text-crit styling on the list row.
 function poTimeBadge(po) {
-  if (!po || po.status === "received" || po.status === "closed") {
-    return { html: "", isOverdue: false };
-  }
+  if (!po) return { html: "", isOverdue: false };
+  // EXPIRED pill for blanket POs stays local — it's specific to the
+  // blanket strip's authorization-window semantics (blanketExpires),
+  // which don't belong in the general poState() classification.
   const bm = poBlanketMeta(po);
   if (bm.kind === "blanket") {
-    // EXPIRED pill fires when ANY blanket line on the PO has lapsed
-    // (conservative — surfaces the closest-to-expiration authorization).
-    // Undated lines never expire. Byte-identical to the pre-rollup single-
-    // line check when the PO has one blanket line.
     const anyExpired = (bm.blanketLines || []).some(l => l.blanketExpires && new Date(l.blanketExpires) < TODAY);
-    if (anyExpired) {
-      return { html: '<span class="pill warn">EXPIRED</span>', isOverdue: false };
-    }
+    if (anyExpired) return { html: '<span class="pill warn">EXPIRED</span>', isOverdue: false };
     return { html: "", isOverdue: false };
   }
-  const overdue = po.expectedDate && new Date(po.expectedDate) < TODAY;
-  if (overdue) {
+  // OVERDUE derives entirely from poState (js/03-calc.js). poState.overdue
+  // fires only when the PO is active AND has at least one open line (per
+  // isLineOpen — openQty-authoritative) AND expected date is past AND no
+  // blanket line present. All the guards that used to live inline here
+  // (po.status !== received/closed check, any-open-line gate) are folded
+  // into poState so tabs / dashboard / badge share the same predicate.
+  if (poState(po).overdue) {
     return { html: '<span class="pill solid-crit">OVERDUE</span>', isOverdue: true };
   }
   return { html: "", isOverdue: false };
@@ -328,9 +328,30 @@ function findExhaustedBlanketForPart(pn) {
   return best;
 }
 
-function posLineStatusCellHTML(ln) {
-  const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
-  return `<span class="pill ${lineStatusClass(ln.status)}">${esc(ln.status)}</span>${remaining > 0 && ln.status !== "received" && ln.status !== "cancelled" ? `<div class="tiny dim mono" style="margin-top:2px">${fmtNum(remaining)} open</div>` : ""}`;
+function posLineStatusCellHTML(po, ln) {
+  // Route the pill through isLineOpen so the drawer's per-line label
+  // matches the openPOQty / Follow-Ups / queue-admission view of the
+  // same line. Previously used stored ln.status (sync-derived from
+  // stale qtyReceived) + (qty - qtyReceived), which showed lines as
+  // "OPEN / 50 open" while every downstream supply consumer correctly
+  // treated them as closed via openQty=0. Now: if isLineOpen says
+  // false, render as closed (Received/Cancelled based on stored status
+  // for the label spelling — RECEIVED default when ambiguous).
+  const closed = !isLineOpen(po, ln);
+  if (closed) {
+    // Prefer the specific "cancelled" label when the stored status
+    // carries it; everything else that's !isLineOpen is effectively
+    // received/complete from the buyer's perspective.
+    const s = String(ln.status || "").toLowerCase().trim();
+    const label = (s === "cancelled" || s === "canceled") ? "cancelled" : "received";
+    return `<span class="pill ${lineStatusClass(label)}">${esc(label)}</span>`;
+  }
+  // Open line — remaining reads openQty when present (Acumatica-fresh),
+  // falls back to (qty - qtyReceived) for legacy rows without openQty.
+  const remaining = (ln.openQty !== undefined && ln.openQty !== null)
+    ? Math.max(0, Number(ln.openQty))
+    : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+  return `<span class="pill ${lineStatusClass(ln.status)}">${esc(ln.status)}</span>${remaining > 0 ? `<div class="tiny dim mono" style="margin-top:2px">${fmtNum(remaining)} open</div>` : ""}`;
 }
 
 function patchOpenPODrawer() {
@@ -356,28 +377,29 @@ function patchOpenPODrawer() {
     setIfNotFocused("cost", ln.cost || 0);
     setIfNotFocused("expectedDate", ln.expectedDate ? isoDate(ln.expectedDate) : "");
     const statusCell = row.querySelector("[data-line-status]");
-    if (statusCell) statusCell.innerHTML = posLineStatusCellHTML(ln);
+    if (statusCell) statusCell.innerHTML = posLineStatusCellHTML(po, ln);
   }
 }
 
 function posMatchesTab(po, tab) {
-  // Active / Overdue / Closed all gate on the same isActivePO chokepoint
-  // (js/03-calc.js) so the tabs partition cleanly and the counts match
-  // both the Purchase Orders nav badge and the Dashboard "Open POs" KPI.
-  // The remaining Acumatica-lifecycle sub-tabs (Open / On Hold / Pending)
-  // narrow within Active using po.acumStatus and a small fallback that
-  // mirrors the previous semantics — they still appear inside Active for
-  // users who want a finer-grained view.
-  const a = po.acumStatus || "";
-  const isAcumPending = a === "Pending Approval" || a === "Pending Printing" || a === "Pending Email" || a === "Awaiting Link";
-  const fbActive = !a && (po.status === "submitted" || po.status === "in_transit");
+  // Consolidated PO-state classification — every tab derives from the
+  // single poState() function in js/03-calc.js. Previously each case
+  // computed its own predicate against po.status/acumStatus/expectedDate,
+  // which drifted from isLineOpen: e.g., POC0004348 with 0 isLineOpen
+  // lines landed in "overdue" because the tab test was `isActivePO(po)
+  // && expectedDate < TODAY`, ignoring line-level truth. Now:
+  //   - active/open/onhold/pending/overdue are all derived from poState.
+  //   - closed = poState.closed = (header closed OR every line is done).
+  //   - Overdue is INDEPENDENT of open/onhold/pending — a PO with an
+  //     open line past its date lands in both "open" and "overdue".
+  const s = poState(po);
   switch (tab) {
-    case "active":  return isActivePO(po);
-    case "open":    return isActivePO(po) && (a === "Open" || fbActive);
-    case "onhold":  return isActivePO(po) && a === "On Hold";
-    case "pending": return isActivePO(po) && isAcumPending;
-    case "overdue": return isActivePO(po) && !!po.expectedDate && new Date(po.expectedDate) < TODAY;
-    case "closed":  return !isActivePO(po);
+    case "active":  return s.active;
+    case "open":    return s.open;
+    case "onhold":  return s.onhold;
+    case "pending": return s.pending;
+    case "overdue": return s.overdue;
+    case "closed":  return s.closed;
     case "all":     return true;
     default:        return true;
   }
@@ -851,7 +873,7 @@ function renderPODetail(po) {
       <div class="dr-section">PO Actions</div>
       <div class="row gap-md flex-wrap">
         ${po.status === "draft" ? `<button class="btn primary" onclick="submitPO('${esc(po.id)}')">▶ Submit PO</button>` : ""}
-        ${(po.status === "submitted" || po.status === "in_transit") ? `<button class="btn primary" onclick="receiveAllPO('${esc(po.id)}')">↓ Receive all open</button>` : ""}
+        ${poState(po).active ? `<button class="btn primary" onclick="receiveAllPO('${esc(po.id)}')">↓ Receive all open</button>` : ""}
         <button class="btn" onclick="duplicatePO('${esc(po.id)}')">⧉ Duplicate</button>
         <button class="btn" onclick="exportPOAsCSV('${esc(po.id)}')">⇩ Export CSV</button>
         <button class="btn danger" onclick="confirmDeletePO('${esc(po.id)}')">Delete PO</button>
@@ -884,7 +906,7 @@ function renderPOLineRow(po, ln, editable) {
       <td style="width:140px">
         <input class="input" type="date" data-field="expectedDate" value="${ln.expectedDate ? isoDate(ln.expectedDate) : ''}" oninput="updatePOLine('${esc(po.id)}','${esc(ln.id)}','expectedDate',this.value)">
       </td>
-      <td data-line-status>${posLineStatusCellHTML(ln)}</td>
+      <td data-line-status>${posLineStatusCellHTML(po, ln)}</td>
       <td>
         <button class="btn sm" onclick="receiveLine('${esc(po.id)}','${esc(ln.id)}')">Receive</button>
         <button class="btn sm ghost" onclick="removePOLine('${esc(po.id)}','${esc(ln.id)}')">×</button>
@@ -1037,13 +1059,24 @@ function confirmReceive(poId, lineId) {
 
 function receiveAllPO(poId) {
   const po = DB.pos.find(p => p.id === poId); if (!po) return;
-  const open = po.lines.filter(l => l.status !== "received" && l.status !== "cancelled");
+  // Route through isLineOpen so lines already closed per Acumatica's
+  // Open Qty (post-ad85c2f) aren't re-received. Reading the stored
+  // ln.status here would include stale-open lines whose openQty is 0 —
+  // batch-receiving them would double-credit on-hand and inflate
+  // qtyReceived past qty. isLineOpen agrees with the drawer's per-line
+  // label and every supply consumer.
+  const open = po.lines.filter(l => isLineOpen(po, l));
   if (!open.length) return;
   if (!confirm(`Receive all ${open.length} open line(s) on ${po.num}? This will increase on-hand.`)) return;
   for (const ln of open) {
-    const remaining = Math.max(0, (ln.qty||0) - (ln.qtyReceived||0));
+    // Remaining: prefer Acumatica's openQty when present, fall back to
+    // (qty - qtyReceived) for legacy rows without openQty.
+    const remaining = (ln.openQty !== undefined && ln.openQty !== null)
+      ? Math.max(0, Number(ln.openQty))
+      : Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
     if (remaining > 0) {
       ln.qtyReceived = (ln.qtyReceived || 0) + remaining;
+      ln.openQty = 0;
       ln.status = "received";
       const part = DB.parts.find(p => p.pn === ln.pn);
       if (part) part.onHand = (part.onHand || 0) + remaining;

@@ -48,8 +48,17 @@ registerRoute("dashboard", () => {
   // Completed/Rejected/Canceled rollups (po.acumStatus); every other status
   // counts as active. overduePOs inherits the same base so a closed-but-
   // past-its-date PO never inflates the overdue subcount.
-  const openPOs = DB.pos.filter(isActivePO);
-  const overduePOs = openPOs.filter(p => p.expectedDate && new Date(p.expectedDate) < TODAY);
+  // Both the "Open POs" KPI value and the "N overdue" subcount now
+  // derive from poState() (js/03-calc.js) — the single source of truth
+  // for PO classification. Previously openPOs used isActivePO (header-
+  // only, could count POs whose header hadn't rolled over even though
+  // every line was received per Acumatica's Open Qty), inflating both
+  // the KPI value and every downstream count. Under poState.active, a
+  // PO is only counted when the header is active AND at least one line
+  // is genuinely open — matching the PO-list Active/Open/Overdue tabs
+  // and the sidebar PO badge exactly.
+  const openPOs = DB.pos.filter(p => poState(p).active);
+  const overduePOs = openPOs.filter(p => poState(p).overdue);
   const draftPOs = DB.pos.filter(p => p.status === "draft");
 
   // Total inventory value
