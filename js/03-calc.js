@@ -3449,6 +3449,55 @@ function partsWithStatus() {
     // any future dashboard aggregate) all read the same value from
     // the shared helper. undefined for non-pre-launch parts (0 memory).
     const preLaunchOB = preLaunch ? preLaunchOrderBy(p) : null;
+
+    // PRE-LAUNCH FORCE-ADMIT — the "MY27 successor sitting at 0/0 with
+    // no queue signal" fix. A pre-launch base_bom part whose order-by
+    // has passed with NO covering supply needs surfacing NOW; the
+    // existing pre-launch override silences it (status="ok") which
+    // hides it through its entire ordering window. This flag re-admits
+    // it. Blanket-covered parts stay on the RELEASE tier
+    // (_forceAdmitAsRelease handles them). PO-covered parts are
+    // already ordered — no signal needed.
+    //
+    // Trigger conditions (all required):
+    //   1. isPreLaunch (transitionStartDate in the future)
+    //   2. itemType === "base_bom"  (queue-eligible + user's scope)
+    //   3. onPO === 0  (no normal PO placed yet)
+    //   4. findOpenBlanketForPart(pn) === null  (no covering blanket)
+    //   5. Order-by (cut-in − ltWeeks × 7 − safetyDays, CALENDAR days)
+    //      is <= today.
+    //
+    // NOTE: this bypasses preLaunchOrderBy() intentionally.
+    // preLaunchOrderBy returns null for pre-launch parts with onHand>0
+    // AND daily<=0 (common — staging stock with no demand rate yet;
+    // CP00544's case), because neither its C1 nor C2 candidate applies.
+    // That helper is meaningful for the drawer's "order by" text
+    // (which shows the earliest actionable deadline given current
+    // stock), but it's the wrong basis for QUEUE ADMISSION where
+    // "have we passed the point of no return for launch supply?"
+    // is answered by the flat cut-in − lead − safety rule regardless
+    // of current stock/rate. safetyDays picked up from DB.settings
+    // (org's configured buffer). Applied REGARDLESS of chainInfo —
+    // chain routing catches critical chain successors independently.
+    let _forceAdmitAsPreLaunchOrder = false;
+    let _preLaunchOrderByDaysPast = null;
+    let _preLaunchForceOrderByDate = null;
+    if (preLaunch
+        && String(p.itemType || "").toLowerCase().trim() === "base_bom"
+        && onPO === 0
+        && !(typeof findOpenBlanketForPart === "function" && findOpenBlanketForPart(p.pn))) {
+      const _plStartD = (typeof parseDateLocal === "function") ? parseDateLocal(p.transitionStartDate) : null;
+      if (_plStartD) {
+        const _plLeadDays = leadTimeDays(p);
+        const _plSafetyDays = Number((DB && DB.settings && DB.settings.safetyDays) || 0);
+        const _plObDate = addDays(_plStartD, -(_plLeadDays + _plSafetyDays));
+        if (_plObDate.getTime() <= TODAY.getTime()) {
+          _forceAdmitAsPreLaunchOrder = true;
+          _preLaunchForceOrderByDate = _plObDate;
+          _preLaunchOrderByDaysPast = Math.floor((TODAY.getTime() - _plObDate.getTime()) / 86400000);
+        }
+      }
+    }
     // CHAIN AWARENESS (Phase B): if the part is in an actively-
     // transitioning supersession chain, override status + daysOfCover
     // with combined chain values from getChainInfo(). Every downstream
@@ -3516,6 +3565,21 @@ function partsWithStatus() {
         stockoutDay: chainInfo.chainRunoutDays,
         leadDays: chainInfo.chainStatusDetail.leadDays,
         reorderBy: chainInfo.chainStatusDetail.reorderBy,
+      } : {}),
+      // PRE-LAUNCH FORCE-ADMIT override — placed LAST (after pre-launch
+      // and chain) so it wins the status/urgency race. Elevates a
+      // standalone pre-launch part (status was "ok" from pre-launch
+      // override) or a chain successor whose chain routing didn't
+      // catch it (status was chainStatus which may be "ok") to
+      // "critical" with urgency reflecting how far past order-by we
+      // are (negative → sorts to top of most-urgent-first views).
+      // Muted stays silent — mute is user-explicit and always wins.
+      ...(_forceAdmitAsPreLaunchOrder && !muted ? {
+        _forceAdmitAsPreLaunchOrder: true,
+        _preLaunchOrderByDaysPast,
+        _preLaunchForceOrderByDate,
+        status: "critical",
+        urgency: -Number(_preLaunchOrderByDaysPast || 0),
       } : {}),
       _suggestedQty: cycleAwareSuggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
@@ -3672,14 +3736,25 @@ function queueParts(itemType) {
   if (_wantType) stats = stats.filter(p => String(p.itemType || "").toLowerCase().trim() === _wantType);
   else stats = stats.filter(p => isQueueEligible(p));
   stats = stats.filter(p => !p.isKit);
-  // Admission: critical / warning as always, PLUS Sensourcing base_bom
-  // rows force-admitted as RELEASE (blanket-aware runout inside 21d
-  // trigger, blanket present, no normal PO). Force-admit is populated
-  // only for cycled Sensourcing rows in partsWithStatus. Blanket-covered
-  // Sensourcing parts outside the 21d window stay SILENT — the drawer's
-  // chain-reorder-by copy is the only signal until RELEASE fires.
+  // Admission: critical / warning as always, PLUS
+  //   - Sensourcing base_bom rows force-admitted as RELEASE (blanket-
+  //     aware runout inside 21d trigger, blanket present, no normal PO).
+  //     Force-admit is populated only for cycled Sensourcing rows in
+  //     partsWithStatus. Blanket-covered Sensourcing parts outside the
+  //     21d window stay SILENT — the drawer's chain-reorder-by copy is
+  //     the only signal until RELEASE fires.
+  //   - PRE-LAUNCH base_bom rows force-admitted when their order-by
+  //     has passed with NO covering supply (no open PO, no blanket).
+  //     Fills the gap that left MY27 successors unordered at 0/0
+  //     through their entire order window. Blanket-covered pre-launch
+  //     parts are handled by the RELEASE tier above; PO-covered ones
+  //     are already ordered. The status/urgency elevation happens in
+  //     partsWithStatus (status="critical"), so the status-based check
+  //     also admits — the flag is kept in the filter as defense-in-
+  //     depth (if someone later reverts the status elevation, the flag
+  //     still admits).
   return stats.filter(p =>
-    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease)
+    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease || p._forceAdmitAsPreLaunchOrder)
     && !p.phasingOut
   );
 }
