@@ -3464,39 +3464,26 @@ function partsWithStatus() {
     //   2. itemType === "base_bom"  (queue-eligible + user's scope)
     //   3. onPO === 0  (no normal PO placed yet)
     //   4. findOpenBlanketForPart(pn) === null  (no covering blanket)
-    //   5. Order-by (cut-in − ltWeeks × 7 − safetyDays, CALENDAR days)
-    //      is <= today.
+    //   5. preLaunchOB.orderByPassed === true. Order-by is on-hand-
+    //      aware post the runout-anchored rewrite of preLaunchOrderBy
+    //      — a part with 100 on hand + 1.83/day at Oct 5 cut-in gets
+    //      order-by ~late October, not mid-August, so no false surface
+    //      for stocked pre-launch parts. Chain successors (0 on hand)
+    //      fall to the launch-anchored branch and STILL surface.
     //
-    // NOTE: this bypasses preLaunchOrderBy() intentionally.
-    // preLaunchOrderBy returns null for pre-launch parts with onHand>0
-    // AND daily<=0 (common — staging stock with no demand rate yet;
-    // CP00544's case), because neither its C1 nor C2 candidate applies.
-    // That helper is meaningful for the drawer's "order by" text
-    // (which shows the earliest actionable deadline given current
-    // stock), but it's the wrong basis for QUEUE ADMISSION where
-    // "have we passed the point of no return for launch supply?"
-    // is answered by the flat cut-in − lead − safety rule regardless
-    // of current stock/rate. safetyDays picked up from DB.settings
-    // (org's configured buffer). Applied REGARDLESS of chainInfo —
-    // chain routing catches critical chain successors independently.
+    // Applied REGARDLESS of chainInfo — chain routing catches critical
+    // chain successors independently.
     let _forceAdmitAsPreLaunchOrder = false;
     let _preLaunchOrderByDaysPast = null;
     let _preLaunchForceOrderByDate = null;
     if (preLaunch
         && String(p.itemType || "").toLowerCase().trim() === "base_bom"
         && onPO === 0
-        && !(typeof findOpenBlanketForPart === "function" && findOpenBlanketForPart(p.pn))) {
-      const _plStartD = (typeof parseDateLocal === "function") ? parseDateLocal(p.transitionStartDate) : null;
-      if (_plStartD) {
-        const _plLeadDays = leadTimeDays(p);
-        const _plSafetyDays = Number((DB && DB.settings && DB.settings.safetyDays) || 0);
-        const _plObDate = addDays(_plStartD, -(_plLeadDays + _plSafetyDays));
-        if (_plObDate.getTime() <= TODAY.getTime()) {
-          _forceAdmitAsPreLaunchOrder = true;
-          _preLaunchForceOrderByDate = _plObDate;
-          _preLaunchOrderByDaysPast = Math.floor((TODAY.getTime() - _plObDate.getTime()) / 86400000);
-        }
-      }
+        && !(typeof findOpenBlanketForPart === "function" && findOpenBlanketForPart(p.pn))
+        && preLaunchOB && preLaunchOB.orderByPassed) {
+      _forceAdmitAsPreLaunchOrder = true;
+      _preLaunchForceOrderByDate = preLaunchOB.orderByDate;
+      _preLaunchOrderByDaysPast = Math.floor((TODAY.getTime() - preLaunchOB.orderByDate.getTime()) / 86400000);
     }
     // CHAIN AWARENESS (Phase B): if the part is in an actively-
     // transitioning supersession chain, override status + daysOfCover
@@ -3651,28 +3638,39 @@ function isPreLaunch(part) {
 }
 
 // PRE-LAUNCH ORDER-BY — deadline by which a replenishment must be placed
-// for a pre-launch part. min() of two constraints, each conditionally
-// applicable:
+// for a pre-launch part. On-hand-aware, single formula (no min() of two
+// constraints):
 //
-//   C1 (need stock BY launch, transitionStartDate − leadTime):
-//       Applicable when EITHER C1 is still in the future OR on-hand at
-//       launch is zero. If on-hand > 0 and C1 has passed, the part
-//       already has SOME stock at launch — C1 is satisfied trivially
-//       and provides no actionable deadline. Skipped.
+//   Runout-anchored (when daily > 0 AND onHand > 0):
+//       orderByDate = projectedRunout − leadDays − safetyDays
+//       where projectedRunout = cut-in + workdaysToCalendarDays(
+//           onHand / daily, cut-in)
+//     A part with 100 units on hand and 1.83/day at cut-in consumes
+//     ~55 workdays post-launch → runout ~Dec 21. Order-by = Dec 21
+//     minus 8w lead minus safety = late October. This is the "reorder
+//     BEFORE post-launch stockout" constraint.
 //
-//   C2 (need reorder BEFORE stockout, projectedRunout − leadTime):
-//       Always applicable. Projected runout = transitionStartDate +
-//       workdaysToCalendarDays(onHand / dailyUse, transitionStartDate).
-//       Uses the same workday-conversion the rest of the runway math
-//       uses, so C2's date agrees with the runway chart's slope.
+//   Launch-anchored fallback (when onHand <= 0 OR daily <= 0):
+//       orderByDate = cut-in − leadDays − safetyDays
+//     No stock → need arrival AT launch (chain successors, brand-new
+//     parts). No rate → conservative (can't project runout, so treat
+//     as if arrival needs to land at launch).
 //
-// Returns { orderByDate, orderByPassed } — the EARLIER of the applicable
-// constraints, and a flag when orderByDate is in the past. Returns null
-// for parts that aren't pre-launch or lack daily/lead data.
+// Prior formula was min(C1 = cut-in − lead, C2 = runout − lead) with
+// C1 gated on "onHand ≤ 0 OR c1 in future" and no safety. That
+// over-fired for pre-launch parts with staging stock: any part with
+// c1 still in the future (say cut-in Oct 5, 8w lead → c1 = Aug 10)
+// would pick c1 as the earlier deadline even though 100 units on
+// hand meant no arrival was needed at cut-in. Runout-only fixes that.
 //
-// SINGLE SOURCE OF TRUTH: drawer banner + Parts Catalog "ORDER NOW" pill
-// + partsWithStatus's _preLaunchOrderBy field all call this. Any surface
-// showing a pre-launch order-by MUST come here (grep-verifiable).
+// Returns { orderByDate, orderByPassed }. Never returns null except
+// on !isPreLaunch or unparseable transitionStartDate.
+//
+// SINGLE SOURCE OF TRUTH: drawer banner + Parts Catalog "ORDER NOW"
+// pill + partsWithStatus's _preLaunchOrderBy field + the queue
+// admission flag (_forceAdmitAsPreLaunchOrder) all call this or its
+// direct field output. Any surface showing a pre-launch order-by MUST
+// come here (grep-verifiable).
 function preLaunchOrderBy(part) {
   if (!part || !isPreLaunch(part)) return null;
   const startD = (typeof parseDateLocal === "function")
@@ -3680,30 +3678,25 @@ function preLaunchOrderBy(part) {
     : null;
   if (!startD) return null;
   const leadDays = leadTimeDays(part);
+  const safetyDays = Number((DB && DB.settings && DB.settings.safetyDays) || 0);
   const daily = Number(part.daily) || 0;
   const onHand = Number(part.onHand) || 0;
   const nowMs = TODAY.getTime();
 
-  // C1: launch − lead. Actionable when future OR when on-hand at launch
-  // is zero (nothing to bridge from — a fresh order must land ON launch).
-  const c1 = addDays(startD, -leadDays);
-  const c1Actionable = c1.getTime() >= nowMs || onHand <= 0;
-
-  // C2: runout − lead. Requires daily > 0 to compute a finite runout.
-  let c2 = null;
+  let orderByDate;
   if (daily > 0 && onHand > 0) {
+    // Runout-anchored. Consume onHand at daily rate starting from
+    // cut-in (pre-launch parts hold flat before cut-in per the runway
+    // math), workday-convert to calendar days for date arithmetic.
     const coverWorkdays = onHand / daily;
     const coverCalendar = workdaysToCalendarDays(coverWorkdays, startD);
     const runoutD = addDays(startD, coverCalendar);
-    c2 = addDays(runoutD, -leadDays);
+    orderByDate = addDays(runoutD, -(leadDays + safetyDays));
+  } else {
+    // Launch-anchored fallback: no stock or no rate.
+    orderByDate = addDays(startD, -(leadDays + safetyDays));
   }
 
-  const candidates = [];
-  if (c1Actionable) candidates.push(c1);
-  if (c2) candidates.push(c2);
-  if (candidates.length === 0) return null;
-
-  const orderByDate = candidates.reduce((a, b) => a.getTime() < b.getTime() ? a : b);
   const orderByPassed = orderByDate.getTime() < nowMs;
   return { orderByDate, orderByPassed };
 }
