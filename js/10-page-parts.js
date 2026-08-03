@@ -520,25 +520,50 @@ function renderPartDetail(part) {
     }
   } else if (preLaunch) {
     // Case-A pre-launch: no consumption until transitionStartDate. The
-    // runway (chart above) now correctly holds flat at onHand until
-    // launch, then depletes — so coverDays reflects the true runout
-    // counted from launch, not from today. The order-by is the shared
-    // helper's min() of the two constraints (see preLaunchOrderBy in
-    // js/03-calc.js): "have stock by launch" and "reorder before
-    // stockout." order-by-passed is surfaced when the deadline is in
-    // the past — the queue-badge OK doesn't blind us to a missed order
-    // window.
+    // runway (chart above) holds flat at onHand until launch, then
+    // depletes — so coverDays reflects the true runout counted from
+    // launch, not from today. Order-by comes from the shared
+    // preLaunchOrderBy helper (js/03-calc.js) which is on-hand-aware
+    // and safety-aware post the 6bea9a7 rewrite.
+    //
+    // ORDER-BY PASSED red alarm ONLY fires when actual action is
+    // needed: order-by is past AND there's no covering PO/blanket.
+    // A pre-launch part with a covering PO or blanket has orderByPassed
+    // true numerically but doesn't need buyer action — the coverage
+    // is in flight. Matches the queue's _forceAdmitAsPreLaunchOrder
+    // gate (js/03-calc.js) so badge, banner, and queue admission
+    // agree on "does this need ordering NOW?"
     const startD = parseDateLocal(part.transitionStartDate);
     const ob = (typeof preLaunchOrderBy === "function") ? preLaunchOrderBy(part) : null;
     const orderByD = ob && ob.orderByDate ? ob.orderByDate : null;
+    const _plHasBlanket = (typeof findOpenBlanketForPart === "function") && !!findOpenBlanketForPart(part.pn);
+    const _plCovered = (onPO > 0) || _plHasBlanket;
+    const _plActionable = orderByD && ob.orderByPassed && !_plCovered;
     const orderByTxt = !orderByD ? "—"
-      : (ob.orderByPassed ? `<span style="color:var(--crit);font-weight:700">now — ORDER-BY PASSED (${fmtDate(orderByD)})</span>` : fmtDate(orderByD));
+      : (_plActionable
+          ? `<span style="color:var(--crit);font-weight:700">now — ORDER-BY PASSED (${fmtDate(orderByD)})</span>`
+          : fmtDate(orderByD));
+    // Coverage note appended when a covering supply exists, so the
+    // banner explains WHY the (possibly past) order-by isn't sounding
+    // an alarm. PO coverage names the qty; blanket coverage names the
+    // tier (RELEASE handles the actual timing).
+    const coverageTxt = !_plCovered ? ""
+      : (onPO > 0
+          ? ` (covered by ${fmtNum(onPO)} on PO)`
+          : " (covered by blanket — RELEASE tier)");
+    // Queue note: differs based on whether this part is actually
+    // admitted. _plActionable === true implies queue admission
+    // (base_bom check aside, but the drawer only reaches this branch
+    // for parts that qualify for the pre-launch UI at all).
+    const queueNote = _plActionable
+      ? "In order queue — order now."
+      : "Not counted in live-demand queues.";
     // Projected runout from the fixed coverDays. addDays takes a Date;
     // TODAY is that Date, coverDays is calendar days from today.
     const runoutTxt = Number.isFinite(coverDays)
       ? `Projected runout ${fmtDate(addDays(TODAY, coverDays))} · `
       : "";
-    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--accent);font-weight:600">Pre-launch — phases in ${fmtDate(startD)}; no consumption yet. ${runoutTxt}order by ${orderByTxt}. Not counted in live-demand queues.</div>`;
+    runwayBanner = `<div class="tiny" style="margin-bottom:8px;color:var(--accent);font-weight:600">Pre-launch — phases in ${fmtDate(startD)}; no consumption yet. ${runoutTxt}order by ${orderByTxt}${coverageTxt}. ${queueNote}</div>`;
   } else if (!Number.isFinite(coverDays)) {
     runwayBanner = `<div class="dim tiny" style="margin-bottom:8px">No projected stockout at current demand.</div>`;
   } else if (leadDays > coverDays) {
@@ -1451,7 +1476,7 @@ registerRoute("parts", () => {
                 </td></tr>
                 ${parts.slice(0, 500).map(p => `
                   <tr class="clickable" data-parts-row data-pt-pn="${esc(partsHeaderValue(p, "pn"))}" data-pt-desc="${esc(partsHeaderValue(p, "desc"))}" data-pt-supplier="${esc(partsHeaderValue(p, "supplier"))}" data-pt-cls="${esc(partsHeaderValue(p, "cls"))}" data-pt-status="${esc(partsHeaderValue(p, "status"))}" onclick="openPartDetail('${esc(p.pn)}')">
-                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${p._preLaunchOrderByPassed ? ' <span class="pill crit" style="font-size:9px;padding:1px 6px;margin-left:4px;letter-spacing:0.04em" title="Pre-launch part — order-by deadline has passed">ORDER NOW</span>' : ''}</td>
+                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${p._forceAdmitAsPreLaunchOrder ? ' <span class="pill crit" style="font-size:9px;padding:1px 6px;margin-left:4px;letter-spacing:0.04em" title="Pre-launch part — order-by deadline has passed and no covering PO or blanket">ORDER NOW</span>' : ''}</td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
                     <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>
