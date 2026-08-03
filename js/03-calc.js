@@ -469,9 +469,40 @@ function poState(po) {
   const fbActive = !a && po && (po.status === "submitted" || po.status === "in_transit");
   // Blanket-inclusive PO (ANY Blanket-type line on the PO) — matches
   // poBlanketMeta's kind:"blanket" logic. Overdue is suppressed for
-  // these — same as the pre-consolidation behavior in poTimeBadge.
+  // these — a blanket is an authorization, not a scheduled delivery,
+  // so it can't legitimately be "overdue" against any expectedDate.
   const anyBlanket = Array.isArray(po.lines) && po.lines.some(isBlanketLine);
-  const overdue = !anyBlanket && !!(po.expectedDate && new Date(po.expectedDate) < TODAY);
+  // Overdue is decided at the LINE level, not the PO header. The header
+  // `po.expectedDate` is set at PO creation and NOT updated when lines
+  // are rescheduled — POC0004006 (header 2026-04-27, all lines 2026-08-20)
+  // was inflating overdue counts by ~36 POs against Acumatica's own
+  // line-level truth (planner said 58 overdue vs Acumatica's 22). Line
+  // `ln.expectedDate` reflects the current promised delivery per line;
+  // header is used only as a per-line fallback when a specific line has
+  // no line-level date. `isLineOpen` gate ensures received/closed lines
+  // don't push a PO into overdue against a past date on an already-done
+  // line. YYYY-MM-DD strings parsed as LOCAL date (not UTC via
+  // `new Date(string)` which shifts one day earlier for US timezones) —
+  // same convention as computeFollowUps at js/22-page-followups.js:43-45.
+  let overdue = false;
+  if (!anyBlanket && Array.isArray(po.lines)) {
+    const todayMs = TODAY.getTime();
+    for (const l of po.lines) {
+      if (!isLineOpen(po, l)) continue;
+      const raw = l.expectedDate || po.expectedDate;
+      if (!raw) continue;
+      let d;
+      if (typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        const [y, m, day] = raw.split("-").map(Number);
+        d = new Date(y, m - 1, day);
+      } else {
+        d = new Date(raw);
+      }
+      if (isNaN(d.getTime())) continue;
+      d.setHours(0, 0, 0, 0);
+      if (d.getTime() < todayMs) { overdue = true; break; }
+    }
+  }
   return {
     closed: false,
     active: true,
