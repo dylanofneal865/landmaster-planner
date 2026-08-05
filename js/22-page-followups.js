@@ -644,6 +644,27 @@ function computeCoverageGaps() {
       // on a no-chain pre-launch part has nowhere else to route.
       if (!demandMember) {
         const suppressedStat = statsByPn.get(p.pn) || p;
+        // runoutDate for a pre-launch overdue-only row: use the earliest
+        // overdue line's expected-arrival date (the "should have arrived
+        // by" signal), not TODAY. Pre-launch parts have no natural
+        // runout — using TODAY as a sort anchor mis-rendered as "runs
+        // out today" (bug fixed alongside the demand-member rollup).
+        // Falls back to null when no expected date is parseable —
+        // render will show "—" and the sort will slot the row via
+        // whatever fallback the sort handles null with.
+        let _fbRunoutDate = null;
+        for (const ol of rollup.overdueLines) {
+          if (!ol || !ol.expected) continue;
+          let d;
+          if (typeof ol.expected === "string" && /^\d{4}-\d{2}-\d{2}$/.test(ol.expected) && typeof parseDateLocal === "function") {
+            d = parseDateLocal(ol.expected);
+          } else {
+            d = new Date(ol.expected);
+            if (d) d.setHours(0, 0, 0, 0);
+          }
+          if (!d || isNaN(d.getTime())) continue;
+          if (!_fbRunoutDate || d.getTime() < _fbRunoutDate.getTime()) _fbRunoutDate = d;
+        }
         out.push({
           part: suppressedStat,
           gapStart: null,
@@ -654,7 +675,7 @@ function computeCoverageGaps() {
           targetArrivalDate: null,
           primarySupplier: suppressedStat.supplier || "",
           overdueRisk: {
-            runoutDate: new Date(TODAY),
+            runoutDate: _fbRunoutDate,
             shortfall: 0,
             overdueLines: [...rollup.overdueLines],
             daysPastDue: rollup.daysPastDue,
@@ -673,6 +694,38 @@ function computeCoverageGaps() {
       // The demand member's own enhanced part row (from partsWithStatus) —
       // that's the one that would appear in `out` if it had a normal gap.
       const demandStat = statsByPn.get(demandMember.pn) || demandMember;
+      // Coverage check: does the demand member ALREADY have its own
+      // exposure? computeCoverageGap returns null iff there is no normal
+      // gap AND no overdue-risk on the demand member — i.e. its own
+      // on-hand + open POs cover projected demand. In that case the
+      // pre-launch part's overdue PO is genuinely someone else's
+      // problem; surfacing the demand member here would falsely flag a
+      // healthy part.
+      //
+      // Prior bug: this pass unconditionally routed a suppressed
+      // pre-launch part's overdue PO onto its demand member's row with
+      // `runoutDate: TODAY` (a sort anchor mis-rendered as a real
+      // stockout date), producing rows like "18555-2 · out today · 78
+      // on hand · covered by CP00663's on-hold PO" when 18555-2 in
+      // fact had 205 on POC0006776 arriving Aug 25 covering demand to
+      // ~Nov 8.
+      const _demandMemberGap = computeCoverageGap(demandStat);
+      if (!_demandMemberGap) {
+        rollupActions.push({
+          suppressedPn: p.pn,
+          demandMember: demandMember.pn,
+          overduePoNum: rollup.overdueLines.map(l => l.po).join(","),
+          daysPastDue: rollup.daysPastDue,
+          action: "skipped — demand member covered by own supply",
+        });
+        continue;
+      }
+      // Real runout for the demand member from its own gap detector:
+      // gapStart when a normal gap was found, else the overdue-risk
+      // runout date. Never TODAY.
+      const _dmActualRunoutDate = _demandMemberGap.gapStart
+        || (_demandMemberGap.overdueRisk && _demandMemberGap.overdueRisk.runoutDate)
+        || null;
       const existingIdx = out.findIndex(r => r.part && r.part.pn === demandMember.pn);
       if (existingIdx >= 0) {
         // MERGE. CONFIRM C: distinguish where the existing row came from
@@ -690,8 +743,14 @@ function computeCoverageGaps() {
         else if (existing._syntheticFromRollup) mergedFrom = "merged: synthesized by earlier rollup";
         else mergedFrom = "merged: existing overdue-risk on demand member";
         if (!existing.overdueRisk) {
+          // Existing row came from a normal gap — existing.gapStart is
+          // truthy by construction (computeCoverageGap only pushes when
+          // it has hasNormalGap or overdueRisk; no overdueRisk here means
+          // hasNormalGap → gapStart set). Fall back to the demand
+          // member's detector-computed runout if for any reason the
+          // gapStart is missing. Never TODAY.
           existing.overdueRisk = {
-            runoutDate: new Date(TODAY),
+            runoutDate: existing.gapStart || _dmActualRunoutDate,
             shortfall: 0,
             overdueLines: [],
             daysPastDue: 0,
@@ -711,14 +770,11 @@ function computeCoverageGaps() {
         });
       } else {
         // SYNTHESIZE — overdue-only row keyed on the demand member.
-        // gapStart / gapEnd / gapDays: null → renders "-" in the GAP column.
-        // shortfall: 0 → matches the "PO qty covers demand" semantic; the
-        //   OVERDUE badge on the row communicates the timing risk. This
-        //   mirrors CP00663's pre-fix SHORT 0 output but on the correct
-        //   part.
-        // runoutDate: TODAY — for sort placement. Demand member isn't
-        //   actually running out today; this just anchors the row near
-        //   today in the sort order.
+        // Reachable when demandMember was filtered out of the normal
+        // loop (itemType allowlist, isKit, onPO<=0, transitionStartDate
+        // suppression) but computeCoverageGap still reported a real
+        // exposure just now. Use the demand member's ACTUAL runout
+        // date from its own detector — never TODAY-as-sort-anchor.
         out.push({
           part: demandStat,
           gapStart: null,
@@ -729,7 +785,7 @@ function computeCoverageGaps() {
           targetArrivalDate: null,
           primarySupplier: demandStat.supplier || "",
           overdueRisk: {
-            runoutDate: new Date(TODAY),
+            runoutDate: _dmActualRunoutDate,
             shortfall: 0,
             overdueLines: [...rollup.overdueLines],
             daysPastDue: rollup.daysPastDue,
