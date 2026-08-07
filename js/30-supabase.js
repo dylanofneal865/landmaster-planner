@@ -28,6 +28,14 @@ const _dirtyUsage = new Set();    // usage IDs that changed
 const _dirtyKitBoms = new Set();  // kit_pns that changed
 let _settingsDirty = false;
 
+// Queue-entry stamp tracking. Populated at boot from the sidecar
+// queue_entries table + updated in-session on every successful stamp.
+// The detector diffs queueParts() against THIS Set — never against a
+// nullable field on the part — so once a PN is stamped locally, no
+// further INSERT attempts fire from this session. Steady-state cost:
+// zero writes, zero broadcasts. See _detectQueueEntries.
+const _stampedPns = new Set();
+
 // Last-local-save timestamps (side channel). Complements the _dirty* sets:
 // _dirtyParts covers the window [set at mutate] → [cleared when push commits].
 // The poll's Promise.all fetch can be in flight during that ENTIRE window
@@ -155,7 +163,7 @@ async function _fetchAllParts() {
   while (true) {
     const { data, error } = await _supa
       .from("parts")
-      .select("pn, data")
+      .select("pn, data, updated_at")
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] page fetch failed:", error);
@@ -243,7 +251,7 @@ async function _fetchSince(table, keyCols, tsCol, sinceIso) {
   return { rows, maxSeenAt: maxSeen === sinceIso ? null : maxSeen };
 }
 
-async function _fetchPartsSince(sinceIso)        { return _fetchSince("parts",         "pn, data",     "updated_at", sinceIso); }
+async function _fetchPartsSince(sinceIso)        { return _fetchSince("parts",         "pn, data, updated_at", "updated_at", sinceIso); }
 async function _fetchPosSince(sinceIso)          { return _fetchSince("pos",           "id, data",     "updated_at", sinceIso); }
 async function _fetchSettingsSince(sinceIso)     { return _fetchSince("settings",      "id, data",     "updated_at", sinceIso); }
 async function _fetchKitBomsSince(sinceIso)      { return _fetchSince("kit_boms",      "kit_pn, data", "updated_at", sinceIso); }
@@ -568,6 +576,89 @@ window.deleteDeletedPartCloud = deleteDeletedPartCloud;
 window.deletePartRowCloud = deletePartRowCloud;
 window.upsertPartCloud = upsertPartCloud;
 
+// Paginated fetch of all queue_entries rows. Sidecar table (not on the
+// realtime publication — poll-only) that stores the first-ever-in-queue
+// timestamp per pn. Runs during cloudInit AFTER parts are hydrated so
+// the mirror is ready when the first refresh() calls the detector.
+// Returned rows are [{pn, first_entered_at}]; last_left_at intentionally
+// absent (v1 has no exit tracking / no re-stamp).
+async function _fetchAllQueueEntries() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("queue_entries")
+      .select("pn, first_entered_at")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] queue_entries page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Insert new queue-entry stamps for the given PNs. First-write-wins
+// via onConflict:"pn", ignoreDuplicates:true — a concurrent session
+// that already stamped a PN wins, and this call is a no-op for that
+// row (Postgres serializes at the PK constraint, and the "ignore-
+// duplicates" prefer header stops PostgREST from returning a conflict
+// error). On success, the caller MUST mirror the stamp into
+// DB.queueEntries and _stampedPns so subsequent refreshes don't
+// re-attempt the write.
+async function _stampQueueEntriesCloud(pns) {
+  if (!_supa || !pns.length) return { ok: false, stamped: [] };
+  const now = new Date().toISOString();
+  const rows = pns.map(pn => ({ pn, first_entered_at: now }));
+  const { error } = await _supa
+    .from("queue_entries")
+    .upsert(rows, { onConflict: "pn", ignoreDuplicates: true });
+  if (error) {
+    console.warn("[cloud] queue_entries upsert failed:", error);
+    return { ok: false, stamped: [] };
+  }
+  return { ok: true, stamped: pns, stampedAt: now };
+}
+
+// Detector — one pass per refresh cycle. Called from js/05-ui-shell.js
+// refresh() right after bumpStatusCache(), so partsWithStatus() (and
+// therefore queueParts()) is fresh AND cached for downstream reads.
+// Only INSERTs for PNs not already in _stampedPns → steady-state cost
+// is a Set difference over ~40-100 pns per cycle, zero writes.
+// Fire-and-forget: the sort surface reads whatever's in DB.queueEntries
+// right now; a stamp that hasn't landed yet just misses the current
+// render and shows on the next refresh.
+async function _detectQueueEntries() {
+  if (!_supa) return;
+  if (typeof queueParts !== "function") return;
+  if (!(DB.queueEntries instanceof Map)) DB.queueEntries = new Map();
+  const currentPns = new Set(queueParts().map(p => p.pn));
+  const toStamp = [];
+  for (const pn of currentPns) if (!_stampedPns.has(pn)) toStamp.push(pn);
+  if (!toStamp.length) return;
+  const { ok, stamped, stampedAt } = await _stampQueueEntriesCloud(toStamp);
+  if (!ok) return;
+  for (const pn of stamped) {
+    _stampedPns.add(pn);
+    // ignoreDuplicates means "someone else may have won" — but we
+    // don't know which pns won vs no-op'd. Mirror OUR stampedAt for
+    // any pn we don't already have a stamp for; next boot's fetch
+    // corrects any pn where another session's earlier stamp is
+    // authoritative. Never overwrite an existing entry — first-write-
+    // wins on the client mirror too.
+    if (!DB.queueEntries.has(pn)) {
+      DB.queueEntries.set(pn, { firstEnteredAt: stampedAt });
+    }
+  }
+}
+window._detectQueueEntries = _detectQueueEntries;
+
 // Paginated fetch of all deleted_parts rows. Runs during cloudInit
 // BEFORE the parts fetch so the tombstone Set is ready when the
 // parts filter runs.
@@ -647,7 +738,7 @@ async function cloudInit() {
     // matches the invariant realtime handlers rely on. Filter drops
     // any pn present in DB.deletedParts so tombstoned parts never
     // enter DB.parts.
-    const cloudParts = data.map(r => ({ pn: r.pn, ...r.data }));
+    const cloudParts = data.map(r => ({ pn: r.pn, ...r.data, updatedAt: r.updated_at || null }));
     const filtered = cloudParts.filter(p => !DB.deletedParts.has(String(p.pn)));
     const droppedCount = cloudParts.length - filtered.length;
     DB.parts.length = 0;
@@ -659,6 +750,26 @@ async function cloudInit() {
       `Synced ${filtered.length} parts from cloud${droppedCount > 0 ? ` (${droppedCount} tombstoned)` : ""}`,
       "ok", "Cloud connected"
     );
+  }
+
+  // ---- queue_entries (sidecar for "Newest in queue" sort) ----
+  // Poll-only — this table is NOT in the realtime publication.
+  // Populated by _detectQueueEntries() firing from refresh(). Fetched
+  // AFTER parts so a hypothetical FK on parts is satisfied and the
+  // mirror aligns with the parts set the detector will diff against.
+  if (!(DB.queueEntries instanceof Map)) DB.queueEntries = new Map();
+  else DB.queueEntries.clear();
+  _stampedPns.clear();
+  const cloudQE = await _fetchAllQueueEntries();
+  if (cloudQE !== null) {
+    for (const row of cloudQE) {
+      if (!row || !row.pn) continue;
+      DB.queueEntries.set(String(row.pn), { firstEnteredAt: row.first_entered_at || null });
+      _stampedPns.add(String(row.pn));
+    }
+    console.log(`[cloud] loaded ${DB.queueEntries.size} queue_entries stamp(s)`);
+  } else {
+    console.warn("[cloud] queue_entries fetch failed — 'Newest in queue' sort will show unstamped this session; detector will re-attempt stamps");
   }
 
   // ---- POs ----
@@ -1532,7 +1643,7 @@ async function _catchupFetch() {
     const tombs = DB.deletedParts instanceof Map ? DB.deletedParts : new Map();
     const merged = cloudParts
       .filter((r) => r && r.pn && !tombs.has(String(r.pn)))
-      .map((r) => ({ pn: r.pn, ...r.data }));
+      .map((r) => ({ pn: r.pn, ...r.data, updatedAt: r.updated_at || null }));
     DB.parts.length = 0;
     for (const p of merged) DB.parts.push(p);
     // Re-prime the dirty-tracking snapshot so subsequent LOCAL edits
@@ -1550,6 +1661,25 @@ async function _catchupFetch() {
     for (const po of merged) DB.pos.push(po);
     _posSnapshot.clear();
     for (const po of DB.pos) _posSnapshot.set(po.id, JSON.stringify(po));
+  }
+
+  // queue_entries — pull fresh stamps that other sessions wrote while
+  // we were disconnected. Detector's steady-state guard relies on
+  // _stampedPns being accurate; without this, a PN stamped by another
+  // session during our downtime would be missing from our mirror and
+  // the next detector pass would issue an ignoreDuplicates INSERT
+  // (harmless no-op, but avoidable) and the sort would still show it
+  // as unstamped locally until next boot. Cheap: one paginated fetch.
+  const cloudQEcatchup = await _fetchAllQueueEntries();
+  if (cloudQEcatchup !== null) {
+    if (!(DB.queueEntries instanceof Map)) DB.queueEntries = new Map();
+    DB.queueEntries.clear();
+    _stampedPns.clear();
+    for (const row of cloudQEcatchup) {
+      if (!row || !row.pn) continue;
+      DB.queueEntries.set(String(row.pn), { firstEnteredAt: row.first_entered_at || null });
+      _stampedPns.add(String(row.pn));
+    }
   }
 
   // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
@@ -1891,7 +2021,7 @@ async function _cloudPollTick() {
           console.debug(`[cloud] skipped stale apply for part ${pn} (local save newer than fetch)`);
           continue;
         }
-        const merged = { pn, ...r.data };
+        const merged = { pn, ...r.data, updatedAt: r.updated_at || null };
         const i = DB.parts.findIndex(p => p.pn === pn);
         const localPart = i >= 0 ? DB.parts[i] : null;
         // Canonical fingerprint on BOTH sides. Key-order-insensitive.
@@ -2225,7 +2355,7 @@ function _handleRealtimePart(payload) {
       console.debug(`[cloud] skipped stale apply for part ${rowPn} (local save newer than realtime echo)`);
       return;
     }
-    const merged = { pn: row.pn, ...row.data };
+    const merged = { pn: row.pn, ...row.data, updatedAt: row.updated_at || null };
     const i = DB.parts.findIndex(p => p.pn === row.pn);
     if (i >= 0) DB.parts[i] = merged;
     else DB.parts.push(merged);
@@ -3007,7 +3137,7 @@ window.cloudForcePull = async function () {
   if (!_supa) { console.log("Not connected"); return; }
   const data = await _fetchAllParts();
   if (data === null) { console.error("Force pull failed"); return; }
-  DB.parts = data.map(r => ({ pn: r.pn, ...r.data }));
+  DB.parts = data.map(r => ({ pn: r.pn, ...r.data, updatedAt: r.updated_at || null }));
   _origSaveDB ? _origSaveDB.call(window) : saveDB();
   if (typeof bumpStatusCache === "function") bumpStatusCache();
   if (typeof refresh === "function") refresh();

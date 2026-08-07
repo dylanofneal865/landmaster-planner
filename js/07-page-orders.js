@@ -11,7 +11,7 @@ let OQ_STATE = {
   supplier: "",
   buyer: "",
   search: "",
-  sortBy: "urgency",    // urgency | pn | supplier | qty | value | desc | lead
+  sortBy: "urgency",    // urgency | pn | supplier | qty | value | desc | lead | recent | entered
   sortDir: "asc",
 
   // Days Cover column-header filter. Single-select; stacks with the toolbar
@@ -463,6 +463,43 @@ function renderOrderQueueFor(itemType) {
         cmp = a._suggestedQty * orderUnitCost(a) - b._suggestedQty * orderUnitCost(b);
         break;
 
+      case "recent": {
+        // "Recently changed" — Supabase DB-stamped updated_at exposed on
+        // the part object as p.updatedAt (see js/30-supabase.js). This
+        // is "most recently touched" (any field: on-hand, cost, buyer,
+        // etc.), NOT "just entered the queue" — status is derived per-
+        // render and never stored, so no true queue-entry timestamp
+        // exists. Rows without updatedAt (e.g. never synced, or a boot
+        // that predates the field being exposed) sort last.
+        // Sort DIRECTION is set to "desc" in the dropdown handler so
+        // the raw cmp here is oldest-first; the desc flip lands newest
+        // -first, and missing timestamps (-Infinity) end up at the
+        // bottom after the flip.
+        const at = a.updatedAt ? Date.parse(a.updatedAt) : -Infinity;
+        const bt = b.updatedAt ? Date.parse(b.updatedAt) : -Infinity;
+        cmp = at - bt;
+        break;
+      }
+
+      case "entered": {
+        // "Newest in queue" — first-ever detection of this pn in the
+        // Base BOM / Options / Service queue. Persisted in the sidecar
+        // Supabase table queue_entries and mirrored client-side in
+        // DB.queueEntries: Map<pn, {firstEnteredAt: ISO}>. Populated
+        // by _detectQueueEntries() firing from refresh(); first-write-
+        // wins via onConflict:pn ignoreDuplicates, so a hovering part
+        // that exits and re-enters keeps its ORIGINAL stamp (v1: no
+        // exit tracking, no re-stamp).
+        // Unstamped rows (in queue before tracking started, or fresh
+        // deploy day 1) sort LAST after the desc flip — see the -Infinity
+        // sentinel and the sortDir="desc" handler for "entered" below.
+        const qe = (DB && DB.queueEntries instanceof Map) ? DB.queueEntries : null;
+        const at = qe && qe.get(a.pn) && qe.get(a.pn).firstEnteredAt ? Date.parse(qe.get(a.pn).firstEnteredAt) : -Infinity;
+        const bt = qe && qe.get(b.pn) && qe.get(b.pn).firstEnteredAt ? Date.parse(qe.get(b.pn).firstEnteredAt) : -Infinity;
+        cmp = at - bt;
+        break;
+      }
+
       case "urgency":
       default:
         // Rank by urgency margin (cover - reorderBy), not raw daysOfCover.
@@ -508,8 +545,10 @@ function renderOrderQueueFor(itemType) {
           </select>
           <div class="grow"></div>
           <span class="muted tiny">Sort:</span>
-          <select class="select" onchange="OQ_STATE.sortBy = this.value; OQ_STATE.sortDir = (this.value === 'value' || this.value === 'qty') ? 'desc' : 'asc'; refresh()">
+          <select class="select" title="Newest in queue = first time this part appeared on the queue (persisted). Recently changed = any field on the part row was touched." onchange="OQ_STATE.sortBy = this.value; OQ_STATE.sortDir = (this.value === 'value' || this.value === 'qty' || this.value === 'recent' || this.value === 'entered') ? 'desc' : 'asc'; refresh()">
             <option value="urgency" ${OQ_STATE.sortBy==='urgency'?'selected':''}>Most urgent</option>
+            <option value="entered" ${OQ_STATE.sortBy==='entered'?'selected':''}>Newest in queue</option>
+            <option value="recent" ${OQ_STATE.sortBy==='recent'?'selected':''}>Recently changed</option>
             <option value="value" ${OQ_STATE.sortBy==='value'?'selected':''}>Highest $</option>
             <option value="qty" ${OQ_STATE.sortBy==='qty'?'selected':''}>Largest qty</option>
             <option value="supplier" ${OQ_STATE.sortBy==='supplier'?'selected':''}>By supplier</option>
@@ -703,6 +742,23 @@ function renderOrderQueueFor(itemType) {
                 </tbody>
               </table>
             </div>
+            ${(() => {
+              // Footer note — count visible-in-current-filter rows that
+              // have NO queue-entry stamp yet. Populated when a queue
+              // member entered BEFORE entry-tracking started (Aug 7,
+              // 2026, when queue_entries was added) — the null seed
+              // choice from the design doc. Only rendered when >0 to
+              // avoid noise once every visible row is stamped.
+              const qe = (typeof DB !== "undefined" && DB.queueEntries instanceof Map) ? DB.queueEntries : null;
+              if (!qe) return "";
+              let unstamped = 0;
+              for (const p of filtered) {
+                const e = qe.get(p.pn);
+                if (!e || !e.firstEnteredAt) unstamped++;
+              }
+              if (!unstamped) return "";
+              return `<div class="muted tiny" style="padding:10px 14px;border-top:1px solid var(--border)">${unstamped} of ${filtered.length} parts entered the queue before entry-tracking started (Aug 7, 2026). Those rows show no timestamp under &ldquo;Newest in queue&rdquo; and sort last.</div>`;
+            })()}
           `}
         </div>
       </div>

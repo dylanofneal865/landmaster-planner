@@ -72,6 +72,13 @@ function navigate(route, params = {}) {
 
 function refresh() {
   bumpStatusCache();
+  // Queue-entry stamp detector — one pass per refresh cycle, right after
+  // the status cache is invalidated so queueParts() reflects fresh
+  // status. Fire-and-forget: steady-state costs zero writes (guarded by
+  // _stampedPns Set); a new queue entry triggers one INSERT with
+  // onConflict:ignoreDuplicates so concurrent sessions can't overwrite
+  // an existing stamp. See js/30-supabase.js _detectQueueEntries.
+  if (typeof _detectQueueEntries === "function") _detectQueueEntries();
   updateTopBar();
   updateNavBadges();
   updateDraftOrderPill();
