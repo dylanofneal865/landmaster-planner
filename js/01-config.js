@@ -160,8 +160,3 @@ function saveDB() {
   try { autoSyncExcel(); } catch (e) { /* don't break save */ }
 }
 
-function resetDB() {
-  localStorage.removeItem(STORAGE_KEY);
-  try { _cacheDel(IDB_DB_KEY); } catch (e) { /* ignore */ }
-  DB = null;
-}

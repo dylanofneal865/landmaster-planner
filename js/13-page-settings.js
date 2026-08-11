@@ -223,9 +223,6 @@ registerRoute("settings", () => {
             <button class="btn" onclick="downloadXlsxOnce('onhand')">⇩ Download On-Hand (XLSX)</button>
             <button class="btn" onclick="downloadXlsxOnce('usage')">⇩ Download Usage (XLSX)</button>
           </div>
-          <div class="row gap-md" style="margin-top:8px;border-top:1px solid var(--line);padding-top:14px">
-            <button class="btn danger" onclick="confirmReset()">↺ Reset all data (load fresh sample)</button>
-          </div>
         </div>
       </div>
 
@@ -330,22 +327,6 @@ function doImportFullDB() {
   }
 }
 
-function confirmReset() {
-  if (!gateDelete()) return;
-  openModal(`
-    <div class="modal-head"><div class="head-sm">Reset all data?</div></div>
-    <div class="modal-body">
-      <p>This deletes <strong>everything</strong> — parts, POs, audit log — and loads fresh sample data.</p>
-      <p class="muted tiny">Consider exporting a backup first.</p>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" data-close>Cancel</button>
-      <button class="btn" onclick="exportFullDB()">Export backup first</button>
-      <button class="btn danger" onclick="doReset()">Reset everything</button>
-    </div>
-  `);
-}
-
 function handleKitBomsImportFile(event) {
   const file = event.target.files?.[0];
   event.target.value = "";
@@ -359,16 +340,6 @@ function handleKitBomsImportFile(event) {
     console.error("Kit BOM import failed:", err);
     showToast("Kit BOM import failed: " + (err.message || err), "crit");
   });
-}
-
-async function doReset() {
-  resetDB();
-  await bootstrapSample();
-  DB = await loadDB();
-  bumpStatusCache();
-  closeModal();
-  showToast("Reset to embedded Landmaster snapshot", "ok");
-  navigate("dashboard");
 }
 
 /* ============================================================
