@@ -27,3 +27,12 @@
 # (unchanged), so this simply refreshes the number every morning.
 [functions."acumatica-service-usage-sync"]
   schedule = "0 6 * * *"
+
+# Weekly Production-Orders sync — Monday 11:00 UTC (~6 AM EST winter / 7 AM
+# EDT summer). Reconciles the production_orders table from the "LM Planner
+# Production Orders" GI. Feeds the read-only "BOM Usage Weekly" reporting
+# tab — the client mirror DB.productionOrders is READ ONLY and never
+# influences partStatus, queueParts, daily rates, or any existing math.
+# Poll-only downstream: production_orders is NOT in the realtime publication.
+[functions."acumatica-production-orders-sync"]
+  schedule = "0 11 * * 1"

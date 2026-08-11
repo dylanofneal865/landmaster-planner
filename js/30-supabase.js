@@ -399,6 +399,37 @@ async function _seedLastSeenCursors() {
 // BOM links — read-only from the browser's perspective. Server-side
 // netlify/functions/acumatica-bom-sync.js owns writes (daily). One paged
 // fetch on boot is enough; no realtime subscription, no push hooks.
+// Paginated fetch of all production_orders rows. Sidecar table populated
+// weekly by netlify/functions/acumatica-production-orders-sync.js —
+// server-owned writes, NEVER pushed from the browser. One paged fetch
+// on boot AND on reconnect (matches queue_entries; production orders
+// change weekly and a reconnect after the Monday sync should pick them
+// up). NOT included in the realtime subscription set — poll-only.
+// Client mirror DB.productionOrders is READ ONLY: no push helper, no
+// dirty tracking, no realtime handler. Only consumer is the "BOM Usage
+// Weekly" reporting tab (added in a later phase).
+async function _fetchAllProductionOrders() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("production_orders")
+      .select("id, data")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] production_orders page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
 async function _fetchAllBomLinks() {
   if (!_supa) return [];
   const all = [];
@@ -904,6 +935,23 @@ async function cloudInit() {
     // and warn so the page can surface it.
     console.warn("[cloud] bom_links fetch failed; DB.bomLinks may be unset");
     if (!Array.isArray(DB.bomLinks)) DB.bomLinks = [];
+  }
+
+  // ---- Production Orders (read-only reporting) ----
+  // Populated weekly by acumatica-production-orders-sync. Client mirror
+  // DB.productionOrders is read-only — never pushed, never mutated by
+  // any user action. Feeds the "BOM Usage Weekly" reporting tab and
+  // NOTHING else (no partStatus/queueParts/daily-rate coupling). Not
+  // in the realtime publication — poll-only via this fetch + reconnect
+  // catchup. Isolation contract: nothing else in the app reads or
+  // writes DB.productionOrders.
+  const cloudProductionOrders = await _fetchAllProductionOrders();
+  if (cloudProductionOrders !== null) {
+    DB.productionOrders = cloudProductionOrders.map(r => ({ id: r.id, ...r.data }));
+    console.log(`[cloud] loaded ${DB.productionOrders.length} production_orders rows`);
+  } else {
+    console.warn("[cloud] production_orders fetch failed; DB.productionOrders may be unset");
+    if (!Array.isArray(DB.productionOrders)) DB.productionOrders = [];
   }
 
   _cloudReady = true;
@@ -1680,6 +1728,18 @@ async function _catchupFetch() {
       DB.queueEntries.set(String(row.pn), { firstEnteredAt: row.first_entered_at || null });
       _stampedPns.add(String(row.pn));
     }
+  }
+
+  // production_orders — weekly-cadence reference data. A reconnect
+  // after the Monday sync should pick up the fresh week; without this
+  // catch-up, the reporting tab would show last week's numbers until
+  // the next full reboot. Read-only mirror — no snapshot priming, no
+  // dirty tracking.
+  const cloudProdOrdersCatchup = await _fetchAllProductionOrders();
+  if (cloudProdOrdersCatchup !== null) {
+    if (!Array.isArray(DB.productionOrders)) DB.productionOrders = [];
+    DB.productionOrders.length = 0;
+    for (const r of cloudProdOrdersCatchup) DB.productionOrders.push({ id: r.id, ...r.data });
   }
 
   // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
