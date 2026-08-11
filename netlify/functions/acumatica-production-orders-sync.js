@@ -233,6 +233,7 @@ exports.handler = async (event) => {
     qtyRemaining:    ["QtyRemaining", "QtyToProdRemaining", "_QtyRemaining"],
     qtyComplete:     ["QtyComplete", "QtyCompleted", "_QtyComplete"],
     warehouse:       ["SiteID", "Warehouse", "_Warehouse"],
+    status:          ["Status", "ProdOrdStatus", "_Status", "_ProdOrdStatus"],
   };
   const detectedField = {};   // logical → OData tag that hit at least once
   const missingField = new Set(Object.keys(FIELD_CANDIDATES));   // never hit → WARN
@@ -276,6 +277,7 @@ exports.handler = async (event) => {
       qty_remaining:   toNum(resolved.qtyRemaining),
       qty_complete:    toNum(resolved.qtyComplete),
       warehouse:       resolved.warehouse || null,
+      status:          resolved.status || null,
     };
 
     if (!feedById.has(data.id)) {
@@ -356,6 +358,7 @@ exports.handler = async (event) => {
       qty_remaining:    data.qty_remaining,
       qty_complete:     data.qty_complete,
       warehouse:        data.warehouse,
+      status:           data.status,
       data,
     });
   }
