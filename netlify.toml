@@ -28,10 +28,11 @@
 [functions."acumatica-service-usage-sync"]
   schedule = "0 6 * * *"
 
-# TEMPORARY schedule bump — one-shot manual trigger to verify the sync
-# after adding the Status column. Will be reverted immediately after the
-# run lands. Original: "0 11 * * 1" (Monday 11:00 UTC).
-# Bumped: 13:17 UTC today (2026-08-11). Fires daily at 13:17 UTC until
-# reverted, so DO NOT leave this in place past the first successful run.
+# Weekly Production-Orders sync — Monday 11:00 UTC (~6 AM EST winter / 7 AM
+# EDT summer). Reconciles the production_orders table from the "LM Planner
+# Production Orders" GI. Feeds the read-only "BOM Usage Weekly" reporting
+# tab — the client mirror DB.productionOrders is READ ONLY and never
+# influences partStatus, queueParts, daily rates, or any existing math.
+# Poll-only downstream: production_orders is NOT in the realtime publication.
 [functions."acumatica-production-orders-sync"]
-  schedule = "17 13 * * *"
+  schedule = "0 11 * * 1"
