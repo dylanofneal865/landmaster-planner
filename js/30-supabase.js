@@ -607,6 +607,119 @@ window.deleteDeletedPartCloud = deleteDeletedPartCloud;
 window.deletePartRowCloud = deletePartRowCloud;
 window.upsertPartCloud = upsertPartCloud;
 
+// Paginated fetch of all build_plan_targets rows. Sidecar table (NOT
+// on the realtime publication — poll-only) that stores a per-FG
+// weekly-units target driving the "Build Plan" tab's what-if daily
+// rollup. Populated by cloudInit + _catchupFetch; written by
+// setBuildPlanTargetCloud / clearBuildPlanTargetCloud (below). Mirror
+// shape: DB.buildPlanTargets = Map<fg_sku, {weeklyQty, updatedAt,
+// updatedBy}>. Server-owned schema; client never mutates the mirror
+// directly except via the two write helpers.
+async function _fetchAllBuildPlanTargets() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("build_plan_targets")
+      .select("fg_sku, weekly_qty, updated_at, updated_by")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] build_plan_targets page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Populate DB.buildPlanTargets from a fetched-row array. Shared by
+// cloudInit and _catchupFetch — same mutation semantics either way
+// (clear in place, refill in place; never reassign the Map reference).
+function _populateBuildPlanTargetsFromRows(rows) {
+  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+  DB.buildPlanTargets.clear();
+  if (!Array.isArray(rows)) return;
+  for (const row of rows) {
+    if (!row || !row.fg_sku) continue;
+    DB.buildPlanTargets.set(String(row.fg_sku), {
+      weeklyQty: Number(row.weekly_qty) || 0,
+      updatedAt: row.updated_at || null,
+      updatedBy: row.updated_by || null,
+    });
+  }
+}
+
+// Upsert a build-plan target. Last-write-wins per fg_sku via
+// onConflict:"fg_sku" — a concurrent session writing a different
+// weekly_qty for the same SKU is a genuine conflict (build plan is
+// shared state, not per-user), and last write is the intent we want.
+// Optimistic mirror update BEFORE the RPC so the UI reflects the
+// change immediately; reverts on failure. Fire-and-forget from the
+// caller's perspective — the render pass reads whatever's in the
+// mirror right now.
+async function setBuildPlanTargetCloud(fgSku, weeklyQty) {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+  const key = String(fgSku);
+  const q = Number(weeklyQty);
+  if (!Number.isFinite(q) || q < 0) return { ok: false, error: new Error("invalid qty") };
+  const nowIso = new Date().toISOString();
+  const prev = DB.buildPlanTargets.get(key);
+  DB.buildPlanTargets.set(key, {
+    weeklyQty: q,
+    updatedAt: nowIso,
+    updatedBy: prev ? prev.updatedBy : null,
+  });
+  const { error } = await _supa
+    .from("build_plan_targets")
+    .upsert(
+      { fg_sku: key, weekly_qty: q, updated_at: nowIso },
+      { onConflict: "fg_sku" }
+    );
+  if (error) {
+    // Revert the optimistic write so the mirror stays consistent
+    // with what the server actually holds.
+    if (prev) DB.buildPlanTargets.set(key, prev);
+    else DB.buildPlanTargets.delete(key);
+    console.error("[cloud] build_plan_targets upsert failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Build-plan target save failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+// Delete a target row. Same optimistic-then-revert pattern.
+async function clearBuildPlanTargetCloud(fgSku) {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+  const key = String(fgSku);
+  const prev = DB.buildPlanTargets.get(key);
+  DB.buildPlanTargets.delete(key);
+  const { error } = await _supa
+    .from("build_plan_targets")
+    .delete()
+    .eq("fg_sku", key);
+  if (error) {
+    if (prev) DB.buildPlanTargets.set(key, prev);
+    console.error("[cloud] build_plan_targets delete failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Build-plan target clear failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+window.setBuildPlanTargetCloud   = setBuildPlanTargetCloud;
+window.clearBuildPlanTargetCloud = clearBuildPlanTargetCloud;
+
 // Paginated fetch of all queue_entries rows. Sidecar table (not on the
 // realtime publication — poll-only) that stores the first-ever-in-queue
 // timestamp per pn. Runs during cloudInit AFTER parts are hydrated so
@@ -952,6 +1065,22 @@ async function cloudInit() {
   } else {
     console.warn("[cloud] production_orders fetch failed; DB.productionOrders may be unset");
     if (!Array.isArray(DB.productionOrders)) DB.productionOrders = [];
+  }
+
+  // ---- Build Plan targets (shared what-if input) ----
+  // Sidecar table populated by setBuildPlanTargetCloud /
+  // clearBuildPlanTargetCloud user actions. Read-only from the
+  // render side of the Build Plan tab — the mirror always reflects
+  // what's authoritative in Supabase. Not in the realtime
+  // publication; a reconnect catchup re-fetches so a concurrent
+  // edit from another session lands on the next reconnect.
+  const cloudBuildPlanTargets = await _fetchAllBuildPlanTargets();
+  if (cloudBuildPlanTargets !== null) {
+    _populateBuildPlanTargetsFromRows(cloudBuildPlanTargets);
+    console.log(`[cloud] loaded ${DB.buildPlanTargets.size} build_plan_targets row(s)`);
+  } else {
+    console.warn("[cloud] build_plan_targets fetch failed; DB.buildPlanTargets may be empty this session");
+    if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
   }
 
   _cloudReady = true;
@@ -1740,6 +1869,15 @@ async function _catchupFetch() {
     if (!Array.isArray(DB.productionOrders)) DB.productionOrders = [];
     DB.productionOrders.length = 0;
     for (const r of cloudProdOrdersCatchup) DB.productionOrders.push({ id: r.id, ...r.data });
+  }
+
+  // build_plan_targets — shared what-if state. A concurrent editor
+  // in another session may have set targets while we were offline,
+  // and our local mirror would be stale otherwise. Cheap: at most
+  // 91 rows (one per FG).
+  const cloudBPTargetsCatchup = await _fetchAllBuildPlanTargets();
+  if (cloudBPTargetsCatchup !== null) {
+    _populateBuildPlanTargetsFromRows(cloudBPTargetsCatchup);
   }
 
   // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
