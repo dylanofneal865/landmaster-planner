@@ -46,6 +46,20 @@ function _bomWeeklyIsoDate(d) {
   return `${y}-${m}-${dd}`;
 }
 
+// Daily-rate formatter — variable precision up to 3 decimals with NO
+// forced trailing zeros: 0.123/d, 1.4/d, 2/d. Diverges from the shared
+// fmtNum(n, d) (which forces both min and max fraction digits to `d`
+// and produces 0.12/1.40/2.00 for daily=2 callers elsewhere) because
+// this tab surfaces very low daily rates (e.g. part 18392: Σ 19 units
+// over 31 weeks × 5 workdays = 0.1225…/d) where fmtNum's default
+// integer rounding renders "0/d" and destroys the signal. Uses
+// maximumFractionDigits without a minimum so exact integers ("2") and
+// short decimals ("1.4") don't grow phantom zeros.
+function _buwDailyFmt(n) {
+  if (n == null || isNaN(n)) return "—";
+  return Number(n).toLocaleString(undefined, { maximumFractionDigits: 3 });
+}
+
 /* ============================================================
    WEEKLY BOM USAGE COMPUTATION
 
@@ -239,9 +253,8 @@ function _buwCellHtml(weeklyQty, dailyQty) {
     return `<td class="buw-cell buw-empty">—</td>`;
   }
   const wRounded = weeklyQty >= 100 ? Math.round(weeklyQty) : Math.round(weeklyQty * 10) / 10;
-  const dRounded = dailyQty >= 100 ? Math.round(dailyQty) : Math.round(dailyQty * 10) / 10;
-  const tip = `Weekly: ${weeklyQty}\nDaily: ${dailyQty}`;
-  return `<td class="buw-cell" title="${esc(tip)}"><div class="buw-w mono">${fmtNum(wRounded)}</div><div class="buw-d mono muted tiny">${fmtNum(dRounded)}/d</div></td>`;
+  const tip = `Weekly: ${weeklyQty}\nDaily: ${_buwDailyFmt(dailyQty)}`;
+  return `<td class="buw-cell" title="${esc(tip)}"><div class="buw-w mono">${fmtNum(wRounded)}</div><div class="buw-d mono muted tiny">${_buwDailyFmt(dailyQty)}/d</div></td>`;
 }
 
 function buwSetSort(key) {
@@ -427,7 +440,7 @@ function renderBomUsageWeekly() {
         <th class="buw-part-cell" title="${esc(r.pn)}${r.desc ? " — " + esc(r.desc) : ""}">
           <div class="buw-part-pn mono clickable" onclick="openPartDetail('${esc(r.pn)}')">${esc(r.pn)}</div>
           ${r.desc ? `<div class="buw-part-desc muted tiny">${esc(r.desc.slice(0, 42))}</div>` : ""}
-          <div class="buw-part-total muted tiny mono">Σ ${fmtNum(Math.round(r.total))} · ${fmtNum(Math.round(dailyAvg * 10) / 10)}/d avg</div>
+          <div class="buw-part-total muted tiny mono">Σ ${fmtNum(Math.round(r.total))} · ${_buwDailyFmt(dailyAvg)}/d avg</div>
         </th>
         ${cells}
       </tr>`;
