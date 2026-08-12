@@ -1,108 +1,149 @@
 /* =====================================================
    24-page-build-plan.js
-   Sections: STATE, MIRROR + INPUT HANDLERS, COMPUTATION, RENDER
+   Sections: STATE, INPUT HANDLERS, MIX + DISTRIBUTE COMPUTATION,
+             DEMAND COMPUTATION, RENDER
 
-   Build Plan — what-if daily usage. Users enter a target
-   units/week for each of the 91 buildable finished goods
-   (FINISHED_GOODS). The tab explodes those targets through
-   DB.bomLinks via explodeBOM and shows, per component part:
-     plannedDaily = Σ over FGs (targetWeekly × qtyPerUnit) ÷ wpw
-   alongside chainDisplayDaily (the app's canonical "current
-   rate") and the delta.
+   Build Plan v2 — mix-driven what-if daily usage.
+
+   User sets a single tab-wide "target units/week". The tab derives
+   each FG's implied weekly from the historical model mix
+   (DB.productionOrders over a trailing window, bucketed by
+   RELEASED date the same way BOM Usage Weekly does). Users can
+   override any FG (pin it); pinned FGs are excluded from mix
+   scaling and the remainder of the target is distributed across
+   unpinned FGs by their normalized mix shares. Component daily
+   demand explodes through DB.bomLinks and is compared against
+   chainDisplayDaily (the app's canonical rate).
 
    ISOLATION CONTRACT (view-only for parts math):
      - NEVER writes to DB.usage, part.daily, part.onHand,
-       part.status, any DB.parts[i].* assignment, DB.bomLinks
-       (reassign), or _dirtyParts.
+       part.status, DB.parts[i] fields, DB.bomLinks (reassign),
+       or _dirtyParts.
      - Does NOT call partsWithStatus(), queueParts(),
        partStatus(), computeDemand(), or bumpStatusCache().
-     - Reads only: FINISHED_GOODS (constant), DB.parts (for
-       description + chainDisplayDaily), DB.bomLinks (via
-       explodeBOM — pure function), DB.buildPlanTargets
-       (this feature's own sidecar mirror), DB.settings
-       (via effectiveWorkdaysPerWeek).
-     - Only writes are to public.build_plan_targets via the
-       cloud-scoped setBuildPlanTargetCloud /
-       clearBuildPlanTargetCloud helpers in js/30-supabase.js.
-       No local blob writes, no _dirty* additions.
+     - Reads only: FINISHED_GOODS, DB.parts (for desc +
+       chainDisplayDaily), DB.bomLinks (via explodeBOM — pure),
+       DB.productionOrders (for mix), DB.buildPlanTargets
+       (settings + overrides), DB.settings (via
+       effectiveWorkdaysPerWeek).
+     - Only writes go to public.build_plan_targets via cloud-
+       scoped helpers in js/30-supabase.js.
    ===================================================== */
 
 /* ============================================================
    STATE
    ============================================================ */
+
+// Window-size options are user-facing and finite; the picker
+// snaps whatever's in the settings row to the nearest allowed
+// value at read time.
+const BUILD_PLAN_WINDOW_OPTIONS = [4, 8, 13, 26];
+
 const BUILD_PLAN_STATE = {
   search: "",
-  sortBy: "delta",     // delta | plannedDaily | currentDaily | pn
+  sortBy: "delta",          // delta | plannedDaily | currentDaily | pn
   sortDir: "desc",
-  showZeroTargets: true,   // true = show every FG in the form; false = only ones with a target
-  minPlannedDaily: 0,      // hide component rows below this threshold (0 = show all)
-  ROW_LIMIT: 200,          // impact-table default cap; toggleable via "Show all"
+  showZeroMixFgs: false,    // include FGs with zero units in the window (defaults hidden)
+  minPlannedDaily: 0,
+  ROW_LIMIT: 200,
   showAll: false,
 };
 
 /* ============================================================
-   MIRROR + INPUT HANDLERS
+   INPUT HANDLERS
    ============================================================ */
 
-// Read helper — returns 0 for unset. Mirror is populated by
-// js/30-supabase.js on cloudInit + reconnect. Never mutated
-// from here except through the write helpers below.
-function _bpGetTarget(fgSku) {
-  if (!(DB.buildPlanTargets instanceof Map)) return 0;
-  const t = DB.buildPlanTargets.get(fgSku);
-  return t && Number.isFinite(Number(t.weeklyQty)) ? Number(t.weeklyQty) : 0;
+// Resolve current settings from the mirror, defaulting the window
+// to 8 when nothing is stored yet. Target defaults to null (not 0)
+// so the render can distinguish "not set yet" from "set to zero".
+function _bpSettings() {
+  const s = DB.buildPlanTargets && DB.buildPlanTargets.settings;
+  return {
+    targetPerWeek: s && Number.isFinite(Number(s.targetPerWeek)) ? Number(s.targetPerWeek) : null,
+    windowWeeks:   s && BUILD_PLAN_WINDOW_OPTIONS.includes(Number(s.windowWeeks)) ? Number(s.windowWeeks) : 8,
+  };
 }
 
-// Number of FGs with a non-zero target.
-function _bpTargetsCount() {
-  if (!(DB.buildPlanTargets instanceof Map)) return 0;
-  let n = 0;
-  for (const t of DB.buildPlanTargets.values()) {
-    if (Number(t && t.weeklyQty) > 0) n++;
-  }
-  return n;
+function _bpOverride(fgSku) {
+  const m = DB.buildPlanTargets && DB.buildPlanTargets.overrides;
+  if (!(m instanceof Map)) return null;
+  const v = m.get(fgSku);
+  return v && Number.isFinite(Number(v.weeklyQty)) ? Number(v.weeklyQty) : null;
 }
 
-// Wired to input onchange — fires on blur/Enter, not on every
-// keystroke, so no debounce needed and we don't push a write per
-// digit typed. Blank input → 0 → clear. Otherwise upsert.
-// Refresh so the impact table + totals recompute against the new
-// target. Optimistic mirror update happens inside the cloud
-// helper; if the write fails, that helper reverts the mirror and
-// toasts.
-async function bpHandleTargetInput(fgSku, rawValue) {
+function _bpOverrideCount() {
+  const m = DB.buildPlanTargets && DB.buildPlanTargets.overrides;
+  return m instanceof Map ? m.size : 0;
+}
+
+// The single tab-wide target. Fires on blur/Enter (onchange), so
+// no debounce needed. Blank → 0 → still valid ("plan for zero
+// production" is a legitimate what-if — set to 0 explicitly to
+// see current-rate cushion). Persist current windowWeeks too so
+// the row is complete either way.
+async function bpHandleTargetInput(rawValue) {
+  const s = _bpSettings();
   const trimmed = String(rawValue == null ? "" : rawValue).trim();
   const n = trimmed === "" ? 0 : Number(trimmed);
-  if (!Number.isFinite(n) || n < 0) {
-    // Non-numeric or negative — leave state alone, just re-render
-    // so the input reverts to the last stored value.
+  if (!Number.isFinite(n) || n < 0) { refresh(); return; }
+  const rounded = Math.round(n);
+  if (typeof setBuildPlanSettingsCloud === "function") {
+    await setBuildPlanSettingsCloud({ targetPerWeek: rounded, windowWeeks: s.windowWeeks });
+  }
+  refresh();
+}
+
+async function bpHandleWindowChange(rawValue) {
+  const s = _bpSettings();
+  const n = Number(rawValue);
+  const w = BUILD_PLAN_WINDOW_OPTIONS.includes(n) ? n : 8;
+  const target = s.targetPerWeek == null ? 0 : s.targetPerWeek;
+  if (typeof setBuildPlanSettingsCloud === "function") {
+    await setBuildPlanSettingsCloud({ targetPerWeek: target, windowWeeks: w });
+  }
+  refresh();
+}
+
+// "Load baseline as target" — write actual-avg-per-week into the
+// target field so the user has a defensible starting point.
+async function bpLoadBaselineAsTarget() {
+  const s = _bpSettings();
+  const mix = _bpComputeMix(s.windowWeeks);
+  const baseline = Math.round(mix.actualAvgPerWeek);
+  if (typeof setBuildPlanSettingsCloud === "function") {
+    await setBuildPlanSettingsCloud({ targetPerWeek: baseline, windowWeeks: s.windowWeeks });
+  }
+  refresh();
+}
+
+async function bpHandleOverrideInput(fgSku, rawValue) {
+  const trimmed = String(rawValue == null ? "" : rawValue).trim();
+  if (trimmed === "") {
+    if (typeof clearBuildPlanOverrideCloud === "function") {
+      await clearBuildPlanOverrideCloud(fgSku);
+    }
     refresh();
     return;
   }
-  const rounded = Math.round(n);   // step=1 in the input, but paranoia
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n < 0) { refresh(); return; }
+  const rounded = Math.round(n);
   if (rounded === 0) {
-    if (typeof clearBuildPlanTargetCloud === "function") {
-      await clearBuildPlanTargetCloud(fgSku);
+    if (typeof clearBuildPlanOverrideCloud === "function") {
+      await clearBuildPlanOverrideCloud(fgSku);
     }
   } else {
-    if (typeof setBuildPlanTargetCloud === "function") {
-      await setBuildPlanTargetCloud(fgSku, rounded);
+    if (typeof setBuildPlanOverrideCloud === "function") {
+      await setBuildPlanOverrideCloud(fgSku, rounded);
     }
   }
   refresh();
 }
 
-// "Clear all targets" — bulk delete. Behind gateDelete because
-// it wipes shared cloud state that other users may have entered.
-async function bpClearAll() {
+async function bpClearAllOverrides() {
   if (typeof gateDelete === "function" && !gateDelete()) return;
-  if (!(DB.buildPlanTargets instanceof Map)) return;
-  const skus = [...DB.buildPlanTargets.keys()];
-  if (!skus.length) { refresh(); return; }
-  for (const fgSku of skus) {
-    if (typeof clearBuildPlanTargetCloud === "function") {
-      await clearBuildPlanTargetCloud(fgSku);
-    }
+  if (typeof clearAllBuildPlanOverridesCloud === "function") {
+    await clearAllBuildPlanOverridesCloud();
   }
   refresh();
 }
@@ -117,48 +158,183 @@ function bpSetSort(key) {
   refresh();
 }
 
-function bpToggleShowAll()      { BUILD_PLAN_STATE.showAll = !BUILD_PLAN_STATE.showAll; refresh(); }
-function bpToggleShowZeros()    { BUILD_PLAN_STATE.showZeroTargets = !BUILD_PLAN_STATE.showZeroTargets; refresh(); }
-function bpSetSearch(v)         { BUILD_PLAN_STATE.search = String(v || "").trim().toLowerCase(); refresh(); }
+function bpToggleShowAll()          { BUILD_PLAN_STATE.showAll         = !BUILD_PLAN_STATE.showAll;         refresh(); }
+function bpToggleShowZeroMixFgs()   { BUILD_PLAN_STATE.showZeroMixFgs  = !BUILD_PLAN_STATE.showZeroMixFgs;  refresh(); }
+function bpSetSearch(v)             { BUILD_PLAN_STATE.search = String(v || "").trim().toLowerCase();      refresh(); }
 
 /* ============================================================
-   COMPUTATION
+   MIX COMPUTATION
 
-   For each FG with target > 0:
-     explode fgSku (memoized per FG within one computation pass)
+   Uses the SAME date basis as BOM Usage Weekly:
+     - parseDateLocal(released_date) — TZ-safe local midnight.
+     - mondayOfWeek(...) — Monday-anchored week bucket.
+   Window = [nowMonday − (windowWeeks × 7), nowMonday). The current
+   in-progress week is excluded — mix reflects completed weeks only,
+   so a partial week's undercount doesn't distort baseline/share.
+   ============================================================ */
+function _bpComputeMix(windowWeeks) {
+  const orders = Array.isArray(DB.productionOrders) ? DB.productionOrders : [];
+  const w = BUILD_PLAN_WINDOW_OPTIONS.includes(Number(windowWeeks)) ? Number(windowWeeks) : 8;
+  const now = new Date();
+  const nowMonday = (typeof mondayOfWeek === "function")
+    ? mondayOfWeek(now)
+    : (() => { const x = new Date(now); x.setHours(0,0,0,0); const s = (x.getDay() + 6) % 7; x.setDate(x.getDate() - s); return x; })();
+  const windowEnd = nowMonday.getTime();                          // exclusive
+  const windowStart = windowEnd - w * 7 * 86400000;               // inclusive
+
+  const byFg = new Map();
+  let totalUnits = 0;
+  let ordersConsidered = 0;
+  let ordersDropped = 0;
+
+  for (const o of orders) {
+    if (!o || !o.released_date || !o.fg_sku) continue;
+    const rel = (typeof parseDateLocal === "function")
+      ? parseDateLocal(o.released_date)
+      : new Date(o.released_date);
+    if (!rel || isNaN(rel.getTime())) { ordersDropped++; continue; }
+    const mon = (typeof mondayOfWeek === "function")
+      ? mondayOfWeek(rel)
+      : (() => { const x = new Date(rel); x.setHours(0,0,0,0); const s = (x.getDay() + 6) % 7; x.setDate(x.getDate() - s); return x; })();
+    const t = mon.getTime();
+    if (t < windowStart || t >= windowEnd) continue;
+    const qty = Number(o.qty_to_produce) || 0;
+    if (qty <= 0) continue;
+    ordersConsidered++;
+    totalUnits += qty;
+    byFg.set(o.fg_sku, (byFg.get(o.fg_sku) || 0) + qty);
+  }
+
+  // Attach share per FG. Zero-total window → shares all 0 (render
+  // will surface the "no history" state; distribute becomes a
+  // "all overrides, no mix" case).
+  const mix = new Map();
+  for (const [fgSku, units] of byFg.entries()) {
+    mix.set(fgSku, {
+      units,
+      share: totalUnits > 0 ? units / totalUnits : 0,
+    });
+  }
+
+  return {
+    byFg: mix,
+    totalUnits,
+    actualAvgPerWeek: w > 0 ? totalUnits / w : 0,
+    weeksCovered: w,
+    ordersConsidered,
+    ordersDropped,
+    windowStart: new Date(windowStart),
+    windowEnd: new Date(windowEnd),
+  };
+}
+
+/* ============================================================
+   DISTRIBUTION
+
+   Rule set:
+     1. Pinned sum = Σ over overrides of the override amount.
+        (Overrides for FGs not in mix STILL count as pinned —
+         a user pinning an FG with no historical mix means they
+         explicitly want that FG built.)
+     2. Remaining = max(0, target − pinnedSum).
+        - When pinned exceeds target, remaining is clamped to 0
+          (never negative) AND `overridesExceedTarget` = true so
+          the render can surface a warning.
+     3. Unpinned share denominator = Σ (share of FGs in mix that
+        are NOT pinned). If it's 0 (all mix FGs pinned, or mix
+        is empty), unpinned FGs all get 0.
+     4. Unpinned implied = remaining × (share / unpinnedShareSum).
+     5. Pinned implied = the override amount, verbatim.
+     6. FGs in FINISHED_GOODS that have neither a mix share nor an
+        override get 0 (still surfaced if Show-all is checked).
+   ============================================================ */
+function _bpDistributeTarget(mix, target, overrides) {
+  const overridesMap = overrides instanceof Map ? overrides : new Map();
+  const overridesTyped = new Map();
+  for (const [fgSku, v] of overridesMap.entries()) {
+    const q = Number(v && v.weeklyQty);
+    if (Number.isFinite(q) && q > 0) overridesTyped.set(fgSku, q);
+  }
+
+  let pinnedSum = 0;
+  for (const q of overridesTyped.values()) pinnedSum += q;
+
+  const targetNum = Math.max(0, Number(target) || 0);
+  const overridesExceedTarget = pinnedSum > targetNum && targetNum > 0;
+  const remaining = Math.max(0, targetNum - pinnedSum);
+
+  let unpinnedShareSum = 0;
+  for (const [fgSku, entry] of mix.entries()) {
+    if (overridesTyped.has(fgSku)) continue;
+    unpinnedShareSum += entry.share;
+  }
+
+  const implied = new Map();
+
+  for (const [fgSku, q] of overridesTyped.entries()) {
+    implied.set(fgSku, {
+      impliedWeekly: q,
+      share:         mix.get(fgSku) ? mix.get(fgSku).share : 0,
+      units:         mix.get(fgSku) ? mix.get(fgSku).units : 0,
+      isPinned:      true,
+      overrideQty:   q,
+    });
+  }
+
+  for (const [fgSku, entry] of mix.entries()) {
+    if (overridesTyped.has(fgSku)) continue;
+    const shareOfRemaining = unpinnedShareSum > 0 ? entry.share / unpinnedShareSum : 0;
+    implied.set(fgSku, {
+      impliedWeekly: remaining * shareOfRemaining,
+      share:         entry.share,
+      units:         entry.units,
+      isPinned:      false,
+      overrideQty:   null,
+    });
+  }
+
+  return {
+    implied,
+    pinnedSum,
+    remaining,
+    overridesExceedTarget,
+    unpinnedShareSum,
+    unpinnedCount: Math.max(0, mix.size - overridesTyped.size),
+    pinnedCount: overridesTyped.size,
+  };
+}
+
+/* ============================================================
+   COMPONENT DEMAND COMPUTATION (mix-driven)
+
+   For each FG with impliedWeekly > 0:
+     explode fgSku (memoized per FG)
      for each leaf:
-       plannedWeekly[leaf.pn] += leaf.qtyPerUnit × targetWeekly
+       plannedWeekly[leaf.pn] += leaf.qtyPerUnit × impliedWeekly
 
    Then per part:
-     plannedDaily = plannedWeekly / workdaysPerWeek
-     currentDaily = chainDisplayDaily(part)         (falls back
-                    to part.daily; matches Base BOM Queue /
-                    Model Year / Parts Catalog display)
+     plannedDaily = plannedWeekly ÷ wpw
+     currentDaily = chainDisplayDaily(part)
      delta        = plannedDaily − currentDaily
-     deltaPct     = delta / currentDaily            (Infinity when
-                    currentDaily is 0 and planned > 0)
-
-   Pure function of the mirror + explodeBOM + settings. Zero
-   writes anywhere. Grep-auditable: no "= " assignment against
-   any DB.parts[i] / part.daily / DB.usage.
+     deltaPct     = delta / currentDaily        (Infinity when 0/planned>0)
    ============================================================ */
 function computeBuildPlanDemand() {
   const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
-  const targets = new Map();   // fg_sku → weeklyQty
-  if (DB.buildPlanTargets instanceof Map) {
-    for (const [fgSku, t] of DB.buildPlanTargets.entries()) {
-      const q = Number(t && t.weeklyQty) || 0;
-      if (q > 0) targets.set(fgSku, q);
-    }
-  }
+  const settings = _bpSettings();
+  const mix = _bpComputeMix(settings.windowWeeks);
+  const overridesMap = (DB.buildPlanTargets && DB.buildPlanTargets.overrides) || new Map();
+  const dist = _bpDistributeTarget(mix.byFg, settings.targetPerWeek == null ? 0 : settings.targetPerWeek, overridesMap);
+
   const explodeCache = new Map();
   const byPart = new Map();
   const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
-  let totalWeeklyUnits = 0;
   const emptyBomFgs = [];
+  let totalWeeklyUnits = 0;
 
-  for (const [fgSku, weeklyQty] of targets) {
-    totalWeeklyUnits += weeklyQty;
+  for (const [fgSku, entry] of dist.implied.entries()) {
+    const wq = Number(entry.impliedWeekly) || 0;
+    if (wq <= 0) continue;
+    totalWeeklyUnits += wq;
     let expl = explodeCache.get(fgSku);
     if (!expl) {
       expl = (typeof explodeBOM === "function")
@@ -174,7 +350,7 @@ function computeBuildPlanDemand() {
       if (!leaf || !leaf.pn) continue;
       const per = Number(leaf.qtyPerUnit) || 0;
       if (per === 0) continue;
-      const weeklyContrib = per * weeklyQty;
+      const weeklyContrib = per * wq;
       let rec = byPart.get(leaf.pn);
       if (!rec) {
         const p = partsByPn.get(leaf.pn);
@@ -183,13 +359,13 @@ function computeBuildPlanDemand() {
           : (p ? (Number(p.daily) || 0) : 0);
         rec = {
           plannedWeekly: 0,
-          plannedDaily: 0,
+          plannedDaily:  0,
           currentDaily,
-          delta: 0,
-          deltaPct: 0,
+          delta:        0,
+          deltaPct:     0,
           contributors: [],
-          desc: (p && p.desc) || "",
-          inCatalog: !!p,
+          desc:         (p && p.desc) || "",
+          inCatalog:    !!p,
         };
         byPart.set(leaf.pn, rec);
       }
@@ -201,22 +377,19 @@ function computeBuildPlanDemand() {
   for (const rec of byPart.values()) {
     rec.plannedDaily = wpw > 0 ? rec.plannedWeekly / wpw : 0;
     rec.delta = rec.plannedDaily - rec.currentDaily;
-    if (rec.currentDaily > 0) {
-      rec.deltaPct = rec.delta / rec.currentDaily;
-    } else if (rec.plannedDaily > 0) {
-      rec.deltaPct = Infinity;
-    } else {
-      rec.deltaPct = 0;
-    }
+    if (rec.currentDaily > 0) rec.deltaPct = rec.delta / rec.currentDaily;
+    else rec.deltaPct = rec.plannedDaily > 0 ? Infinity : 0;
   }
 
   return {
     byPart,
     totalWeeklyUnits,
-    targetsUsed: targets.size,
     workdaysPerWeek: wpw,
     explodeCacheSize: explodeCache.size,
     emptyBomFgs,
+    settings,
+    mix,
+    dist,
   };
 }
 
@@ -225,19 +398,32 @@ function computeBuildPlanDemand() {
    ============================================================ */
 
 // Variable-precision daily formatter — same convention as
-// _buwDailyFmt in js/23-bom-usage-weekly.js: up to 3 decimals,
-// no forced trailing zeros. 0.123/d, 1.4/d, 2/d.
+// _buwDailyFmt in the BOM Usage Weekly tab (max 3 decimals, no
+// forced trailing zeros): 0.123/d, 1.4/d, 2/d.
 function _bpDailyFmt(n) {
   if (n == null || isNaN(n)) return "—";
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: 3 });
 }
 
-// Chassis-group key derived from the FG description's leading
-// token. FINISHED_GOODS is already ordered by chassis pair
-// (N6/T6, N7/U7, AMP/E7, base chassis), so grouping by
-// first-token gives natural section headers without adding a
-// tag field to the constant. Base chassis SKUs (JA27004+)
-// use e.g. "N7-U7" — kept intact as their own group.
+// Weekly formatter — integers when >= 1, one decimal below (implied
+// weeklies can be fractional under mix scaling: e.g. share 0.037 ×
+// remaining 10 = 0.37 units/wk).
+function _bpWeeklyFmt(n) {
+  if (n == null || isNaN(n)) return "—";
+  const x = Number(n);
+  if (x >= 1) return Math.round(x).toLocaleString();
+  return x.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function _bpPctFmt(share) {
+  if (share == null || isNaN(share)) return "—";
+  const pct = share * 100;
+  if (pct < 0.1 && pct > 0) return "<0.1%";
+  return pct.toLocaleString(undefined, { maximumFractionDigits: 1 }) + "%";
+}
+
+// Chassis-group key from the FG description's leading token.
+// FINISHED_GOODS is Engineering-ordered by chassis pair.
 function _bpChassisOf(fg) {
   const d = String((fg && fg.desc) || "").trim();
   const tok = d.split(/\s+/)[0] || "OTHER";
@@ -247,39 +433,63 @@ function _bpChassisOf(fg) {
 function renderBuildPlan() {
   const fgs = (typeof FINISHED_GOODS !== "undefined" && Array.isArray(FINISHED_GOODS)) ? FINISHED_GOODS : [];
   const result = computeBuildPlanDemand();
-  const { byPart, totalWeeklyUnits, targetsUsed, workdaysPerWeek: wpw, explodeCacheSize, emptyBomFgs } = result;
+  const { byPart, totalWeeklyUnits, workdaysPerWeek: wpw, emptyBomFgs, settings, mix, dist } = result;
 
-  // ---- Form rows, grouped by chassis token, with mirror-primed
-  //      values so a fresh render reflects the current cloud state.
+  // Prefill decision: if settings row is null AND we have a mix
+  // baseline, prefill the input's `value` with the rounded actual
+  // avg so a first-time user sees a defensible starting number
+  // (without persisting it — writes happen only when they commit
+  // via blur/Enter).
+  const targetDisplayed = settings.targetPerWeek != null
+    ? settings.targetPerWeek
+    : Math.round(mix.actualAvgPerWeek);
+  const targetIsPrefill = settings.targetPerWeek == null;
+
+  const overrideCount = dist.pinnedCount;
+
+  // ---- Form left panel: FG rows grouped by chassis ----
   const formHtml = (() => {
     if (!fgs.length) return `<div class="empty"><div class="empty-msg">FINISHED_GOODS is empty — nothing to plan against.</div></div>`;
     let currentGroup = null;
     const parts = [];
     for (const fg of fgs) {
       const grp = _bpChassisOf(fg);
+      const impl = dist.implied.get(fg.pn);
+      const inMix = mix.byFg.has(fg.pn);
+      const impliedWeekly = impl ? impl.impliedWeekly : 0;
+      const share = impl ? impl.share : 0;
+      const isPinned = impl ? impl.isPinned : false;
+      const overrideVal = _bpOverride(fg.pn);
+      if (!BUILD_PLAN_STATE.showZeroMixFgs && !inMix && !isPinned) continue;
+
       if (grp !== currentGroup) {
         if (currentGroup !== null) parts.push(`</div>`);
         parts.push(`<div class="bp-fg-group"><div class="bp-fg-grouphead mono muted tiny">${esc(grp)}</div>`);
         currentGroup = grp;
       }
-      const cur = _bpGetTarget(fg.pn);
-      if (!BUILD_PLAN_STATE.showZeroTargets && cur === 0) continue;
+
       const desc = fg.desc || "";
+      const impliedTxt = isPinned
+        ? `<span class="pill warn tiny" title="Pinned via override">pin ${_bpWeeklyFmt(impliedWeekly)}</span>`
+        : `<span class="mono tiny">${_bpWeeklyFmt(impliedWeekly)}</span>`;
       parts.push(`
-        <div class="bp-fg-row">
+        <div class="bp-fg-row ${isPinned ? "bp-pinned" : ""}" title="${esc(fg.pn)}${desc ? " — " + esc(desc) : ""}">
           <div class="bp-fg-pn mono">${esc(fg.pn)}</div>
-          <div class="bp-fg-desc muted tiny">${esc(desc.slice(0, 46))}</div>
+          <div class="bp-fg-desc muted tiny">${esc(desc.slice(0, 42))}</div>
+          <div class="bp-fg-share muted tiny mono right">${inMix ? _bpPctFmt(share) : "—"}</div>
+          <div class="bp-fg-implied right">${impliedTxt}<span class="muted tiny mono"> /wk</span></div>
           <input class="input bp-fg-input mono" type="number" step="1" min="0" inputmode="numeric"
-                 placeholder="0" value="${cur > 0 ? cur : ""}"
-                 onchange="bpHandleTargetInput('${esc(fg.pn)}', this.value)"
-                 title="Weekly units of ${esc(fg.pn)} to plan for. Blank or 0 clears the target.">
+                 placeholder="pin"
+                 value="${overrideVal != null ? overrideVal : ""}"
+                 onchange="bpHandleOverrideInput('${esc(fg.pn)}', this.value)"
+                 title="Pin ${esc(fg.pn)} to a specific units/week. Blank = no pin (use mix share).">
         </div>`);
     }
     if (currentGroup !== null) parts.push(`</div>`);
     return parts.join("");
   })();
 
-  // ---- Impact table rows.
+  // ---- Impact table (component demand) ----
   const partRowsAll = [...byPart.entries()]
     .map(([pn, rec]) => ({ pn, ...rec }))
     .filter(r => r.plannedDaily >= (Number(BUILD_PLAN_STATE.minPlannedDaily) || 0));
@@ -330,23 +540,35 @@ function renderBuildPlan() {
   }).join("");
 
   const emptyBomWarning = emptyBomFgs.length > 0
-    ? `<div class="muted tiny" style="margin-top:6px">${emptyBomFgs.length} FG${emptyBomFgs.length === 1 ? "" : "s"} in the plan explode to zero leaves (BOM missing): <span class="mono">${esc(emptyBomFgs.slice(0, 6).join(", "))}${emptyBomFgs.length > 6 ? ` +${emptyBomFgs.length - 6} more` : ""}</span></div>`
+    ? `<div class="text-warn tiny" style="margin-top:6px">${emptyBomFgs.length} FG${emptyBomFgs.length === 1 ? "" : "s"} in the plan explode to zero leaves (BOM missing): <span class="mono">${esc(emptyBomFgs.slice(0, 6).join(", "))}${emptyBomFgs.length > 6 ? ` +${emptyBomFgs.length - 6} more` : ""}</span></div>`
+    : "";
+
+  const overrideExceedsWarn = dist.overridesExceedTarget
+    ? `<div class="pill crit tiny" title="Pinned Σ ${dist.pinnedSum} exceeds target ${settings.targetPerWeek}. Remaining unpinned FGs distribute against 0 — increase target or reduce pins.">overrides exceed target</div>`
     : "";
 
   $("#main").innerHTML = `
     <style>
       .bp-basis { padding: 8px 12px; background: var(--bg-1); border-radius: 6px; margin-bottom: 12px; font-size: 12px; line-height: 1.5; color: var(--t2); }
       .bp-basis strong { color: var(--t1); }
-      .bp-layout { display: grid; grid-template-columns: minmax(320px, 380px) 1fr; gap: 14px; align-items: start; }
-      @media (max-width: 1100px) { .bp-layout { grid-template-columns: 1fr; } }
-      .bp-form-panel { max-height: calc(100vh - 340px); overflow-y: auto; }
+      .bp-header-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px; background: var(--bg-1); border-radius: 6px; margin-bottom: 12px; }
+      .bp-header-row label { font-size: 12px; color: var(--t2); }
+      .bp-target-input { width: 100px; font-size: 15px; padding: 4px 8px; text-align: right; font-variant-numeric: tabular-nums; }
+      .bp-prefill { color: var(--warn); font-weight: 500; }
+      .bp-baseline { font-size: 11px; color: var(--t3); font-family: var(--f-mono); }
+      .bp-header-row .grow { flex: 1; }
+      .bp-layout { display: grid; grid-template-columns: minmax(360px, 440px) 1fr; gap: 14px; align-items: start; }
+      @media (max-width: 1180px) { .bp-layout { grid-template-columns: 1fr; } }
+      .bp-form-panel { max-height: calc(100vh - 380px); overflow-y: auto; }
       .bp-fg-group { border-bottom: 1px solid var(--line-soft); padding-bottom: 6px; margin-bottom: 6px; }
       .bp-fg-grouphead { padding: 8px 12px 4px; letter-spacing: 0.08em; text-transform: uppercase; }
-      .bp-fg-row { display: grid; grid-template-columns: 82px 1fr 84px; gap: 8px; align-items: center; padding: 4px 12px; }
+      .bp-fg-row { display: grid; grid-template-columns: 82px 1fr 46px 82px 68px; gap: 6px; align-items: center; padding: 4px 12px; font-size: 11.5px; }
+      .bp-fg-row.bp-pinned { background: rgba(255,181,71,0.06); }
       .bp-fg-row:hover { background: var(--bg-hover); }
       .bp-fg-pn { font-weight: 500; color: var(--t1); }
-      .bp-fg-desc { line-height: 1.2; }
-      .bp-fg-input { padding: 4px 6px; text-align: right; font-variant-numeric: tabular-nums; }
+      .bp-fg-desc { line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bp-fg-share, .bp-fg-implied { text-align: right; font-variant-numeric: tabular-nums; }
+      .bp-fg-input { padding: 3px 6px; text-align: right; font-variant-numeric: tabular-nums; font-size: 11.5px; }
       .bp-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
       .bp-toolbar .search-input { flex: 0 0 240px; }
       .bp-toolbar .grow { flex: 1; }
@@ -356,15 +578,40 @@ function renderBuildPlan() {
       <div class="page-head">
         <div>
           <div class="page-title">Build Plan</div>
-          <div class="page-sub mono">${targetsUsed} FG TARGET${targetsUsed === 1 ? "" : "S"} · ${fmtNum(Math.round(totalWeeklyUnits))} UNITS/WK PLANNED · ${byPart.size} COMPONENT PART${byPart.size === 1 ? "" : "S"} IMPACTED · WPW ${wpw}</div>
+          <div class="page-sub mono">MIX-DRIVEN WHAT-IF · ${overrideCount} PIN${overrideCount === 1 ? "" : "S"} · ${byPart.size} COMPONENT PART${byPart.size === 1 ? "" : "S"} · WPW ${wpw}</div>
         </div>
         <div class="page-actions">
-          ${targetsUsed > 0 ? `<button class="btn danger" onclick="bpClearAll()">Clear all targets</button>` : ""}
+          ${overrideCount > 0 ? `<button class="btn danger" onclick="bpClearAllOverrides()">Clear overrides</button>` : ""}
         </div>
       </div>
 
+      <div class="bp-header-row">
+        <label style="display:flex;flex-direction:column;gap:2px">
+          <span>Target units/week</span>
+          <input id="bp-target" class="input bp-target-input mono ${targetIsPrefill ? "bp-prefill" : ""}"
+                 type="number" step="1" min="0" inputmode="numeric"
+                 value="${targetDisplayed}"
+                 title="Total units/week to plan across the finished-good mix. Blank or 0 clears the plan.${targetIsPrefill ? " (Shown value is the actual-avg prefill — not yet saved.)" : ""}"
+                 onchange="bpHandleTargetInput(this.value)">
+        </label>
+        <div class="bp-baseline">
+          Last ${settings.windowWeeks} wks actual:<br>
+          <strong>${fmtNum(Math.round(mix.actualAvgPerWeek))}</strong> units/wk avg
+          · ${mix.ordersConsidered} orders · ${fmtNum(Math.round(mix.totalUnits))} units total
+        </div>
+        <button class="btn" onclick="bpLoadBaselineAsTarget()" title="Copy the actual-avg baseline into the target input">Use baseline as target</button>
+        <label style="display:flex;flex-direction:column;gap:2px">
+          <span>Mix window</span>
+          <select class="select" onchange="bpHandleWindowChange(this.value)">
+            ${BUILD_PLAN_WINDOW_OPTIONS.map(w => `<option value="${w}" ${settings.windowWeeks === w ? "selected" : ""}>Last ${w} wks</option>`).join("")}
+          </select>
+        </label>
+        <div class="grow"></div>
+        ${overrideExceedsWarn}
+      </div>
+
       <div class="bp-basis">
-        <strong>Basis:</strong> Enter target units/week per finished good. Component demand explodes through <em>DB.bomLinks</em> (daily Acumatica BOM sync). Planned daily = <em>Σ(target × qty/unit) ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. This tab is <strong>view-only for parts math</strong> — targets persist to the shared build_plan_targets sidecar, but nothing here writes to part.daily or triggers a queue re-computation.
+        <strong>Basis:</strong> Historical model mix from <em>DB.productionOrders</em>, bucketed by <strong>RELEASED date</strong> (Monday-anchored weeks, same as BOM Usage Weekly). Each FG's implied weekly = <em>target × (share of last ${settings.windowWeeks} weeks' units)</em>. Pinned FGs use their override amount and are excluded from mix scaling; the remainder distributes across unpinned FGs by their normalized shares. Planned daily = <em>implied weekly ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. <strong>View-only for parts math</strong>: nothing here writes part.daily or triggers a queue re-computation.
         ${emptyBomWarning}
       </div>
 
@@ -372,15 +619,17 @@ function renderBuildPlan() {
 
         <div class="panel bp-form-panel">
           <div class="panel-head">
-            <div class="panel-title">Targets · units per week</div>
-            <div class="panel-sub">${fgs.length} finished goods${targetsUsed > 0 ? ` · ${targetsUsed} set` : ""}</div>
+            <div class="panel-title">Finished goods · mix + pins</div>
+            <div class="panel-sub">${mix.byFg.size} FG${mix.byFg.size === 1 ? "" : "s"} in mix${overrideCount > 0 ? ` · ${overrideCount} pinned` : ""}</div>
           </div>
           <div class="panel-body flush">
-            <div style="padding:8px 12px;display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--line)">
+            <div style="padding:8px 12px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--line);font-size:11px;color:var(--t3)">
               <label class="muted tiny" style="display:flex;gap:6px;align-items:center;cursor:pointer">
-                <input type="checkbox" ${BUILD_PLAN_STATE.showZeroTargets ? "checked" : ""} onchange="bpToggleShowZeros()">
-                Show all 91 FGs
+                <input type="checkbox" ${BUILD_PLAN_STATE.showZeroMixFgs ? "checked" : ""} onchange="bpToggleShowZeroMixFgs()">
+                Show FGs with zero history
               </label>
+              <div class="grow" style="flex:1"></div>
+              <span class="mono">share · implied · pin</span>
             </div>
             ${formHtml}
           </div>
@@ -389,7 +638,7 @@ function renderBuildPlan() {
         <div class="panel">
           <div class="panel-head">
             <div class="panel-title">Component demand</div>
-            <div class="panel-sub">${totalMatched} of ${byPart.size} impacted parts${q ? ` · matching "${esc(q)}"` : ""}${truncated > 0 ? ` · showing top ${shownRows.length}` : ""}</div>
+            <div class="panel-sub">${totalMatched} of ${byPart.size} impacted parts${q ? ` · matching "${esc(q)}"` : ""}${truncated > 0 ? ` · showing top ${shownRows.length}` : ""}${totalWeeklyUnits > 0 ? ` · plan total ${_bpWeeklyFmt(totalWeeklyUnits)} units/wk` : ""}</div>
           </div>
           <div class="bp-toolbar" style="padding:8px 12px">
             <div class="search-input">
@@ -415,7 +664,7 @@ function renderBuildPlan() {
                 </thead>
                 <tbody>
                   ${byPart.size === 0
-                    ? `<tr><td colspan="6"><div class="empty"><div class="empty-title">No targets yet</div><div class="empty-msg">Enter weekly units for one or more finished goods on the left. Component demand rolls up here as the numbers explode through their BOMs.</div></div></td></tr>`
+                    ? `<tr><td colspan="6"><div class="empty"><div class="empty-title">${settings.targetPerWeek == null && mix.totalUnits === 0 ? "No production history yet" : "No component demand"}</div><div class="empty-msg">${settings.targetPerWeek == null && mix.totalUnits === 0 ? "The last " + settings.windowWeeks + " weeks contain no production orders. Either the sync hasn't run or the released dates fall outside the window." : "Enter a target above and pin any FGs you want to build at a specific rate. Component demand rolls up here."}</div></div></td></tr>`
                     : (shownRows.length === 0
                         ? `<tr><td colspan="6" class="muted tiny" style="padding:12px;text-align:center">No parts match the current filter.</td></tr>`
                         : partsBody)}
@@ -428,12 +677,9 @@ function renderBuildPlan() {
       </div>
     </div>`;
 
-  // Loaded token for live check — set on every successful render.
-  // A page refresh replaces innerHTML but re-runs this line, so the
-  // token stays present as long as the tab is the active route.
-  // Consumers: `String(window.BUILD_PLAN_LOADED)` or the more
-  // specific check in this ticket.
-  window.BUILD_PLAN_LOADED = "build-plan-v1-loaded";
+  // Loaded token for live check — v2 for cache-diagnosis. Set on
+  // every render so a stale-cache tab is easy to spot.
+  window.BUILD_PLAN_LOADED = "build-plan-v2-loaded";
 }
 
 registerRoute("build-plan", renderBuildPlan);

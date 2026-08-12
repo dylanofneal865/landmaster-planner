@@ -608,13 +608,17 @@ window.deletePartRowCloud = deletePartRowCloud;
 window.upsertPartCloud = upsertPartCloud;
 
 // Paginated fetch of all build_plan_targets rows. Sidecar table (NOT
-// on the realtime publication — poll-only) that stores a per-FG
-// weekly-units target driving the "Build Plan" tab's what-if daily
-// rollup. Populated by cloudInit + _catchupFetch; written by
-// setBuildPlanTargetCloud / clearBuildPlanTargetCloud (below). Mirror
-// shape: DB.buildPlanTargets = Map<fg_sku, {weeklyQty, updatedAt,
-// updatedBy}>. Server-owned schema; client never mutates the mirror
-// directly except via the two write helpers.
+// on the realtime publication — poll-only) that stores the Build Plan
+// tab's shared state:
+//   - A sentinel row with fg_sku='__settings__' whose `data` jsonb holds
+//     {targetPerWeek, windowWeeks} — the tab-wide input + mix window.
+//   - Zero or more regular rows (fg_sku ≠ '__settings__') whose
+//     weekly_qty is that FG's manual override (pin) in units-per-week.
+// Populated by cloudInit + _catchupFetch. Client mirror shape:
+//   DB.buildPlanTargets = {
+//     settings: {targetPerWeek, windowWeeks, updatedAt} | null,
+//     overrides: Map<fg_sku, {weeklyQty, updatedAt, updatedBy}>,
+//   }
 async function _fetchAllBuildPlanTargets() {
   if (!_supa) return [];
   const all = [];
@@ -623,7 +627,7 @@ async function _fetchAllBuildPlanTargets() {
   while (true) {
     const { data, error } = await _supa
       .from("build_plan_targets")
-      .select("fg_sku, weekly_qty, updated_at, updated_by")
+      .select("fg_sku, weekly_qty, data, updated_at, updated_by")
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] build_plan_targets page fetch failed:", error);
@@ -637,16 +641,36 @@ async function _fetchAllBuildPlanTargets() {
   return all;
 }
 
-// Populate DB.buildPlanTargets from a fetched-row array. Shared by
-// cloudInit and _catchupFetch — same mutation semantics either way
-// (clear in place, refill in place; never reassign the Map reference).
+// Populate DB.buildPlanTargets from a fetched-row array. Splits the
+// sentinel settings row from regular per-FG override rows. Mutates
+// the mirror in place — the outer object is only assigned once (on
+// first call); the overrides Map is cleared+refilled per app
+// convention so any UI holding a reference stays valid.
+//
+// Reading a v1 row (no `data` column populated, plain per-FG weekly_qty
+// interpreted as "the plan for that FG") lands here as an override —
+// which is the correct semantic under v2. Existing rows silently
+// become pinned overrides; no data migration needed.
 function _populateBuildPlanTargetsFromRows(rows) {
-  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
-  DB.buildPlanTargets.clear();
+  if (!DB.buildPlanTargets || !(DB.buildPlanTargets.overrides instanceof Map)) {
+    DB.buildPlanTargets = { settings: null, overrides: new Map() };
+  }
+  DB.buildPlanTargets.settings = null;
+  DB.buildPlanTargets.overrides.clear();
   if (!Array.isArray(rows)) return;
   for (const row of rows) {
     if (!row || !row.fg_sku) continue;
-    DB.buildPlanTargets.set(String(row.fg_sku), {
+    const key = String(row.fg_sku);
+    if (key === "__settings__") {
+      const d = row.data || {};
+      DB.buildPlanTargets.settings = {
+        targetPerWeek: Number(d.targetPerWeek) || 0,
+        windowWeeks:   Number(d.windowWeeks)   || 8,
+        updatedAt:     row.updated_at || null,
+      };
+      continue;
+    }
+    DB.buildPlanTargets.overrides.set(key, {
       weeklyQty: Number(row.weekly_qty) || 0,
       updatedAt: row.updated_at || null,
       updatedBy: row.updated_by || null,
@@ -654,23 +678,58 @@ function _populateBuildPlanTargetsFromRows(rows) {
   }
 }
 
-// Upsert a build-plan target. Last-write-wins per fg_sku via
-// onConflict:"fg_sku" — a concurrent session writing a different
-// weekly_qty for the same SKU is a genuine conflict (build plan is
-// shared state, not per-user), and last write is the intent we want.
-// Optimistic mirror update BEFORE the RPC so the UI reflects the
-// change immediately; reverts on failure. Fire-and-forget from the
-// caller's perspective — the render pass reads whatever's in the
-// mirror right now.
-async function setBuildPlanTargetCloud(fgSku, weeklyQty) {
+// Upsert the tab-wide settings sentinel row. Last-write-wins per the
+// primary key ('__settings__') — Build Plan is shared state, so a
+// concurrent session writing a different target is a genuine conflict
+// and the later write is the intent to accept. Optimistic mirror
+// update BEFORE the RPC so the UI reflects the change immediately;
+// reverts on failure.
+async function setBuildPlanSettingsCloud({ targetPerWeek, windowWeeks }) {
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
-  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+  if (!DB.buildPlanTargets) DB.buildPlanTargets = { settings: null, overrides: new Map() };
+  const t = Number(targetPerWeek);
+  const w = Number(windowWeeks);
+  if (!Number.isFinite(t) || t < 0) return { ok: false, error: new Error("invalid targetPerWeek") };
+  if (!Number.isFinite(w) || w <= 0) return { ok: false, error: new Error("invalid windowWeeks") };
+  const nowIso = new Date().toISOString();
+  const prev = DB.buildPlanTargets.settings;
+  const nextSettings = { targetPerWeek: t, windowWeeks: w, updatedAt: nowIso };
+  DB.buildPlanTargets.settings = nextSettings;
+  const { error } = await _supa
+    .from("build_plan_targets")
+    .upsert(
+      {
+        fg_sku:     "__settings__",
+        weekly_qty: 0,          // sentinel — not read; column is NOT NULL
+        data:       { targetPerWeek: t, windowWeeks: w },
+        updated_at: nowIso,
+      },
+      { onConflict: "fg_sku" }
+    );
+  if (error) {
+    DB.buildPlanTargets.settings = prev;
+    console.error("[cloud] build_plan_targets settings upsert failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Build-plan settings save failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+// Upsert a per-FG override (pin). Regular per-FG row — the `data`
+// column is left null so a plain SELECT can distinguish overrides
+// from the sentinel row by the presence/absence of `data`.
+async function setBuildPlanOverrideCloud(fgSku, weeklyQty) {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!DB.buildPlanTargets) DB.buildPlanTargets = { settings: null, overrides: new Map() };
   const key = String(fgSku);
+  if (key === "__settings__") return { ok: false, error: new Error("reserved key") };
   const q = Number(weeklyQty);
   if (!Number.isFinite(q) || q < 0) return { ok: false, error: new Error("invalid qty") };
   const nowIso = new Date().toISOString();
-  const prev = DB.buildPlanTargets.get(key);
-  DB.buildPlanTargets.set(key, {
+  const prev = DB.buildPlanTargets.overrides.get(key);
+  DB.buildPlanTargets.overrides.set(key, {
     weeklyQty: q,
     updatedAt: nowIso,
     updatedBy: prev ? prev.updatedBy : null,
@@ -678,47 +737,74 @@ async function setBuildPlanTargetCloud(fgSku, weeklyQty) {
   const { error } = await _supa
     .from("build_plan_targets")
     .upsert(
-      { fg_sku: key, weekly_qty: q, updated_at: nowIso },
+      { fg_sku: key, weekly_qty: q, data: null, updated_at: nowIso },
       { onConflict: "fg_sku" }
     );
   if (error) {
-    // Revert the optimistic write so the mirror stays consistent
-    // with what the server actually holds.
-    if (prev) DB.buildPlanTargets.set(key, prev);
-    else DB.buildPlanTargets.delete(key);
-    console.error("[cloud] build_plan_targets upsert failed:", error);
+    if (prev) DB.buildPlanTargets.overrides.set(key, prev);
+    else DB.buildPlanTargets.overrides.delete(key);
+    console.error("[cloud] build_plan_targets override upsert failed:", error);
     if (typeof showToast === "function") {
-      showToast("Build-plan target save failed: " + error.message, "crit");
+      showToast("Build-plan override save failed: " + error.message, "crit");
     }
     return { ok: false, error };
   }
   return { ok: true };
 }
 
-// Delete a target row. Same optimistic-then-revert pattern.
-async function clearBuildPlanTargetCloud(fgSku) {
+// Delete a single override row. Optimistic-then-revert. Never
+// touches the settings sentinel — the caller shouldn't ever pass
+// '__settings__' here, but the guard makes it safe.
+async function clearBuildPlanOverrideCloud(fgSku) {
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
-  if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+  if (!DB.buildPlanTargets) DB.buildPlanTargets = { settings: null, overrides: new Map() };
   const key = String(fgSku);
-  const prev = DB.buildPlanTargets.get(key);
-  DB.buildPlanTargets.delete(key);
+  if (key === "__settings__") return { ok: false, error: new Error("reserved key") };
+  const prev = DB.buildPlanTargets.overrides.get(key);
+  DB.buildPlanTargets.overrides.delete(key);
   const { error } = await _supa
     .from("build_plan_targets")
     .delete()
     .eq("fg_sku", key);
   if (error) {
-    if (prev) DB.buildPlanTargets.set(key, prev);
-    console.error("[cloud] build_plan_targets delete failed:", error);
+    if (prev) DB.buildPlanTargets.overrides.set(key, prev);
+    console.error("[cloud] build_plan_targets override delete failed:", error);
     if (typeof showToast === "function") {
-      showToast("Build-plan target clear failed: " + error.message, "crit");
+      showToast("Build-plan override clear failed: " + error.message, "crit");
     }
     return { ok: false, error };
   }
   return { ok: true };
 }
 
-window.setBuildPlanTargetCloud   = setBuildPlanTargetCloud;
-window.clearBuildPlanTargetCloud = clearBuildPlanTargetCloud;
+// Delete every override in one call. Sentinel settings row is
+// preserved by the .neq filter — settings and overrides are
+// independent lifecycles. Optimistic-then-revert on the whole batch.
+async function clearAllBuildPlanOverridesCloud() {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!DB.buildPlanTargets) DB.buildPlanTargets = { settings: null, overrides: new Map() };
+  if (DB.buildPlanTargets.overrides.size === 0) return { ok: true };
+  const prev = new Map(DB.buildPlanTargets.overrides);
+  DB.buildPlanTargets.overrides.clear();
+  const { error } = await _supa
+    .from("build_plan_targets")
+    .delete()
+    .neq("fg_sku", "__settings__");
+  if (error) {
+    for (const [k, v] of prev) DB.buildPlanTargets.overrides.set(k, v);
+    console.error("[cloud] build_plan_targets clear-all overrides failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Clear overrides failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+window.setBuildPlanSettingsCloud       = setBuildPlanSettingsCloud;
+window.setBuildPlanOverrideCloud       = setBuildPlanOverrideCloud;
+window.clearBuildPlanOverrideCloud     = clearBuildPlanOverrideCloud;
+window.clearAllBuildPlanOverridesCloud = clearAllBuildPlanOverridesCloud;
 
 // Paginated fetch of all queue_entries rows. Sidecar table (not on the
 // realtime publication — poll-only) that stores the first-ever-in-queue
@@ -1067,20 +1153,23 @@ async function cloudInit() {
     if (!Array.isArray(DB.productionOrders)) DB.productionOrders = [];
   }
 
-  // ---- Build Plan targets (shared what-if input) ----
-  // Sidecar table populated by setBuildPlanTargetCloud /
-  // clearBuildPlanTargetCloud user actions. Read-only from the
-  // render side of the Build Plan tab — the mirror always reflects
-  // what's authoritative in Supabase. Not in the realtime
-  // publication; a reconnect catchup re-fetches so a concurrent
-  // edit from another session lands on the next reconnect.
+  // ---- Build Plan (shared what-if input) ----
+  // Sidecar table split into two roles by _populateBuildPlanTargetsFromRows:
+  //   - '__settings__' sentinel row → DB.buildPlanTargets.settings
+  //   - all other rows → DB.buildPlanTargets.overrides (Map<fg_sku, ...>)
+  // Poll-only. NOT in the realtime publication; a reconnect catchup
+  // re-fetches so a concurrent edit from another session lands on the
+  // next reconnect.
   const cloudBuildPlanTargets = await _fetchAllBuildPlanTargets();
   if (cloudBuildPlanTargets !== null) {
     _populateBuildPlanTargetsFromRows(cloudBuildPlanTargets);
-    console.log(`[cloud] loaded ${DB.buildPlanTargets.size} build_plan_targets row(s)`);
+    const s = DB.buildPlanTargets.settings;
+    console.log(`[cloud] loaded build_plan_targets: ${DB.buildPlanTargets.overrides.size} override(s), settings=${s ? `target ${s.targetPerWeek}/wk, window ${s.windowWeeks}wk` : "unset"}`);
   } else {
     console.warn("[cloud] build_plan_targets fetch failed; DB.buildPlanTargets may be empty this session");
-    if (!(DB.buildPlanTargets instanceof Map)) DB.buildPlanTargets = new Map();
+    if (!DB.buildPlanTargets || !(DB.buildPlanTargets.overrides instanceof Map)) {
+      DB.buildPlanTargets = { settings: null, overrides: new Map() };
+    }
   }
 
   _cloudReady = true;
