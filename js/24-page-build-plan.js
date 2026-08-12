@@ -397,22 +397,21 @@ function computeBuildPlanDemand() {
    RENDER
    ============================================================ */
 
-// Variable-precision daily formatter — same convention as
-// _buwDailyFmt in the BOM Usage Weekly tab (max 3 decimals, no
-// forced trailing zeros): 0.123/d, 1.4/d, 2/d.
-function _bpDailyFmt(n) {
-  if (n == null || isNaN(n)) return "—";
-  return Number(n).toLocaleString(undefined, { maximumFractionDigits: 3 });
-}
+// Daily formatter — reuses _buwDailyFmt from js/23-bom-usage-weekly.js
+// (loaded before this module per index.html script order). Max 3
+// decimals, no forced trailing zeros: 0.123/d, 1.4/d, 2/d. Kept as a
+// shared helper so the two tabs' daily-precision convention can't
+// drift.
 
-// Weekly formatter — integers when >= 1, one decimal below (implied
-// weeklies can be fractional under mix scaling: e.g. share 0.037 ×
-// remaining 10 = 0.37 units/wk).
+// Weekly formatter — variable precision up to 2 decimals with no
+// forced trailing zeros: 0.31/wk, 5.7/wk, 25/wk. Was previously
+// integer-rounding for values ≥ 1 (`if (x >= 1) return Math.round(x)`),
+// which showed "26" for a mix-derived 25.7/wk and "5" for 5.05/wk.
+// Fixed to unconditional max 2 decimals — the underlying implied
+// weekly is never rounded upstream, so this is now display-only.
 function _bpWeeklyFmt(n) {
   if (n == null || isNaN(n)) return "—";
-  const x = Number(n);
-  if (x >= 1) return Math.round(x).toLocaleString();
-  return x.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 function _bpPctFmt(share) {
@@ -526,15 +525,15 @@ function renderBuildPlan() {
       .slice()
       .sort((a, b) => b.weeklyContrib - a.weeklyContrib)
       .slice(0, 8)
-      .map(c => `${c.fgSku}: ${_bpDailyFmt(c.dailyContrib)}/d`)
+      .map(c => `${c.fgSku}: ${_buwDailyFmt(c.dailyContrib)}/d`)
       .join("\n");
     return `
       <tr>
         <td class="pn mono clickable" onclick="openPartDetail('${esc(r.pn)}')">${esc(r.pn)}${r.inCatalog ? "" : ' <span class="pill muted tiny">not in catalog</span>'}</td>
         <td class="muted tiny">${esc((r.desc || "").slice(0, 48))}</td>
-        <td class="right num mono">${_bpDailyFmt(r.currentDaily)}/d</td>
-        <td class="right num mono bold" title="${esc(contribTip)}">${_bpDailyFmt(r.plannedDaily)}/d</td>
-        <td class="right num mono ${deltaCls}">${r.delta > 0 ? "+" : ""}${_bpDailyFmt(r.delta)}/d</td>
+        <td class="right num mono">${_buwDailyFmt(r.currentDaily)}/d</td>
+        <td class="right num mono bold" title="${esc(contribTip)}">${_buwDailyFmt(r.plannedDaily)}/d</td>
+        <td class="right num mono ${deltaCls}">${r.delta > 0 ? "+" : ""}${_buwDailyFmt(r.delta)}/d</td>
         <td class="right num muted tiny">${r.contributors.length} FG${r.contributors.length === 1 ? "" : "s"}</td>
       </tr>`;
   }).join("");
