@@ -27,8 +27,8 @@ function computeFollowUps(minDays) {
   // legacy `> FOLLOWUP_DAYS` semantics — a line at exactly minDays is
   // NOT included). Defaults to FOLLOWUP_DAYS (10) so no-arg callers keep
   // the same behavior — currently the dashboard panel's inline scan.
-  // The Follow-Ups page AND the sidebar badge both pass an explicit 1
-  // ("overdue = >1 day late") so they can't drift.
+  // The Follow-Ups page AND the sidebar badge both pass an explicit 0
+  // ("overdue = 1+ days late") so they can't drift.
   const floor = (typeof minDays === "number" && isFinite(minDays)) ? minDays : FOLLOWUP_DAYS;
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const statsByPn = new Map(stats.map(p => [p.pn, p]));
@@ -73,14 +73,14 @@ function computeFollowUps(minDays) {
   return followUps;
 }
 
-// Nav-badge count — overdue open-PO lines (daysPastDue > 1). Uses the same
-// computeFollowUps predicate as the Follow-Ups page (which also passes 1
+// Nav-badge count — overdue open-PO lines (daysPastDue > 0). Uses the same
+// computeFollowUps predicate as the Follow-Ups page (which also passes 0
 // after the "Days late >" toolbar input was removed), so badge === page
 // header count by construction. FOLLOWUP_DAYS stays untouched — it still
 // drives the dashboard panel filter/label (js/06-page-dashboard.js:109,
 // :294) intentionally, on its own separate threshold.
 function followUpCount() {
-  try { return computeFollowUps(1).length; } catch (e) { return 0; }
+  try { return computeFollowUps(0).length; } catch (e) { return 0; }
 }
 
 // Group flat follow-ups by supplier. Lines sorted worst-first within a group;
@@ -1170,7 +1170,7 @@ function renderFollowUps() {
   // Overdue = daysPastDue > 1. Pinned floor (previously user-tunable via
   // the removed "Days late >" toolbar input) — matches followUpCount()
   // exactly so the sidebar badge and this header can never drift.
-  const all = computeFollowUps(1);
+  const all = computeFollowUps(0);
   const total = all.length;
   const chasedCount = all.reduce((n, fu) => n + (isPartPoHandled(fu.pn, fu.po.id) ? 1 : 0), 0);
 
