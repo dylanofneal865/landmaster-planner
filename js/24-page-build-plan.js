@@ -730,10 +730,10 @@ registerRoute("build-plan", renderBuildPlan);
    mutated.
    ============================================================ */
 
-let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc" };
+let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {} };
 
 function _bpApplyReset() {
-  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc" };
+  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {} };
 }
 
 function _bpApplyDupChildren() {
@@ -900,14 +900,16 @@ function _bpApplyRenderBody() {
   const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
   const arrow = (k) => sortKey === k ? (sortDir === 1 ? " &#9650;" : " &#9660;") : "";
 
-  const renderTable = (list, bucket, showBulk) => {
+  const renderTable = (list, bucket) => {
     if (!list.length) return `<div class="muted tiny" style="padding:10px">No rows.</div>`;
-    const bulk = showBulk
-      ? `<div style="display:flex;gap:8px;margin:6px 0">
-           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', true)">Check all outliers</button>
-           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', false)">Uncheck all outliers</button>
-         </div>`
-      : "";
+    // Bulk buttons scope to "visible" — the whole bucket in
+    // current sort order (no filter narrows what's rendered
+    // within a bucket, so "visible" == "all rows in this table").
+    const bulk = `<div style="display:flex;gap:8px;margin:6px 0">
+           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', true)">Check visible</button>
+           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', false)">Uncheck visible</button>
+           <span class="muted tiny" style="align-self:center">Tip: Shift+click a row to toggle the range from the last click.</span>
+         </div>`;
     // Sort a shallow copy so the bucket array (shared with the
     // apply/count paths) stays in insertion order.
     const sorted = list.slice().sort((a, b) => _bpApplyCompare(a, b, sortKey) * sortDir);
@@ -922,8 +924,12 @@ function _bpApplyRenderBody() {
       const tags = [];
       if (r.dup) tags.push(`<span class="pill warn tiny">dup BOM</span>`);
       if (r.zeroOut) tags.push(`<span class="pill muted tiny">zero-out</span>`);
+      // onclick (not onchange) so the event object is available
+      // for shiftKey detection in bpApplyToggle. data-pn lets
+      // targeted DOM patches find the checkbox without re-
+      // rendering the whole table.
       return `<tr>
-        <td><input type="checkbox" ${checked ? "checked" : ""} onchange="bpApplyToggle('${esc(r.pn)}', this.checked)"></td>
+        <td><input type="checkbox" ${checked ? "checked" : ""} data-pn="${esc(r.pn)}" data-bucket="${bucket}" onclick="bpApplyToggle('${esc(r.pn)}', this.checked, event)"></td>
         <td class="pn mono">${esc(r.pn)}</td>
         <td class="muted tiny">${esc((r.desc || "").slice(0, 42))}</td>
         <td class="right num mono">${_buwDailyFmt(r.current)}/d</td>
@@ -934,7 +940,7 @@ function _bpApplyRenderBody() {
       </tr>`;
     }).join("");
     return `${bulk}
-      <div class="tbl-wrap" style="max-height:340px;overflow:auto">
+      <div id="bp-apply-${bucket}-wrap" class="tbl-wrap" style="max-height:340px;overflow:auto">
         <table class="tbl">
           <thead><tr>
             <th></th>
@@ -951,8 +957,8 @@ function _bpApplyRenderBody() {
       </div>`;
   };
 
-  const outliersHtml = renderTable(buckets.outlier, "outlier", true);
-  const autoHtml = renderTable(buckets.auto, "auto", false);
+  const outliersHtml = renderTable(buckets.outlier, "outlier");
+  const autoHtml = renderTable(buckets.auto, "auto");
 
   return `
     ${dupBanner}
@@ -980,17 +986,84 @@ function _bpApplyRenderBody() {
   `;
 }
 
+// Capture/restore each table's scrollTop across a body re-render.
+// Threshold + sort + bulk-visible all go through _bpApplyRerender,
+// which replaces innerHTML and rebuilds both wraps from scratch.
+// Without capture+restore the user is thrown back to the top of
+// both tables. Single-row checkbox toggles avoid this entirely by
+// patching counts/button only (bpApplyToggle) — no re-render.
+function _bpApplyCaptureScrollTops() {
+  const tops = {};
+  const outWrap = document.getElementById("bp-apply-outlier-wrap");
+  const autoWrap = document.getElementById("bp-apply-auto-wrap");
+  if (outWrap) tops.outlier = outWrap.scrollTop;
+  if (autoWrap) tops.auto = autoWrap.scrollTop;
+  return tops;
+}
+
+function _bpApplyRestoreScrollTops(tops) {
+  if (!tops) return;
+  const outWrap = document.getElementById("bp-apply-outlier-wrap");
+  const autoWrap = document.getElementById("bp-apply-auto-wrap");
+  if (outWrap && tops.outlier != null) outWrap.scrollTop = tops.outlier;
+  if (autoWrap && tops.auto != null) autoWrap.scrollTop = tops.auto;
+}
+
+// Single snapshot of buckets + per-bucket sort order. Callers that
+// need to know the current visible order of a bucket (shift-range,
+// bulk-visible, bucket lookup by pn) share this instead of re-
+// running _bpApplyBuildRows() three times per handler.
+function _bpApplyBucketsAndSort() {
+  const { rows } = _bpApplyBuildRows();
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
+  const cmp = (a, b) => _bpApplyCompare(a, b, _bpApply.sortKey) * sortDir;
+  return {
+    buckets,
+    sortedByBucket: {
+      outlier: buckets.outlier.slice().sort(cmp),
+      auto:    buckets.auto.slice().sort(cmp),
+    },
+  };
+}
+
+function _bpApplyBucketOf(pn, sortedByBucket) {
+  if (sortedByBucket.outlier.some(r => r.pn === pn)) return "outlier";
+  if (sortedByBucket.auto.some(r => r.pn === pn)) return "auto";
+  return null;
+}
+
+// Patch the "Apply N rates" button label + disabled state in place.
+// Called on every user action that changes _bpApply.touched. Pass
+// buckets when you already have them to avoid recomputing.
+function _bpApplyPatchCounts(buckets) {
+  const btn = document.getElementById("bp-apply-btn");
+  if (!btn) return;
+  if (!buckets) {
+    const snap = _bpApplyBucketsAndSort();
+    buckets = snap.buckets;
+  }
+  const n = _bpApplyCurrentCheckedCount(buckets);
+  btn.textContent = `Apply ${n} rate${n === 1 ? "" : "s"}`;
+  btn.disabled = n === 0;
+}
+
+function _bpApplyUpdateCheckboxDom(pns, checked) {
+  const set = new Set(pns);
+  const bodyEl = document.getElementById("bp-apply-body");
+  if (!bodyEl) return;
+  const boxes = bodyEl.querySelectorAll('input[type=checkbox][data-pn]');
+  for (const box of boxes) {
+    if (set.has(box.getAttribute("data-pn"))) box.checked = !!checked;
+  }
+}
+
 function _bpApplyRerender() {
+  const tops = _bpApplyCaptureScrollTops();
   const bodyEl = document.getElementById("bp-apply-body");
   if (bodyEl) bodyEl.innerHTML = _bpApplyRenderBody();
-  const btn = document.getElementById("bp-apply-btn");
-  if (btn) {
-    const { rows } = _bpApplyBuildRows();
-    const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
-    const n = _bpApplyCurrentCheckedCount(buckets);
-    btn.textContent = `Apply ${n} rate${n === 1 ? "" : "s"}`;
-    btn.disabled = n === 0;
-  }
+  _bpApplyRestoreScrollTops(tops);
+  _bpApplyPatchCounts();
 }
 
 function bpApplySetThreshold(v) {
@@ -999,15 +1072,57 @@ function bpApplySetThreshold(v) {
   _bpApplyRerender();
 }
 
-function bpApplyToggle(pn, checked) {
+function bpApplyToggle(pn, checked, ev) {
+  // Shift-click: apply the clicked checkbox's new state to every
+  // row between it and the last-clicked checkbox in the same
+  // bucket (email-client range select).
+  if (ev && ev.shiftKey) {
+    _bpApplyRangeToggle(pn, checked);
+    return;
+  }
   _bpApply.touched.set(pn, !!checked);
-  _bpApplyRerender();
+  const snap = _bpApplyBucketsAndSort();
+  const bucket = _bpApplyBucketOf(pn, snap.sortedByBucket);
+  if (bucket) _bpApply.lastClicked[bucket] = pn;
+  // No body re-render — the clicked checkbox is already toggled
+  // by the native click; the only stale UI is the button's count.
+  _bpApplyPatchCounts(snap.buckets);
+}
+
+function _bpApplyRangeToggle(pn, newState) {
+  const snap = _bpApplyBucketsAndSort();
+  const bucket = _bpApplyBucketOf(pn, snap.sortedByBucket);
+  if (!bucket) {
+    _bpApply.touched.set(pn, !!newState);
+    _bpApplyPatchCounts(snap.buckets);
+    return;
+  }
+  const list = snap.sortedByBucket[bucket];
+  const iNow = list.findIndex(r => r.pn === pn);
+  const last = _bpApply.lastClicked[bucket];
+  const iLast = last ? list.findIndex(r => r.pn === last) : -1;
+  let affected;
+  if (iLast < 0 || iNow < 0) {
+    // No prior anchor in this bucket (or row moved out): fall
+    // back to a single-row toggle so the click isn't lost.
+    affected = [pn];
+  } else {
+    const [lo, hi] = iNow < iLast ? [iNow, iLast] : [iLast, iNow];
+    affected = list.slice(lo, hi + 1).map(r => r.pn);
+  }
+  for (const p of affected) _bpApply.touched.set(p, !!newState);
+  _bpApply.lastClicked[bucket] = pn;
+  _bpApplyUpdateCheckboxDom(affected, newState);
+  _bpApplyPatchCounts(snap.buckets);
 }
 
 function bpApplyBulkToggle(bucket, checked) {
-  const { rows } = _bpApplyBuildRows();
-  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
-  for (const r of (buckets[bucket] || [])) _bpApply.touched.set(r.pn, !!checked);
+  const snap = _bpApplyBucketsAndSort();
+  const list = snap.sortedByBucket[bucket] || [];
+  // Iterate in current sort order for the "top-to-bottom" mental
+  // model (functionally equivalent to any order, since every row
+  // gets the same state).
+  for (const r of list) _bpApply.touched.set(r.pn, !!checked);
   _bpApplyRerender();
 }
 
