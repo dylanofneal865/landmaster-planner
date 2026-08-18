@@ -15,19 +15,31 @@
    demand explodes through DB.bomLinks and is compared against
    chainDisplayDaily (the app's canonical rate).
 
-   ISOLATION CONTRACT (view-only for parts math):
-     - NEVER writes to DB.usage, part.daily, part.onHand,
-       part.status, DB.parts[i] fields, DB.bomLinks (reassign),
+   ISOLATION CONTRACT:
+     Two — and only two — write paths exist in this module:
+       1. DB.buildPlanTargets: cloud-scoped helpers in
+          js/30-supabase.js (setBuildPlanSettingsCloud /
+          setBuildPlanOverrideCloud / clearBuildPlanOverrideCloud /
+          clearAllBuildPlanOverridesCloud).
+       2. part.daily: bpApplyRates() — the "Apply plan -> Base
+          BOM rates" modal. Gated by gateEdit(); scoped strictly
+          to itemType === "base_bom" && !isKit(part); single
+          "daily-bulk-edit" audit event; mirrors bbuApplyPaste
+          (js/19-page-usage.js). Nothing else on this tab writes
+          part.daily.
+     - NEVER writes to DB.usage, part.onHand, part.status,
+       DB.parts[i] fields other than daily, DB.bomLinks (reassign),
        or _dirtyParts.
-     - Does NOT call partsWithStatus(), queueParts(),
-       partStatus(), computeDemand(), or bumpStatusCache().
-     - Reads only: FINISHED_GOODS, DB.parts (for desc +
-       chainDisplayDaily), DB.bomLinks (via explodeBOM — pure),
-       DB.productionOrders (for mix), DB.buildPlanTargets
-       (settings + overrides), DB.settings (via
-       effectiveWorkdaysPerWeek).
-     - Only writes go to public.build_plan_targets via cloud-
-       scoped helpers in js/30-supabase.js.
+     - Reads only: FINISHED_GOODS, DB.parts (for desc, stored
+       daily, chainDisplayDaily), DB.bomLinks (via explodeBOM —
+       pure; scanned once per apply-modal-open for duplicated
+       parent->child pairs), DB.productionOrders (for mix),
+       DB.buildPlanTargets (settings + overrides), DB.settings
+       (via effectiveWorkdaysPerWeek).
+     - Does NOT call partsWithStatus(), queueParts(), partStatus(),
+       or computeDemand(). bumpStatusCache() IS called once at
+       the tail of bpApplyRates() (mirroring bbuApplyPaste) so
+       the queue picks up the newly-written daily rates.
    ===================================================== */
 
 /* ============================================================
@@ -599,6 +611,7 @@ function renderBuildPlan() {
           · ${mix.ordersConsidered} orders · ${fmtNum(Math.round(mix.totalUnits))} units total
         </div>
         <button class="btn" onclick="bpLoadBaselineAsTarget()" title="Copy the actual-avg baseline into the target input">Use baseline as target</button>
+        <button class="btn" onclick="bpOpenApplyModal()" title="Review and write plan-derived daily rates onto base_bom parts">Apply plan &rarr; Base BOM rates</button>
         <label style="display:flex;flex-direction:column;gap:2px">
           <span>Mix window</span>
           <select class="select" onchange="bpHandleWindowChange(this.value)">
@@ -610,7 +623,7 @@ function renderBuildPlan() {
       </div>
 
       <div class="bp-basis">
-        <strong>Basis:</strong> Historical model mix from <em>DB.productionOrders</em>, bucketed by <strong>RELEASED date</strong> (Monday-anchored weeks, same as BOM Usage Weekly). Each FG's implied weekly = <em>target × (share of last ${settings.windowWeeks} weeks' units)</em>. Pinned FGs use their override amount and are excluded from mix scaling; the remainder distributes across unpinned FGs by their normalized shares. Planned daily = <em>implied weekly ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. <strong>View-only for parts math</strong>: nothing here writes part.daily or triggers a queue re-computation.
+        <strong>Basis:</strong> Historical model mix from <em>DB.productionOrders</em>, bucketed by <strong>RELEASED date</strong> (Monday-anchored weeks, same as BOM Usage Weekly). Each FG's implied weekly = <em>target × (share of last ${settings.windowWeeks} weeks' units)</em>. Pinned FGs use their override amount and are excluded from mix scaling; the remainder distributes across unpinned FGs by their normalized shares. Planned daily = <em>implied weekly ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. <strong>Writes part.daily on base_bom parts ONLY</strong> via the Apply plan &rarr; Base BOM rates modal; nothing else on this tab writes.
         ${emptyBomWarning}
       </div>
 
@@ -682,3 +695,391 @@ function renderBuildPlan() {
 }
 
 registerRoute("build-plan", renderBuildPlan);
+
+/* ============================================================
+   APPLY PLAN -> BASE BOM RATES
+
+   The ONLY path this module has for writing part.daily.
+   Mirrors bbuApplyPaste (js/19-page-usage.js:1129) end-to-end:
+   gate once, re-verify eligibility per part at write time,
+   skip near-zero diffs, single "daily-bulk-edit" audit event,
+   saveDB + bumpStatusCache + closeModal + toast + refresh.
+
+   Eligibility (STRICT):
+     part.itemType === "base_bom" && !isKit(part)
+
+   Candidates (union of two sources):
+     1. byPart entries whose catalog part passes eligibility.
+     2. Every eligible catalog part with stored daily > 0 that
+        is absent from byPart, or has plannedDaily == 0 in
+        byPart -> ZERO-OUT rows. This is deliberate: without
+        them, stale rates for parts the current plan no longer
+        touches would silently survive the apply.
+
+   CURRENT per row = Number(part.daily) || 0 — the STORED value
+   being overwritten. Deliberately NOT chainDisplayDaily (which
+   the grid displays); the apply diff must show what we are
+   actually replacing on disk.
+
+   Dup-guard: DB.bomLinks is scanned once per modal open for
+   parent->child pairs occurring more than once. Any candidate
+   whose pn is a child in such a pair is FORCED into the outlier
+   bucket, default-unchecked, tagged "dup BOM" — regardless of
+   delta magnitude — because their plannedWeekly may be inflated
+   by the duplicate link. Guard is read-only; bomLinks is never
+   mutated.
+   ============================================================ */
+
+let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc" };
+
+function _bpApplyReset() {
+  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc" };
+}
+
+function _bpApplyDupChildren() {
+  const seen = new Map();
+  const links = (typeof DB !== "undefined" && Array.isArray(DB.bomLinks)) ? DB.bomLinks : [];
+  for (const l of links) {
+    if (!l || !l.parent || !l.child) continue;
+    const k = l.parent + "||" + l.child;
+    seen.set(k, (seen.get(k) || 0) + 1);
+  }
+  const dupChildren = new Set();
+  const dupParents = new Set();
+  let pairCount = 0;
+  for (const [k, n] of seen.entries()) {
+    if (n > 1) {
+      const idx = k.indexOf("||");
+      dupParents.add(k.slice(0, idx));
+      dupChildren.add(k.slice(idx + 2));
+      pairCount++;
+    }
+  }
+  return { dupChildren, dupParents, pairCount };
+}
+
+function _bpApplyBuildRows() {
+  const demand = computeBuildPlanDemand();
+  const byPart = demand.byPart;
+  const dup = _bpApplyDupChildren();
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const rows = [];
+  const seenPns = new Set();
+
+  for (const [pn, rec] of byPart.entries()) {
+    const p = partsByPn.get(pn);
+    if (!p) continue;
+    if (p.itemType !== "base_bom" || isKit(p)) continue;
+    // CURRENT is the STORED daily, not chainDisplayDaily. The
+    // grid displays chain rate for context; the apply diff must
+    // show the value that is actually about to be overwritten.
+    const current = Number(p.daily) || 0;
+    const newDaily = Math.round((Number(rec.plannedDaily) || 0) * 1000) / 1000;
+    const deltaAbs = newDaily - current;
+    const deltaPct = current > 0 ? deltaAbs / current : (newDaily > 0 ? Infinity : 0);
+    rows.push({
+      pn,
+      desc: p.desc || "",
+      current,
+      newDaily,
+      deltaAbs,
+      deltaPct,
+      dup: dup.dupChildren.has(pn),
+      zeroOut: newDaily === 0 && current > 0,
+    });
+    seenPns.add(pn);
+  }
+
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn) continue;
+    if (p.itemType !== "base_bom" || isKit(p)) continue;
+    if (seenPns.has(p.pn)) continue;
+    const current = Number(p.daily) || 0;
+    if (current <= 0) continue;
+    const newDaily = 0;
+    const deltaAbs = newDaily - current;
+    rows.push({
+      pn: p.pn,
+      desc: p.desc || "",
+      current,
+      newDaily,
+      deltaAbs,
+      deltaPct: -1,
+      dup: dup.dupChildren.has(p.pn),
+      zeroOut: true,
+    });
+  }
+
+  return { rows, dup };
+}
+
+function _bpApplyBucketRows(rows, thresholdPct) {
+  const auto = [], outlier = [], unchanged = [];
+  for (const r of rows) {
+    if (Math.abs(r.deltaAbs) < 0.0001) { unchanged.push(r); continue; }
+    const isOutlier = r.dup
+      || r.current === 0
+      || r.newDaily === 0
+      || (Math.abs(r.deltaPct) * 100) >= thresholdPct;
+    if (isOutlier) outlier.push(r);
+    else auto.push(r);
+  }
+  // Row order is applied downstream inside the renderer via
+  // _bpApplyCompare so that sorting reflects the current
+  // _bpApply.sortKey / sortDir. Bucketing itself stays stable.
+  return { auto, outlier, unchanged };
+}
+
+// Comparator for the apply-modal row tables. Deliberately treats
+// Δ (deltaAbs) as SIGNED when clicked directly, while the default
+// sort ("deltaAbs" magnitude) sits above it so first-open users
+// see biggest-changes-first regardless of sign. Δ% honors +/-Inf
+// as extremes so a −100% zero-out lands at one end and a fresh
+// non-zero plan (current 0 → new >0) lands at the other.
+function _bpApplyCompare(a, b, key) {
+  switch (key) {
+    case "pn":       return String(a.pn).localeCompare(String(b.pn));
+    case "current":  return (a.current  || 0) - (b.current  || 0);
+    case "newDaily": return (a.newDaily || 0) - (b.newDaily || 0);
+    case "delta":    return a.deltaAbs - b.deltaAbs;
+    case "deltaPct": {
+      const ap = a.deltaPct, bp = b.deltaPct;
+      if (ap === bp) return 0;
+      if (ap === Infinity)  return  1;
+      if (bp === Infinity)  return -1;
+      if (ap === -Infinity) return -1;
+      if (bp === -Infinity) return  1;
+      return ap - bp;
+    }
+    case "deltaAbs":
+    default:         return Math.abs(a.deltaAbs) - Math.abs(b.deltaAbs);
+  }
+}
+
+function bpApplySetSort(key) {
+  if (_bpApply.sortKey === key) {
+    _bpApply.sortDir = _bpApply.sortDir === "asc" ? "desc" : "asc";
+  } else {
+    _bpApply.sortKey = key;
+    _bpApply.sortDir = "desc";
+  }
+  _bpApplyRerender();
+}
+
+function _bpApplyIsChecked(r, bucket) {
+  const t = _bpApply.touched.get(r.pn);
+  if (typeof t === "boolean") return t;
+  // Defaults: AUTO checked, OUTLIER unchecked.
+  return bucket === "auto";
+}
+
+function _bpApplyCurrentCheckedCount(buckets) {
+  let n = 0;
+  for (const b of ["auto", "outlier"]) {
+    for (const r of buckets[b]) if (_bpApplyIsChecked(r, b)) n++;
+  }
+  return n;
+}
+
+function _bpApplyRenderBody() {
+  const { rows, dup } = _bpApplyBuildRows();
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  const zeroOutCount = buckets.outlier.filter(r => r.zeroOut).length
+    + buckets.auto.filter(r => r.zeroOut).length;
+
+  const dupParentList = [...dup.dupParents];
+  const dupBanner = dup.pairCount > 0
+    ? `<div style="padding:8px 10px;margin-bottom:10px;border-radius:6px;background:rgba(255,181,71,0.14);border:1px solid rgba(255,181,71,0.35);color:var(--t1);font-size:12px">
+         <strong>BOM data warning:</strong> ${dup.pairCount} duplicated parent&rarr;child pair${dup.pairCount === 1 ? "" : "s"}
+         (parents: <span class="mono">${esc(dupParentList.slice(0, 6).join(", "))}${dupParentList.length > 6 ? ` +${dupParentList.length - 6} more` : ""}</span>)
+         &mdash; planned rates under these may be inflated.
+       </div>`
+    : "";
+
+  const sortKey = _bpApply.sortKey;
+  const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
+  const arrow = (k) => sortKey === k ? (sortDir === 1 ? " &#9650;" : " &#9660;") : "";
+
+  const renderTable = (list, bucket, showBulk) => {
+    if (!list.length) return `<div class="muted tiny" style="padding:10px">No rows.</div>`;
+    const bulk = showBulk
+      ? `<div style="display:flex;gap:8px;margin:6px 0">
+           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', true)">Check all outliers</button>
+           <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', false)">Uncheck all outliers</button>
+         </div>`
+      : "";
+    // Sort a shallow copy so the bucket array (shared with the
+    // apply/count paths) stays in insertion order.
+    const sorted = list.slice().sort((a, b) => _bpApplyCompare(a, b, sortKey) * sortDir);
+    const body = sorted.map(r => {
+      // Checkbox state comes from _bpApply.touched (via
+      // _bpApplyIsChecked), NOT from the DOM — so re-sort/re-
+      // render never loses a user's toggles.
+      const checked = _bpApplyIsChecked(r, bucket);
+      const deltaPctTxt = r.deltaPct === Infinity ? "&infin;"
+        : (r.deltaPct * 100).toLocaleString(undefined, { maximumFractionDigits: 1 }) + "%";
+      const deltaCls = r.deltaAbs > 0 ? "text-warn" : (r.deltaAbs < 0 ? "muted" : "dim");
+      const tags = [];
+      if (r.dup) tags.push(`<span class="pill warn tiny">dup BOM</span>`);
+      if (r.zeroOut) tags.push(`<span class="pill muted tiny">zero-out</span>`);
+      return `<tr>
+        <td><input type="checkbox" ${checked ? "checked" : ""} onchange="bpApplyToggle('${esc(r.pn)}', this.checked)"></td>
+        <td class="pn mono">${esc(r.pn)}</td>
+        <td class="muted tiny">${esc((r.desc || "").slice(0, 42))}</td>
+        <td class="right num mono">${_buwDailyFmt(r.current)}/d</td>
+        <td class="right num mono bold">${_buwDailyFmt(r.newDaily)}/d</td>
+        <td class="right num mono ${deltaCls}">${r.deltaAbs > 0 ? "+" : ""}${_buwDailyFmt(r.deltaAbs)}</td>
+        <td class="right num mono ${deltaCls}">${deltaPctTxt}</td>
+        <td>${tags.join(" ")}</td>
+      </tr>`;
+    }).join("");
+    return `${bulk}
+      <div class="tbl-wrap" style="max-height:340px;overflow:auto">
+        <table class="tbl">
+          <thead><tr>
+            <th></th>
+            <th class="clickable sortable" onclick="bpApplySetSort('pn')">PN${arrow("pn")}</th>
+            <th>Desc</th>
+            <th class="right clickable sortable" onclick="bpApplySetSort('current')">Current /d${arrow("current")}</th>
+            <th class="right clickable sortable" onclick="bpApplySetSort('newDaily')">New /d${arrow("newDaily")}</th>
+            <th class="right clickable sortable" onclick="bpApplySetSort('delta')">&Delta;${arrow("delta")}</th>
+            <th class="right clickable sortable" onclick="bpApplySetSort('deltaPct')">&Delta;%${arrow("deltaPct")}</th>
+            <th>Tag</th>
+          </tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>`;
+  };
+
+  const outliersHtml = renderTable(buckets.outlier, "outlier", true);
+  const autoHtml = renderTable(buckets.auto, "auto", false);
+
+  return `
+    ${dupBanner}
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--t2)">
+      <label>Threshold %
+        <input type="number" step="1" min="0" value="${_bpApply.thresholdPct}"
+               style="width:70px;margin-left:6px" class="input mono"
+               onchange="bpApplySetThreshold(this.value)">
+      </label>
+      <span class="muted tiny">
+        <strong>${buckets.auto.length}</strong> auto &middot;
+        <strong>${buckets.outlier.length}</strong> outliers &middot;
+        <strong>${buckets.unchanged.length}</strong> unchanged &middot;
+        <strong>${zeroOutCount}</strong> zero-outs
+      </span>
+    </div>
+    <div style="margin-bottom:14px">
+      <div style="font-weight:600;margin-bottom:4px">Outliers (${buckets.outlier.length}) &mdash; review before applying</div>
+      ${outliersHtml}
+    </div>
+    <details>
+      <summary style="cursor:pointer;font-weight:600">Auto (${buckets.auto.length}) &mdash; within &plusmn;${_bpApply.thresholdPct}%, default checked</summary>
+      <div style="margin-top:8px">${autoHtml}</div>
+    </details>
+  `;
+}
+
+function _bpApplyRerender() {
+  const bodyEl = document.getElementById("bp-apply-body");
+  if (bodyEl) bodyEl.innerHTML = _bpApplyRenderBody();
+  const btn = document.getElementById("bp-apply-btn");
+  if (btn) {
+    const { rows } = _bpApplyBuildRows();
+    const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+    const n = _bpApplyCurrentCheckedCount(buckets);
+    btn.textContent = `Apply ${n} rate${n === 1 ? "" : "s"}`;
+    btn.disabled = n === 0;
+  }
+}
+
+function bpApplySetThreshold(v) {
+  const n = parseFloat(v);
+  _bpApply.thresholdPct = (isFinite(n) && n >= 0) ? n : 35;
+  _bpApplyRerender();
+}
+
+function bpApplyToggle(pn, checked) {
+  _bpApply.touched.set(pn, !!checked);
+  _bpApplyRerender();
+}
+
+function bpApplyBulkToggle(bucket, checked) {
+  const { rows } = _bpApplyBuildRows();
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  for (const r of (buckets[bucket] || [])) _bpApply.touched.set(r.pn, !!checked);
+  _bpApplyRerender();
+}
+
+function bpOpenApplyModal() {
+  _bpApplyReset();
+  const settings = _bpSettings();
+  const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
+  const target = settings.targetPerWeek != null ? settings.targetPerWeek : 0;
+  const { rows } = _bpApplyBuildRows();
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  const initialN = _bpApplyCurrentCheckedCount(buckets);
+  openModal(`
+    <div class="modal-head">
+      <div class="head-sm">Apply plan &rarr; Base BOM rates</div>
+      <div class="muted tiny mt-xs">
+        Target <strong>${fmtNum(target)}</strong>/wk &middot; mix <strong>${settings.windowWeeks}</strong> wks &middot; <strong>${wpw}</strong> workdays/wk.
+        Writes part.daily on eligible base_bom parts only.
+      </div>
+    </div>
+    <div class="modal-body">
+      <div id="bp-apply-body">${_bpApplyRenderBody()}</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>Cancel</button>
+      <button id="bp-apply-btn" class="btn primary" onclick="bpApplyRates()" ${initialN === 0 ? "disabled" : ""}>Apply ${initialN} rate${initialN === 1 ? "" : "s"}</button>
+    </div>
+  `);
+}
+
+function bpApplyRates() {
+  // Mirror of bbuApplyPaste (js/19-page-usage.js:1129):
+  //   gate once, re-verify eligibility per write, skip near-zero
+  //   diffs, single audit event, saveDB + bumpStatusCache +
+  //   closeModal + toast + refresh.
+  if (!gateEdit()) return;
+  const { rows } = _bpApplyBuildRows();
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  const settings = _bpSettings();
+  const target = settings.targetPerWeek != null ? settings.targetPerWeek : 0;
+  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+
+  let updated = 0, outliersApproved = 0, skipped = 0;
+  const unchangedCounted = buckets.unchanged.length;
+
+  const applyOne = (r, bucket) => {
+    if (!_bpApplyIsChecked(r, bucket)) return;
+    const part = partsByPn.get(r.pn);
+    if (!part || part.itemType !== "base_bom" || isKit(part)) { skipped++; return; }
+    const old = Number(part.daily) || 0;
+    const newDaily = r.newDaily;
+    if (Math.abs(newDaily - old) < 0.0001) return;
+    part.daily = newDaily;
+    updated++;
+    if (bucket === "outlier") outliersApproved++;
+  };
+  for (const r of buckets.auto) applyOne(r, "auto");
+  for (const r of buckets.outlier) applyOne(r, "outlier");
+
+  logAudit(
+    "daily-bulk-edit",
+    `Build Plan apply @ ${target}/wk (${settings.windowWeeks}w, thr ${_bpApply.thresholdPct}%): ${updated} updated (${outliersApproved} outliers approved), ${unchangedCounted} unchanged, ${skipped} skipped`,
+    { target, windowWeeks: settings.windowWeeks, thresholdPct: _bpApply.thresholdPct }
+  );
+  saveDB();
+  bumpStatusCache();
+  closeModal();
+  const tail = [];
+  if (unchangedCounted) tail.push(`${unchangedCounted} unchanged`);
+  if (skipped) tail.push(`${skipped} skipped`);
+  showToast(
+    `Applied ${updated} rate${updated === 1 ? "" : "s"} (${outliersApproved} outlier${outliersApproved === 1 ? "" : "s"})${tail.length ? " · " + tail.join(" · ") : ""}`,
+    updated > 0 ? "ok" : "warn"
+  );
+  refresh();
+}
