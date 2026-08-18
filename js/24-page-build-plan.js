@@ -730,10 +730,15 @@ registerRoute("build-plan", renderBuildPlan);
    mutated.
    ============================================================ */
 
-let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {} };
+// supplierExclude holds SUPPLIER KEYS (see _bpApplySupplierKey)
+// that the user has unchecked in the filter dropdown. Empty Set
+// == no filter == show everything. Filtering NEVER mutates
+// _bpApply.touched — re-including a supplier restores each row's
+// prior checkbox state from touched (or bucket default).
+let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set() };
 
 function _bpApplyReset() {
-  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {} };
+  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set() };
 }
 
 function _bpApplyDupChildren() {
@@ -780,6 +785,7 @@ function _bpApplyBuildRows() {
     rows.push({
       pn,
       desc: p.desc || "",
+      supplier: String(p.supplier || "").trim(),
       current,
       newDaily,
       deltaAbs,
@@ -801,6 +807,7 @@ function _bpApplyBuildRows() {
     rows.push({
       pn: p.pn,
       desc: p.desc || "",
+      supplier: String(p.supplier || "").trim(),
       current,
       newDaily,
       deltaAbs,
@@ -881,11 +888,86 @@ function _bpApplyCurrentCheckedCount(buckets) {
   return n;
 }
 
+// Sentinel key for rows whose part.supplier is empty/whitespace.
+// Kept as a stable string so it round-trips through the filter
+// dropdown's dataset attributes without special-casing.
+const _BP_NO_SUPPLIER_KEY = "(no supplier)";
+
+function _bpApplySupplierKey(r) {
+  return r.supplier ? r.supplier : _BP_NO_SUPPLIER_KEY;
+}
+
+function _bpApplyIsRowVisible(r) {
+  return !_bpApply.supplierExclude.has(_bpApplySupplierKey(r));
+}
+
+// Distinct supplier keys across the CURRENT candidate rows
+// (outlier + auto only — unchanged rows never render, so they'd
+// only pad the option list without giving the user anything to
+// act on). Row counts come from the unfiltered buckets so the
+// user always sees the full population per supplier and can toggle
+// hidden ones back in without losing the count context.
+function _bpApplySupplierOptions(buckets) {
+  const counts = new Map();
+  for (const r of buckets.outlier) {
+    const k = _bpApplySupplierKey(r);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  for (const r of buckets.auto) {
+    const k = _bpApplySupplierKey(r);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, count]) => ({ key, count }));
+}
+
+function _bpApplyRenderSupplierFilter(supplierOptions) {
+  const total = supplierOptions.length;
+  const excluded = supplierOptions.filter(o => _bpApply.supplierExclude.has(o.key)).length;
+  const included = total - excluded;
+  const label = excluded === 0
+    ? `Suppliers: <strong>all ${total}</strong>`
+    : `Suppliers: <strong>${included}</strong> of ${total} <span class="pill warn tiny" style="margin-left:4px">${excluded} hidden</span>`;
+  if (total === 0) {
+    return `<span class="muted tiny">No suppliers</span>`;
+  }
+  const items = supplierOptions.map(o => {
+    const isChecked = !_bpApply.supplierExclude.has(o.key);
+    return `<label style="display:flex;gap:6px;align-items:center;padding:3px 6px;cursor:pointer;font-size:12px;border-radius:3px" onmouseover="this.style.background='var(--bg-hover, rgba(255,255,255,0.04))'" onmouseout="this.style.background='transparent'">
+        <input type="checkbox" ${isChecked ? "checked" : ""} data-supplier="${esc(o.key)}" onclick="bpApplyToggleSupplier(this.dataset.supplier, this.checked)">
+        <span class="mono" style="flex:1">${esc(o.key)}</span>
+        <span class="muted tiny">${o.count}</span>
+      </label>`;
+  }).join("");
+  return `
+    <details id="bp-supplier-filter" class="bp-supplier-filter" style="position:relative">
+      <summary style="cursor:pointer;padding:4px 10px;border:1px solid var(--line);border-radius:4px;background:var(--bg);font-size:12px;user-select:none;display:inline-block">${label}</summary>
+      <div style="position:absolute;top:calc(100% + 4px);left:0;z-index:100;background:var(--bg-1);border:1px solid var(--line);border-radius:6px;padding:6px;max-height:280px;overflow-y:auto;min-width:240px;box-shadow:0 4px 12px rgba(0,0,0,0.3)">
+        <div style="display:flex;gap:6px;padding:4px 6px;border-bottom:1px solid var(--line-soft);margin-bottom:4px">
+          <button class="btn tiny" onclick="bpApplySelectAllSuppliers(true)">Include all</button>
+          <button class="btn tiny" onclick="bpApplySelectAllSuppliers(false)">Exclude all</button>
+        </div>
+        ${items}
+      </div>
+    </details>`;
+}
+
 function _bpApplyRenderBody() {
-  const { rows, dup } = _bpApplyBuildRows();
-  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
-  const zeroOutCount = buckets.outlier.filter(r => r.zeroOut).length
-    + buckets.auto.filter(r => r.zeroOut).length;
+  const snap = _bpApplyBucketsAndSort();
+  const { buckets, filteredBuckets, filteredSortedByBucket, dup, supplierOptions } = snap;
+
+  // Header counts reflect the FILTERED view so the numbers next
+  // to the tables match what's actually rendered.
+  const zeroOutCount = filteredBuckets.outlier.filter(r => r.zeroOut).length
+    + filteredBuckets.auto.filter(r => r.zeroOut).length;
+  const totalCandidates = buckets.outlier.length + buckets.auto.length;
+  const visibleCandidates = filteredBuckets.outlier.length + filteredBuckets.auto.length;
+  const rowsHidden = totalCandidates - visibleCandidates;
+  const excludedCount = _bpApply.supplierExclude.size;
+  const hiddenIndication = excludedCount > 0
+    ? ` &middot; <em class="text-warn">${excludedCount} supplier${excludedCount === 1 ? "" : "s"} hidden (${rowsHidden} row${rowsHidden === 1 ? "" : "s"})</em>`
+    : "";
 
   const dupParentList = [...dup.dupParents];
   const dupBanner = dup.pairCount > 0
@@ -900,23 +982,24 @@ function _bpApplyRenderBody() {
   const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
   const arrow = (k) => sortKey === k ? (sortDir === 1 ? " &#9650;" : " &#9660;") : "";
 
+  // renderTable receives an already-sorted, already-filtered list.
+  // Sorting/filtering are hoisted into _bpApplyBucketsAndSort so
+  // that all consumers (render, count, apply, range) share exactly
+  // the same view.
   const renderTable = (list, bucket) => {
     if (!list.length) return `<div class="muted tiny" style="padding:10px">No rows.</div>`;
-    // Bulk buttons scope to "visible" — the whole bucket in
-    // current sort order (no filter narrows what's rendered
-    // within a bucket, so "visible" == "all rows in this table").
+    // Bulk buttons scope to "visible" — the filtered rows in the
+    // current sort order. Supplier-hidden rows are excluded from
+    // this action, matching Apply semantics.
     const bulk = `<div style="display:flex;gap:8px;margin:6px 0">
            <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', true)">Check visible</button>
            <button class="btn tiny" onclick="bpApplyBulkToggle('${bucket}', false)">Uncheck visible</button>
            <span class="muted tiny" style="align-self:center">Tip: Shift+click a row to toggle the range from the last click.</span>
          </div>`;
-    // Sort a shallow copy so the bucket array (shared with the
-    // apply/count paths) stays in insertion order.
-    const sorted = list.slice().sort((a, b) => _bpApplyCompare(a, b, sortKey) * sortDir);
-    const body = sorted.map(r => {
+    const body = list.map(r => {
       // Checkbox state comes from _bpApply.touched (via
       // _bpApplyIsChecked), NOT from the DOM — so re-sort/re-
-      // render never loses a user's toggles.
+      // render/re-filter never loses a user's toggles.
       const checked = _bpApplyIsChecked(r, bucket);
       const deltaPctTxt = r.deltaPct === Infinity ? "&infin;"
         : (r.deltaPct * 100).toLocaleString(undefined, { maximumFractionDigits: 1 }) + "%";
@@ -957,10 +1040,15 @@ function _bpApplyRenderBody() {
       </div>`;
   };
 
-  const outliersHtml = renderTable(buckets.outlier, "outlier");
-  const autoHtml = renderTable(buckets.auto, "auto");
+  const outliersHtml = renderTable(filteredSortedByBucket.outlier, "outlier");
+  const autoHtml = renderTable(filteredSortedByBucket.auto, "auto");
+  const supplierFilterHtml = _bpApplyRenderSupplierFilter(supplierOptions);
 
   return `
+    <style>
+      .bp-supplier-filter > summary { list-style:none; }
+      .bp-supplier-filter > summary::-webkit-details-marker { display:none; }
+    </style>
     ${dupBanner}
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--t2)">
       <label>Threshold %
@@ -968,19 +1056,20 @@ function _bpApplyRenderBody() {
                style="width:70px;margin-left:6px" class="input mono"
                onchange="bpApplySetThreshold(this.value)">
       </label>
+      ${supplierFilterHtml}
       <span class="muted tiny">
-        <strong>${buckets.auto.length}</strong> auto &middot;
-        <strong>${buckets.outlier.length}</strong> outliers &middot;
-        <strong>${buckets.unchanged.length}</strong> unchanged &middot;
-        <strong>${zeroOutCount}</strong> zero-outs
+        <strong>${filteredBuckets.auto.length}</strong> auto &middot;
+        <strong>${filteredBuckets.outlier.length}</strong> outliers &middot;
+        <strong>${filteredBuckets.unchanged.length}</strong> unchanged &middot;
+        <strong>${zeroOutCount}</strong> zero-outs${hiddenIndication}
       </span>
     </div>
     <div style="margin-bottom:14px">
-      <div style="font-weight:600;margin-bottom:4px">Outliers (${buckets.outlier.length}) &mdash; review before applying</div>
+      <div style="font-weight:600;margin-bottom:4px">Outliers (${filteredBuckets.outlier.length}) &mdash; review before applying</div>
       ${outliersHtml}
     </div>
     <details>
-      <summary style="cursor:pointer;font-weight:600">Auto (${buckets.auto.length}) &mdash; within &plusmn;${_bpApply.thresholdPct}%, default checked</summary>
+      <summary style="cursor:pointer;font-weight:600">Auto (${filteredBuckets.auto.length}) &mdash; within &plusmn;${_bpApply.thresholdPct}%, default checked</summary>
       <div style="margin-top:8px">${autoHtml}</div>
     </details>
   `;
@@ -1009,22 +1098,36 @@ function _bpApplyRestoreScrollTops(tops) {
   if (autoWrap && tops.auto != null) autoWrap.scrollTop = tops.auto;
 }
 
-// Single snapshot of buckets + per-bucket sort order. Callers that
-// need to know the current visible order of a bucket (shift-range,
-// bulk-visible, bucket lookup by pn) share this instead of re-
-// running _bpApplyBuildRows() three times per handler.
+// Single snapshot of buckets + per-bucket sort order + filter view.
+// Callers that need to know the current visible order of a bucket
+// (shift-range, bulk-visible, bucket lookup by pn, apply, count)
+// share this instead of re-running _bpApplyBuildRows() N times
+// per handler. filteredBuckets / filteredSortedByBucket honor the
+// current supplierExclude Set; buckets / sortedByBucket ignore it
+// so the supplier options list has the full population to draw
+// from.
 function _bpApplyBucketsAndSort() {
-  const { rows } = _bpApplyBuildRows();
+  const built = _bpApplyBuildRows();
+  const rows = built.rows;
+  const dup = built.dup;
   const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
   const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
   const cmp = (a, b) => _bpApplyCompare(a, b, _bpApply.sortKey) * sortDir;
-  return {
-    buckets,
-    sortedByBucket: {
-      outlier: buckets.outlier.slice().sort(cmp),
-      auto:    buckets.auto.slice().sort(cmp),
-    },
+  const sortedByBucket = {
+    outlier: buckets.outlier.slice().sort(cmp),
+    auto:    buckets.auto.slice().sort(cmp),
   };
+  const filteredBuckets = {
+    outlier:   buckets.outlier.filter(_bpApplyIsRowVisible),
+    auto:      buckets.auto.filter(_bpApplyIsRowVisible),
+    unchanged: buckets.unchanged.filter(_bpApplyIsRowVisible),
+  };
+  const filteredSortedByBucket = {
+    outlier: sortedByBucket.outlier.filter(_bpApplyIsRowVisible),
+    auto:    sortedByBucket.auto.filter(_bpApplyIsRowVisible),
+  };
+  const supplierOptions = _bpApplySupplierOptions(buckets);
+  return { buckets, sortedByBucket, filteredBuckets, filteredSortedByBucket, dup, supplierOptions };
 }
 
 function _bpApplyBucketOf(pn, sortedByBucket) {
@@ -1034,16 +1137,15 @@ function _bpApplyBucketOf(pn, sortedByBucket) {
 }
 
 // Patch the "Apply N rates" button label + disabled state in place.
-// Called on every user action that changes _bpApply.touched. Pass
-// buckets when you already have them to avoid recomputing.
-function _bpApplyPatchCounts(buckets) {
+// Called on every user action that changes _bpApply.touched or the
+// supplier filter. Counts only VISIBLE checked rows — filtered-out
+// suppliers are excluded from Apply per spec. Pass a snap when you
+// already have one to avoid recomputing.
+function _bpApplyPatchCounts(snap) {
   const btn = document.getElementById("bp-apply-btn");
   if (!btn) return;
-  if (!buckets) {
-    const snap = _bpApplyBucketsAndSort();
-    buckets = snap.buckets;
-  }
-  const n = _bpApplyCurrentCheckedCount(buckets);
+  if (!snap) snap = _bpApplyBucketsAndSort();
+  const n = _bpApplyCurrentCheckedCount(snap.filteredBuckets);
   btn.textContent = `Apply ${n} rate${n === 1 ? "" : "s"}`;
   btn.disabled = n === 0;
 }
@@ -1058,17 +1160,51 @@ function _bpApplyUpdateCheckboxDom(pns, checked) {
   }
 }
 
+// Preserve the supplier-filter dropdown's open state across a body
+// re-render — without this, toggling any option collapses the
+// dropdown mid-click and forces the user to re-open it every time.
+function _bpApplyCaptureFilterOpen() {
+  const el = document.getElementById("bp-supplier-filter");
+  return el ? !!el.open : false;
+}
+
+function _bpApplyRestoreFilterOpen(wasOpen) {
+  const el = document.getElementById("bp-supplier-filter");
+  if (el) el.open = !!wasOpen;
+}
+
 function _bpApplyRerender() {
   const tops = _bpApplyCaptureScrollTops();
+  const filterOpen = _bpApplyCaptureFilterOpen();
   const bodyEl = document.getElementById("bp-apply-body");
   if (bodyEl) bodyEl.innerHTML = _bpApplyRenderBody();
   _bpApplyRestoreScrollTops(tops);
+  _bpApplyRestoreFilterOpen(filterOpen);
   _bpApplyPatchCounts();
 }
 
 function bpApplySetThreshold(v) {
   const n = parseFloat(v);
   _bpApply.thresholdPct = (isFinite(n) && n >= 0) ? n : 35;
+  _bpApplyRerender();
+}
+
+function bpApplyToggleSupplier(key, checked) {
+  // Filter mutation NEVER touches _bpApply.touched — re-including
+  // a supplier restores each row's prior checkbox state from
+  // touched (or bucket default) automatically.
+  if (checked) _bpApply.supplierExclude.delete(key);
+  else _bpApply.supplierExclude.add(key);
+  _bpApplyRerender();
+}
+
+function bpApplySelectAllSuppliers(includeAll) {
+  if (includeAll) {
+    _bpApply.supplierExclude.clear();
+  } else {
+    const snap = _bpApplyBucketsAndSort();
+    for (const o of snap.supplierOptions) _bpApply.supplierExclude.add(o.key);
+  }
   _bpApplyRerender();
 }
 
@@ -1082,29 +1218,32 @@ function bpApplyToggle(pn, checked, ev) {
   }
   _bpApply.touched.set(pn, !!checked);
   const snap = _bpApplyBucketsAndSort();
-  const bucket = _bpApplyBucketOf(pn, snap.sortedByBucket);
+  const bucket = _bpApplyBucketOf(pn, snap.filteredSortedByBucket);
   if (bucket) _bpApply.lastClicked[bucket] = pn;
   // No body re-render — the clicked checkbox is already toggled
   // by the native click; the only stale UI is the button's count.
-  _bpApplyPatchCounts(snap.buckets);
+  _bpApplyPatchCounts(snap);
 }
 
 function _bpApplyRangeToggle(pn, newState) {
   const snap = _bpApplyBucketsAndSort();
-  const bucket = _bpApplyBucketOf(pn, snap.sortedByBucket);
+  const bucket = _bpApplyBucketOf(pn, snap.filteredSortedByBucket);
   if (!bucket) {
     _bpApply.touched.set(pn, !!newState);
-    _bpApplyPatchCounts(snap.buckets);
+    _bpApplyPatchCounts(snap);
     return;
   }
-  const list = snap.sortedByBucket[bucket];
+  // Range operates on the FILTERED sort order — supplier-hidden
+  // rows are not in the DOM and shouldn't be swept up by a range
+  // that crosses them.
+  const list = snap.filteredSortedByBucket[bucket];
   const iNow = list.findIndex(r => r.pn === pn);
   const last = _bpApply.lastClicked[bucket];
   const iLast = last ? list.findIndex(r => r.pn === last) : -1;
   let affected;
   if (iLast < 0 || iNow < 0) {
-    // No prior anchor in this bucket (or row moved out): fall
-    // back to a single-row toggle so the click isn't lost.
+    // No prior anchor in this bucket (or anchor now filtered out):
+    // fall back to a single-row toggle so the click isn't lost.
     affected = [pn];
   } else {
     const [lo, hi] = iNow < iLast ? [iNow, iLast] : [iLast, iNow];
@@ -1113,15 +1252,14 @@ function _bpApplyRangeToggle(pn, newState) {
   for (const p of affected) _bpApply.touched.set(p, !!newState);
   _bpApply.lastClicked[bucket] = pn;
   _bpApplyUpdateCheckboxDom(affected, newState);
-  _bpApplyPatchCounts(snap.buckets);
+  _bpApplyPatchCounts(snap);
 }
 
 function bpApplyBulkToggle(bucket, checked) {
   const snap = _bpApplyBucketsAndSort();
-  const list = snap.sortedByBucket[bucket] || [];
-  // Iterate in current sort order for the "top-to-bottom" mental
-  // model (functionally equivalent to any order, since every row
-  // gets the same state).
+  // Iterate FILTERED sort order — "visible" means rendered, which
+  // excludes supplier-hidden rows per spec.
+  const list = snap.filteredSortedByBucket[bucket] || [];
   for (const r of list) _bpApply.touched.set(r.pn, !!checked);
   _bpApplyRerender();
 }
@@ -1131,9 +1269,10 @@ function bpOpenApplyModal() {
   const settings = _bpSettings();
   const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
   const target = settings.targetPerWeek != null ? settings.targetPerWeek : 0;
-  const { rows } = _bpApplyBuildRows();
-  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
-  const initialN = _bpApplyCurrentCheckedCount(buckets);
+  // supplierExclude is empty right after reset, so filteredBuckets
+  // == buckets on open — initialN is the same either way.
+  const snap = _bpApplyBucketsAndSort();
+  const initialN = _bpApplyCurrentCheckedCount(snap.filteredBuckets);
   openModal(`
     <div class="modal-head">
       <div class="head-sm">Apply plan &rarr; Base BOM rates</div>
@@ -1158,14 +1297,15 @@ function bpApplyRates() {
   //   diffs, single audit event, saveDB + bumpStatusCache +
   //   closeModal + toast + refresh.
   if (!gateEdit()) return;
-  const { rows } = _bpApplyBuildRows();
-  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  // Filtered buckets ONLY — supplier-hidden rows are excluded from
+  // Apply per spec, regardless of their touched/checked state.
+  const snap = _bpApplyBucketsAndSort();
   const settings = _bpSettings();
   const target = settings.targetPerWeek != null ? settings.targetPerWeek : 0;
   const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
 
   let updated = 0, outliersApproved = 0, skipped = 0;
-  const unchangedCounted = buckets.unchanged.length;
+  const unchangedCounted = snap.filteredBuckets.unchanged.length;
 
   const applyOne = (r, bucket) => {
     if (!_bpApplyIsChecked(r, bucket)) return;
@@ -1178,13 +1318,15 @@ function bpApplyRates() {
     updated++;
     if (bucket === "outlier") outliersApproved++;
   };
-  for (const r of buckets.auto) applyOne(r, "auto");
-  for (const r of buckets.outlier) applyOne(r, "outlier");
+  for (const r of snap.filteredBuckets.auto) applyOne(r, "auto");
+  for (const r of snap.filteredBuckets.outlier) applyOne(r, "outlier");
 
+  const supplierExcludeCount = _bpApply.supplierExclude.size;
+  const filterTail = supplierExcludeCount > 0 ? `, ${supplierExcludeCount} supplier${supplierExcludeCount === 1 ? "" : "s"} filtered out` : "";
   logAudit(
     "daily-bulk-edit",
-    `Build Plan apply @ ${target}/wk (${settings.windowWeeks}w, thr ${_bpApply.thresholdPct}%): ${updated} updated (${outliersApproved} outliers approved), ${unchangedCounted} unchanged, ${skipped} skipped`,
-    { target, windowWeeks: settings.windowWeeks, thresholdPct: _bpApply.thresholdPct }
+    `Build Plan apply @ ${target}/wk (${settings.windowWeeks}w, thr ${_bpApply.thresholdPct}%): ${updated} updated (${outliersApproved} outliers approved), ${unchangedCounted} unchanged, ${skipped} skipped${filterTail}`,
+    { target, windowWeeks: settings.windowWeeks, thresholdPct: _bpApply.thresholdPct, supplierExcludeCount, supplierExclude: [..._bpApply.supplierExclude] }
   );
   saveDB();
   bumpStatusCache();
