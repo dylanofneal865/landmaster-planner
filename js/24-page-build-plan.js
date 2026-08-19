@@ -139,7 +139,7 @@ async function bpHandleOverrideInput(fgSku, rawValue) {
   }
   const n = Number(trimmed);
   if (!Number.isFinite(n) || n < 0) { refresh(); return; }
-  const rounded = Math.round(n);
+  const rounded = Math.round(n * 100) / 100;
   if (rounded === 0) {
     if (typeof clearBuildPlanOverrideCloud === "function") {
       await clearBuildPlanOverrideCloud(fgSku);
@@ -489,7 +489,7 @@ function renderBuildPlan() {
           <div class="bp-fg-desc muted tiny">${esc(desc.slice(0, 42))}</div>
           <div class="bp-fg-share muted tiny mono right">${inMix ? _bpPctFmt(share) : "—"}</div>
           <div class="bp-fg-implied right">${impliedTxt}<span class="muted tiny mono"> /wk</span></div>
-          <input class="input bp-fg-input mono" type="number" step="1" min="0" inputmode="numeric"
+          <input class="input bp-fg-input mono" type="number" step="any" min="0" inputmode="decimal"
                  placeholder="pin"
                  value="${overrideVal != null ? overrideVal : ""}"
                  onchange="bpHandleOverrideInput('${esc(fg.pn)}', this.value)"
