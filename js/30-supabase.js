@@ -666,6 +666,7 @@ function _populateBuildPlanTargetsFromRows(rows) {
       DB.buildPlanTargets.settings = {
         targetPerWeek: Number(d.targetPerWeek) || 0,
         windowWeeks:   Number(d.windowWeeks)   || 8,
+        startDate:     (typeof d.startDate === "string" && d.startDate) ? d.startDate : null,
         updatedAt:     row.updated_at || null,
       };
       continue;
@@ -684,16 +685,17 @@ function _populateBuildPlanTargetsFromRows(rows) {
 // and the later write is the intent to accept. Optimistic mirror
 // update BEFORE the RPC so the UI reflects the change immediately;
 // reverts on failure.
-async function setBuildPlanSettingsCloud({ targetPerWeek, windowWeeks }) {
+async function setBuildPlanSettingsCloud({ targetPerWeek, windowWeeks, startDate = null }) {
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
   if (!DB.buildPlanTargets) DB.buildPlanTargets = { settings: null, overrides: new Map() };
   const t = Number(targetPerWeek);
   const w = Number(windowWeeks);
   if (!Number.isFinite(t) || t < 0) return { ok: false, error: new Error("invalid targetPerWeek") };
   if (!Number.isFinite(w) || w <= 0) return { ok: false, error: new Error("invalid windowWeeks") };
+  const sd = (typeof startDate === "string" && startDate) ? startDate : null;
   const nowIso = new Date().toISOString();
   const prev = DB.buildPlanTargets.settings;
-  const nextSettings = { targetPerWeek: t, windowWeeks: w, updatedAt: nowIso };
+  const nextSettings = { targetPerWeek: t, windowWeeks: w, startDate: sd, updatedAt: nowIso };
   DB.buildPlanTargets.settings = nextSettings;
   const { error } = await _supa
     .from("build_plan_targets")
@@ -701,7 +703,7 @@ async function setBuildPlanSettingsCloud({ targetPerWeek, windowWeeks }) {
       {
         fg_sku:     "__settings__",
         weekly_qty: 0,          // sentinel — not read; column is NOT NULL
-        data:       { targetPerWeek: t, windowWeeks: w },
+        data:       { targetPerWeek: t, windowWeeks: w, startDate: sd },
         updated_at: nowIso,
       },
       { onConflict: "fg_sku" }

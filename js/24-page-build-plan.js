@@ -68,11 +68,14 @@ const BUILD_PLAN_STATE = {
 // Resolve current settings from the mirror, defaulting the window
 // to 8 when nothing is stored yet. Target defaults to null (not 0)
 // so the render can distinguish "not set yet" from "set to zero".
+// startDate is an ISO "YYYY-MM-DD" string or null (null = today's
+// behavior everywhere: no annotations, no lead-time scheduling).
 function _bpSettings() {
   const s = DB.buildPlanTargets && DB.buildPlanTargets.settings;
   return {
     targetPerWeek: s && Number.isFinite(Number(s.targetPerWeek)) ? Number(s.targetPerWeek) : null,
     windowWeeks:   s && BUILD_PLAN_WINDOW_OPTIONS.includes(Number(s.windowWeeks)) ? Number(s.windowWeeks) : 8,
+    startDate:     s && typeof s.startDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s.startDate) ? s.startDate : null,
   };
 }
 
@@ -100,7 +103,9 @@ async function bpHandleTargetInput(rawValue) {
   if (!Number.isFinite(n) || n < 0) { refresh(); return; }
   const rounded = Math.round(n);
   if (typeof setBuildPlanSettingsCloud === "function") {
-    await setBuildPlanSettingsCloud({ targetPerWeek: rounded, windowWeeks: s.windowWeeks });
+    // Pass all three fields so this write doesn't clobber a
+    // sibling's value in the sentinel row.
+    await setBuildPlanSettingsCloud({ targetPerWeek: rounded, windowWeeks: s.windowWeeks, startDate: s.startDate });
   }
   refresh();
 }
@@ -111,7 +116,7 @@ async function bpHandleWindowChange(rawValue) {
   const w = BUILD_PLAN_WINDOW_OPTIONS.includes(n) ? n : 8;
   const target = s.targetPerWeek == null ? 0 : s.targetPerWeek;
   if (typeof setBuildPlanSettingsCloud === "function") {
-    await setBuildPlanSettingsCloud({ targetPerWeek: target, windowWeeks: w });
+    await setBuildPlanSettingsCloud({ targetPerWeek: target, windowWeeks: w, startDate: s.startDate });
   }
   refresh();
 }
@@ -123,7 +128,22 @@ async function bpLoadBaselineAsTarget() {
   const mix = _bpComputeMix(s.windowWeeks);
   const baseline = Math.round(mix.actualAvgPerWeek);
   if (typeof setBuildPlanSettingsCloud === "function") {
-    await setBuildPlanSettingsCloud({ targetPerWeek: baseline, windowWeeks: s.windowWeeks });
+    await setBuildPlanSettingsCloud({ targetPerWeek: baseline, windowWeeks: s.windowWeeks, startDate: s.startDate });
+  }
+  refresh();
+}
+
+// Plan-start-date handler. Blank input → null (no scheduling, no
+// annotations). ISO "YYYY-MM-DD" strings only; anything else is
+// ignored to keep parseDateLocal happy downstream.
+async function bpHandleStartDateChange(rawValue) {
+  const s = _bpSettings();
+  const trimmed = String(rawValue == null ? "" : rawValue).trim();
+  const next = trimmed === "" ? null
+    : (/^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : s.startDate);
+  const target = s.targetPerWeek == null ? 0 : s.targetPerWeek;
+  if (typeof setBuildPlanSettingsCloud === "function") {
+    await setBuildPlanSettingsCloud({ targetPerWeek: target, windowWeeks: s.windowWeeks, startDate: next });
   }
   refresh();
 }
@@ -558,6 +578,26 @@ function renderBuildPlan() {
     ? `<div class="pill crit tiny" title="Pinned Σ ${dist.pinnedSum} exceeds target ${settings.targetPerWeek}. Remaining unpinned FGs distribute against 0 — increase target or reduce pins.">overrides exceed target</div>`
     : "";
 
+  // startDate annotation for the basis strip. Empty string when
+  // startDate is null (today's behavior); otherwise borrows the
+  // same phrasing the Apply-modal header uses so the two stay
+  // in sync. Computed here (outside the modal snap) via a light
+  // inline calc so we don't need to build the whole apply snap
+  // for the main tab's basis strip.
+  const startDateNote = (() => {
+    if (!settings.startDate || typeof parseDateLocal !== "function") return "";
+    const dt = parseDateLocal(settings.startDate);
+    if (!dt) return "";
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const dayMs = 86400000;
+    const diffDays = Math.round((dt.getTime() - today.getTime()) / dayMs);
+    const md = `${dt.getMonth() + 1}/${dt.getDate()}`;
+    if (diffDays === 0) return `effective today`;
+    if (diffDays > 0)  return `effective ${md} · starts in ${diffDays} day${diffDays === 1 ? "" : "s"}`;
+    const past = -diffDays;
+    return `effective ${md} · started ${past} day${past === 1 ? "" : "s"} ago`;
+  })();
+
   $("#main").innerHTML = `
     <style>
       .bp-basis { padding: 8px 12px; background: var(--bg-1); border-radius: 6px; margin-bottom: 12px; font-size: 12px; line-height: 1.5; color: var(--t2); }
@@ -618,12 +658,19 @@ function renderBuildPlan() {
             ${BUILD_PLAN_WINDOW_OPTIONS.map(w => `<option value="${w}" ${settings.windowWeeks === w ? "selected" : ""}>Last ${w} wks</option>`).join("")}
           </select>
         </label>
+        <label style="display:flex;flex-direction:column;gap:2px">
+          <span>Plan start</span>
+          <input id="bp-start-date" class="input mono" type="date"
+                 value="${settings.startDate || ""}"
+                 title="Optional. When set, the Apply modal defers each part until (startDate - part lead time). Blank = no scheduling."
+                 onchange="bpHandleStartDateChange(this.value)">
+        </label>
         <div class="grow"></div>
         ${overrideExceedsWarn}
       </div>
 
       <div class="bp-basis">
-        <strong>Basis:</strong> Historical model mix from <em>DB.productionOrders</em>, bucketed by <strong>RELEASED date</strong> (Monday-anchored weeks, same as BOM Usage Weekly). Each FG's implied weekly = <em>target × (share of last ${settings.windowWeeks} weeks' units)</em>. Pinned FGs use their override amount and are excluded from mix scaling; the remainder distributes across unpinned FGs by their normalized shares. Planned daily = <em>implied weekly ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. <strong>Writes part.daily on base_bom parts ONLY</strong> via the Apply plan &rarr; Base BOM rates modal; nothing else on this tab writes.
+        <strong>Basis:</strong> Historical model mix from <em>DB.productionOrders</em>, bucketed by <strong>RELEASED date</strong> (Monday-anchored weeks, same as BOM Usage Weekly). Each FG's implied weekly = <em>target × (share of last ${settings.windowWeeks} weeks' units)</em>. Pinned FGs use their override amount and are excluded from mix scaling; the remainder distributes across unpinned FGs by their normalized shares. Planned daily = <em>implied weekly ÷ ${wpw}</em>. Current daily = <em>chainDisplayDaily(part)</em> — the same rate the Base BOM Queue and Parts Catalog show. ${startDateNote ? `<br><strong>Target ${fmtNum(settings.targetPerWeek == null ? 0 : settings.targetPerWeek)}/wk ${startDateNote}.</strong> ` : ""}<strong>Writes part.daily on base_bom parts ONLY</strong> via the Apply plan &rarr; Base BOM rates modal; nothing else on this tab writes.
         ${emptyBomWarning}
       </div>
 
@@ -735,10 +782,14 @@ registerRoute("build-plan", renderBuildPlan);
 // == no filter == show everything. Filtering NEVER mutates
 // _bpApply.touched — re-including a supplier restores each row's
 // prior checkbox state from touched (or bucket default).
-let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set() };
+// scheduledSort is a separate sort state for the "Scheduled"
+// bucket so its default order ("due" asc) can differ from the
+// shared outlier/auto sort ("deltaAbs" desc) without a shared-
+// state collision.
+let _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set(), scheduledSort: { key: "due", dir: "asc" } };
 
 function _bpApplyReset() {
-  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set() };
+  _bpApply = { thresholdPct: 35, touched: new Map(), sortKey: "deltaAbs", sortDir: "desc", lastClicked: {}, supplierExclude: new Set(), scheduledSort: { key: "due", dir: "asc" } };
 }
 
 function _bpApplyDupChildren() {
@@ -786,6 +837,10 @@ function _bpApplyBuildRows() {
       pn,
       desc: p.desc || "",
       supplier: String(p.supplier || "").trim(),
+      // Calendar days; consumed by the Scheduled bucket to compute
+      // switchBy = startDate - leadTimeDays. Cached here so the
+      // bucketer stays a pure function of the row list.
+      leadTimeDays: (typeof leadTimeDays === "function") ? (Number(leadTimeDays(p)) || 0) : (Math.round((Number(p.ltWeeks) || 0) * 7)),
       current,
       newDaily,
       deltaAbs,
@@ -808,6 +863,7 @@ function _bpApplyBuildRows() {
       pn: p.pn,
       desc: p.desc || "",
       supplier: String(p.supplier || "").trim(),
+      leadTimeDays: (typeof leadTimeDays === "function") ? (Number(leadTimeDays(p)) || 0) : (Math.round((Number(p.ltWeeks) || 0) * 7)),
       current,
       newDaily,
       deltaAbs,
@@ -820,10 +876,34 @@ function _bpApplyBuildRows() {
   return { rows, dup };
 }
 
-function _bpApplyBucketRows(rows, thresholdPct) {
-  const auto = [], outlier = [], unchanged = [];
+// Bucket rows into auto / outlier / unchanged / scheduled.
+// When scheduling is active (startMs is in the future relative to
+// todayMs), each non-zero-out row's switchBy is computed as
+// startMs − leadTimeDays × 86400000. Rows whose switchBy is still
+// in the future (today < switchBy) go to the SCHEDULED bucket
+// with r.dueDate attached (a JS Date at local midnight of switch
+// day). Zero-out rows are exempt from scheduling — a dead rate
+// is dead regardless of when the new plan takes effect — so they
+// stay in outliers.
+//
+// This function is annotation+bucketing only; no math-engine
+// change: computeBuildPlanDemand, _bpDistributeTarget, runout /
+// coverage, and any WRITTEN value are untouched by startDate.
+function _bpApplyBucketRows(rows, thresholdPct, todayMs, startMs) {
+  const auto = [], outlier = [], unchanged = [], scheduled = [];
+  const dayMs = 86400000;
+  const schedulingActive = todayMs != null && startMs != null && startMs > todayMs;
   for (const r of rows) {
     if (Math.abs(r.deltaAbs) < 0.0001) { unchanged.push(r); continue; }
+    if (schedulingActive && !r.zeroOut) {
+      const switchMs = startMs - (Number(r.leadTimeDays) || 0) * dayMs;
+      if (todayMs < switchMs) {
+        r.dueDate = new Date(switchMs);
+        r.dueDate.setHours(0, 0, 0, 0);
+        scheduled.push(r);
+        continue;
+      }
+    }
     const isOutlier = r.dup
       || r.current === 0
       || r.newDaily === 0
@@ -834,7 +914,7 @@ function _bpApplyBucketRows(rows, thresholdPct) {
   // Row order is applied downstream inside the renderer via
   // _bpApplyCompare so that sorting reflects the current
   // _bpApply.sortKey / sortDir. Bucketing itself stays stable.
-  return { auto, outlier, unchanged };
+  return { auto, outlier, unchanged, scheduled };
 }
 
 // Comparator for the apply-modal row tables. Deliberately treats
@@ -858,6 +938,11 @@ function _bpApplyCompare(a, b, key) {
       if (bp === -Infinity) return  1;
       return ap - bp;
     }
+    case "due": {
+      const ad = a.dueDate ? a.dueDate.getTime() : 0;
+      const bd = b.dueDate ? b.dueDate.getTime() : 0;
+      return ad - bd;
+    }
     case "deltaAbs":
     default:         return Math.abs(a.deltaAbs) - Math.abs(b.deltaAbs);
   }
@@ -873,6 +958,22 @@ function bpApplySetSort(key) {
   _bpApplyRerender();
 }
 
+// Scheduled bucket has its own sort state (default: due asc) so
+// it can present the "closest deadline first" view without
+// disturbing the outlier/auto sort. First click on a new key
+// defaults to asc for "due" (earliest first is the intuitive
+// direction there) and desc for everything else.
+function bpApplySetScheduledSort(key) {
+  const s = _bpApply.scheduledSort;
+  if (s.key === key) {
+    s.dir = s.dir === "asc" ? "desc" : "asc";
+  } else {
+    s.key = key;
+    s.dir = key === "due" ? "asc" : "desc";
+  }
+  _bpApplyRerender();
+}
+
 function _bpApplyIsChecked(r, bucket) {
   const t = _bpApply.touched.get(r.pn);
   if (typeof t === "boolean") return t;
@@ -882,8 +983,10 @@ function _bpApplyIsChecked(r, bucket) {
 
 function _bpApplyCurrentCheckedCount(buckets) {
   let n = 0;
-  for (const b of ["auto", "outlier"]) {
-    for (const r of buckets[b]) if (_bpApplyIsChecked(r, b)) n++;
+  // Scheduled rows default-unchecked; only user-checked ones (an
+  // "early adopt") count toward Apply N.
+  for (const b of ["auto", "outlier", "scheduled"]) {
+    for (const r of (buckets[b] || [])) if (_bpApplyIsChecked(r, b)) n++;
   }
   return n;
 }
@@ -909,11 +1012,8 @@ function _bpApplyIsRowVisible(r) {
 // hidden ones back in without losing the count context.
 function _bpApplySupplierOptions(buckets) {
   const counts = new Map();
-  for (const r of buckets.outlier) {
-    const k = _bpApplySupplierKey(r);
-    counts.set(k, (counts.get(k) || 0) + 1);
-  }
-  for (const r of buckets.auto) {
+  const feed = [...buckets.outlier, ...buckets.auto, ...(buckets.scheduled || [])];
+  for (const r of feed) {
     const k = _bpApplySupplierKey(r);
     counts.set(k, (counts.get(k) || 0) + 1);
   }
@@ -955,19 +1055,38 @@ function _bpApplyRenderSupplierFilter(supplierOptions) {
 
 function _bpApplyRenderBody() {
   const snap = _bpApplyBucketsAndSort();
-  const { buckets, filteredBuckets, filteredSortedByBucket, dup, supplierOptions } = snap;
+  const { buckets, filteredBuckets, filteredSortedByBucket, dup, supplierOptions, startDt, schedulingActive } = snap;
 
   // Header counts reflect the FILTERED view so the numbers next
   // to the tables match what's actually rendered.
   const zeroOutCount = filteredBuckets.outlier.filter(r => r.zeroOut).length
     + filteredBuckets.auto.filter(r => r.zeroOut).length;
-  const totalCandidates = buckets.outlier.length + buckets.auto.length;
-  const visibleCandidates = filteredBuckets.outlier.length + filteredBuckets.auto.length;
+  const totalCandidates = buckets.outlier.length + buckets.auto.length + buckets.scheduled.length;
+  const visibleCandidates = filteredBuckets.outlier.length + filteredBuckets.auto.length + filteredBuckets.scheduled.length;
   const rowsHidden = totalCandidates - visibleCandidates;
   const excludedCount = _bpApply.supplierExclude.size;
   const hiddenIndication = excludedCount > 0
     ? ` &middot; <em class="text-warn">${excludedCount} supplier${excludedCount === 1 ? "" : "s"} hidden (${rowsHidden} row${rowsHidden === 1 ? "" : "s"})</em>`
     : "";
+
+  // Scheduled count line: "N scheduled (due M/D-M/D)". Only shown
+  // when scheduling is active AND at least one row is deferred.
+  let scheduledIndication = "";
+  if (schedulingActive && filteredBuckets.scheduled.length > 0) {
+    const dues = filteredBuckets.scheduled
+      .map(r => r.dueDate ? r.dueDate.getTime() : 0)
+      .filter(t => t > 0)
+      .sort((a, b) => a - b);
+    if (dues.length > 0) {
+      const first = new Date(dues[0]);
+      const last = new Date(dues[dues.length - 1]);
+      const fmtMD = (d) => `${d.getMonth() + 1}/${d.getDate()}`;
+      const rangeStr = dues[0] === dues[dues.length - 1] ? fmtMD(first) : `${fmtMD(first)}&ndash;${fmtMD(last)}`;
+      scheduledIndication = ` &middot; <strong>${filteredBuckets.scheduled.length}</strong> scheduled (due ${rangeStr})`;
+    } else {
+      scheduledIndication = ` &middot; <strong>${filteredBuckets.scheduled.length}</strong> scheduled`;
+    }
+  }
 
   const dupParentList = [...dup.dupParents];
   const dupBanner = dup.pairCount > 0
@@ -981,13 +1100,23 @@ function _bpApplyRenderBody() {
   const sortKey = _bpApply.sortKey;
   const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
   const arrow = (k) => sortKey === k ? (sortDir === 1 ? " &#9650;" : " &#9660;") : "";
+  const schedSortKey = _bpApply.scheduledSort.key;
+  const schedSortDir = _bpApply.scheduledSort.dir === "asc" ? 1 : -1;
+  const schedArrow = (k) => schedSortKey === k ? (schedSortDir === 1 ? " &#9650;" : " &#9660;") : "";
+
+  const fmtMD = (d) => d ? `${d.getMonth() + 1}/${d.getDate()}` : "";
 
   // renderTable receives an already-sorted, already-filtered list.
   // Sorting/filtering are hoisted into _bpApplyBucketsAndSort so
   // that all consumers (render, count, apply, range) share exactly
-  // the same view.
+  // the same view. Scheduled bucket uses its own sort state (arrow
+  // + set-sort handler) so its default "due asc" doesn't collide
+  // with the shared outlier/auto sort.
   const renderTable = (list, bucket) => {
     if (!list.length) return `<div class="muted tiny" style="padding:10px">No rows.</div>`;
+    const isScheduled = bucket === "scheduled";
+    const setSortFn = isScheduled ? "bpApplySetScheduledSort" : "bpApplySetSort";
+    const arr = isScheduled ? schedArrow : arrow;
     // Bulk buttons scope to "visible" — the filtered rows in the
     // current sort order. Supplier-hidden rows are excluded from
     // this action, matching Apply semantics.
@@ -1007,6 +1136,10 @@ function _bpApplyRenderBody() {
       const tags = [];
       if (r.dup) tags.push(`<span class="pill warn tiny">dup BOM</span>`);
       if (r.zeroOut) tags.push(`<span class="pill muted tiny">zero-out</span>`);
+      if (isScheduled && r.dueDate) tags.push(`<span class="pill tiny">due ${fmtMD(r.dueDate)}</span>`);
+      const dueCell = isScheduled
+        ? `<td class="right num mono">${r.dueDate ? esc(fmtMD(r.dueDate)) : "&mdash;"}</td>`
+        : "";
       // onclick (not onchange) so the event object is available
       // for shiftKey detection in bpApplyToggle. data-pn lets
       // targeted DOM patches find the checkbox without re-
@@ -1019,20 +1152,25 @@ function _bpApplyRenderBody() {
         <td class="right num mono bold">${_buwDailyFmt(r.newDaily)}/d</td>
         <td class="right num mono ${deltaCls}">${r.deltaAbs > 0 ? "+" : ""}${_buwDailyFmt(r.deltaAbs)}</td>
         <td class="right num mono ${deltaCls}">${deltaPctTxt}</td>
+        ${dueCell}
         <td>${tags.join(" ")}</td>
       </tr>`;
     }).join("");
+    const dueHeader = isScheduled
+      ? `<th class="right clickable sortable" onclick="${setSortFn}('due')">Due${arr("due")}</th>`
+      : "";
     return `${bulk}
       <div id="bp-apply-${bucket}-wrap" class="tbl-wrap" style="max-height:340px;overflow:auto">
         <table class="tbl">
           <thead><tr>
             <th></th>
-            <th class="clickable sortable" onclick="bpApplySetSort('pn')">PN${arrow("pn")}</th>
+            <th class="clickable sortable" onclick="${setSortFn}('pn')">PN${arr("pn")}</th>
             <th>Desc</th>
-            <th class="right clickable sortable" onclick="bpApplySetSort('current')">Current /d${arrow("current")}</th>
-            <th class="right clickable sortable" onclick="bpApplySetSort('newDaily')">New /d${arrow("newDaily")}</th>
-            <th class="right clickable sortable" onclick="bpApplySetSort('delta')">&Delta;${arrow("delta")}</th>
-            <th class="right clickable sortable" onclick="bpApplySetSort('deltaPct')">&Delta;%${arrow("deltaPct")}</th>
+            <th class="right clickable sortable" onclick="${setSortFn}('current')">Current /d${arr("current")}</th>
+            <th class="right clickable sortable" onclick="${setSortFn}('newDaily')">New /d${arr("newDaily")}</th>
+            <th class="right clickable sortable" onclick="${setSortFn}('delta')">&Delta;${arr("delta")}</th>
+            <th class="right clickable sortable" onclick="${setSortFn}('deltaPct')">&Delta;%${arr("deltaPct")}</th>
+            ${dueHeader}
             <th>Tag</th>
           </tr></thead>
           <tbody>${body}</tbody>
@@ -1042,7 +1180,32 @@ function _bpApplyRenderBody() {
 
   const outliersHtml = renderTable(filteredSortedByBucket.outlier, "outlier");
   const autoHtml = renderTable(filteredSortedByBucket.auto, "auto");
+  const scheduledHtml = schedulingActive
+    ? renderTable(filteredSortedByBucket.scheduled, "scheduled")
+    : "";
   const supplierFilterHtml = _bpApplyRenderSupplierFilter(supplierOptions);
+
+  // Scheduled section summary label: "Scheduled (N) — due M/D-M/D
+  // · default-unchecked; check to adopt early". Only rendered when
+  // scheduling is active AND at least one row exists in the bucket.
+  let scheduledSection = "";
+  if (schedulingActive && filteredBuckets.scheduled.length > 0) {
+    const dues = filteredBuckets.scheduled
+      .map(r => r.dueDate ? r.dueDate.getTime() : 0)
+      .filter(t => t > 0)
+      .sort((a, b) => a - b);
+    const first = dues.length ? new Date(dues[0]) : null;
+    const last = dues.length ? new Date(dues[dues.length - 1]) : null;
+    const fmtMD2 = (d) => d ? `${d.getMonth() + 1}/${d.getDate()}` : "";
+    const rangeStr = (first && last)
+      ? (dues[0] === dues[dues.length - 1] ? fmtMD2(first) : `${fmtMD2(first)}&ndash;${fmtMD2(last)}`)
+      : "";
+    scheduledSection = `
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-weight:600">Scheduled (${filteredBuckets.scheduled.length}) &mdash; ${rangeStr ? "due " + rangeStr + " &middot; " : ""}default-unchecked; check to adopt early</summary>
+        <div style="margin-top:8px">${scheduledHtml}</div>
+      </details>`;
+  }
 
   return `
     <style>
@@ -1061,18 +1224,37 @@ function _bpApplyRenderBody() {
         <strong>${filteredBuckets.auto.length}</strong> auto &middot;
         <strong>${filteredBuckets.outlier.length}</strong> outliers &middot;
         <strong>${filteredBuckets.unchanged.length}</strong> unchanged &middot;
-        <strong>${zeroOutCount}</strong> zero-outs${hiddenIndication}
+        <strong>${zeroOutCount}</strong> zero-outs${scheduledIndication}${hiddenIndication}
       </span>
     </div>
     <div style="margin-bottom:14px">
       <div style="font-weight:600;margin-bottom:4px">Outliers (${filteredBuckets.outlier.length}) &mdash; review before applying</div>
       ${outliersHtml}
     </div>
+    ${scheduledSection}
     <details>
       <summary style="cursor:pointer;font-weight:600">Auto (${filteredBuckets.auto.length}) &mdash; within &plusmn;${_bpApply.thresholdPct}%, default checked</summary>
       <div style="margin-top:8px">${autoHtml}</div>
     </details>
   `;
+}
+
+// Human-readable startDate annotation, used in the basis strip and
+// the Apply-modal header. Empty string when startDate is null.
+// Format: "effective <M/D> · starts in N days" (future) /
+// "effective today" (today) / "effective <M/D> · started N days
+// ago" (past).
+function _bpApplyStartDateNote(snap) {
+  if (!snap) snap = _bpApplyBucketsAndSort();
+  if (!snap.startDt) return "";
+  const dt = snap.startDt;
+  const md = `${dt.getMonth() + 1}/${dt.getDate()}`;
+  const dayMs = 86400000;
+  const diffDays = Math.round((snap.startMs - snap.todayMs) / dayMs);
+  if (diffDays === 0) return `effective today`;
+  if (diffDays > 0) return `effective ${md} &middot; starts in ${diffDays} day${diffDays === 1 ? "" : "s"}`;
+  const past = -diffDays;
+  return `effective ${md} &middot; started ${past} day${past === 1 ? "" : "s"} ago`;
 }
 
 // Capture/restore each table's scrollTop across a body re-render.
@@ -1110,29 +1292,47 @@ function _bpApplyBucketsAndSort() {
   const built = _bpApplyBuildRows();
   const rows = built.rows;
   const dup = built.dup;
-  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct);
+  // Resolve today at local midnight and startDate via
+  // parseDateLocal (js/02-utils.js) so bucketing is tz-safe.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayMs = today.getTime();
+  const settings = _bpSettings();
+  const startDt = settings.startDate && typeof parseDateLocal === "function"
+    ? parseDateLocal(settings.startDate)
+    : null;
+  const startMs = startDt ? startDt.getTime() : null;
+  const schedulingActive = startMs != null && startMs > todayMs;
+
+  const buckets = _bpApplyBucketRows(rows, _bpApply.thresholdPct, todayMs, startMs);
   const sortDir = _bpApply.sortDir === "asc" ? 1 : -1;
   const cmp = (a, b) => _bpApplyCompare(a, b, _bpApply.sortKey) * sortDir;
+  const schedSortDir = _bpApply.scheduledSort.dir === "asc" ? 1 : -1;
+  const schedCmp = (a, b) => _bpApplyCompare(a, b, _bpApply.scheduledSort.key) * schedSortDir;
   const sortedByBucket = {
-    outlier: buckets.outlier.slice().sort(cmp),
-    auto:    buckets.auto.slice().sort(cmp),
+    outlier:   buckets.outlier.slice().sort(cmp),
+    auto:      buckets.auto.slice().sort(cmp),
+    scheduled: buckets.scheduled.slice().sort(schedCmp),
   };
   const filteredBuckets = {
     outlier:   buckets.outlier.filter(_bpApplyIsRowVisible),
     auto:      buckets.auto.filter(_bpApplyIsRowVisible),
     unchanged: buckets.unchanged.filter(_bpApplyIsRowVisible),
+    scheduled: buckets.scheduled.filter(_bpApplyIsRowVisible),
   };
   const filteredSortedByBucket = {
-    outlier: sortedByBucket.outlier.filter(_bpApplyIsRowVisible),
-    auto:    sortedByBucket.auto.filter(_bpApplyIsRowVisible),
+    outlier:   sortedByBucket.outlier.filter(_bpApplyIsRowVisible),
+    auto:      sortedByBucket.auto.filter(_bpApplyIsRowVisible),
+    scheduled: sortedByBucket.scheduled.filter(_bpApplyIsRowVisible),
   };
   const supplierOptions = _bpApplySupplierOptions(buckets);
-  return { buckets, sortedByBucket, filteredBuckets, filteredSortedByBucket, dup, supplierOptions };
+  return { buckets, sortedByBucket, filteredBuckets, filteredSortedByBucket, dup, supplierOptions, startDt, startMs, todayMs, schedulingActive };
 }
 
 function _bpApplyBucketOf(pn, sortedByBucket) {
   if (sortedByBucket.outlier.some(r => r.pn === pn)) return "outlier";
   if (sortedByBucket.auto.some(r => r.pn === pn)) return "auto";
+  if ((sortedByBucket.scheduled || []).some(r => r.pn === pn)) return "scheduled";
   return null;
 }
 
@@ -1273,11 +1473,12 @@ function bpOpenApplyModal() {
   // == buckets on open — initialN is the same either way.
   const snap = _bpApplyBucketsAndSort();
   const initialN = _bpApplyCurrentCheckedCount(snap.filteredBuckets);
+  const startNote = _bpApplyStartDateNote(snap);
   openModal(`
     <div class="modal-head">
       <div class="head-sm">Apply plan &rarr; Base BOM rates</div>
       <div class="muted tiny mt-xs">
-        Target <strong>${fmtNum(target)}</strong>/wk &middot; mix <strong>${settings.windowWeeks}</strong> wks &middot; <strong>${wpw}</strong> workdays/wk.
+        Target <strong>${fmtNum(target)}</strong>/wk &middot; mix <strong>${settings.windowWeeks}</strong> wks &middot; <strong>${wpw}</strong> workdays/wk${startNote ? ` &middot; ${startNote}` : ""}.
         Writes part.daily on eligible base_bom parts only.
       </div>
     </div>
@@ -1306,6 +1507,14 @@ function bpApplyRates() {
 
   let updated = 0, outliersApproved = 0, skipped = 0;
   const unchangedCounted = snap.filteredBuckets.unchanged.length;
+  // scheduledSkipped counts scheduled rows the user DID NOT check
+  // (i.e. left to auto-adopt when their switchBy arrives). Early-
+  // adopted scheduled rows (user-checked) are written just like
+  // outlier approvals — they still flow through applyOne below.
+  let scheduledSkipped = 0;
+  for (const r of snap.filteredBuckets.scheduled) {
+    if (!_bpApplyIsChecked(r, "scheduled")) scheduledSkipped++;
+  }
 
   const applyOne = (r, bucket) => {
     if (!_bpApplyIsChecked(r, bucket)) return;
@@ -1320,13 +1529,20 @@ function bpApplyRates() {
   };
   for (const r of snap.filteredBuckets.auto) applyOne(r, "auto");
   for (const r of snap.filteredBuckets.outlier) applyOne(r, "outlier");
+  for (const r of snap.filteredBuckets.scheduled) applyOne(r, "scheduled");
 
   const supplierExcludeCount = _bpApply.supplierExclude.size;
   const filterTail = supplierExcludeCount > 0 ? `, ${supplierExcludeCount} supplier${supplierExcludeCount === 1 ? "" : "s"} filtered out` : "";
+  const startDateTail = settings.startDate ? `, effective ${settings.startDate}` : "";
+  const auditDetail = { target, windowWeeks: settings.windowWeeks, thresholdPct: _bpApply.thresholdPct, supplierExcludeCount, supplierExclude: [..._bpApply.supplierExclude] };
+  if (settings.startDate) {
+    auditDetail.startDate = settings.startDate;
+    auditDetail.scheduledSkipped = scheduledSkipped;
+  }
   logAudit(
     "daily-bulk-edit",
-    `Build Plan apply @ ${target}/wk (${settings.windowWeeks}w, thr ${_bpApply.thresholdPct}%): ${updated} updated (${outliersApproved} outliers approved), ${unchangedCounted} unchanged, ${skipped} skipped${filterTail}`,
-    { target, windowWeeks: settings.windowWeeks, thresholdPct: _bpApply.thresholdPct, supplierExcludeCount, supplierExclude: [..._bpApply.supplierExclude] }
+    `Build Plan apply @ ${target}/wk (${settings.windowWeeks}w, thr ${_bpApply.thresholdPct}%): ${updated} updated (${outliersApproved} outliers approved), ${unchangedCounted} unchanged, ${skipped} skipped${filterTail}${startDateTail}`,
+    auditDetail
   );
   saveDB();
   bumpStatusCache();
