@@ -303,6 +303,41 @@ function calendarDaysToWorkdays(calDays, startDate = TODAY, wpw = effectiveWorkd
   return workdays;
 }
 
+/* ------------------------------------------------------------------
+   STEPPED-RATE SUPPORT (Phase 1: read-side only).
+
+   Data shape (Phase 2 will introduce the writers):
+     part.rateStep = { prevDaily: Number, effectiveDate: "YYYY-MM-DD" }
+
+   Semantics:
+     - Burn prevDaily on workdays BEFORE effectiveDate.
+     - Burn part.daily on workdays ON/AFTER effectiveDate.
+     - Missing / malformed / past-dated rateStep → dailyOnDate returns
+       part.daily every time, so every consumer stays byte-identical
+       to today's math when no rateStep is set (the whole codebase
+       today, since no writer exists yet).
+
+   Structurally SEPARATE from dated receipts (projectOnHand's
+   receipts[] handling): a rate change is a depletion-coefficient
+   change; it never credits stock. No shared code with the receipt
+   path — the parked stepped-receipt bug is not touched by any of
+   this.
+   ------------------------------------------------------------------ */
+function dailyOnDate(part, date) {
+  const rs = part && part.rateStep;
+  if (!rs || rs.prevDaily == null || !rs.effectiveDate) return Number(part && part.daily) || 0;
+  const eff = (typeof parseDateLocal === "function") ? parseDateLocal(rs.effectiveDate) : null;
+  if (!eff || eff.getTime() <= TODAY.getTime()) return Number(part.daily) || 0;
+  return date < eff ? (Number(rs.prevDaily) || 0) : (Number(part.daily) || 0);
+}
+
+function hasActiveRateStep(part) {
+  const rs = part && part.rateStep;
+  if (!rs || rs.prevDaily == null || !rs.effectiveDate) return false;
+  const eff = (typeof parseDateLocal === "function") ? parseDateLocal(rs.effectiveDate) : null;
+  return !!(eff && eff.getTime() > TODAY.getTime());
+}
+
 // ----- Shared "is this PO line actually open?" gate -------------------------
 //
 // The PO Lines GI was changed to also feed back received / closed lines so
@@ -854,7 +889,10 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
         predStock = Math.max(0, predStock - precutinRate);
       } else if (consuming) {
         // Phase 2 or non-hardCutin path: existing per-workday depletion.
-        oh -= (part.daily || 0);
+        // dailyOnDate returns part.daily when no rateStep is active,
+        // so this is byte-identical to `oh -= (part.daily || 0)` for
+        // every part that lacks a future-dated rateStep.
+        oh -= dailyOnDate(part, d);
       }
     }
     oh += receipts[i];
@@ -908,7 +946,13 @@ function daysUntilStockout(part, lines) {
   // transitionStartDate parses AND is strictly in the future. Non-pre-
   // launch parts (start unset / past / bad) fall through to the original
   // (cover from TODAY) branch — byte-identical to pre-fix.
-  if (incoming <= 0) {
+  // Closed-form fast path holds only when there are no incoming POs
+  // AND the part has no future-dated rateStep. A stepped rate would
+  // change the depletion coefficient mid-window, which the closed
+  // form's single-rate onHand/daily conversion cannot express — so
+  // we route to the projectOnHand walk (byte-identical result to
+  // today for parts without rateStep).
+  if (incoming <= 0 && !hasActiveRateStep(part)) {
     const coverWorkdays = (Number(part.onHand) || 0) / daily;
     let startD = TODAY;
     let daysUntilStart = 0;
@@ -922,10 +966,12 @@ function daysUntilStockout(part, lines) {
     const cal = daysUntilStart + workdaysToCalendarDays(coverWorkdays, startD);
     return cal > 365 ? Infinity : cal;
   }
-  // Incoming POs exist → use the receipt-timing-aware projection (which now
-  // also depletes on workdays via the same isWorkday helper) so a PO landing
-  // too late still surfaces a stockout. Find the LAST day on-hand is still
-  // positive — accounts for transient dips that recover when a PO lands.
+  // Incoming POs exist OR the part has an active rateStep → use the
+  // receipt-timing-aware projection (which now also depletes on
+  // workdays via the same isWorkday helper, and consults dailyOnDate
+  // so stepped rates flip on their effective date). Find the LAST
+  // day on-hand is still positive — accounts for transient dips that
+  // recover when a PO lands.
   const series = projectOnHand(part, 365, lines);
   let lastPositive = -1;
   for (let i = 0; i < series.length; i++) {
@@ -982,7 +1028,9 @@ function daysUntilFirstZero(part, supplyLines) {
   // No supply → workday cover from onHand only (byte-identical shape to
   // daysUntilStockout's no-incoming branch so a Sensourcing part with no
   // open PO AND no blanket resolves the same way).
-  if (!supplyLines || supplyLines.length === 0) {
+  // Same rateStep gate as daysUntilStockout: a stepped rate needs
+  // the day-walk. Byte-identical to today when no rateStep is set.
+  if ((!supplyLines || supplyLines.length === 0) && !hasActiveRateStep(part)) {
     const coverWorkdays = (Number(part.onHand) || 0) / daily;
     let startD = TODAY;
     let daysUntilStart = 0;
@@ -1070,9 +1118,36 @@ function _computeTriggerFromRunoutAndTransition(runoutDaysOfCover, transitionSta
 // so the mixed-units bug (calendar × per-workday) doesn't happen at any
 // call site. suggestedQty and cycleAwareSuggestedQty both call this.
 // startDate defaults to TODAY, matching the runway/days-cover convention.
-function _windowDemandUnits(calendarWindowDays, dailyRatePerWorkday, startDate = TODAY) {
+function _windowDemandUnits(calendarWindowDays, dailyRatePerWorkday, startDate = TODAY, part = null) {
   const rate = Number(dailyRatePerWorkday) || 0;
   if (rate <= 0) return 0;
+  // Two-segment path ONLY when the caller passed the part AND the
+  // part has an active future-dated rateStep. Byte-identical single-
+  // segment output otherwise — including when the caller passes a
+  // boost.dailyRate override (rate != part.daily), because the
+  // Math.max(part.daily, boost.dailyRate) composition happens at
+  // the caller and stays intact for the post-eff segment.
+  if (part && typeof hasActiveRateStep === "function" && hasActiveRateStep(part)) {
+    const eff = parseDateLocal(part.rateStep.effectiveDate);
+    const daysToEff = Math.round((eff.getTime() - startDate.getTime()) / DAY_MS);
+    // daysToEff <= 0 → eff already reached; guarded upstream by
+    // hasActiveRateStep, but treat as single-segment for safety.
+    if (daysToEff > 0) {
+      if (daysToEff >= calendarWindowDays) {
+        // Window ends before rate change → entire window at prevDaily.
+        const workdays = calendarDaysToWorkdays(calendarWindowDays, startDate);
+        return workdays * (Number(part.rateStep.prevDaily) || 0);
+      }
+      // Split: [startDate+1, eff-1] at prevDaily, [eff, startDate+W] at rate.
+      // calendarDaysToWorkdays counts workdays in (startDate, startDate+N],
+      // so `daysToEff - 1` covers everything before eff itself.
+      const totalWorkdays = calendarDaysToWorkdays(calendarWindowDays, startDate);
+      const seg1Workdays = calendarDaysToWorkdays(daysToEff - 1, startDate);
+      const seg2Workdays = Math.max(0, totalWorkdays - seg1Workdays);
+      const prevRate = Number(part.rateStep.prevDaily) || 0;
+      return seg1Workdays * prevRate + seg2Workdays * rate;
+    }
+  }
   const workdays = calendarDaysToWorkdays(calendarWindowDays, startDate);
   return workdays * rate;
 }
@@ -1114,7 +1189,10 @@ function suggestedQty(part, onPO) {
   const dailyRate = boost
     ? Math.max(Number(part.daily) || 0, boost.dailyRate)
     : (part.daily || 0);
-  const target = _windowDemandUnits(lt + safety + horizon, dailyRate);
+  // Pass `part` so _windowDemandUnits can split the window at the
+  // rateStep.effectiveDate when active. No-op when rateStep is
+  // missing / malformed / past-dated.
+  const target = _windowDemandUnits(lt + safety + horizon, dailyRate, TODAY, part);
 
   // Effective supply. When boosted, every predecessor's on-hand counts as
   // stock we'll consume first — only the final part has open POs that we
@@ -1430,7 +1508,14 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     if (i > 0) {
       const d = (typeof addDays === "function") ? addDays(today, i) : new Date(today.getTime() + i * DAY_MS);
       if (typeof isWorkday === "function" && isWorkday(d, wpw)) {
-        selfStock -= chainRate;
+        // Anchor-only rate per design decision D3. If the anchor
+        // carries a future-dated rateStep, look up the per-day rate;
+        // otherwise burn the precomputed chainRate scalar (byte-
+        // identical to today for every chain without an anchor
+        // rateStep).
+        selfStock -= (typeof hasActiveRateStep === "function" && hasActiveRateStep(anchor))
+          ? dailyOnDate(anchor, d)
+          : chainRate;
       }
     }
     if (selfStock < 0) {
@@ -2382,7 +2467,8 @@ function cycleAwareSuggestedQty(part, onPO) {
   // Calendar-window → workday-demand conversion via the shared helper.
   // Same fix as suggestedQty — the previous formula multiplied calendar
   // days × per-workday rate directly, over-ordering by ~7/wpw.
-  const target = _windowDemandUnits(lt + safety + horizon, dailyRate);
+  // Passes `part` so a future-dated rateStep splits the window at eff.
+  const target = _windowDemandUnits(lt + safety + horizon, dailyRate, TODAY, part);
   const onPOQty = (typeof onPO === "number")
     ? onPO
     : ((typeof openPOQty === "function") ? openPOQty(part.pn) : 0);
