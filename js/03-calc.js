@@ -751,7 +751,7 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   const accumReceipt = (ln, remaining, po) => {
     let offset;
     let isOverdue = false;
-    const expDate = ln.expectedDate ? new Date(ln.expectedDate) : null;
+    const expDate = ln.expectedDate ? parseDateLocal(ln.expectedDate) : null;
     if (!expDate || isNaN(expDate)) {
       // Missing/invalid date → assume arrival at the part's lead time from
       // today. NOT treated as overdue — we have no signal that it's late.
@@ -1726,8 +1726,8 @@ function chainTransitionRisk(part) {
       if (remaining <= 0) continue;
       const expRaw = ln.expectedDate || po.expectedDate;
       if (!expRaw) continue;
-      const exp = new Date(expRaw);
-      if (isNaN(exp)) continue;
+      const exp = parseDateLocal(expRaw);
+      if (!exp) continue;
       exp.setHours(0, 0, 0, 0);
       if (exp.getTime() <= runoutMs) return false; // covered
     }
