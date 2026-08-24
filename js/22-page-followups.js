@@ -307,14 +307,19 @@ function computeCoverageGap(part, lines) {
     // to the result (projectOnHand's receipts array aggregates qtys and
     // loses PO origin). Same isLineOpen gate as projectOnHand.
     //
-    // CRITICAL: offset MUST be computed exactly the way projectOnHand
-    // computes it, or the line won't match recoverIdx and the row shows
-    // "—". projectOnHand uses `new Date(string)` + setHours, which for
-    // YYYY-MM-DD strings (Acumatica's wire format) parses as UTC midnight
-    // and lands one calendar day earlier in US-local timezones. We mirror
-    // that for the MATCH only; for the DISPLAY date we re-parse YYYY-MM-DD
-    // as a local calendar date so the row reads the supplier's actual
-    // promise date, not the UTC-shifted internal one.
+    // CRITICAL — LOCKSTEP WITH projectOnHand'S RECEIPTS PARSE:
+    // offset MUST be computed exactly the way projectOnHand computes it,
+    // or the line won't match recoverIdx and the row shows "—". Both
+    // sides now parse via parseDateLocal (js/02-utils.js) so YYYY-MM-DD
+    // wire strings land on the correct local calendar day — a change
+    // from the earlier state where projectOnHand parsed `new Date(str)`
+    // (UTC-shifted a day earlier in US-local) and this matcher mirrored
+    // that bug for consistency. The lockstep requirement itself has NOT
+    // gone away: any future change to either side's parse — projectOnHand
+    // accumReceipt at js/03-calc.js:~L754 or this loop — MUST change
+    // both, or the matcher will diverge from recoverIdx again. Same
+    // parse also drives the display date, so a single result serves both
+    // paths.
     for (const po of (DB.pos || [])) {
       for (const ln of (po.lines || [])) {
         if (ln.pn !== part.pn) continue;
@@ -322,25 +327,18 @@ function computeCoverageGap(part, lines) {
         const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
         if (remaining <= 0) continue;
         const expRaw = ln.expectedDate || po.expectedDate;
-        // 1) Offset for MATCHING — mirror projectOnHand's parse exactly.
+        // Single parse serves both MATCH and DISPLAY (parseDateLocal
+        // returns a Date at local midnight — no setHours needed).
         let offset;
-        const expForMatch = expRaw ? new Date(expRaw) : null;
+        const expForMatch = expRaw ? parseDateLocal(expRaw) : null;
         if (expForMatch && !isNaN(expForMatch.getTime())) {
-          expForMatch.setHours(0, 0, 0, 0);
           offset = Math.round((expForMatch.getTime() - TODAY.getTime()) / DAY_MS);
           if (offset < 0) offset = 0;
         } else {
           offset = (typeof leadTimeDays === "function") ? leadTimeDays(part) : 0;
         }
         if (offset !== recoverIdx) continue;
-        // 2) Display date — for YYYY-MM-DD strings, re-parse as a local
-        //    calendar date so the row shows what the supplier promised.
-        let expForDisplay = expForMatch;
-        if (typeof expRaw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(expRaw)) {
-          const [y, m, d] = expRaw.split("-").map(Number);
-          const local = new Date(y, m - 1, d);
-          if (!isNaN(local.getTime())) expForDisplay = local;
-        }
+        const expForDisplay = expForMatch;
         coveringPOs.push({
           poId: po.id,
           poNum: po.num,
