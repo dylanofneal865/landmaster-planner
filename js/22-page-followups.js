@@ -1672,6 +1672,12 @@ function draftCoverageExpediteRow(idx) {
 // covering every NOT-YET-SENT + NOT-HANDLED-ELSEWHERE exposed line
 // they own. Per-supplier fan-out is critical — bundling parts from
 // different suppliers into one email is never correct.
+//
+// Dispatcher: 0 pending → warn toast; 1 supplier → draft immediately
+// (byte-identical to prior behavior); 2+ suppliers → open a picker
+// modal so the user chooses whom to draft. The actual drafting logic
+// lives in _draftCoverageExpeditesFor(supplierKeys), shared by both
+// paths.
 function draftCoverageExpediteAll() {
   const gaps = (window._COVERAGE_GAPS || []);
   if (!gaps.length) { showToast("No coverage gaps to draft", "warn"); return; }
@@ -1692,6 +1698,109 @@ function draftCoverageExpediteAll() {
   const bySupplier = new Map();
   for (const g of pending) {
     const key = g.primarySupplier || "—";
+    if (!bySupplier.has(key)) bySupplier.set(key, []);
+    bySupplier.get(key).push(g);
+  }
+  if (bySupplier.size === 0) {
+    showToast("Nothing to draft", "warn");
+    return;
+  }
+  if (bySupplier.size === 1) {
+    // Skip the picker when there's only one supplier — no choice to
+    // offer. Matches the pre-picker "one email per supplier" flow.
+    _draftCoverageExpeditesFor([...bySupplier.keys()]);
+    return;
+  }
+  _cgOpenDraftPicker(bySupplier);
+}
+
+// Picker modal — stateless, rebuilt each open, no persistence between
+// invocations. Checkbox state lives entirely in the DOM; the primary
+// button reads it at submit via data-supplier attributes.
+function _cgOpenDraftPicker(bySupplier) {
+  // Per-supplier metrics for the picker rows: parts = gap count
+  // (one CG row per part), POs = distinct poNum across the supplier's
+  // expedite lines. Same _coverageGapExpediteLines helper the drafter
+  // uses, so the counts match what the emails will actually cover.
+  const options = [];
+  for (const [supplier, list] of bySupplier.entries()) {
+    const allExpLines = list.flatMap(_coverageGapExpediteLines);
+    const distinctPOs = new Set(allExpLines.map(l => l.poNum));
+    options.push({
+      key: supplier,
+      partCount: list.length,
+      poCount: distinctPOs.size,
+    });
+  }
+  options.sort((a, b) => b.partCount - a.partCount);
+
+  const rows = options.map(o => `
+    <label style="display:flex;gap:8px;align-items:center;padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--line-soft);font-size:12px">
+      <input type="checkbox" class="cg-draft-picker-cb" data-supplier="${esc(o.key)}" onclick="_cgDraftPickerUpdateCount()">
+      <span style="flex:1"><strong>${esc(o.key)}</strong></span>
+      <span class="muted tiny mono">${o.partCount} part${o.partCount === 1 ? "" : "s"} &middot; ${o.poCount} PO${o.poCount === 1 ? "" : "s"}</span>
+    </label>
+  `).join("");
+
+  openModal(`
+    <div class="modal-head">
+      <div class="head-sm">Draft expedites &mdash; choose suppliers</div>
+      <div class="muted tiny mt-xs">One email per selected supplier. All unchecked by default.</div>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button class="btn tiny" onclick="_cgDraftPickerToggleAll(true)">All</button>
+        <button class="btn tiny" onclick="_cgDraftPickerToggleAll(false)">None</button>
+      </div>
+      <div id="cg-draft-picker" style="max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:4px">
+        ${rows}
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>Cancel</button>
+      <button id="cg-draft-picker-btn" class="btn primary" onclick="_cgDraftPickerSubmit()" disabled>Draft 0 emails</button>
+    </div>
+  `);
+}
+
+function _cgDraftPickerToggleAll(checked) {
+  const boxes = document.querySelectorAll('.cg-draft-picker-cb');
+  for (const b of boxes) b.checked = !!checked;
+  _cgDraftPickerUpdateCount();
+}
+
+function _cgDraftPickerUpdateCount() {
+  const n = document.querySelectorAll('.cg-draft-picker-cb:checked').length;
+  const btn = document.getElementById('cg-draft-picker-btn');
+  if (btn) {
+    btn.textContent = `Draft ${n} email${n === 1 ? "" : "s"}`;
+    btn.disabled = n === 0;
+  }
+}
+
+function _cgDraftPickerSubmit() {
+  const boxes = [...document.querySelectorAll('.cg-draft-picker-cb:checked')];
+  const keys = boxes.map(b => b.getAttribute('data-supplier'));
+  closeModal();
+  if (keys.length) _draftCoverageExpeditesFor(keys);
+}
+
+// The actual per-supplier fan-out + email drafting loop, factored
+// out of draftCoverageExpediteAll so both the immediate (one-supplier)
+// path and the picker (multi-supplier) path share it byte-equivalently.
+// Suppliers not in `supplierKeys` are skipped; everything else — the
+// rowHandled skip, per-PO grouping, subject/intro/body assembly, toast
+// — matches the pre-picker behavior for the selected set.
+function _draftCoverageExpeditesFor(supplierKeys) {
+  const keySet = new Set(supplierKeys);
+  if (!keySet.size) return;
+  const gaps = (window._COVERAGE_GAPS || []);
+  const rowHandled = (g) => (g._st ? g._st.all : _cgHandledState(g).all);
+  const pending = gaps.filter(g => !rowHandled(g));
+  const bySupplier = new Map();
+  for (const g of pending) {
+    const key = g.primarySupplier || "—";
+    if (!keySet.has(key)) continue;
     if (!bySupplier.has(key)) bySupplier.set(key, []);
     bySupplier.get(key).push(g);
   }
