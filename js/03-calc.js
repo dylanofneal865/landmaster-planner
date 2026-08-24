@@ -863,6 +863,37 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   // Non-hardCutin path unchanged (hardCutin=null → predStock=0).
   let predStock = hardCutin ? Math.max(0, Number(hardCutin.predecessorStock) || 0) : 0;
   const predReceiptsByDay = (hardCutin && hardCutin.predReceiptsByDay) || null;
+
+  // HARD CUT-IN BANK SWEEP — own-part receipts that arrive BEFORE
+  // the cut-in day would inflate `oh` during phase 1, and phase 1
+  // now plots the predecessor pool ONLY (see display block below).
+  // Move all pre-cutin own receipts into a bank and credit the full
+  // bank on cutinOffset so phase 2 opens with ownStock + bank in one
+  // clean step-up. No plotted cliffs mid-phase-1 from own PO
+  // arrivals. Non-hardCutin path (cutinOffset === null) skips the
+  // sweep entirely — byte-identical to today.
+  //
+  // Banked receipts whose cut-in falls beyond the projection horizon
+  // (cutinOffset > days) are DROPPED — they'd never be plotted (the
+  // whole window is phase 1 → pool-only display), and adding them
+  // into receipts[>days] would corrupt the `oh += receipts[i]` loop
+  // by writing past the array bound.
+  const cutinOffset = (hardCutin && cutinMs)
+    ? Math.max(0, Math.round((cutinMs - TODAY.getTime()) / DAY_MS))
+    : null;
+  if (cutinOffset != null) {
+    let bank = 0;
+    const sweepEnd = Math.min(cutinOffset, days);
+    for (let i = 0; i < sweepEnd; i++) {
+      bank += receipts[i];
+      receipts[i] = 0;
+    }
+    if (cutinOffset <= days) {
+      receipts[cutinOffset] += bank;
+    }
+    // else: cutinOffset > days → bank dropped (out-of-horizon).
+  }
+
   const wpw = effectiveWorkdaysPerWeek();
   for (let i = 0; i <= days; i++) {
     const d = addDays(TODAY, i);
@@ -874,8 +905,15 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     // plotted line jumps +qty on the arrival day and depletion resumes
     // from the boosted level — same order the phase-1 walk in
     // _chainHardCutinSupply uses to compute predStockWalking.
+    //
+    // predRecvToday is surfaced in the series `recv` field below so the
+    // chart's PO markers render on pred-arrival days during phase 1
+    // (receipts[i] is 0 for own-part rows post bank-sweep, so without
+    // this the phase-1 dots would disappear).
+    let predRecvToday = 0;
     if (predReceiptsByDay && predReceiptsByDay.has(i)) {
-      predStock += predReceiptsByDay.get(i);
+      predRecvToday = predReceiptsByDay.get(i);
+      predStock += predRecvToday;
     }
     // Skip depletion until we reach transitionStartDate. Receipts still
     // land on their real calendar offset — a PO scheduled to arrive
@@ -896,28 +934,21 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
       }
     }
     oh += receipts[i];
-    // Series `oh` during phase 1 (hardCutin active) — three cases:
-    //   predStock > 0 : predStock + oh  (predecessor is the live coverage;
-    //                    own stock physically present via early receipts is
-    //                    added to the chart honestly. At cut-in predStock
-    //                    drops out and displayOh becomes `oh` — cliff of
-    //                    EXACTLY strandedPredecessorQty.)
-    //   predStock == 0 (predecessor EXHAUSTED PRE-CUT-IN) : 0
-    //                    The chain is out of coverage. Own stock still
-    //                    physically accumulates in `oh` but is not
-    //                    consumable yet — displaying it as coverage would
-    //                    be false (the successor is not live). The runout
-    //                    day, computed independently by _chainHardCutinSupply
-    //                    (workdaysToCalendarDays(predecessorStock/chainRate)),
-    //                    lands on the same day the chart line first touches
-    //                    zero here, so header text and chart agree.
-    //   phase 2 : oh    (successor is live; own + receipts deplete normally)
-    // Non-hardCutin path unchanged because beforeCutin is false — falls
-    // straight through to `oh`.
-    const displayOh = beforeCutin
-      ? (predStock > 0 ? predStock + oh : 0)
-      : oh;
-    series.push({ d, oh: displayOh, recv: receipts[i] });
+    // Display during phase 1 (hardCutin active): predecessor POOL
+    // ONLY — no own stock added, no receipts credited into the
+    // plotted line. Pre-cutin own receipts were swept into a bank
+    // and re-credited on cutinOffset (see bank sweep above); on
+    // cut-in day the chart steps up by ownStock + bank in one
+    // visible cliff. When predStock exhausts pre-cutin, phase 1
+    // pins at 0 (chain out of coverage; successor not yet live)
+    // and stays flat until the cutin cliff. The runout day
+    // computed independently by _chainHardCutinSupply
+    // (workdaysToCalendarDays(predecessorStock/chainRate)) lands on
+    // the same day the chart line first touches zero here, so
+    // header text and chart agree. Non-hardCutin path unchanged
+    // because beforeCutin is false — displayOh = oh throughout.
+    const displayOh = beforeCutin ? Math.max(0, predStock) : oh;
+    series.push({ d, oh: displayOh, recv: receipts[i] + predRecvToday });
   }
   // Attach the overdue summary as plain properties on the array. Existing
   // callers (.map / .length / indexing / .findIndex) are unaffected.
