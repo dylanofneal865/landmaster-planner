@@ -1086,7 +1086,7 @@ function partStatusBlanketAware(part, supplyLines) {
 // future consumer inherits it. Returns { triggerDate, daysToTrigger,
 // inWindow } given a runoutDaysOfCover (any calendar-days number,
 // finite = a valid runout, Infinity or non-finite = no runout) and
-// an optional transitionStartDate string. inWindow uses the 52-day
+// an optional transitionStartDate string. inWindow uses the 15-day
 // calendar threshold.
 function _computeTriggerFromRunoutAndTransition(runoutDaysOfCover, transitionStartDate) {
   let runoutDate = null;
@@ -1108,7 +1108,7 @@ function _computeTriggerFromRunoutAndTransition(runoutDaysOfCover, transitionSta
   }
   const daysToTrigger = triggerDate
     ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
-  const inWindow = daysToTrigger !== null && daysToTrigger <= 52;
+  const inWindow = daysToTrigger !== null && daysToTrigger <= 15;
   return { triggerDate, daysToTrigger, inWindow };
 }
 
