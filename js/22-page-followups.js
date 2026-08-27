@@ -1487,6 +1487,20 @@ function _runoutDate(g) {
   return g.gapStart || (g.overdueRisk && g.overdueRisk.runoutDate) || null;
 }
 
+// Roll a Sat / Sun / Mon date back to the prior Friday. Suppliers
+// can't ship over the weekend, and Monday arrival requires the
+// truck to leave by Friday, so any of the three prints the prior
+// Friday. Non-mutating: returns a fresh Date (via addDays) or the
+// input unchanged for Tue-Fri. Null-safe.
+function _rollBackToFriday(d) {
+  if (!d) return d;
+  const day = d.getDay();               // 0 Sun, 1 Mon, 6 Sat
+  if (day === 0) return addDays(d, -2); // Sun → Fri
+  if (day === 1) return addDays(d, -3); // Mon → Fri (no weekend shipping)
+  if (day === 6) return addDays(d, -1); // Sat → Fri
+  return d;
+}
+
 // Need-by = runoutDate − STOCKOUT_CUSHION_DAYS. Calendar days,
 // preserved as a local Date so downstream _fmtDateForEmail's
 // month-day-year formatting reads the same in every timezone.
@@ -1495,7 +1509,11 @@ function _needByDate(g) {
   if (!runout) return null;
   const d = new Date(runout.getTime());
   d.setDate(d.getDate() - STOCKOUT_CUSHION_DAYS);
-  return d;
+  // Emailed deadlines must be shippable dates — no weekend receipt,
+  // and Monday arrival requires Friday ship, so Sat/Sun/Mon all
+  // print the prior Friday. Past-date guards downstream continue
+  // to degrade a rolled-back past date to "immediately"/"ASAP".
+  return _rollBackToFriday(d);
 }
 
 // Past-date guard for the stockout line. Never print a past need-by:
