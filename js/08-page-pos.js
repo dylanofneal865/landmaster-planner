@@ -295,7 +295,22 @@ function findOpenBlanketsForPart(pn) {
       if (aE !== bE) return aE < bE ? -1 : 1;
     } else if (aE && !bE) return -1;
     else if (!aE && bE) return 1;
-    // same expiration (or both undated) — larger open wins
+    // Tiebreak on ties in blanketExpires (equal, or both undated).
+    // Releases and cap-and-split must consume the blanket DUE SOONEST —
+    // the old largest-open tiebreak picked a far-future blanket over
+    // the one that tripped the release window. Falls through to
+    // ln.expectedDate then po.expectedDate (parseDateLocal for tz
+    // safety, undated last), then finally to largest open as before.
+    const aExpRaw = (a.line && a.line.expectedDate) || (a.po && a.po.expectedDate) || null;
+    const bExpRaw = (b.line && b.line.expectedDate) || (b.po && b.po.expectedDate) || null;
+    const aExp = aExpRaw && typeof parseDateLocal === "function" ? parseDateLocal(aExpRaw) : null;
+    const bExp = bExpRaw && typeof parseDateLocal === "function" ? parseDateLocal(bExpRaw) : null;
+    if (aExp && bExp) {
+      const aMs = aExp.getTime(), bMs = bExp.getTime();
+      if (aMs !== bMs) return aMs - bMs;
+    } else if (aExp && !bExp) return -1;
+    else if (!aExp && bExp) return 1;
+    // Final fallback — larger open wins.
     return b.open - a.open;
   });
   return out;

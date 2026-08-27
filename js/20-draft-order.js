@@ -246,6 +246,12 @@ function draftOrderTotals() {
         part, qty: p.qty, unit, lineTotal, noCost,
         blanketPoNum: p.blanketPoNum,
         blanketOpenQty: p.blanketOpenQty,
+        // Item-level qtySource surfaced onto each emitted line so
+        // the drawer / PDF render can distinguish a "release"
+        // (full-blanket release seeded by quickAddToDraft) from a
+        // regular "cycle"/"standard" draft without re-looking up
+        // the DRAFT_ORDER item.
+        _qtySource: item.qtySource || null,
         // Split-awareness for the drawer: the drawer collapses a multi-line
         // split into one editable primary row + read-only sub-rows so the
         // math is transparent without duplicating the qty input. The PDF
@@ -305,11 +311,40 @@ function quickAddToDraft(pn) {
   // boost logic all inherited from the shared helpers, so CP00238's 500
   // MOQ floor still applies after the swap.
   const partForQty = { ...part, onPO: openPOQty(pn), daily: part.daily };
-  const qty = (typeof cycleAwareSuggestedQty === "function")
+  let qty = (typeof cycleAwareSuggestedQty === "function")
     ? cycleAwareSuggestedQty(partForQty)
     : suggestedQty(partForQty);
   const cycleForPart = (typeof getSupplierCycle === "function") ? getSupplierCycle(part.supplier) : null;
-  const qtySource = cycleForPart ? "cycle" : "standard";
+  let qtySource = cycleForPart ? "cycle" : "standard";
+  // RELEASE PATH — Sensourcing full-blanket release.
+  //
+  // When a Sensourcing part enters the release trigger window
+  // (partsWithStatus flips _forceAdmitAsRelease at ≤15 days from
+  // consumption of the blanket balance), cycleAwareSuggestedQty
+  // returns 0 because blanketIncomingQty nets the demand fully
+  // into `have` — the blanket already covers everything. But the
+  // business rule is that a release converts the FULL remaining
+  // blanketOpenQty to a normal PO, never partial. Without this
+  // path the row lands in the draft as qty 0 / $0.
+  //
+  // Detect: qty <= 0 AND cycled supplier AND an open blanket
+  // exists for this pn. Re-set qty to the blanket balance and
+  // stamp qtySource="release" so drawer + PDF wording flip to
+  // the full-release phrasing. Non-cycled or blanket-less parts
+  // keep today's 0-qty stub behavior (nothing to release against).
+  if (qty <= 0 && cycleForPart) {
+    // Route through findOpenBlanketsForPart (plural) — its sort now
+    // picks the blanket due soonest, matching _computeBlanketSplit's
+    // allocation order. Using singular findOpenBlanketForPart here
+    // would revert to the largest-open blanket, which can differ from
+    // the one that actually tripped the release window.
+    const _blks = (typeof findOpenBlanketsForPart === "function") ? findOpenBlanketsForPart(pn) : [];
+    const b = _blks[0] || null;
+    if (b && b.open > 0) {
+      qty = b.open;
+      qtySource = "release";
+    }
+  }
   draftOrderAdd(pn, qty, qtySource);
   showToast(`${pn} × ${fmtNum(qty)} added to Draft Order`, "ok", "Added");
 }
@@ -374,17 +409,43 @@ function openDraftOrderDrawer() {
                   const _releaseFlag = _item ? (_item._releaseAgainstBlanket !== false) : true;
                   const _blkNow = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(part.pn) : null;
                   const _hasBlanketBacking = !!_blkNow;
-                  // Header note under the PN — five shapes (was three):
+                  // Header note under the PN — six shapes now:
                   //   toggle-off:          "will place as new order" (muted)
                   //   split (2+ lines):    "319 needed · cap-and-split below"
+                  //   full release:        "Release full blanket balance — N against POx (expires M/D/YY)"
                   //   single release:      "↳ Release against POx (Y left after)"
                   //   normal + exhausted:  "POy fully consumed — ordering normally"
                   //   normal:              (none)
+                  //
+                  // Full-release wins over the plain "Release against POx"
+                  // wording when qtySource === "release" (seeded by
+                  // quickAddToDraft for parts inside the release trigger
+                  // window). It LOSES to isSplit — if the blanket balance
+                  // shrunk after the row was added and the qty no longer
+                  // fits in one release, the split banner is more
+                  // informative than "full release" (which is no longer
+                  // true). Manual qty edits reset qtySource → "cycle"
+                  // (draftOrderUpdateQty), so this branch also drops out
+                  // as soon as the user touches the qty.
                   let releaseNote = "";
                   if (_hasBlanketBacking && !_releaseFlag) {
                     releaseNote = `<div class="dim tiny mono" style="margin-top:2px">will place as new order</div>`;
                   } else if (isSplit) {
                     releaseNote = `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">${fmtNum(totalQty)} needed · cap-and-split below</div>`;
+                  } else if (_item && _item.qtySource === "release" && blanketPoNum) {
+                    const _blks = (typeof findOpenBlanketsForPart === "function") ? findOpenBlanketsForPart(part.pn) : [];
+                    const _matchBlk = _blks.find(b => b && b.po && b.po.num === blanketPoNum);
+                    const _expRaw = _matchBlk && _matchBlk.blanketExpires;
+                    // Build the parenthetical inline so "(no expiry)" reads
+                    // naturally instead of the tautological "(expires no
+                    // expiry)". Prefix "expires " only when we have a real
+                    // parsed date.
+                    let _expClause = "no expiry";
+                    if (_expRaw && typeof parseDateLocal === "function") {
+                      const _dt = parseDateLocal(_expRaw);
+                      if (_dt) _expClause = `expires ${_dt.getMonth() + 1}/${_dt.getDate()}/${String(_dt.getFullYear()).slice(-2)}`;
+                    }
+                    releaseNote = `<div class="tiny mono" style="margin-top:2px;color:var(--accent-d)">Release full blanket balance &mdash; ${fmtNum(qty)} against ${esc(blanketPoNum)} (${esc(_expClause)})</div>`;
                   } else if (blanketPoNum) {
                     const leftAfter = Math.max(0, (blanketOpenQty || 0) - qty);
                     const leftTxt = blanketOpenQty > 0
@@ -567,6 +628,10 @@ function draftOrderUpdateQty(pn, value) {
   existing._releases = split.releases;
   existing._normalQty = split.normalQty;
   existing._exhaustedBlanketPoNum = split.exhaustedBlanketPoNum;
+  // Manual qty edit detaches the row from its full-blanket-release seed;
+  // downstream wording drops back to the standard "Release against POx"
+  // phrasing on drawer + PDF. Left alone on non-release rows.
+  if (existing.qtySource === "release") existing.qtySource = "cycle";
   draftOrderSave();
 
   const newSplitCount = !releaseFlag
@@ -953,7 +1018,7 @@ async function _buildDraftOrderPDF() {
   const rowStatuses = [];
   for (const supplier of supplierKeys) {
     const grp = supplierGroups[supplier];
-    for (const { part, qty, unit, lineTotal, noCost, blanketPoNum } of grp.lines) {
+    for (const { part, qty, unit, lineTotal, noCost, blanketPoNum, _qtySource } of grp.lines) {
       const stat = partStatus(part);
       // CHAIN-AWARE Days Cover on the PDF — the draft-order path bypasses
       // partsWithStatus (it looks up parts via DB.parts.find in
@@ -988,8 +1053,15 @@ async function _buildDraftOrderPDF() {
       // The drawer's HTML template still uses "↳" — that path renders in
       // the browser font and doesn't have the WinAnsi limitation.
       const desc = part.desc || "";
+      // Full-release rows (qtySource "release") use distinct wording so
+      // the buyer sees this is the SCHEDULED full-balance release, not a
+      // partial draw against a blanket that still has qty left afterward.
+      const _fullRelease = _qtySource === "release";
+      const _releasePhrase = _fullRelease
+        ? `RELEASE full blanket ${blanketPoNum}`
+        : `Release against ${blanketPoNum}`;
       const descWithRelease = blanketPoNum
-        ? (desc ? `${desc} — Release against ${blanketPoNum}` : `Release against ${blanketPoNum}`)
+        ? (desc ? `${desc} — ${_releasePhrase}` : _releasePhrase)
         : desc;
       allRows.push([
         supplier,
