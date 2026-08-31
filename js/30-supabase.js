@@ -808,6 +808,220 @@ window.setBuildPlanOverrideCloud       = setBuildPlanOverrideCloud;
 window.clearBuildPlanOverrideCloud     = clearBuildPlanOverrideCloud;
 window.clearAllBuildPlanOverridesCloud = clearAllBuildPlanOverridesCloud;
 
+// ------------------------------------------------------------------
+// Frame Schedule (MOR-RYDE weekly qty grid + global caps).
+// Sidecar table (NOT on the realtime publication — poll-only) that
+// stores the Frame Schedule tab's shared state. Same column shape as
+// build_plan_targets so the schema template transfers: fg_sku PRIMARY
+// KEY, weekly_qty NOT NULL, data jsonb, updated_at, updated_by.
+//
+// TWO ROW ROLES (split by fg_sku, mirrors the build_plan_targets
+// __settings__ sentinel convention):
+//   - fg_sku='__settings__' — global caps in `data.caps = {crewhd,
+//     std}`. Single row; upserted via setFrameScheduleSettingsCloud.
+//   - fg_sku=<ISO Monday, "YYYY-MM-DD"> — one per week; `data`
+//     carries {qty:{pn:n}, slot?:{pn,locked,source}}. slot is
+//     present only on the slot-START week. weekly_qty is unused
+//     (column is NOT NULL for schema compat).
+//
+// v2.0 rows written before the global-caps migration may still
+// carry a `caps` field on per-week rows — the populate reader
+// tolerates and ignores it (see comment inside).
+//
+// Client mirror shape:
+//   DB.frameSchedule = {
+//     settings: {caps:{crewhd,std}, updatedAt} | null,
+//     weeks:    Map<isoMonday, {qty:{pn:n}, slot|null, updatedAt}>,
+//     loaded:   bool,
+//   }
+// ------------------------------------------------------------------
+async function _fetchAllFrameSchedule() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("frame_schedule")
+      .select("fg_sku, weekly_qty, data, updated_at, updated_by")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] frame_schedule page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Populate DB.frameSchedule from a fetched-row array. Clear-and-refill
+// the weeks Map in place per app convention — the outer object is
+// only reassigned on shape mismatch. Mirrors
+// _populateBuildPlanTargetsFromRows exactly so any UI consumer holding
+// a reference to DB.frameSchedule stays valid across reloads.
+function _populateFrameScheduleFromRows(rows) {
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+  }
+  DB.frameSchedule.settings = null;
+  DB.frameSchedule.weeks.clear();
+  if (!Array.isArray(rows)) { DB.frameSchedule.loaded = true; return; }
+  for (const row of rows) {
+    if (!row || !row.fg_sku) continue;
+    const key = String(row.fg_sku);
+    const d = row.data || {};
+    if (key === "__settings__") {
+      // v2.1 global caps sentinel. Row's `data.caps` carries the
+      // whole-tab CREW/HD and STD per-week caps.
+      DB.frameSchedule.settings = {
+        caps: {
+          crewhd: Number(d.caps && d.caps.crewhd) || 0,
+          std:    Number(d.caps && d.caps.std)    || 0,
+        },
+        updatedAt: row.updated_at || null,
+      };
+      continue;
+    }
+    // Regular per-week row. v2 added `slot: {pn, locked, source}`
+    // on the slot-START week. v2.0 rows still had per-week `caps`
+    // on `data` — we IGNORE that field now that caps are global
+    // (the settings sentinel above owns them). Old rows continue
+    // to be readable; their stale caps are silently dropped.
+    const slot = (d.slot && typeof d.slot === "object" && d.slot.pn)
+      ? {
+          pn: String(d.slot.pn),
+          // v3.3: optional pn2 for 1-week split runs. Absent =
+          // whole-run slot (both weeks are pn). Old rows without
+          // pn2 continue to read as whole runs.
+          pn2: (typeof d.slot.pn2 === "string" && d.slot.pn2) ? d.slot.pn2 : null,
+          locked: !!d.slot.locked,
+          source: (d.slot.source === "manual" || d.slot.source === "seed") ? d.slot.source : "auto",
+        }
+      : null;
+    DB.frameSchedule.weeks.set(key, {
+      qty: (d.qty && typeof d.qty === "object") ? d.qty : {},
+      slot,
+      updatedAt: row.updated_at || null,
+    });
+  }
+  DB.frameSchedule.loaded = true;
+}
+
+// Upsert one week (isoMonday key). Optimistic mirror + revert-on-error.
+// Last-write-wins on the (fg_sku) primary key — Frame Schedule is
+// shared state and a concurrent editor in another session writing a
+// different qty is a genuine conflict; the later write is the intent
+// to accept. The full week payload replaces the row so a qty that
+// drops to 0 disappears from the qty map (see caller filtering).
+async function setFrameScheduleWeekCloud(isoMonday, payload) {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+  }
+  const key = String(isoMonday || "");
+  // Guard: the settings sentinel belongs to setFrameScheduleSettingsCloud.
+  // A stray call here would clobber the caps blob.
+  if (key === "__settings__") {
+    return { ok: false, error: new Error("reserved key — use setFrameScheduleSettingsCloud") };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) {
+    return { ok: false, error: new Error("invalid iso Monday key") };
+  }
+  // v2.1: no per-week caps. Payload carries {qty, slot?}.
+  const qty = {};
+  if (payload && payload.qty && typeof payload.qty === "object") {
+    for (const [k, v] of Object.entries(payload.qty)) {
+      const n = Math.max(0, Number(v) || 0);
+      if (n > 0) qty[k] = n;
+    }
+  }
+  // slot descriptor: present ONLY on the slot-START week. Non-start
+  // weeks omit the field; the read path treats missing slot as null.
+  let slot = null;
+  if (payload && payload.slot && typeof payload.slot === "object" && payload.slot.pn) {
+    slot = {
+      pn: String(payload.slot.pn),
+      locked: !!payload.slot.locked,
+      source: (payload.slot.source === "manual" || payload.slot.source === "seed") ? payload.slot.source : "auto",
+    };
+    // v3.3: attach pn2 ONLY when it's a real split (present and
+    // different from pn). Whole runs omit the field so old
+    // readers that don't know about pn2 are unaffected.
+    if (typeof payload.slot.pn2 === "string" && payload.slot.pn2 && payload.slot.pn2 !== slot.pn) {
+      slot.pn2 = payload.slot.pn2;
+    }
+  }
+  const nowIso = new Date().toISOString();
+  const prev = DB.frameSchedule.weeks.get(key);
+  DB.frameSchedule.weeks.set(key, { qty, slot, updatedAt: nowIso });
+  const dataPayload = slot ? { qty, slot } : { qty };
+  const { error } = await _supa
+    .from("frame_schedule")
+    .upsert(
+      {
+        fg_sku:     key,
+        weekly_qty: 0,          // unused for frame_schedule; column NOT NULL
+        data:       dataPayload,
+        updated_at: nowIso,
+      },
+      { onConflict: "fg_sku" }
+    );
+  if (error) {
+    if (prev) DB.frameSchedule.weeks.set(key, prev);
+    else DB.frameSchedule.weeks.delete(key);
+    console.error("[cloud] frame_schedule upsert failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Frame schedule save failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+// Upsert the global CREW/HD + STD caps into the __settings__
+// sentinel row. Optimistic mirror + revert-on-error. Last-write-
+// wins per primary key — global caps are shared state so a
+// concurrent editor is a genuine conflict; the later timestamp
+// prevails. Mirrors setBuildPlanSettingsCloud (js/30 build_plan
+// targets) end to end.
+async function setFrameScheduleSettingsCloud(caps) {
+  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+  }
+  const crewhd = Math.max(0, Number(caps && caps.crewhd) || 0);
+  const std    = Math.max(0, Number(caps && caps.std)    || 0);
+  const nowIso = new Date().toISOString();
+  const prev = DB.frameSchedule.settings;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, updatedAt: nowIso };
+  const { error } = await _supa
+    .from("frame_schedule")
+    .upsert(
+      {
+        fg_sku:     "__settings__",
+        weekly_qty: 0,          // sentinel — not read; column NOT NULL
+        data:       { caps: { crewhd, std } },
+        updated_at: nowIso,
+      },
+      { onConflict: "fg_sku" }
+    );
+  if (error) {
+    DB.frameSchedule.settings = prev;
+    console.error("[cloud] frame_schedule settings upsert failed:", error);
+    if (typeof showToast === "function") {
+      showToast("Frame schedule caps save failed: " + error.message, "crit");
+    }
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+window.setFrameScheduleWeekCloud     = setFrameScheduleWeekCloud;
+window.setFrameScheduleSettingsCloud = setFrameScheduleSettingsCloud;
+
 // Paginated fetch of all queue_entries rows. Sidecar table (not on the
 // realtime publication — poll-only) that stores the first-ever-in-queue
 // timestamp per pn. Runs during cloudInit AFTER parts are hydrated so
@@ -1171,6 +1385,20 @@ async function cloudInit() {
     console.warn("[cloud] build_plan_targets fetch failed; DB.buildPlanTargets may be empty this session");
     if (!DB.buildPlanTargets || !(DB.buildPlanTargets.overrides instanceof Map)) {
       DB.buildPlanTargets = { settings: null, overrides: new Map() };
+    }
+  }
+
+  // ---- Frame Schedule (MOR-RYDE weekly cap + qty grid) ----
+  // Sidecar table, poll-only like build_plan_targets. Rows keyed by
+  // ISO Monday date in fg_sku; data jsonb carries {caps, qty}.
+  const cloudFrameSchedule = await _fetchAllFrameSchedule();
+  if (cloudFrameSchedule !== null) {
+    _populateFrameScheduleFromRows(cloudFrameSchedule);
+    console.log(`[cloud] loaded frame_schedule: ${DB.frameSchedule.weeks.size} week(s)`);
+  } else {
+    console.warn("[cloud] frame_schedule fetch failed; DB.frameSchedule may be empty this session");
+    if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+      DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
     }
   }
 
@@ -1969,6 +2197,13 @@ async function _catchupFetch() {
   const cloudBPTargetsCatchup = await _fetchAllBuildPlanTargets();
   if (cloudBPTargetsCatchup !== null) {
     _populateBuildPlanTargetsFromRows(cloudBPTargetsCatchup);
+  }
+
+  // frame_schedule — shared weekly grid. Same rationale as
+  // build_plan_targets: cheap fetch (a few dozen rows at most).
+  const cloudFrameScheduleCatchup = await _fetchAllFrameSchedule();
+  if (cloudFrameScheduleCatchup !== null) {
+    _populateFrameScheduleFromRows(cloudFrameScheduleCatchup);
   }
 
   // Draft — LWW-safe adoption. Only accept cloud if strictly newer than
