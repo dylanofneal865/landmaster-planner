@@ -430,6 +430,46 @@ async function _fetchAllProductionOrders() {
   return all;
 }
 
+// Paginated fetch of po_receipts rows — FULL ARCHIVE for FRAME_PNS.
+// Sidecar table populated daily by
+// netlify/functions/acumatica-po-receipts-sync.js — server-owned
+// writes, NEVER pushed from the browser. One paged fetch on boot
+// AND on reconnect. NOT included in the realtime subscription set —
+// poll-only. Client mirror DB.poReceipts is READ ONLY: no push
+// helper, no dirty tracking, no realtime handler. Only consumer is
+// the Frame Schedule tab's Receipt History panel.
+//
+// SERVER-SIDE PN FILTER — the archive table holds every released
+// receipt line ever synced (retention policy: forever). The Frame
+// Schedule tab only cares about six frame PNs, so we filter via
+// `.in("data->>pn", [...])` before pagination. Keeps the client
+// working set small even after years of history. The PN list is
+// intentionally duplicated here rather than imported from js/25 —
+// this file loads first and has no dependency on the page module.
+const _FRAME_PNS_FOR_RECEIPTS = ["UT101001", "UT101002", "UT101003", "UT101004", "UT101005", "UT101006"];
+async function _fetchAllPoReceipts() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("po_receipts")
+      .select("id, data")
+      .in("data->>pn", _FRAME_PNS_FOR_RECEIPTS)
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] po_receipts page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
 async function _fetchAllBomLinks() {
   if (!_supa) return [];
   const all = [];
@@ -1402,6 +1442,23 @@ async function cloudInit() {
     }
   }
 
+  // ---- PO Receipts (last 26 weeks, read-only overlay) ----
+  // Populated daily by acumatica-po-receipts-sync. Client mirror
+  // DB.poReceipts is READ ONLY — never pushed, never mutated by any
+  // user action. Feeds the Frame Schedule tab's "got N" received-vs-
+  // scheduled overlay and NOTHING else. Not in the realtime
+  // publication — poll-only via this fetch + reconnect catchup.
+  const cloudPoReceipts = await _fetchAllPoReceipts();
+  if (cloudPoReceipts !== null) {
+    if (!Array.isArray(DB.poReceipts)) DB.poReceipts = [];
+    DB.poReceipts.length = 0;
+    for (const r of cloudPoReceipts) DB.poReceipts.push({ id: r.id, ...r.data });
+    console.log(`[cloud] loaded ${DB.poReceipts.length} po_receipts rows (full archive for FRAME_PNS)`);
+  } else {
+    console.warn("[cloud] po_receipts fetch failed; DB.poReceipts may be unset");
+    if (!Array.isArray(DB.poReceipts)) DB.poReceipts = [];
+  }
+
   _cloudReady = true;
   // Prime snapshots so future _detectChanges() only flags real edits
   for (const p of DB.parts) _partsSnapshot.set(p.pn, JSON.stringify(p));
@@ -2204,6 +2261,18 @@ async function _catchupFetch() {
   const cloudFrameScheduleCatchup = await _fetchAllFrameSchedule();
   if (cloudFrameScheduleCatchup !== null) {
     _populateFrameScheduleFromRows(cloudFrameScheduleCatchup);
+  }
+
+  // po_receipts — daily-cadence history feed, 26-week window. A
+  // reconnect after the 06:15 UTC sync should pick up the fresh
+  // day; without this, the "got N" overlay on Frame Schedule would
+  // show yesterday's receipt totals until the next full reboot.
+  // Read-only mirror — no snapshot priming, no dirty tracking.
+  const cloudPoReceiptsCatchup = await _fetchAllPoReceipts();
+  if (cloudPoReceiptsCatchup !== null) {
+    if (!Array.isArray(DB.poReceipts)) DB.poReceipts = [];
+    DB.poReceipts.length = 0;
+    for (const r of cloudPoReceiptsCatchup) DB.poReceipts.push({ id: r.id, ...r.data });
   }
 
   // Draft — LWW-safe adoption. Only accept cloud if strictly newer than

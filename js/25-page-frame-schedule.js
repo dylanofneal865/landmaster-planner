@@ -32,7 +32,10 @@
        annotation in the warning row and the _fsDebugSim inbound
        table — POs are NOT credited into the sim itself; the
        schedule is the supply plan and the operator orders extra
-       as needed. Never writes part fields, POs, statuses,
+       as needed. Reads DB.poReceipts (populated by the daily
+       PO-receipts sync) for the "got N" received-vs-scheduled
+       overlay on past+current cells; receipts NEVER feed the sim.
+       Never writes part fields, POs, receipts, statuses,
        queues, drafts, or any other shared store.
      - Never calls the status pipeline
        (partsWithStatus / queueParts / partStatus / computeDemand /
@@ -101,6 +104,11 @@ const FRAMESCHED_STATE = {
   // Track slot startIsos already auto-persisted this session so
   // we don't fire redundant crossing writes on subsequent renders.
   _autoPersistedSlots: new Set(),
+  // Receipt History panel: which slice of the full-archive history
+  // to render. "8" | "26" | "all"; default 26. In-memory only —
+  // reverts on reload, which is fine (a display preference, not a
+  // decision that needs to travel across sessions).
+  _historyRange: "26",
 };
 
 /* ============================================================
@@ -1023,6 +1031,31 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
       _fsCommitWeek(iso, payload);
     }
   }
+
+  // ── HISTORY GAP FIX ─────────────────────────────────────────────
+  // For LOCKED slots (including seed), ensure the CURRENT week has
+  // a persisted qty so that once the week rolls into "past" the
+  // render's past-column reader has real numbers to show. Runs on
+  // every render, gated only by "no persisted qty yet" — idempotent
+  // once the current week has been quantified. No sanity-gate
+  // needed: this pass persists QTY, not pn (pn was gated above).
+  //
+  // Degenerate caps: payload.qty is empty → skip write. So a
+  // transient zero-caps render can't stamp a blank current week.
+  const currentCol = cols.find(c => c.current);
+  if (currentCol) {
+    for (const s of slots) {
+      if (!s.locked || !s.resolvedPn) continue;
+      const idx = s.weekIsos.indexOf(currentCol.iso);
+      if (idx < 0) continue;
+      const wk = _fsWeekData(currentCol.iso);
+      if (wk.qty && Object.keys(wk.qty).length > 0) continue;
+      const payload = _fsBuildWeekPayload(currentCol.iso, scheduledRuns, s, idx === 0);
+      if (payload.qty && Object.keys(payload.qty).length > 0) {
+        _fsCommitWeek(currentCol.iso, payload);
+      }
+    }
+  }
 }
 
 // Threshold (stockout-units delta) above which a LOCKED
@@ -1107,6 +1140,24 @@ function renderFrameSchedule() {
   const weekToSlot = new Map();
   for (const s of slots) {
     for (const iso of s.weekIsos) weekToSlot.set(iso, s);
+  }
+
+  // Received-qty index: sum DB.poReceipts by (pn|weekIso). Consumed
+  // by the RECEIPT HISTORY panel below (grid cells no longer show
+  // "got N" — that annotation moved OFF the schedule grid so slot
+  // content can't affect column widths). DB.poReceipts is READ
+  // ONLY here — populated by _fetchAllPoReceipts (js/30). No iso
+  // filter: the panel spans 8 past Mondays that may lie OUTSIDE
+  // the grid's visible cols, and DB.poReceipts is already scoped
+  // to 26 weeks by the fetch.
+  const receivedByPnWeek = new Map();
+  const _poReceipts = (typeof DB !== "undefined" && Array.isArray(DB.poReceipts)) ? DB.poReceipts : [];
+  const _frameSet = new Set(FRAME_PNS);
+  for (const rec of _poReceipts) {
+    if (!rec || !rec.pn || !rec.weekIso) continue;
+    if (!_frameSet.has(rec.pn)) continue;
+    const key = rec.pn + "|" + rec.weekIso;
+    receivedByPnWeek.set(key, (receivedByPnWeek.get(key) || 0) + (Number(rec.qty) || 0));
   }
 
   // Precompute per-week per-pool nonzero counts for the same-pool
@@ -1343,6 +1394,187 @@ function renderFrameSchedule() {
         </div>`;
       }).join("");
 
+  // ---- Receipt History panel (scheduled vs received) ----
+  // Off-grid overlay showing every Monday from the earliest known
+  // frame-schedule week (or earliest FRAME_PN receipt, whichever is
+  // older) through the LAST COMPLETED week. Newest on the LEFT,
+  // oldest on the right; horizontally scrollable with the frame
+  // column sticky. Range control lets the operator narrow to the
+  // last 8 wk / 26 wk / all (default 26) — pure render filter, no
+  // data changes. CSV export writes frame,week,scheduled,received
+  // for the shown range. Reads persisted qty for scheduled (past
+  // weeks only ever have persisted qty — the sim skips past cols)
+  // and receivedByPnWeek for received. NO persistence writes.
+  const currentIso = (cols.find(c => c.current) || {}).iso || null;
+
+  // Compute prev-Monday (Monday before current week). Fall back to
+  // today's local Monday when no current col exists.
+  let prevMondayAnchor;
+  if (currentIso) {
+    const currentCol = cols.find(c => c.current);
+    prevMondayAnchor = (typeof addDays === "function")
+      ? addDays(currentCol.date, -7)
+      : new Date(currentCol.date.getTime() - 7 * 86400000);
+  } else {
+    prevMondayAnchor = new Date();
+    prevMondayAnchor.setHours(0, 0, 0, 0);
+    const back = (prevMondayAnchor.getDay() + 6) % 7;
+    prevMondayAnchor.setDate(prevMondayAnchor.getDate() - back - 7);
+  }
+  prevMondayAnchor.setHours(0, 0, 0, 0);
+  const prevMondayIso = _fsIsoMonday(prevMondayAnchor);
+
+  // Earliest Monday = min of (persisted frame_schedule weeks with
+  // any real frame qty, DB.poReceipts weeks for FRAME_PNS). YYYY-MM-DD
+  // sorts lexicographically = chronologically. If nothing found, use
+  // prevMondayIso so the panel still renders (single column).
+  let earliestIso = null;
+  if (DB.frameSchedule && DB.frameSchedule.weeks instanceof Map) {
+    for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+      if (!wk || !wk.qty) continue;
+      let any = false;
+      for (const pn of FRAME_PNS) { if (Number(wk.qty[pn]) > 0) { any = true; break; } }
+      if (!any) continue;
+      if (iso > prevMondayIso) continue;   // future — panel is history only
+      if (!earliestIso || iso < earliestIso) earliestIso = iso;
+    }
+  }
+  for (const rec of _poReceipts) {
+    if (!rec || !rec.pn || !rec.weekIso) continue;
+    if (!_frameSet.has(rec.pn)) continue;
+    if (rec.weekIso > prevMondayIso) continue;
+    if (!earliestIso || rec.weekIso < earliestIso) earliestIso = rec.weekIso;
+  }
+  if (!earliestIso) earliestIso = prevMondayIso;
+
+  // Build every Monday from earliestIso through prevMondayIso,
+  // step 7 days. Then reverse for NEWEST-ON-LEFT display order.
+  const historyIsosAsc = [];
+  {
+    const start = parseDateLocal(earliestIso);
+    start.setHours(0, 0, 0, 0);
+    let d = new Date(start.getTime());
+    // Safety cap: 10 years of weekly steps = 520 iterations. In
+    // practice we expect a few dozen to a few hundred.
+    for (let steps = 0; steps < 520; steps++) {
+      const iso = _fsIsoMonday(d);
+      historyIsosAsc.push(iso);
+      if (iso >= prevMondayIso) break;
+      d = (typeof addDays === "function") ? addDays(d, 7) : new Date(d.getTime() + 7 * 86400000);
+      d.setHours(0, 0, 0, 0);
+    }
+  }
+  const allHistoryIsos = historyIsosAsc.slice().reverse();   // newest first (left)
+
+  // Apply range filter — pure render slice. FRAMESCHED_STATE holds
+  // the current selection so it survives re-renders (cap edits,
+  // reconnect refresh) within the session.
+  const range = FRAMESCHED_STATE._historyRange || "26";
+  let visibleHistoryIsos;
+  if (range === "all") {
+    visibleHistoryIsos = allHistoryIsos;
+  } else {
+    const n = (range === "8") ? 8 : 26;
+    visibleHistoryIsos = allHistoryIsos.slice(0, n);
+  }
+
+  // Row per frame in FRAME_PNS order (NOT rows — rows is filtered
+  // by inCatalog; the panel spec calls for the full six).
+  const historyRows = FRAME_PNS.map(pn => {
+    const short = FRAME_SHORT[pn] || "";
+    let winSched = 0;
+    let winRecv = 0;
+    const cells = visibleHistoryIsos.map(iso => {
+      const wk = _fsWeekData(iso);
+      const sched = Number(wk.qty && wk.qty[pn]) || 0;
+      const recv = Number(receivedByPnWeek.get(pn + "|" + iso)) || 0;
+      winSched += sched;
+      winRecv += recv;
+      if (sched === 0 && recv === 0) {
+        return `<td class="right mono fs-hist-cell fs-got-none" title="No scheduled qty and no receipts">&mdash;</td>`;
+      }
+      const cls = (recv >= sched) ? "fs-got-ok" : "fs-got-short";
+      const title = `Scheduled ${sched}, received ${recv}`;
+      return `<td class="right mono fs-hist-cell ${cls}" title="${esc(title)}">sched ${sched} &middot; got ${recv}</td>`;
+    }).join("");
+    // Window totals — over the SHOWN range only.
+    let totCell;
+    if (winSched === 0 && winRecv === 0) {
+      totCell = `<td class="right mono fs-hist-cell fs-got-none" title="No scheduled qty and no receipts across the shown range">&mdash;</td>`;
+    } else {
+      const totCls = (winRecv >= winSched) ? "fs-got-ok" : "fs-got-short";
+      totCell = `<td class="right mono fs-hist-cell ${totCls}" title="Shown range: scheduled ${winSched}, received ${winRecv}"><strong>sched ${winSched} / got ${winRecv}</strong></td>`;
+    }
+    // This-week column: received-so-far only, always dim (partial
+    // week — comparing against a scheduled cap isn't fair yet).
+    const thisWkRecv = currentIso ? (Number(receivedByPnWeek.get(pn + "|" + currentIso)) || 0) : 0;
+    const thisWkTitle = currentIso
+      ? `Received ${thisWkRecv} so far this week`
+      : `No current week in grid`;
+    const thisWkCell = `<td class="right mono fs-hist-cell fs-got-current" title="${esc(thisWkTitle)}">got ${thisWkRecv} so far</td>`;
+    return `<tr>
+      <th class="fs-hist-sticky">
+        <span class="mono">${esc(pn)}</span>
+        ${short ? `<span class="muted tiny" style="margin-left:6px">&middot; ${esc(short)}</span>` : ""}
+      </th>
+      ${cells}
+      ${totCell}
+      ${thisWkCell}
+    </tr>`;
+  }).join("");
+
+  const historyHeadMD = visibleHistoryIsos.map(iso =>
+    `<th class="right dim" title="${esc(iso)}">${esc(_fsMdFromIso(iso))}</th>`
+  ).join("");
+
+  // Range control + CSV button. Handlers are window-scoped so the
+  // inline onclick attribute resolves. Range buttons flip
+  // FRAMESCHED_STATE and re-render; CSV builds a Blob for the
+  // shown range.
+  const rangeBtn = (label, val) => {
+    const active = (range === val);
+    const cls = active ? "pill info tiny" : "pill muted tiny";
+    return `<span class="${cls}" role="button" tabindex="0" style="cursor:pointer;margin-left:4px;letter-spacing:0.05em" onclick="_fsHandleHistoryRange('${val}')">${esc(label)}</span>`;
+  };
+  const totalWeeks = allHistoryIsos.length;
+  const shownWeeks = visibleHistoryIsos.length;
+  const rangeControl = `
+    <div class="fs-history-controls">
+      <span class="muted tiny">Show:</span>
+      ${rangeBtn("last 8 wk", "8")}
+      ${rangeBtn("26 wk", "26")}
+      ${rangeBtn("all", "all")}
+      <span class="muted tiny" style="margin-left:12px">${shownWeeks} of ${totalWeeks} wk shown</span>
+      <span class="pill muted tiny" role="button" tabindex="0" style="cursor:pointer;margin-left:auto;letter-spacing:0.05em" onclick="_fsDownloadHistoryCsv()" title="Download frame, week, scheduled, received for the shown range">Download CSV</span>
+    </div>`;
+
+  const historyPanel = `
+    <div class="fs-history-panel">
+      <div class="fs-warn-title">Receipt history &mdash; scheduled vs received</div>
+      ${rangeControl}
+      <div class="tbl-wrap fs-history-wrap" style="overflow:auto">
+        <table class="tbl fs-history-tbl">
+          <colgroup>
+            <col class="fs-hist-col-sticky">
+            ${visibleHistoryIsos.map(() => `<col class="fs-hist-col-week">`).join("")}
+            <col class="fs-hist-col-total">
+            <col class="fs-hist-col-thiswk">
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="fs-hist-sticky">Frame</th>
+              ${historyHeadMD}
+              <th class="right">Window totals</th>
+              <th class="right">This wk</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${historyRows}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+
   // Global caps input strip in the page head. Changes go through
   // setFrameScheduleSettingsCloud (optimistic mirror + revert)
   // and re-run the sim so proposed slots reflect the new cap;
@@ -1397,6 +1629,26 @@ function renderFrameSchedule() {
       .fs-run { background: rgba(80,180,120,0.22); font-weight: 600; }
       .fs-filler { background: rgba(80,180,120,0.08); font-style: italic; }
       .fs-tbl td, .fs-tbl th { white-space: nowrap; }
+      /* Receipt-status color palette — reused by the Receipt History
+         panel below. Grid cells no longer carry these classes; the
+         overlay lives entirely in its own table. */
+      .fs-got-ok      { color: var(--ok, #4bcc80); }
+      .fs-got-short   { color: var(--crit, #ff6b6b); }
+      .fs-got-none    { color: var(--t2); opacity: 0.55; }
+      .fs-got-current { color: var(--t2); opacity: 0.70; font-style: italic; }
+      /* Receipt History panel — separate fixed-layout table so slot
+         content in the schedule grid can never affect its widths. */
+      .fs-history-panel { padding:10px 12px; background:var(--bg-1); border-radius:6px; margin-top:12px; }
+      .fs-history-tbl { table-layout: fixed; }
+      .fs-history-tbl th, .fs-history-tbl td { white-space: nowrap; padding: 4px 8px; }
+      .fs-history-tbl th.right { text-align: right; }
+      .fs-hist-col-sticky { width: 240px; }
+      .fs-hist-col-week   { width: 108px; }
+      .fs-hist-col-total  { width: 156px; }
+      .fs-hist-col-thiswk { width: 148px; }
+      .fs-hist-sticky { position: sticky; left: 0; background: var(--bg-1); z-index: 2; width: 240px; text-align: left; }
+      .fs-hist-cell { text-align: right; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+      .fs-history-controls { display:flex; align-items:center; gap:2px; padding:2px 4px 8px 4px; font-size:11px; }
       .fs-global-caps { display:flex; align-items:center; gap:14px; padding:10px 12px; background:var(--bg-1); border-radius:6px; margin-bottom:12px; }
       .fs-caps-label { display:flex; flex-direction:column; gap:2px; }
       .fs-caps-input { width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -1447,6 +1699,8 @@ function renderFrameSchedule() {
         <div class="fs-warn-title">Projected coverage &mdash; winning sequence</div>
         ${warningsPanel}
       </div>
+
+      ${historyPanel}
     </div>`;
 
   // Fire persistence for LOCKED slots that just crossed the 42-day
@@ -1538,6 +1792,126 @@ function _fsHandleSettingsCap(pool, raw) {
   // Optimistic mirror update happened inside setFrameScheduleSettingsCloud
   // (before the RPC), so this render sees the new value immediately.
   renderFrameSchedule();
+}
+
+// Receipt History range control — flip the visible slice and
+// re-render. Values: "8" | "26" | "all". Pure display state, no
+// PIN gate (nothing writes to shared stores). Unknown values are
+// clamped to "26" so a bad inline value can't wedge the panel.
+function _fsHandleHistoryRange(val) {
+  const allowed = new Set(["8", "26", "all"]);
+  FRAMESCHED_STATE._historyRange = allowed.has(String(val)) ? String(val) : "26";
+  renderFrameSchedule();
+}
+
+// Receipt History CSV export — client-side only. Rebuilds the
+// panel's data for the currently shown range (same math as the
+// render pass) and delivers a Blob via a temporary anchor. NO
+// cloud calls; no writes; no state mutation.
+//
+// Columns: frame,week,scheduled,received. One row per (pn, week)
+// including zero-zero pairs so the CSV mirrors the visible table
+// exactly. Current week is NOT included — the panel treats it as
+// a partial-info column, and mixing partial receipts into a
+// reconcile export would be misleading.
+function _fsDownloadHistoryCsv() {
+  try {
+    const cols = _fsColumns();
+    const currentCol = cols.find(c => c.current);
+    // Compute prev-Monday (same fallback as render).
+    let prevMondayAnchor;
+    if (currentCol) {
+      prevMondayAnchor = (typeof addDays === "function") ? addDays(currentCol.date, -7)
+                                                          : new Date(currentCol.date.getTime() - 7 * 86400000);
+    } else {
+      prevMondayAnchor = new Date();
+      prevMondayAnchor.setHours(0, 0, 0, 0);
+      const back = (prevMondayAnchor.getDay() + 6) % 7;
+      prevMondayAnchor.setDate(prevMondayAnchor.getDate() - back - 7);
+    }
+    prevMondayAnchor.setHours(0, 0, 0, 0);
+    const prevMondayIso = _fsIsoMonday(prevMondayAnchor);
+
+    // Received index for FRAME_PNS across the archive.
+    const receivedByPnWeek = new Map();
+    const _poReceipts = (typeof DB !== "undefined" && Array.isArray(DB.poReceipts)) ? DB.poReceipts : [];
+    const _frameSet = new Set(FRAME_PNS);
+    for (const rec of _poReceipts) {
+      if (!rec || !rec.pn || !rec.weekIso) continue;
+      if (!_frameSet.has(rec.pn)) continue;
+      const key = rec.pn + "|" + rec.weekIso;
+      receivedByPnWeek.set(key, (receivedByPnWeek.get(key) || 0) + (Number(rec.qty) || 0));
+    }
+
+    // Earliest known Monday from persisted schedule + receipts.
+    let earliestIso = null;
+    if (DB.frameSchedule && DB.frameSchedule.weeks instanceof Map) {
+      for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+        if (!wk || !wk.qty) continue;
+        let any = false;
+        for (const pn of FRAME_PNS) { if (Number(wk.qty[pn]) > 0) { any = true; break; } }
+        if (!any) continue;
+        if (iso > prevMondayIso) continue;
+        if (!earliestIso || iso < earliestIso) earliestIso = iso;
+      }
+    }
+    for (const rec of _poReceipts) {
+      if (!rec || !rec.pn || !rec.weekIso) continue;
+      if (!_frameSet.has(rec.pn)) continue;
+      if (rec.weekIso > prevMondayIso) continue;
+      if (!earliestIso || rec.weekIso < earliestIso) earliestIso = rec.weekIso;
+    }
+    if (!earliestIso) earliestIso = prevMondayIso;
+
+    // Ascending week list, then range-slice (newest side).
+    const asc = [];
+    {
+      const start = parseDateLocal(earliestIso);
+      start.setHours(0, 0, 0, 0);
+      let d = new Date(start.getTime());
+      for (let steps = 0; steps < 520; steps++) {
+        const iso = _fsIsoMonday(d);
+        asc.push(iso);
+        if (iso >= prevMondayIso) break;
+        d = (typeof addDays === "function") ? addDays(d, 7) : new Date(d.getTime() + 7 * 86400000);
+        d.setHours(0, 0, 0, 0);
+      }
+    }
+    const newestFirst = asc.slice().reverse();
+    const range = FRAMESCHED_STATE._historyRange || "26";
+    const visible = (range === "all") ? newestFirst : newestFirst.slice(0, range === "8" ? 8 : 26);
+    // CSV lines ordered oldest → newest so a reconcile is easy to
+    // scan chronologically. Display order (newest-left) is a
+    // rendering choice, not an export contract.
+    const chronological = visible.slice().reverse();
+
+    const lines = ["frame,week,scheduled,received"];
+    for (const pn of FRAME_PNS) {
+      for (const iso of chronological) {
+        const wk = _fsWeekData(iso);
+        const sched = Number(wk.qty && wk.qty[pn]) || 0;
+        const recv = Number(receivedByPnWeek.get(pn + "|" + iso)) || 0;
+        lines.push(`${pn},${iso},${sched},${recv}`);
+      }
+    }
+
+    const csv = lines.join("\n") + "\n";
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `frame-receipt-history-${range}-${_fsIsoMonday(new Date())}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Free the object URL on next tick so the click-triggered
+    // navigation has time to consume it.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    if (typeof console !== "undefined") {
+      console.warn("[frame-sched] receipt history CSV export failed", err);
+    }
+  }
 }
 
 // Manual slot override. pn === "" clears the override and lets

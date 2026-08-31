@@ -36,3 +36,12 @@
 # Poll-only downstream: production_orders is NOT in the realtime publication.
 [functions."acumatica-production-orders-sync"]
   schedule = "0 11 * * 1"
+
+# Daily PO-Receipts sync — runs once at 06:15 UTC. Reconciles the
+# po_receipts table from the "LM Planner - PO Receipt" GI. Feeds the
+# "got N" received-vs-scheduled overlay on the Frame Schedule tab.
+# HISTORY-PRESERVING: the source GI is windowed to ~180 days, so this
+# sync upserts changed/new rows only — never deletes. Client mirror
+# DB.poReceipts is READ ONLY and not in the realtime publication.
+[functions."acumatica-po-receipts-sync"]
+  schedule = "15 6 * * *"
