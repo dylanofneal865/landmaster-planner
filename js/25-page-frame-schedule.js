@@ -221,6 +221,35 @@ function _fsWeeksToNextRunFor(pn, fromIso, slots, cols) {
   return _fsWeeksBetween(fromIso, lastIso) + 1;
 }
 
+// v4.9 CATCH-UP MODE: a pool is "behind" when ANY of its frames
+// is projected to fall below the buffer target between now and
+// that frame's next scheduled run. While a pool is behind, runs
+// for that pool build at FULL CAP (whole packs, cap-clamped) —
+// dig out of the hole fast. Once every frame in the pool would
+// reach its next run at/above target, revert to demand-sizing.
+//
+// projected = onHand − weeksToNext × burn        (end-of-gap oh)
+// target    = bufferWeeks × burn                 (min cushion)
+// frameBehind = projected < target
+// poolBehind = ANY frame in pool has frameBehind
+//
+// Cheap: linear over rows (≤ 6 frames). Called at each placement
+// (per run + per filler), so a handful per week.
+function _fsPoolBehind(pool, rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeks, fromIso) {
+  const bw = Math.max(0, Number(bufferWeeks) || 0);
+  for (const r of rows) {
+    if (r.pool !== pool) continue;
+    const burn = Number(weeklyBurnByPn.get(r.pn)) || 0;
+    if (burn <= 0) continue;
+    const weeksToNext = _fsWeeksToNextRunFor(r.pn, fromIso, slots, cols);
+    const oh = Number(onHand.get(r.pn)) || 0;
+    const projected = oh - weeksToNext * burn;
+    const target = bw * burn;
+    if (projected < target) return true;
+  }
+  return false;
+}
+
 // Frame rows: six hardcoded PNs enriched with DB.parts data
 // (onHand, daily, desc). If a PN isn't in DB.parts, onHand and
 // daily default to 0 and inCatalog=false so the renderer can
@@ -756,21 +785,33 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
         onHand.set(pn, (onHand.get(pn) || 0) + qN);
       }
     } else if (slot && runPn) {
-      // v4.6 PACKS. Runs build whole stacks of FRAME_PACK; caps
-      // and demand round to packs. Distinct paths for whole runs
-      // vs. split slots — whole runs plan slot-wide and spread
-      // the packs across the 2 weeks; split slots pack per-week
-      // because each week runs a different frame.
+      // v4.6 PACKS + v4.9 CATCH-UP. Runs build whole stacks of
+      // FRAME_PACK. Two modes:
+      //   CATCHUP (poolBehind === true) — any frame in runPool is
+      //     projected below buffer target through its next run.
+      //     Runs place FULL CAP in whole packs THIS week. No
+      //     stash / slot-level distribution — each week evaluates
+      //     independently so we exit catchup the week we're clear.
+      //   DEMAND (poolBehind === false) — original v4.6 logic:
+      //     split → per-week demand; whole-run → slot-level demand
+      //     distributed evenly across the 2 weeks via stash.
       const cap = runPool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
       const capPerWeekPacks = Math.floor(cap / FRAME_PACK);
       const isSplit = !!(slot.resolvedPn2 && slot.resolvedPn2 !== slot.resolvedPn);
       const isWeek1 = slot.weekIsos[0] === iso;
       const isWeek2 = slot.weekIsos[1] === iso;
+      const poolBehind = _fsPoolBehind(runPool, rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeksLocal, iso);
 
       let placedQty = 0;
-      if (isSplit) {
-        // SPLIT slot — each week's frame is independently packed.
-        // A single week never mixes two frames.
+      let placedMode = "demand";
+      if (poolBehind) {
+        // CATCHUP — full cap in whole packs, this week.
+        // Clear any stash so week 2 re-evaluates fresh.
+        slotWeek2Whole.delete(slot.startIso);
+        placedQty = capPerWeekPacks * FRAME_PACK;
+        placedMode = "catchup";
+      } else if (isSplit) {
+        // SPLIT slot — per-week demand of THIS week's frame.
         const burnRun = weeklyBurnByPn.get(runPn) || 0;
         const ohRun  = Number(onHand.get(runPn)) || 0;
         const weeksToNext = _fsWeeksToNextRunFor(runPn, iso, slots, cols);
@@ -779,11 +820,7 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
         const placedPacks = Math.min(neededPacks, capPerWeekPacks);
         placedQty = placedPacks * FRAME_PACK;
       } else if (isWeek1) {
-        // WHOLE-RUN slot, first week. Compute demand at slot start,
-        // pack up to the nearest FRAME_PACK, cap-clamp to whole-
-        // slot pack capacity (2 × capPerWeekPacks), then split the
-        // packs evenly across the 2 weeks (ceil to week 1, floor
-        // to week 2). Stash week 2's share for the next iteration.
+        // WHOLE-RUN week 1 — slot-level demand, balanced distribute.
         const burnRun = weeklyBurnByPn.get(runPn) || 0;
         const ohRun  = Number(onHand.get(runPn)) || 0;
         const weeksToNext = _fsWeeksToNextRunFor(runPn, iso, slots, cols);
@@ -796,10 +833,9 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
         placedQty = week1Packs * FRAME_PACK;
         slotWeek2Whole.set(slot.startIso, { pn: runPn, qty: week2Packs * FRAME_PACK });
       } else if (isWeek2) {
-        // WHOLE-RUN slot, second week — read the stash. If empty
-        // (slotWeek2Whole wasn't set, e.g. slot starts before the
-        // sim's visible window), compute demand fresh for this
-        // week as a fallback and pack it.
+        // WHOLE-RUN week 2 — read stash. Empty stash means week 1
+        // ran in catchup mode (or slot started before visible
+        // window); fall back to single-week demand for this week.
         const stash = slotWeek2Whole.get(slot.startIso);
         if (stash && stash.pn === runPn) {
           placedQty = stash.qty;
@@ -815,32 +851,38 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
 
       if (placedQty > 0) {
         const qty = Math.round(placedQty);   // final integer guard
-        scheduledRuns.get(runPn).push({ weekIso: iso, qty, kind: "run" });
+        scheduledRuns.get(runPn).push({ weekIso: iso, qty, kind: "run", mode: placedMode });
         onHand.set(runPn, (Number(onHand.get(runPn)) || 0) + qty);
         runCount++;
       }
 
-      // DROP-IN filler — ONLY when THIS WEEK's running frame is
-      // CREW/HD. Also whole packs of the STD frame: filler qty =
-      // ceil(neededFill/FRAME_PACK)*FRAME_PACK, capped by
-      // floor(spareCap/FRAME_PACK)*FRAME_PACK. If spareCap < 1
-      // pack, no filler that week.
+      // DROP-IN filler — CREW/HD week only. Same catchup rule
+      // applied to the STD pool: when STD pool is behind, spare
+      // capacity fills at FULL PACKS; otherwise demand-sized.
       if (runPool === "crewhd") {
         const spareCap = Math.max(0, (globalCaps.std || 0) - (globalCaps.crewhd || 0));
         const spareCapPacks = Math.floor(spareCap / FRAME_PACK);
         if (spareCapPacks > 0) {
           const fillerPn = _fsPickFillerCandidate(rows, onHand, runPn, rateByPn);
           if (fillerPn) {
-            const burnFill = weeklyBurnByPn.get(fillerPn) || 0;
-            const ohFill = Number(onHand.get(fillerPn)) || 0;
-            const weeksToNextFill = _fsWeeksToNextRunFor(fillerPn, iso, slots, cols);
-            const neededFill = Math.max(0, burnFill * (weeksToNextFill + bufferWeeksLocal) - ohFill);
-            const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
-            const fillPacks = Math.min(neededFillPacks, spareCapPacks);
-            const fillQty = Math.round(fillPacks * FRAME_PACK);
+            const stdBehind = _fsPoolBehind("std", rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeksLocal, iso);
+            let fillQty = 0;
+            let fillMode = "demand";
+            if (stdBehind) {
+              fillQty = Math.round(spareCapPacks * FRAME_PACK);
+              fillMode = "catchup";
+            } else {
+              const burnFill = weeklyBurnByPn.get(fillerPn) || 0;
+              const ohFill = Number(onHand.get(fillerPn)) || 0;
+              const weeksToNextFill = _fsWeeksToNextRunFor(fillerPn, iso, slots, cols);
+              const neededFill = Math.max(0, burnFill * (weeksToNextFill + bufferWeeksLocal) - ohFill);
+              const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
+              const fillPacks = Math.min(neededFillPacks, spareCapPacks);
+              fillQty = Math.round(fillPacks * FRAME_PACK);
+            }
             if (fillQty > 0) {
-              scheduledRuns.get(fillerPn).push({ weekIso: iso, qty: fillQty, kind: "filler" });
-              onHand.set(fillerPn, ohFill + fillQty);
+              scheduledRuns.get(fillerPn).push({ weekIso: iso, qty: fillQty, kind: "filler", mode: fillMode });
+              onHand.set(fillerPn, (Number(onHand.get(fillerPn)) || 0) + fillQty);
             }
           }
         }
@@ -4278,6 +4320,11 @@ window._fsDebugSim = function () {
   // Memoize chain-aware rate ONCE — see renderFrameSchedule comment.
   const rateByPn = {};
   for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
+  // v4.9 diag: mirror the sim's weeklyBurnByPn so _fsPoolBehind
+  // can be called from the walk below with the same shape as in
+  // _fsSimulate.
+  const weeklyBurnByPn = new Map();
+  for (const r of rows) weeklyBurnByPn.set(r.pn, (rateByPn[r.pn] || 0) * FS_WORKDAYS_PER_WEEK);
 
   // Run the optimizer first so the walk below reflects the SAME
   // pn per open slot that the render sees (avoids the debug
@@ -4354,23 +4401,29 @@ window._fsDebugSim = function () {
         buildCreditsThisWeek.get(pn).push({ qty: qN, kind });
       }
     } else if (slot && runPn) {
-      // v4.6 mirror the sim's whole-pack qty. Every placed qty is
-      // a multiple of FRAME_PACK; a single week never mixes two
-      // frames; whole-run slots plan slot-wide and split the
-      // packs across weeks; split slots pack per-week. Emit
-      // needed/cap alongside so the operator sees the pack math.
+      // v4.9 CATCHUP mirror. Every placed qty is a multiple of
+      // FRAME_PACK. When poolBehind → full cap (both weeks); else
+      // demand-sized (whole-run slot-level, split per-week).
+      // buildCredits entries carry a `mode` field ("catchup" /
+      // "demand" / "demand-met") so the walk shows the decision.
       const cap = runPool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
       const capPerWeekPacks = Math.floor(cap / FRAME_PACK);
       const isSplit = !!(slot.resolvedPn2 && slot.resolvedPn2 !== slot.resolvedPn);
       const isWeek1 = slot.weekIsos[0] === iso;
       const isWeek2 = slot.weekIsos[1] === iso;
-      const burnRun = Number(rateByPn[runPn]) * FS_WORKDAYS_PER_WEEK || 0;
+      const burnRun = weeklyBurnByPn.get(runPn) || 0;
       const ohRun = Number(onHand.get(runPn)) || 0;
       const weeksToNext = _fsWeeksToNextRunFor(runPn, iso, slots, cols);
       const neededRun = Math.max(0, burnRun * (weeksToNext + bufferWeeks) - ohRun);
+      const poolBehind = _fsPoolBehind(runPool, rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeks, iso);
 
       let runQty = 0;
-      if (isSplit) {
+      let runMode = "demand";
+      if (poolBehind) {
+        slotWeek2Whole.delete(slot.startIso);
+        runQty = Math.round(capPerWeekPacks * FRAME_PACK);
+        runMode = "catchup";
+      } else if (isSplit) {
         const packs = Math.min(Math.ceil(neededRun / FRAME_PACK), capPerWeekPacks);
         runQty = Math.round(packs * FRAME_PACK);
       } else if (isWeek1) {
@@ -4392,9 +4445,9 @@ window._fsDebugSim = function () {
 
       if (runQty > 0) {
         onHand.set(runPn, ohRun + runQty);
-        buildCreditsThisWeek.get(runPn).push({ qty: runQty, kind: "run", needed: neededRun, cap, packs: runQty / FRAME_PACK });
+        buildCreditsThisWeek.get(runPn).push({ qty: runQty, kind: "run", mode: runMode, needed: neededRun, cap, packs: runQty / FRAME_PACK });
       } else if (neededRun === 0) {
-        buildCreditsThisWeek.get(runPn).push({ qty: 0, kind: "demand-met", needed: 0, cap, packs: 0 });
+        buildCreditsThisWeek.get(runPn).push({ qty: 0, kind: "demand-met", mode: "demand", needed: 0, cap, packs: 0 });
       }
 
       if (runPool === "crewhd") {
@@ -4403,16 +4456,26 @@ window._fsDebugSim = function () {
         if (spareCapPacks > 0) {
           const fillerPn = _fsPickFillerCandidate(rows, onHand, runPn, rateByPn);
           if (fillerPn) {
-            const burnFill = Number(rateByPn[fillerPn]) * FS_WORKDAYS_PER_WEEK || 0;
+            const burnFill = weeklyBurnByPn.get(fillerPn) || 0;
             const ohFill = Number(onHand.get(fillerPn)) || 0;
             const weeksToNextFill = _fsWeeksToNextRunFor(fillerPn, iso, slots, cols);
             const neededFill = Math.max(0, burnFill * (weeksToNextFill + bufferWeeks) - ohFill);
-            const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
-            const fillPacks = Math.min(neededFillPacks, spareCapPacks);
-            const fillQty = Math.round(fillPacks * FRAME_PACK);
+            const stdBehind = _fsPoolBehind("std", rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeks, iso);
+            let fillQty = 0;
+            let fillMode = "demand";
+            let fillPacks = 0;
+            if (stdBehind) {
+              fillPacks = spareCapPacks;
+              fillQty = Math.round(fillPacks * FRAME_PACK);
+              fillMode = "catchup";
+            } else {
+              const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
+              fillPacks = Math.min(neededFillPacks, spareCapPacks);
+              fillQty = Math.round(fillPacks * FRAME_PACK);
+            }
             if (fillQty > 0) {
               onHand.set(fillerPn, ohFill + fillQty);
-              buildCreditsThisWeek.get(fillerPn).push({ qty: fillQty, kind: "filler", needed: neededFill, cap: spareCap, packs: fillPacks });
+              buildCreditsThisWeek.get(fillerPn).push({ qty: fillQty, kind: "filler", mode: fillMode, needed: neededFill, cap: spareCap, packs: fillPacks });
             }
           }
         }
@@ -4473,11 +4536,12 @@ window._fsDebugSim = function () {
         chainDaily: Number(rateThisWeek.get(r.pn).toFixed(3)),
         startOh: Number(startOh.get(r.pn).toFixed(3)),
         buildCredits: bc.length ? bc.map(x => {
+          const modeTag = x.mode ? `:${x.mode}` : "";
           if (x.kind === "demand-met") return `[met, needed=0, cap=${x.cap}]`;
           const detail = (x.needed !== undefined && x.cap !== undefined)
             ? ` [needed=${Number(x.needed).toFixed(1)}, cap=${x.cap}]`
             : "";
-          return `+${x.qty}(${x.kind})${detail}`;
+          return `+${x.qty}(${x.kind}${modeTag})${detail}`;
         }).join(" ") : "",
         burn: Number(burn.toFixed(3)),
         endOh: Number(endOh.toFixed(3)),
