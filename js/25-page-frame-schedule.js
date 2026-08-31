@@ -705,14 +705,25 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
     }
 
     // 1. Determine placements.
-    //    v3.4 RULE — Locks pin pn/pn2 only. Quantities for every
-    //    week from NEXT Monday onward always recompute from the
-    //    CURRENT global caps, regardless of lock state. Only the
-    //    CURRENT week keeps its persisted qty (already committed/
-    //    in progress). Past weeks aren't simmed (skipped above).
+    //    v4.8 RULE — Locks fix BOTH pn/pn2 AND persisted qty.
+    //    For a LOCKED slot (including SEED slots — they are
+    //    locked by build definition) with any persisted week qty,
+    //    the sim replays that qty verbatim regardless of whether
+    //    the week is current or future. Only PROPOSED slots get
+    //    the demand-sized packs below.
+    //
+    //    Rationale: the operator's explicit qty setting (e.g. a
+    //    seed week persisted at 21) must survive re-renders and
+    //    optimizer passes. If caps change, the "re-quantify locked
+    //    future weeks" pass in _fsHandleSettingsCap updates the
+    //    persisted qty; the sim then replays the new value on the
+    //    next render. Verbatim replay here means neither cap
+    //    edits nor demand math silently override a persisted qty.
+    //
+    //    Past weeks aren't simmed (skipped above).
     const wk = _fsWeekData(iso);
     const isLockedWithPersistedQty =
-      slot && slot.locked && c.current && wk.qty && Object.keys(wk.qty).length > 0;
+      slot && slot.locked && wk.qty && Object.keys(wk.qty).length > 0;
 
     // v3.3: split-slot support. week 2 of a split slot runs
     // resolvedPn2 instead of resolvedPn. Each week's cap + filler
@@ -4314,11 +4325,13 @@ window._fsDebugSim = function () {
     // Placements (mirror the sim exactly — NO PO credits).
     // v3.3: split slots run frame A in week-1, frame B in week-2.
     // runPn is chosen per-week based on slot.weekIsos[1] === iso.
-    // v3.4: persisted qty is honored only for the CURRENT week
-    // (already committed/in progress). Future locked weeks always
-    // recompute from live caps — see _fsSimulate header.
+    // v4.8: persisted qty is honored for ALL non-past weeks of a
+    // LOCKED slot (including SEED). See _fsSimulate for the full
+    // rationale — TL;DR: operator's explicit qty must survive
+    // renders / optimizer passes; cap edits update persistence
+    // via the re-quantify pass, not via demand sizing here.
     const wk = _fsWeekData(iso);
-    const isLockedWithPersistedQty = slot && slot.locked && c.current && wk.qty && Object.keys(wk.qty).length > 0;
+    const isLockedWithPersistedQty = slot && slot.locked && wk.qty && Object.keys(wk.qty).length > 0;
     const isWeek2 = !!(slot && slot.weekIsos && slot.weekIsos[1] === iso);
     const runPn = slot && slot.resolvedPn
       ? (isWeek2 && slot.resolvedPn2 ? slot.resolvedPn2 : slot.resolvedPn)
