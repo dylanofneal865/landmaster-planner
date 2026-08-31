@@ -916,11 +916,18 @@ function _populateFrameScheduleFromRows(rows) {
     if (key === "__settings__") {
       // v2.1 global caps sentinel. Row's `data.caps` carries the
       // whole-tab CREW/HD and STD per-week caps.
+      // v4.1: `data.bufferWeeks` (float, min-cover-in-weeks
+      // safety buffer) lifted alongside the caps. Legacy
+      // `data.buffer` (integer units) is intentionally IGNORED —
+      // the units-based term was superseded by the weeks-based
+      // formulation before it saw production use.
+      const bw = Number(d.bufferWeeks);
       DB.frameSchedule.settings = {
         caps: {
           crewhd: Number(d.caps && d.caps.crewhd) || 0,
           std:    Number(d.caps && d.caps.std)    || 0,
         },
+        bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
         updatedAt: row.updated_at || null,
       };
       continue;
@@ -941,9 +948,23 @@ function _populateFrameScheduleFromRows(rows) {
           source: (d.slot.source === "manual" || d.slot.source === "seed") ? d.slot.source : "auto",
         }
       : null;
+    // v4.1: onHandAtClose = {pn: units, ...} snapshot of each
+    // frame's on-hand at week close. Lifted here so the client
+    // can compute "actual /wk" burn = prevOnHand + received −
+    // thisOnHand across consecutive snapshots. Missing = no
+    // snapshot yet for that week.
+    let onHandAtClose = null;
+    if (d.onHandAtClose && typeof d.onHandAtClose === "object") {
+      onHandAtClose = {};
+      for (const [k, v] of Object.entries(d.onHandAtClose)) {
+        const n = Number(v);
+        if (Number.isFinite(n)) onHandAtClose[k] = n;
+      }
+    }
     DB.frameSchedule.weeks.set(key, {
       qty: (d.qty && typeof d.qty === "object") ? d.qty : {},
       slot,
+      onHandAtClose,
       updatedAt: row.updated_at || null,
     });
   }
@@ -970,7 +991,7 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) {
     return { ok: false, error: new Error("invalid iso Monday key") };
   }
-  // v2.1: no per-week caps. Payload carries {qty, slot?}.
+  // v2.1: no per-week caps. Payload carries {qty, slot?, onHandAtClose?}.
   const qty = {};
   if (payload && payload.qty && typeof payload.qty === "object") {
     for (const [k, v] of Object.entries(payload.qty)) {
@@ -994,10 +1015,31 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
       slot.pn2 = payload.slot.pn2;
     }
   }
+  // v4.1: onHandAtClose = {pn: units} snapshot. Coerced to
+  // numbers; non-numeric entries dropped. Present or absent
+  // independently of slot/qty — pn writers omit slot, snapshot
+  // writers may omit qty (though callers today send both).
+  let onHandAtClose = null;
+  if (payload && payload.onHandAtClose && typeof payload.onHandAtClose === "object") {
+    onHandAtClose = {};
+    for (const [k, v] of Object.entries(payload.onHandAtClose)) {
+      const n = Number(v);
+      if (Number.isFinite(n)) onHandAtClose[k] = n;
+    }
+    if (Object.keys(onHandAtClose).length === 0) onHandAtClose = null;
+  }
   const nowIso = new Date().toISOString();
   const prev = DB.frameSchedule.weeks.get(key);
-  DB.frameSchedule.weeks.set(key, { qty, slot, updatedAt: nowIso });
-  const dataPayload = slot ? { qty, slot } : { qty };
+  DB.frameSchedule.weeks.set(key, {
+    qty,
+    slot,
+    onHandAtClose: onHandAtClose || (prev && prev.onHandAtClose) || null,
+    updatedAt: nowIso,
+  });
+  const dataPayload = { qty };
+  if (slot) dataPayload.slot = slot;
+  if (onHandAtClose) dataPayload.onHandAtClose = onHandAtClose;
+  else if (prev && prev.onHandAtClose) dataPayload.onHandAtClose = prev.onHandAtClose;
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(
@@ -1034,16 +1076,27 @@ async function setFrameScheduleSettingsCloud(caps) {
   }
   const crewhd = Math.max(0, Number(caps && caps.crewhd) || 0);
   const std    = Math.max(0, Number(caps && caps.std)    || 0);
-  const nowIso = new Date().toISOString();
+  // v4.1 accept an optional `bufferWeeks` field (float, min cover
+  // in weeks). When present + finite, persist it; when omitted,
+  // preserve the prior mirror's value so a caps-only edit doesn't
+  // wipe the buffer. Legacy `caps.buffer` (integer units) is
+  // intentionally ignored — never round-tripped through here.
   const prev = DB.frameSchedule.settings;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, updatedAt: nowIso };
+  const bwArg = Number(caps && caps.bufferWeeks);
+  const bufferWeeks = Number.isFinite(bwArg) && bwArg >= 0
+    ? bwArg
+    : (prev && Number.isFinite(prev.bufferWeeks) ? prev.bufferWeeks : null);
+  const nowIso = new Date().toISOString();
+  const dataOut = { caps: { crewhd, std } };
+  if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, updatedAt: nowIso };
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(
       {
         fg_sku:     "__settings__",
         weekly_qty: 0,          // sentinel — not read; column NOT NULL
-        data:       { caps: { crewhd, std } },
+        data:       dataOut,
         updated_at: nowIso,
       },
       { onConflict: "fg_sku" }

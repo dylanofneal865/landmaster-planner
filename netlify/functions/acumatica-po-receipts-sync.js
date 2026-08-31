@@ -1,10 +1,23 @@
-// Netlify Scheduled Function — pulls PO receipts from the Acumatica
-// OData generic inquiry "LM Planner - PO Receipt" and reconciles the
-// Supabase `po_receipts` table.
+// Shared runner + HTTP handler for the PO-receipts sync.
 //
-// Schedule: once daily at 06:15 UTC (configured in netlify.toml). PO
-// receipts are a slow-moving history feed — new rows land as receipts
-// are entered in Acumatica; existing rows do not change.
+// Two invocation modes:
+//   - "full"        — no OData filter; walks the entire GI (180-day
+//                     window Acumatica exposes). Daily 06:15 UTC via
+//                     the thin wrapper acumatica-po-receipts-full.js.
+//   - "incremental" — adds a `$filter=Date ge datetimeoffset'...'`
+//                     clause with cutoff = today − 4 days. Every 30
+//                     minutes via acumatica-po-receipts-incremental.js.
+//                     Cheap: only the last few days of receipts come
+//                     back on the wire, so pagination usually finishes
+//                     in one page.
+//
+// runReceiptsSync(mode) is the exported entry point the wrappers call.
+// exports.handler is still available for manual HTTP triggers — mode
+// is read from ?mode=<full|incremental>, defaulting to "incremental".
+//
+// Reconciliation is history-preserving (no delete step) in every mode:
+// the source GI is windowed to ~180 days and the incremental mode is
+// windowed to ~4 days; older rows must survive on the client.
 //
 // ISOLATION CONTRACT — read-only reporting feature:
 //   - Writes ONLY to public.po_receipts (and one row to public.audit
@@ -143,9 +156,32 @@ function _receiptFingerprint(data) {
   return JSON.stringify(_canonicalize(data));
 }
 
-exports.handler = async (event) => {
+// Compute the incremental $filter clause. Acumatica OData is v3, so
+// datetime literals use `datetimeoffset'YYYY-MM-DDTHH:MM:SSZ'`. The
+// Date field name matches the GI's exposed "Date" column (candidate
+// list also tries alt spellings; the filter always uses "Date"
+// because that's the GI-facing column and the filter must reference
+// the OData property name, not any decorated variant).
+//
+// Cutoff = midnight UTC N days ago. Deliberately generous by ~1 day
+// vs. the ticket's "4 day window" so a receipt entered at any time
+// on the target window's boundary day is safely inside the filter
+// (a strict `today−4d 00:00 local` cutoff would drop entries stamped
+// slightly before midnight due to server timezone drift).
+function _computeIncrementalFilterClause(daysBack) {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - daysBack * 86400000);
+  cutoff.setUTCHours(0, 0, 0, 0);
+  const iso = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return `Date ge datetimeoffset'${iso}'`;
+}
+
+// Main runner — shared by both wrappers and the manual HTTP handler.
+// mode: "full" | "incremental"
+async function runReceiptsSync(mode) {
   const t0 = Date.now();
-  const log = (msg, data) => console.log(`[acumatica-po-receipts-sync] ${msg}`, data || "");
+  const runMode = (mode === "full") ? "full" : "incremental";
+  const log = (msg, data) => console.log(`[acumatica-po-receipts-sync:${runMode}] ${msg}`, data || "");
 
   const {
     ACUMATICA_BASE_URL,
@@ -159,18 +195,31 @@ exports.handler = async (event) => {
 
   if (!ACUMATICA_BASE_URL || !ACUMATICA_USERNAME || !ACUMATICA_PASSWORD || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     log("Missing required environment variables");
-    return { statusCode: 500, body: JSON.stringify({ error: "Missing env vars" }) };
+    return { statusCode: 500, body: JSON.stringify({ mode: runMode, error: "Missing env vars" }) };
   }
 
   const giEncoded = encodeURIComponent(ACUMATICA_PO_RECEIPTS_GI_NAME || "LM Planner - PO Receipt");
   const company = ACUMATICA_COMPANY || "LIVE";
   const baseUrl = `${ACUMATICA_BASE_URL}/OData/${company}/${giEncoded}`;
+
+  // Incremental filter (Date ge datetimeoffset'...'). Built once and
+  // appended to every page URL. Full mode drops the filter and walks
+  // the whole 180-day GI window.
+  let filterClause = "";
+  if (runMode === "incremental") {
+    filterClause = _computeIncrementalFilterClause(4);
+    log(`incremental $filter: ${filterClause}`);
+  } else {
+    log("full mode — no $filter, walking the entire GI window");
+  }
   log("Fetching (paginated)", baseUrl);
 
   // ── Paginated fetch ─────────────────────────────────────────────────
   // Acumatica OData caps a single response at ~1000 rows. Walk pages
   // via $top/$skip until a short page reports the feed is drained.
-  // Pattern cloned from acumatica-production-orders-sync.js.
+  // Pattern cloned from acumatica-production-orders-sync.js. In
+  // incremental mode with a 4-day window, pagination almost always
+  // finishes in one page — the loop still handles a busy day gracefully.
   const PAGE_SIZE = 1000;
   const MAX_PAGES = 30;
   let entries = [];
@@ -178,7 +227,9 @@ exports.handler = async (event) => {
   try {
     const auth = Buffer.from(`${ACUMATICA_USERNAME}:${ACUMATICA_PASSWORD}`).toString("base64");
     for (let page = 0, skip = 0; page < MAX_PAGES; page++, skip += PAGE_SIZE) {
-      const pageUrl = `${baseUrl}?$top=${PAGE_SIZE}&$skip=${skip}`;
+      const qs = [`$top=${PAGE_SIZE}`, `$skip=${skip}`];
+      if (filterClause) qs.push(`$filter=${encodeURIComponent(filterClause)}`);
+      const pageUrl = `${baseUrl}?${qs.join("&")}`;
       const resp = await fetch(pageUrl, {
         headers: {
           Authorization: `Basic ${auth}`,
@@ -188,7 +239,7 @@ exports.handler = async (event) => {
       if (!resp.ok) {
         const body = await resp.text();
         log("Acumatica returned non-OK status", { status: resp.status, page, skip, body: body.slice(0, 200) });
-        return { statusCode: 502, body: JSON.stringify({ error: "Acumatica auth/fetch failed", status: resp.status, page }) };
+        return { statusCode: 502, body: JSON.stringify({ mode: runMode, error: "Acumatica auth/fetch failed", status: resp.status, page }) };
       }
       const pageXml = await resp.text();
       const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
@@ -202,7 +253,7 @@ exports.handler = async (event) => {
     }
   } catch (err) {
     log("Fetch threw", err.message);
-    return { statusCode: 502, body: JSON.stringify({ error: "Acumatica fetch error", detail: err.message }) };
+    return { statusCode: 502, body: JSON.stringify({ mode: runMode, error: "Acumatica fetch error", detail: err.message }) };
   }
 
   log(`Fetched ${entries.length} <entry> element(s) across ${pageCount} page(s)`);
@@ -217,8 +268,6 @@ exports.handler = async (event) => {
   }
 
   // ── Candidate lists per logical field ──────────────────────────────
-  // User-added GI columns arrive with a leading underscore; base-entity
-  // columns don't. Try both spellings.
   const FIELD_CANDIDATES = {
     receiptNbr:  ["ReceiptNbr", "_ReceiptNbr"],
     date:        ["Date", "ReceiptDate", "_Date", "_ReceiptDate"],
@@ -235,8 +284,7 @@ exports.handler = async (event) => {
 
   // ── Parse each entry into a normalized receipt row ─────────────────
   // Filter IN CODE: Status === "Released" (GI conditions are unreliable
-  // per project convention — every other sync applies its own predicate
-  // here). Dedupe by composite id; first-wins matches bom-sync.
+  // per project convention). Dedupe by composite id; first-wins.
   const feedById = new Map();
   let rowsDroppedNotReleased = 0;
   let rowsDroppedMissingKeys = 0;
@@ -244,7 +292,6 @@ exports.handler = async (event) => {
   const statusCounts = Object.create(null);
   for (const raw of entries) {
     const { get } = makeFieldGetters(raw);
-
     const resolved = {};
     for (const [logical, candidates] of Object.entries(FIELD_CANDIDATES)) {
       const { field, value } = getFirstHit(get, candidates);
@@ -257,24 +304,15 @@ exports.handler = async (event) => {
 
     const status = (resolved.status || "").trim();
     statusCounts[status || "<empty>"] = (statusCounts[status || "<empty>"] || 0) + 1;
-    if (status !== "Released") {
-      rowsDroppedNotReleased++;
-      continue;
-    }
+    if (status !== "Released") { rowsDroppedNotReleased++; continue; }
 
     const receiptNbr = sanitizeIdPart(resolved.receiptNbr);
     const lineNbr = sanitizeIdPart(resolved.lineNbr);
-    const pn = String(resolved.inventoryId || "").trim();  // TRIM per spec
-    if (!receiptNbr || !lineNbr || !pn) {
-      rowsDroppedMissingKeys++;
-      continue;
-    }
+    const pn = String(resolved.inventoryId || "").trim();
+    if (!receiptNbr || !lineNbr || !pn) { rowsDroppedMissingKeys++; continue; }
 
     const receiptDate = toDateStr(resolved.date);
-    if (!receiptDate) {
-      rowsDroppedNoDate++;
-      continue;
-    }
+    if (!receiptDate) { rowsDroppedNoDate++; continue; }
 
     const weekIso = localMondayIso(receiptDate);
     const qty = toNum(resolved.receiptQty);
@@ -287,14 +325,11 @@ exports.handler = async (event) => {
       pn,
       qty,
       vendor: (resolved.vendor || "").trim() || null,
-      status,                                // always "Released" past the filter
+      status,
       lineNbr,
       weekIso,
     };
-
-    if (!feedById.has(id)) {
-      feedById.set(id, { id, data });
-    }
+    if (!feedById.has(id)) feedById.set(id, { id, data });
   }
 
   log(`Field mapping detected:`, detectedField);
@@ -304,40 +339,50 @@ exports.handler = async (event) => {
   log(`Status value counts (pre-filter):`, statusCounts);
   log(`Parsed ${feedById.size} released receipt lines (rawEntries: ${entries.length}, dropped: ${rowsDroppedNotReleased} not-released, ${rowsDroppedMissingKeys} missing-keys, ${rowsDroppedNoDate} no-date)`);
 
-  // Zero-row bailout — a schema/auth glitch that returns zero rows must
-  // not touch the table.
+  // Zero-row bailout. For incremental mode a zero-row feed is normal
+  // — nothing happened in the last 4 days. For full mode it usually
+  // means an auth/schema glitch and we bail without touching the
+  // table (matches every other sync's zero-row guard).
   if (feedById.size === 0) {
-    log("No released receipts parsed from feed — possible schema change or empty GI; bailing without touching the table");
-    return { statusCode: 200, body: JSON.stringify({ upserted: 0, unchanged: 0, pages: pageCount, note: "No rows parsed" }) };
+    if (runMode === "full") {
+      log("No released receipts parsed from feed — possible schema change or empty GI; bailing without touching the table");
+    } else {
+      log("No released receipts in the last 4 days — nothing to reconcile (quiet, no audit row).");
+    }
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ mode: runMode, upserted: 0, unchanged: 0, pages: pageCount, note: "No rows parsed" }),
+    };
   }
 
   const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  // ── Load existing rows for diff ───────────────────────────────────
-  // HISTORY-PRESERVING: unlike bom-sync / production-orders, we do NOT
-  // delete rows absent from the feed. The feed is a 180-day window;
-  // older rows must persist so long-range receive-vs-scheduled math
-  // stays valid. Only new/changed rows are upserted.
-  const existing = [];
-  const PAGE = 1000;
-  for (let from = 0; ; from += PAGE) {
-    const { data, error } = await supa.from("po_receipts").select("id, data").range(from, from + PAGE - 1);
+  // ── SCOPED existing-row lookup ────────────────────────────────────
+  // Full-table scans on po_receipts get expensive fast (archive
+  // grows without bound). Load only the rows the feed's own ids
+  // touch: `.in("id", chunk)` in chunks of 500 to stay under
+  // PostgREST's URL length ceiling. Every incremental run's diff
+  // now costs a handful of KB regardless of how big po_receipts is.
+  const feedIds = [...feedById.keys()];
+  const existingById = new Map();
+  const LOOKUP_CHUNK = 500;
+  for (let i = 0; i < feedIds.length; i += LOOKUP_CHUNK) {
+    const chunk = feedIds.slice(i, i + LOOKUP_CHUNK);
+    const { data, error } = await supa.from("po_receipts").select("id, data").in("id", chunk);
     if (error) {
-      log("po_receipts select error", error);
-      return { statusCode: 500, body: JSON.stringify({ error: "po_receipts select failed", detail: error.message }) };
+      log("po_receipts scoped select error", error);
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ mode: runMode, error: "po_receipts select failed", detail: error.message }),
+      };
     }
-    if (!data || data.length === 0) break;
-    existing.push(...data);
-    if (data.length < PAGE) break;
+    for (const r of (data || [])) existingById.set(r.id, r.data || {});
   }
-  const existingById = new Map(existing.map((r) => [r.id, r.data || {}]));
-  log(`Loaded ${existing.length} existing po_receipts rows`);
+  log(`Scoped-lookup loaded ${existingById.size} existing rows against ${feedIds.length} feed ids`);
 
-  // ── Diff ──────────────────────────────────────────────────────────
-  // Upsert rows that are new OR whose canonical fingerprint changed.
-  // NO delete step — see history-preserving note above.
+  // ── Diff (changed-only upsert). History preserved. ────────────────
   const rowsToUpsert = [];
   let unchanged = 0;
   for (const [id, row] of feedById.entries()) {
@@ -348,7 +393,6 @@ exports.handler = async (event) => {
     }
     rowsToUpsert.push({ id, data: row.data });
   }
-
   log(`Will upsert ${rowsToUpsert.length} (${unchanged} unchanged); history preserved (no delete step)`);
 
   // ── Batched upsert (500 rows/req) — retry once then skip ──────────
@@ -376,43 +420,66 @@ exports.handler = async (event) => {
 
   const upsertFailed = failedUpsertIds.length;
 
-  // ── Audit row ─────────────────────────────────────────────────────
-  const auditId = `audit_acumatica_po_receipts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await supa.from("audit").upsert([
-    {
-      id: auditId,
-      data: {
+  // ── Audit row (conditional) ───────────────────────────────────────
+  // Only emit audit when we actually changed data OR the run was a
+  // full sweep. Prevents the 48×/day incremental cadence from
+  // spamming the audit table with "0 upserted" no-ops. A full sweep
+  // gets an audit row even at 0 upserted so ops can confirm the
+  // daily reconcile ran.
+  if (totalUpserted > 0 || runMode === "full") {
+    const auditId = `audit_acumatica_po_receipts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await supa.from("audit").upsert([
+      {
         id: auditId,
-        ts: new Date().toISOString(),
-        type: "acumatica-po-receipts-sync",
-        msg:
-          `Acumatica PO-receipts sync: ${totalUpserted} upserted (${unchanged} unchanged) ` +
-          `across ${feedById.size} released lines in feed` +
-          (upsertFailed > 0 ? ` — ${upsertFailed} ids failed after retry` : "") +
-          (missingField.size > 0 ? ` — WARNING: ${missingField.size} field(s) unmapped: ${[...missingField].join(",")}` : ""),
-        detail: {
-          source: "netlify-scheduled-function",
-          fetched: entries.length,
-          pages: pageCount,
-          rowsInFeed: feedById.size,
-          rowsExisting: existing.length,
-          upserted: totalUpserted,
-          unchanged,
-          upsertFailed,
-          droppedNotReleased: rowsDroppedNotReleased,
-          droppedMissingKeys: rowsDroppedMissingKeys,
-          droppedNoDate: rowsDroppedNoDate,
-          statusCounts,
-          detectedFieldMapping: detectedField,
-          unmappedFields: [...missingField],
-          durationMs: Date.now() - t0,
+        data: {
+          id: auditId,
+          ts: new Date().toISOString(),
+          type: "acumatica-po-receipts-sync",
+          msg:
+            `Acumatica PO-receipts sync (${runMode}): ${totalUpserted} upserted (${unchanged} unchanged) ` +
+            `across ${feedById.size} released lines in feed` +
+            (upsertFailed > 0 ? ` — ${upsertFailed} ids failed after retry` : "") +
+            (missingField.size > 0 ? ` — WARNING: ${missingField.size} field(s) unmapped: ${[...missingField].join(",")}` : ""),
+          detail: {
+            source: "netlify-scheduled-function",
+            mode: runMode,
+            filter: filterClause || null,
+            fetched: entries.length,
+            pages: pageCount,
+            rowsInFeed: feedById.size,
+            rowsExistingLookedUp: existingById.size,
+            upserted: totalUpserted,
+            unchanged,
+            upsertFailed,
+            droppedNotReleased: rowsDroppedNotReleased,
+            droppedMissingKeys: rowsDroppedMissingKeys,
+            droppedNoDate: rowsDroppedNoDate,
+            statusCounts,
+            detectedFieldMapping: detectedField,
+            unmappedFields: [...missingField],
+            durationMs: Date.now() - t0,
+          },
         },
       },
-    },
-  ]);
+    ]);
+  }
+
+  // ── Broadcast hook ───────────────────────────────────────────────
+  // The codebase has a landmaster-broadcast channel and a
+  // sendBroadcast pattern (see acumatica-kit-sync.js), BUT the
+  // client-side broadcast fetcher registry in js/30-supabase.js
+  // (_BROADCAST_FETCHERS) does NOT include po_receipts — an
+  // emitted ping for this table would be logged and skipped by
+  // clients. Rather than wire in a fetcher on the client side
+  // (out of scope for this ticket), we skip the broadcast here.
+  // A polled refresh comes on the next cloudInit / reconnect.
+  //
+  // If po_receipts is later registered as a broadcast fetcher,
+  // the hook here becomes: sendBroadcast({ tables: ["po_receipts"] })
+  // whenever totalUpserted > 0.
 
   log(
-    `Done. ${totalUpserted} upserted, ${unchanged} unchanged across ${feedById.size} lines in ${Date.now() - t0}ms` +
+    `Done (${runMode}). ${totalUpserted} upserted, ${unchanged} unchanged across ${feedById.size} lines in ${Date.now() - t0}ms` +
       (upsertFailed > 0 ? ` (skipped ${upsertFailed} upsert ids)` : "") +
       (missingField.size > 0 ? ` — WARNING: unmapped fields: ${[...missingField].join(",")}` : "")
   );
@@ -420,9 +487,10 @@ exports.handler = async (event) => {
   return {
     statusCode: 200,
     body: JSON.stringify({
+      mode: runMode,
+      pages: pageCount,
       upserted: totalUpserted,
       unchanged,
-      pages: pageCount,
       durationMs: Date.now() - t0,
       rowsInFeed: feedById.size,
       upsertFailed,
@@ -433,4 +501,14 @@ exports.handler = async (event) => {
       unmappedFields: [...missingField],
     }),
   };
+}
+
+exports.runReceiptsSync = runReceiptsSync;
+
+// Manual HTTP trigger — mode from ?mode=full|incremental (default
+// incremental, matching the higher-frequency schedule).
+exports.handler = async (event) => {
+  const qs = (event && event.queryStringParameters) || {};
+  const mode = String(qs.mode || "").toLowerCase() === "full" ? "full" : "incremental";
+  return runReceiptsSync(mode);
 };

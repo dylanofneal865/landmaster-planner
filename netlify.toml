@@ -37,11 +37,20 @@
 [functions."acumatica-production-orders-sync"]
   schedule = "0 11 * * 1"
 
-# Daily PO-Receipts sync — runs once at 06:15 UTC. Reconciles the
-# po_receipts table from the "LM Planner - PO Receipt" GI. Feeds the
-# "got N" received-vs-scheduled overlay on the Frame Schedule tab.
-# HISTORY-PRESERVING: the source GI is windowed to ~180 days, so this
-# sync upserts changed/new rows only — never deletes. Client mirror
-# DB.poReceipts is READ ONLY and not in the realtime publication.
-[functions."acumatica-po-receipts-sync"]
+# PO-Receipts sync — split into two cadences that share the same
+# runReceiptsSync(mode) in acumatica-po-receipts-sync.js.
+#
+# FULL sweep — 06:15 UTC daily. No OData $filter, walks the entire
+# 180-day GI window, upserts changes. Always writes an audit row so
+# ops can confirm the daily reconcile fired.
+[functions."acumatica-po-receipts-full"]
   schedule = "15 6 * * *"
+
+# INCREMENTAL sweep — every 30 minutes. Adds a `Date ge datetimeoffset
+# '...'` filter with a 4-day lookback; wire response is typically a
+# single short page. Audit rows only emitted when data actually
+# changed (so 48×/day doesn't spam the audit table with no-ops).
+# Diffs against a SCOPED existing-row lookup so cost stays O(feedSize)
+# regardless of po_receipts archive size.
+[functions."acumatica-po-receipts-incremental"]
+  schedule = "*/30 * * * *"
