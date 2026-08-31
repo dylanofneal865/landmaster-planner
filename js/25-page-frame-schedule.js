@@ -269,9 +269,13 @@ function _fsDaily(row) {
   return Number(row && row.daily) || 0;
 }
 
-// 14-week column layout: 2 past Mondays (dimmed, read-only) +
-// current + 11 future. Uses mondayOfWeek from js/23 (window-
-// exposed) for tz-safe Monday anchoring.
+// v4.9: 12-week column layout starting at the CURRENT Monday.
+// No past columns — the leftmost cell is today's week (or the
+// upcoming Monday if today is not one), current + 11 future.
+// Slot anchor + cadence unchanged; a seed run whose week is the
+// current Monday renders as a single current-week entry.
+// Uses mondayOfWeek from js/23 (window-exposed) for tz-safe
+// Monday anchoring.
 function _fsColumns() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -279,14 +283,14 @@ function _fsColumns() {
     ? mondayOfWeek(today)
     : today;
   const cols = [];
-  for (let i = -2; i <= 11; i++) {
+  for (let i = 0; i <= 11; i++) {
     const d = (typeof addDays === "function")
       ? addDays(currentMonday, i * 7)
       : new Date(currentMonday.getTime() + i * 7 * 86400000);
     cols.push({
       iso: _fsIsoMonday(d),
       md: _fsMdShort(d),
-      past: i < 0,
+      past: false,
       current: i === 0,
       date: d,
     });
@@ -370,10 +374,10 @@ function _fsTargetUnits(row, weekDate, bufferWeeks) {
   return bw * rate * FS_WORKDAYS_PER_WEEK;
 }
 
-// v4 Sim column set — extends the 14-week render layout to a
-// SIM_HORIZON_WEEKS future horizon. Same 2 past cols; same current;
-// SIM_HORIZON_WEEKS future cols instead of 11. Fields identical to
-// _fsColumns's shape so callers are drop-in interchangeable.
+// v4.9 Sim column set — extends the 12-week render layout to a
+// SIM_HORIZON_WEEKS future horizon. Same start (current Monday);
+// SIM_HORIZON_WEEKS future cols instead of 11. Fields identical
+// to _fsColumns's shape so callers are drop-in interchangeable.
 function _fsSimColumns() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -381,14 +385,14 @@ function _fsSimColumns() {
     ? mondayOfWeek(today)
     : today;
   const cols = [];
-  for (let i = -2; i <= SIM_HORIZON_WEEKS - 1; i++) {
+  for (let i = 0; i <= SIM_HORIZON_WEEKS - 1; i++) {
     const d = (typeof addDays === "function")
       ? addDays(currentMonday, i * 7)
       : new Date(currentMonday.getTime() + i * 7 * 86400000);
     cols.push({
       iso: _fsIsoMonday(d),
       md: _fsMdShort(d),
-      past: i < 0,
+      past: false,
       current: i === 0,
       date: d,
     });
@@ -3354,7 +3358,7 @@ function renderFrameSchedule() {
       <div class="page-head">
         <div>
           <div class="page-title">Frame Schedule</div>
-          <div class="page-sub mono">${slots.length} SLOT${slots.length === 1 ? "" : "S"} &middot; 14 WEEKS (2 PAST &middot; CURRENT &middot; 11 FUTURE) &middot; LOCK HORIZON ${LOCK_HORIZON_DAYS}D &middot; ANCHOR ${SLOT_ANCHOR_ISO}</div>
+          <div class="page-sub mono">${slots.length} SLOT${slots.length === 1 ? "" : "S"} &middot; 12 WEEKS (CURRENT &middot; 11 FUTURE) &middot; LOCK HORIZON ${LOCK_HORIZON_DAYS}D &middot; ANCHOR ${SLOT_ANCHOR_ISO}</div>
         </div>
       </div>
 
