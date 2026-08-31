@@ -10,17 +10,17 @@
 [functions."acumatica-sync"]
   schedule = "*/2 * * * *"
 
-# Daily BOM sync — runs once at 06:00 UTC. Reconciles bom_links from the
+# Daily BOM sync -- runs once at 06:00 UTC. Reconciles bom_links from the
 # "LM Planner BOM" GI; slow-moving reference data, separate cadence.
 [functions."acumatica-bom-sync"]
   schedule = "0 6 * * *"
 
-# Daily Kit sync — runs once at 06:00 UTC. Reconciles kit_boms from the
+# Daily Kit sync -- runs once at 06:00 UTC. Reconciles kit_boms from the
 # "LM Planner Kit Components" GI; slow-moving reference data, same cadence as BOM.
 [functions."acumatica-kit-sync"]
   schedule = "0 6 * * *"
 
-# Daily Service-Usage sync — runs once at 06:00 UTC. Computes 180-day rolling
+# Daily Service-Usage sync -- runs once at 06:00 UTC. Computes 180-day rolling
 # daily-usage rate per LMCOMPO service part from the "LM Planner Service Usage"
 # GI and merge-safely writes it to parts.data.daily. Replaces the monthly
 # manual Excel Service-Usage Import; the Service Queue reads part.daily
@@ -28,29 +28,29 @@
 [functions."acumatica-service-usage-sync"]
   schedule = "0 6 * * *"
 
-# Weekly Production-Orders sync — Monday 11:00 UTC (~6 AM EST winter / 7 AM
+# Weekly Production-Orders sync -- Monday 11:00 UTC (~6 AM EST winter / 7 AM
 # EDT summer). Reconciles the production_orders table from the "LM Planner
 # Production Orders" GI. Feeds the read-only "BOM Usage Weekly" reporting
-# tab — the client mirror DB.productionOrders is READ ONLY and never
+# tab -- the client mirror DB.productionOrders is READ ONLY and never
 # influences partStatus, queueParts, daily rates, or any existing math.
 # Poll-only downstream: production_orders is NOT in the realtime publication.
 [functions."acumatica-production-orders-sync"]
   schedule = "0 11 * * 1"
 
-# PO-Receipts sync — split into two cadences that share the same
+# PO-Receipts sync -- split into two cadences that share the same
 # runReceiptsSync(mode) in acumatica-po-receipts-sync.js.
 #
-# FULL sweep — 06:15 UTC daily. No OData $filter, walks the entire
+# FULL sweep -- 06:15 UTC daily. No OData filter, walks the entire
 # 180-day GI window, upserts changes. Always writes an audit row so
 # ops can confirm the daily reconcile fired.
 [functions."acumatica-po-receipts-full"]
   schedule = "15 6 * * *"
 
-# INCREMENTAL sweep — every 30 minutes. Adds a `Date ge datetimeoffset
-# '...'` filter with a 4-day lookback; wire response is typically a
-# single short page. Audit rows only emitted when data actually
-# changed (so 48×/day doesn't spam the audit table with no-ops).
-# Diffs against a SCOPED existing-row lookup so cost stays O(feedSize)
-# regardless of po_receipts archive size.
+# INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetimeoffset"
+# filter with a 4-day lookback; wire response is typically a single short
+# page. Audit rows only emitted when data actually changed (so 48x/day
+# does not spam the audit table with no-ops). Diffs against a SCOPED
+# existing-row lookup so cost stays O(feedSize) regardless of po_receipts
+# archive size.
 [functions."acumatica-po-receipts-incremental"]
   schedule = "*/30 * * * *"
