@@ -3396,10 +3396,14 @@ function renderFrameSchedule() {
       .fs-degenerate-banner { padding:10px 12px; background:rgba(180,180,180,0.10); border:1px dashed var(--line); border-radius:6px; margin-bottom:12px; font-size:12px; color:var(--t2); }
     </style>
     <div class="page">
-      <div class="page-head">
+      <div class="page-head" style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px;">
         <div>
           <div class="page-title">Frame Schedule</div>
           <div class="page-sub mono">${slots.length} SLOT${slots.length === 1 ? "" : "S"} &middot; 12 WEEKS (CURRENT &middot; 11 FUTURE) &middot; LOCK HORIZON ${LOCK_HORIZON_DAYS}D &middot; ANCHOR ${SLOT_ANCHOR_ISO}</div>
+        </div>
+        <div class="fs-publish-strip" style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
+          <button class="btn" id="fs-publish-btn" onclick="_fsPublishSupplier(event)" title="Publish a read-only snapshot of the schedule grid at a stable URL suppliers can bookmark. Re-clicking republishes to the same URL.">&#x2197; Publish for supplier</button>
+          <div id="fs-publish-status" class="mono tiny muted" style="text-align:right; min-height:14px;">${_fsRenderPublishStatus()}</div>
         </div>
       </div>
 
@@ -4581,3 +4585,321 @@ window._fsDebugSim = function () {
 
   return { perFrame, summary };
 };
+
+/* ============================================================
+   v5 SUPPLIER SNAPSHOT
+
+   Publishes a read-only, self-contained HTML page at a stable
+   URL that the supplier (MOR-RYDE) can bookmark. The page shows
+   ONLY the schedule grid -- 6 frames x 12 weeks with per-week
+   quantities. No caps, no true-demand, no warnings, no on-hand
+   values, no cover, no colors that encode status, no planner
+   chrome.
+
+   Token round-trip: a v4 UUID minted client-side via
+   crypto.randomUUID on first publish and persisted in the
+   __settings__ row's `publishToken` field so every republish
+   reuses the same URL. Row-level security on
+   frame_schedule_published denies anon; only the publish/view
+   Netlify functions read/write via the service key. See
+   netlify/functions/frame-schedule-{publish,view}.js.
+
+   Last-published stamp: settings.lastPublishedAt is an ISO
+   timestamp captured after a successful publish and surfaced in
+   the page-head status area so the operator always knows how
+   fresh the supplier's copy is.
+   ============================================================ */
+
+// Token gate mirrored from the two Netlify functions and js/30.
+// Kept literal (no shared const) so a single-file scan of any
+// layer shows the exact shape it accepts. Loose form: 24..128
+// URL-safe characters -- wide enough for the "fs-<uuid>" mint
+// (39 chars) plus any future format tweaks.
+const _FS_TOKEN_RE = /^[A-Za-z0-9._-]{24,128}$/;
+
+// Long-form generation stamp -- "Month D, YYYY". Long-form on
+// the supplier page so there's zero ambiguity about MM/DD vs
+// DD/MM for offshore vendors. Local browser date is fine; the
+// grid columns already localize to Monday of each week.
+function _fsSupplierGeneratedStamp(d) {
+  const months = ["January","February","March","April","May","June",
+                  "July","August","September","October","November","December"];
+  return `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+
+// Format an ISO string for the page-head status "Last published"
+// line. Local browser locale via toLocaleString; falls back to
+// the raw ISO if that throws (older engines).
+function _fsFormatLastPublished(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    return d.toLocaleString();
+  } catch (_) {
+    return String(iso);
+  }
+}
+
+// Render the "Last published <stamp>" line for the page-head
+// status area. Called from renderFrameSchedule on every render
+// so the stamp is visible even without clicking Publish this
+// session. Empty string if we've never published.
+function _fsRenderPublishStatus() {
+  const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
+  const iso = s && typeof s.lastPublishedAt === "string" ? s.lastPublishedAt : null;
+  if (!iso) return "";
+  return `Last published ${esc(_fsFormatLastPublished(iso))}`;
+}
+
+// Build the standalone HTML document the supplier will see.
+// Reproduces the same optimizer input the render function uses,
+// then emits a self-contained page (inline CSS, no external
+// assets, no scripts). Called on demand from the Publish button.
+function _fsBuildSupplierHtml() {
+  const rows       = _fsRows();
+  const renderCols = _fsColumns();
+  const simCols    = _fsSimColumns();
+  const slots      = _fsBuildSlots(simCols);
+  const globalCaps = _fsSettingsCaps();
+  const visibleStartIsos = new Set(renderCols.map(c => c.iso));
+  const rateByPn = {};
+  for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
+  const simResult = _fsOptimize(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
+  const scheduledRuns = simResult.scheduledRuns;
+
+  // Per-cell qty: sum of any scheduled runs at (pn, weekIso).
+  // Locked / seed weeks are already reflected inside scheduledRuns
+  // by the optimizer, so a single lookup covers every slot kind.
+  const qtyAt = (pn, iso) => {
+    const runs = scheduledRuns.get(pn) || [];
+    let q = 0;
+    for (const r of runs) if (r.weekIso === iso) q += r.qty;
+    return q;
+  };
+
+  // Header row: week columns as M/D. No "current"-highlight
+  // class -- suppliers don't need to know which week is current
+  // (the date already tells them), and colored highlighting
+  // would encode planner state we're trying to keep out.
+  const headerCells = renderCols.map(c => `<th class="wk">${esc(c.md)}</th>`).join("");
+
+  // Body rows: 6 frames. Each row = PN + short name. Cells are
+  // the integer quantity to ship or BLANK when nothing is
+  // scheduled. Whole numbers only (packs are already multiples
+  // of 3 upstream, but Math.round guards against any float drift).
+  const bodyRows = rows.map(r => {
+    const short = FRAME_SHORT[r.pn] || "";
+    const cells = renderCols.map(c => {
+      const q = qtyAt(r.pn, c.iso);
+      if (q > 0) return `<td class="run">${Math.round(q)}</td>`;
+      return `<td class="idle"></td>`;
+    }).join("");
+    return `<tr>
+      <td class="pn">
+        <div class="pn-line"><strong>${esc(r.pn)}</strong></div>
+        <div class="pn-sub">${esc(short)}</div>
+      </td>
+      ${cells}
+    </tr>`;
+  }).join("");
+
+  const stamp = _fsSupplierGeneratedStamp(new Date());
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Landmaster Frame Schedule</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --line: #d8d8d8;
+    --hdr-bg: #f2f2f2;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 40px; }
+  .head { border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 18px; }
+  .title { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: 0.02em; }
+  .sub { font-size: 12px; color: var(--muted); }
+  .grid-wrap { overflow-x: auto; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: center; white-space: nowrap; }
+  table.grid thead th { background: var(--hdr-bg); font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+  table.grid td.pn { text-align: left; white-space: normal; min-width: 160px; background: var(--hdr-bg); }
+  table.grid td.pn .pn-line { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  table.grid td.pn .pn-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  table.grid td.run { font-weight: 600; font-variant-numeric: tabular-nums; }
+  table.grid td.idle { color: var(--muted); }
+  .foot { margin-top: 14px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <h1 class="title">LANDMASTER &#x2014; MOR-RYDE Frame Schedule</h1>
+      <div class="sub">Generated ${esc(stamp)}</div>
+    </div>
+    <div class="grid-wrap">
+      <table class="grid">
+        <thead>
+          <tr>
+            <th class="pn">Frame</th>
+            ${headerCells}
+          </tr>
+        </thead>
+        <tbody>
+          ${bodyRows}
+        </tbody>
+      </table>
+    </div>
+    <div class="foot">Quantities are frames to ship per week. Questions: &lt;your contact&gt;.</div>
+  </div>
+</body>
+</html>`;
+}
+
+// Publish handler for the "Publish for supplier" button. Mints
+// a "fs-<uuid>" token on first use (crypto.randomUUID prefixed
+// with "fs-" -> 39 chars, matching the shared _FS_TOKEN_RE),
+// builds the supplier HTML, POSTs to the publish function, and
+// persists {publishToken, lastPublishedAt} via
+// setFrameScheduleSettingsCloud so subsequent publishes reuse
+// the same URL and the page-head stamp is always fresh. Renders
+// the absolute URL + Copy button + "Last published <stamp>"
+// into #fs-publish-status.
+async function _fsPublishSupplier(evt) {
+  if (evt && typeof evt.preventDefault === "function") evt.preventDefault();
+  const btn    = document.getElementById("fs-publish-btn");
+  const status = document.getElementById("fs-publish-status");
+  const setStatus = (html, kind) => {
+    if (!status) return;
+    // kind: "ok" | "err" | null (neutral / in-flight)
+    status.className = "mono tiny " + (kind === "ok" ? "" : kind === "err" ? "crit" : "muted");
+    status.style.textAlign = "right";
+    status.innerHTML = html;
+  };
+
+  if (typeof publishFrameScheduleSnapshot !== "function") {
+    setStatus("Publish helper unavailable (cloud not loaded).", "err");
+    return;
+  }
+  const settings = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
+  let token = settings && typeof settings.publishToken === "string" && _FS_TOKEN_RE.test(settings.publishToken)
+    ? settings.publishToken
+    : null;
+  let mintedNew = false;
+  if (!token) {
+    if (typeof crypto === "undefined" || typeof crypto.randomUUID !== "function") {
+      setStatus("Cannot mint token (crypto.randomUUID unavailable).", "err");
+      return;
+    }
+    // "fs-" prefix + v4 UUID -- 39 chars, only URL-safe
+    // characters. Guarantees > 24 chars even if a UA ever
+    // returns a compact UUID variant, and stays inside the loose
+    // _FS_TOKEN_RE gate shared with both Netlify functions.
+    token = "fs-" + crypto.randomUUID();
+    mintedNew = true;
+  }
+
+  if (btn) { btn.disabled = true; }
+  setStatus("Publishing...", null);
+
+  let html;
+  try {
+    html = _fsBuildSupplierHtml();
+  } catch (err) {
+    if (btn) btn.disabled = false;
+    setStatus("Build failed: " + esc(String(err && err.message || err)), "err");
+    return;
+  }
+
+  const res = await publishFrameScheduleSnapshot(token, html);
+  if (!res || !res.ok) {
+    if (btn) btn.disabled = false;
+    const msg = res && res.error && res.error.message ? res.error.message : "unknown error";
+    setStatus("Publish failed: " + esc(msg), "err");
+    return;
+  }
+
+  // Server returns a RELATIVE path -- prepend the current origin
+  // so the URL handed back is a full clickable link that works
+  // even when copied/pasted outside this tab.
+  const absoluteUrl = (typeof window !== "undefined" && window.location && window.location.origin)
+    ? window.location.origin + res.url
+    : res.url;
+
+  // Persist BOTH the token (if newly minted) AND the fresh
+  // lastPublishedAt so the page-head "Last published" line
+  // reflects reality across renders and sessions. The writer
+  // preserves omitted fields, so a caps or buffer edit later
+  // doesn't wipe either value.
+  const lastPublishedAt = (typeof res.updatedAt === "string" && res.updatedAt)
+    ? res.updatedAt
+    : new Date().toISOString();
+  if (typeof setFrameScheduleSettingsCloud === "function") {
+    const caps = (settings && settings.caps) || { crewhd: 0, std: 0 };
+    const bw   = settings && Number.isFinite(settings.bufferWeeks) ? settings.bufferWeeks : undefined;
+    const arg  = {
+      crewhd: Number(caps.crewhd) || 0,
+      std:    Number(caps.std)    || 0,
+      lastPublishedAt,
+    };
+    if (mintedNew) arg.publishToken = token;
+    if (typeof bw === "number") arg.bufferWeeks = bw;
+    setFrameScheduleSettingsCloud(arg).then(r => {
+      if (!r || !r.ok) {
+        console.warn("[frame-schedule] failed to persist publish settings", r && r.error);
+      }
+    });
+  }
+
+  if (btn) btn.disabled = false;
+  const urlAttr = absoluteUrl.replace(/"/g, "&quot;");
+  const urlEsc  = esc(absoluteUrl);
+  const stampEsc = esc(_fsFormatLastPublished(lastPublishedAt));
+  setStatus(
+    `<a href="${urlAttr}" target="_blank" rel="noopener">${urlEsc}</a>` +
+    ` <span class="fs-acc-copy" role="button" tabindex="0" title="Copy URL" onclick="_fsCopySupplierUrl('${urlAttr}',event)" style="margin-left:8px; cursor:pointer; text-decoration:underline;">copy</span>` +
+    `<div class="muted" style="margin-top:2px">Last published ${stampEsc}</div>`,
+    "ok"
+  );
+  if (typeof showToast === "function") showToast("Supplier snapshot published.", "ok");
+}
+
+// Copy the supplier URL to the clipboard. Mirrors _fsCopyRc's
+// async-then-textarea-fallback pattern so unsupported browsers
+// still copy.
+function _fsCopySupplierUrl(url, evt) {
+  if (evt && typeof evt.stopPropagation === "function") evt.stopPropagation();
+  if (!url) return;
+  const done = ok => {
+    if (typeof showToast === "function") {
+      showToast(ok ? "URL copied" : "Copy failed", ok ? "ok" : "warn");
+    }
+  };
+  try {
+    if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(String(url)).then(() => done(true), () => done(false));
+      return;
+    }
+  } catch (_) { /* fall through */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = String(url);
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    document.body.removeChild(ta);
+    done(!!ok);
+  } catch (_) {
+    done(false);
+  }
+}

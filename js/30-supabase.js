@@ -922,12 +922,28 @@ function _populateFrameScheduleFromRows(rows) {
       // the units-based term was superseded by the weeks-based
       // formulation before it saw production use.
       const bw = Number(d.bufferWeeks);
+      // v5 publishToken: lifted so the supplier-snapshot Publish
+      // button reuses the same URL across republishes. Shape:
+      // 24..128 URL-safe chars ("fs-<uuid>" from the client mint).
+      // Absent on legacy rows → null → client mints on first click.
+      const rawTok = d && d.publishToken;
+      const publishToken = (typeof rawTok === "string" && /^[A-Za-z0-9._-]{24,128}$/.test(rawTok))
+        ? rawTok : null;
+      // v5 lastPublishedAt: ISO timestamp of the most recent
+      // successful publish. Rendered next to the URL in the
+      // client's status area so the operator always knows how
+      // fresh the supplier's copy is. Null on legacy rows /
+      // before the first publish.
+      const rawLp = d && d.lastPublishedAt;
+      const lastPublishedAt = (typeof rawLp === "string" && rawLp.length > 0) ? rawLp : null;
       DB.frameSchedule.settings = {
         caps: {
           crewhd: Number(d.caps && d.caps.crewhd) || 0,
           std:    Number(d.caps && d.caps.std)    || 0,
         },
         bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
+        publishToken,
+        lastPublishedAt,
         updatedAt: row.updated_at || null,
       };
       continue;
@@ -1086,10 +1102,28 @@ async function setFrameScheduleSettingsCloud(caps) {
   const bufferWeeks = Number.isFinite(bwArg) && bwArg >= 0
     ? bwArg
     : (prev && Number.isFinite(prev.bufferWeeks) ? prev.bufferWeeks : null);
+  // v5 publishToken: same preservation shape as bufferWeeks. When
+  // caller passes a valid token (client mints "fs-<uuid>" via
+  // crypto.randomUUID), persist it. When caller omits, keep
+  // whatever the prior mirror had so a caps-only or buffer-only
+  // edit doesn't wipe the supplier URL.
+  const ptArg = caps && caps.publishToken;
+  const publishToken = (typeof ptArg === "string" && /^[A-Za-z0-9._-]{24,128}$/.test(ptArg))
+    ? ptArg
+    : (prev && typeof prev.publishToken === "string" && prev.publishToken ? prev.publishToken : null);
+  // v5 lastPublishedAt: ISO timestamp captured by the Publish
+  // button after a successful upsert. Preserved-on-omit like the
+  // other v5 fields so a caps edit doesn't blank the stamp.
+  const lpArg = caps && caps.lastPublishedAt;
+  const lastPublishedAt = (typeof lpArg === "string" && lpArg.length > 0)
+    ? lpArg
+    : (prev && typeof prev.lastPublishedAt === "string" && prev.lastPublishedAt ? prev.lastPublishedAt : null);
   const nowIso = new Date().toISOString();
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, updatedAt: nowIso };
+  if (publishToken !== null) dataOut.publishToken = publishToken;
+  if (lastPublishedAt !== null) dataOut.lastPublishedAt = lastPublishedAt;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, updatedAt: nowIso };
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(
@@ -1112,8 +1146,45 @@ async function setFrameScheduleSettingsCloud(caps) {
   return { ok: true };
 }
 
+// v5 Publish a frame-schedule supplier snapshot. Sends the pre-
+// rendered supplier HTML + a stable token to the publish Netlify
+// function; returns the resulting public URL. Token round-trip
+// happens through setFrameScheduleSettingsCloud (the caller is
+// responsible for persisting the freshly-minted token before /
+// after this call so republishes reuse the same URL). Pure HTTP;
+// no direct Supabase call here.
+async function publishFrameScheduleSnapshot(token, html) {
+  if (typeof token !== "string" || !/^[A-Za-z0-9._-]{24,128}$/.test(token)) {
+    return { ok: false, error: new Error("invalid token") };
+  }
+  if (typeof html !== "string" || html.length === 0) {
+    return { ok: false, error: new Error("missing html") };
+  }
+  try {
+    const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, html }),
+    });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* not json */ }
+    if (!resp.ok) {
+      const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+      return { ok: false, error: new Error(`publish returned ${resp.status}: ${detail}`) };
+    }
+    if (!json || !json.url) {
+      return { ok: false, error: new Error("publish returned no url") };
+    }
+    return { ok: true, url: json.url, updatedAt: json.updated_at || null, bytes: json.bytes || 0 };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
 window.setFrameScheduleWeekCloud     = setFrameScheduleWeekCloud;
 window.setFrameScheduleSettingsCloud = setFrameScheduleSettingsCloud;
+window.publishFrameScheduleSnapshot  = publishFrameScheduleSnapshot;
 
 // Paginated fetch of all queue_entries rows. Sidecar table (not on the
 // realtime publication — poll-only) that stores the first-ever-in-queue
