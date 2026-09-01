@@ -4059,9 +4059,18 @@ function _fsDownloadHistoryCsv() {
 // values force the slot's pn and mark it source="manual".
 // Persists BOTH weeks of the slot with the same slot info on the
 // start week, computed qty on both.
-function _fsHandleSlotOverride(startIso, pn) {
+function _fsHandleSlotOverride(startIso, pn, pn2) {
   if (typeof gateEdit === "function" && !gateEdit()) return;
   if (pn && FRAME_PNS.indexOf(pn) < 0) return;
+
+  // v5.2 Normalize pn2 up front. A real split needs pn2 to be
+  // a valid frame DIFFERENT from pn; anything else (undefined,
+  // empty string, non-frame, or the same as pn) collapses to
+  // null and the override behaves as a whole-run pin.
+  let pn2Norm = null;
+  if (typeof pn2 === "string" && pn2.length > 0 && pn2 !== pn && FRAME_PNS.indexOf(pn2) >= 0) {
+    pn2Norm = pn2;
+  }
 
   // DEGENERATE-STATE REFUSAL: without both caps set, any auto pick
   // (including the one that clears an override would trigger) is
@@ -4099,7 +4108,7 @@ function _fsHandleSlotOverride(startIso, pn) {
     if (typeof logAudit === "function") {
       logAudit("frame-sched-edit",
         `Frame schedule: slot ${startIso} override cleared`,
-        { slotStart: startIso, pn: null });
+        { slotStart: startIso, pn: null, pn2: null });
     }
     renderFrameSchedule();
     return;
@@ -4109,10 +4118,19 @@ function _fsHandleSlotOverride(startIso, pn) {
   // {pn, locked:true, source:"manual"} directly — no sanity gate,
   // because the whole point of a manual override is to force this
   // pn regardless of what the optimizer would pick.
+  //
+  // v5.2 When pn2Norm is set, persist {pn, pn2, locked:true,
+  // source:"manual"} so _fsBuildSlots (which already reads
+  // persistedSlot.pn2 for optimizer-produced splits) picks it up
+  // as resolvedPn2 -- from there the sim's week-2 branch, the
+  // "split" pill in the slot band, and _fsBuildWeekPayload's
+  // pn2 emit all fire the same way they do for an auto split.
   const cur = DB.frameSchedule.weeks.get(startIso) || { qty: {}, slot: null };
+  const slotDesc = { pn, locked: true, source: "manual" };
+  if (pn2Norm) slotDesc.pn2 = pn2Norm;
   DB.frameSchedule.weeks.set(startIso, {
     qty: cur.qty || {},
-    slot: { pn, locked: true, source: "manual" },
+    slot: slotDesc,
     updatedAt: cur.updatedAt || null,
   });
   FRAMESCHED_STATE._autoPersistedSlots.delete(startIso);
@@ -4128,9 +4146,9 @@ function _fsHandleSlotOverride(startIso, pn) {
   const rateByPn = {};
   for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
   // Optimizer: the manual slot is now fixed (build-time
-  // resolvedPn from the persisted mirror update above); remaining
-  // open slots re-optimize around it. Sim runs without PO
-  // credits — see _fsSimulate header.
+  // resolvedPn / resolvedPn2 from the persisted mirror update
+  // above); remaining open slots re-optimize around it. Sim
+  // runs without PO credits — see _fsSimulate header.
   const simResult = _fsOptimize(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
   const scheduledRuns = simResult.scheduledRuns;
 
@@ -4140,14 +4158,20 @@ function _fsHandleSlotOverride(startIso, pn) {
       const wkIso = slot.weekIsos[idx];
       if (!cols.some(c => c.iso === wkIso)) continue;
       const isStart = idx === 0;
+      // _fsBuildWeekPayload sizes each week against slot.
+      // resolvedPn (week 1) / slot.resolvedPn2 (week 2 when set)
+      // via the scheduledRuns map the optimizer just produced,
+      // so a manual split's second week persists on pn2 without
+      // any extra plumbing here.
       const payload = _fsBuildWeekPayload(wkIso, scheduledRuns, slot, isStart);
       _fsCommitWeek(wkIso, payload);
     }
   }
   if (typeof logAudit === "function") {
-    logAudit("frame-sched-edit",
-      `Frame schedule: slot ${startIso} override -> ${pn}`,
-      { slotStart: startIso, pn });
+    const msg = pn2Norm
+      ? `Frame schedule: slot ${startIso} override -> ${pn} + ${pn2Norm} (split)`
+      : `Frame schedule: slot ${startIso} override -> ${pn}`;
+    logAudit("frame-sched-edit", msg, { slotStart: startIso, pn, pn2: pn2Norm });
   }
   renderFrameSchedule();
 }
@@ -4242,10 +4266,18 @@ registerRoute("frameschedule", renderFrameSchedule);
    stay wired up for DevTools console use so an operator can
    still override / re-pick a slot when reality forces it:
 
-     window.fsOverrideSlot("2026-10-19", "UT101003")   // pin
-     window.fsOverrideSlot("2026-10-19", "")           // clear
-     window.fsRepickSlot("2026-10-19")                 // re-pick one
-     window.fsRepickAll()                              // re-pick every locked auto/seed
+     window.fsOverrideSlot("2026-10-19", "UT101003")               // whole-run pin
+     window.fsOverrideSlot("2026-10-19", "UT101003", "UT101005")   // 1-week split (v5.2)
+     window.fsOverrideSlot("2026-10-19", "")                       // clear
+     window.fsRepickSlot("2026-10-19")                             // re-pick one
+     window.fsRepickAll()                                          // re-pick every locked auto/seed
+
+   The 3-arg form pins week 1 to pn and week 2 to pn2 (must be
+   a valid FRAME_PNS entry different from pn); an empty / same-as-pn
+   pn2 collapses to the whole-run behavior. Splits render the
+   existing "split" pill in the slot band and persist as
+   { pn, pn2, locked, source:"manual" } — identical shape to an
+   optimizer-produced split.
 
    All three go through gateEdit + logAudit + the standard
    optimize + persist flow, exactly as they did when they had
