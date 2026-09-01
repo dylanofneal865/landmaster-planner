@@ -102,13 +102,16 @@ exports.handler = async (event) => {
       body: JSON.stringify({ error: "Missing html body" }),
     };
   }
-  // Belt-and-suspenders 1 MB cap. The supplier grid is a small
-  // static page; anything larger is a client bug.
-  if (html.length > 1000000) {
+  // Belt-and-suspenders 3 MB cap. v5.1 the supplier snapshot
+  // now embeds the full Frame Schedule tab (including an
+  // inlined copy of css/styles.css), so the payload is larger
+  // than the old grid-only page but still comfortably under a
+  // few MB. Anything past 3 MB is a client bug.
+  if (html.length > 3000000) {
     return {
       statusCode: 413,
       headers: { ...cors, "content-type": "application/json" },
-      body: JSON.stringify({ error: "html too large (>1MB)" }),
+      body: JSON.stringify({ error: "html too large (>3MB)" }),
     };
   }
 

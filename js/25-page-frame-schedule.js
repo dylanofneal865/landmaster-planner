@@ -176,6 +176,14 @@ const FRAMESCHED_STATE = {
   _autoPublishDirty: false,
   _lastRenderKey: null,
   _lastPublishedKey: null,
+  // v5.1 Supplier snapshot now embeds the FULL Frame Schedule tab,
+  // read-only. The build path fetches css/styles.css once and
+  // inlines it into every published document so the supplier page
+  // renders identically to the planner outside the app. Cached
+  // here so a burst of auto-publishes doesn't refetch the same
+  // 1600-line stylesheet.
+  _supplierCssCache: null,
+  _supplierCssFetching: null,
 };
 
 /* ============================================================
@@ -4617,20 +4625,41 @@ window._fsDebugSim = function () {
 /* ============================================================
    v5 SUPPLIER SNAPSHOT
 
-   Publishes a read-only, self-contained HTML page at a stable
-   URL that the supplier (MOR-RYDE) can bookmark. The page shows
-   ONLY the schedule grid -- 6 frames x 12 weeks with per-week
-   quantities. No caps, no true-demand, no warnings, no on-hand
-   values, no cover, no colors that encode status, no planner
-   chrome.
+   Publishes a read-only, self-contained HTML copy of the ENTIRE
+   Frame Schedule tab -- page header + stats line, cap and
+   min-cover controls (rendered as inert values), slot header,
+   the grid with locked/proposed/split badges and 12-wk totals,
+   True Demand panel, coverage warnings, receipt history. The
+   supplier sees exactly what the planner does, minus any way
+   to interact with it.
 
-   Token round-trip: a v4 UUID minted client-side via
-   crypto.randomUUID on first publish and persisted in the
-   __settings__ row's `publishToken` field so every republish
-   reuses the same URL. Row-level security on
-   frame_schedule_published denies anon; only the publish/view
-   Netlify functions read/write via the service key. See
-   netlify/functions/frame-schedule-{publish,view}.js.
+   Build path:
+     1. renderFrameSchedule has already run in both call paths
+        (manual button click and auto-publish tail). The builder
+        confirms and errors out if #main is showing a different
+        tab so an ill-timed auto-publish never captures the
+        wrong page.
+     2. #main is deep-cloned; the live DOM is never touched.
+     3. Interactivity is stripped from the clone -- inputs /
+        selects / textareas become spans showing their current
+        value, buttons become spans, all on* / href /
+        contenteditable / <script> / role="button" go away.
+     4. css/styles.css is fetched once (cached in FRAMESCHED_STATE)
+        and inlined into a <style> tag along with the Google
+        Fonts <link>s so the dark theme renders identically
+        outside the app.
+     5. The clone gets wrapped in a full standalone document
+        (<!doctype>, meta, title, inlined <style>, no <script>
+        tags anywhere) with a "Generated <Month D, YYYY>" line
+        above it.
+
+   Token round-trip: minted client-side via crypto.randomUUID
+   on first publish and persisted in the __settings__ row's
+   `publishToken` field so every republish reuses the same URL.
+   Row-level security on frame_schedule_published denies anon;
+   only the publish/view Netlify functions read/write via the
+   service key. See netlify/functions/frame-schedule-{publish,
+   view}.js and supplier-site/ for the separate-domain view.
 
    Last-published stamp: settings.lastPublishedAt is an ISO
    timestamp captured after a successful publish and surfaced in
@@ -4707,6 +4736,13 @@ function _fsSupplierUrl(relPath) {
 // Only the RENDERED columns (12 visible weeks) participate --
 // beyond-window optimizer output is invisible to the supplier
 // snapshot and must not force an auto-publish.
+//
+// v5.1 Now that the snapshot embeds the whole tab (caps strip,
+// min-cover, warnings, true-demand panel, ...), the key also
+// includes the settings that drive those non-grid regions --
+// otherwise a cap or min-cover edit that leaves the visible
+// grid identical (rare but possible at extremes) wouldn't
+// trigger a republish and the supplier page would go stale.
 function _fsGridKey(rows, cols, scheduledRuns) {
   if (!Array.isArray(rows) || !Array.isArray(cols) || !scheduledRuns) return "";
   const parts = [];
@@ -4719,6 +4755,10 @@ function _fsGridKey(rows, cols, scheduledRuns) {
       if (q > 0) parts.push(`${r.pn}|${iso}|${Math.round(q)}`);
     }
   }
+  const caps = _fsSettingsCaps();
+  const bw   = _fsSettingsBufferWeeks();
+  parts.push(`caps|${Number(caps && caps.crewhd) || 0}|${Number(caps && caps.std) || 0}`);
+  parts.push(`bw|${Number.isFinite(bw) ? bw : ""}`);
   return parts.join(",");
 }
 
@@ -4762,7 +4802,11 @@ function _fsAutoPublish() {
 // The debounce-fired half of _fsAutoPublish. Separated so the
 // in-flight watcher can re-enter it directly (bypassing another
 // debounce round) when a change queued up while a POST was live.
-function _fsAutoPublishFire() {
+// v5.1: async because the builder now fetches the stylesheet on
+// first call. The in-flight flag is set BEFORE the await so a
+// concurrent render that lands during the build correctly marks
+// the run dirty for a follow-up.
+async function _fsAutoPublishFire() {
   const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
   const token = s && typeof s.publishToken === "string" && _FS_TOKEN_RE.test(s.publishToken)
     ? s.publishToken
@@ -4773,186 +4817,269 @@ function _fsAutoPublishFire() {
   if (targetKey === FRAMESCHED_STATE._lastPublishedKey) return;
 
   if (FRAMESCHED_STATE._autoPublishInFlight) {
-    // A POST is currently running. Mark that a fresh change
-    // arrived so the watcher re-fires on resolve.
+    // A POST (or its build) is currently running. Mark that a
+    // fresh change arrived so the watcher re-fires on resolve.
     FRAMESCHED_STATE._autoPublishDirty = true;
     return;
   }
 
   if (typeof publishFrameScheduleSnapshot !== "function") return;
 
+  FRAMESCHED_STATE._autoPublishInFlight = true;
+  FRAMESCHED_STATE._autoPublishDirty = false;
+
   let html;
   try {
-    html = _fsBuildSupplierHtml();
+    html = await _fsBuildSupplierHtml();
   } catch (err) {
     console.warn("[frame-schedule] auto-publish build failed", err);
+    FRAMESCHED_STATE._autoPublishInFlight = false;
+    // Retry pattern -- if a change queued during the failed
+    // build, kick off another debounced cycle; _lastPublishedKey
+    // is untouched so the mismatch will still be seen.
+    if (FRAMESCHED_STATE._autoPublishDirty) {
+      FRAMESCHED_STATE._autoPublishDirty = false;
+      _fsAutoPublish();
+    }
     return;
   }
 
-  FRAMESCHED_STATE._autoPublishInFlight = true;
-  FRAMESCHED_STATE._autoPublishDirty = false;
-  publishFrameScheduleSnapshot(token, html).then(res => {
-    FRAMESCHED_STATE._autoPublishInFlight = false;
-    if (!res || !res.ok) {
-      console.warn("[frame-schedule] auto-publish POST failed", res && res.error);
-      // Retry once whatever comes next -- keep _lastPublishedKey
-      // unchanged so the very next render notices the mismatch.
-      if (FRAMESCHED_STATE._autoPublishDirty) {
-        FRAMESCHED_STATE._autoPublishDirty = false;
-        _fsAutoPublish();
-      }
-      return;
-    }
-
-    // Success. Match the manual handler's persistence + UI shape
-    // one-for-one, minus the toast.
-    FRAMESCHED_STATE._lastPublishedKey = targetKey;
-    const lastPublishedAt = (typeof res.updatedAt === "string" && res.updatedAt)
-      ? res.updatedAt
-      : new Date().toISOString();
-    if (typeof setFrameScheduleSettingsCloud === "function") {
-      const caps = (s && s.caps) || { crewhd: 0, std: 0 };
-      const bw   = s && Number.isFinite(s.bufferWeeks) ? s.bufferWeeks : undefined;
-      const arg  = {
-        crewhd: Number(caps.crewhd) || 0,
-        std:    Number(caps.std)    || 0,
-        lastPublishedAt,
-      };
-      if (typeof bw === "number") arg.bufferWeeks = bw;
-      setFrameScheduleSettingsCloud(arg).then(r => {
-        if (!r || !r.ok) {
-          console.warn("[frame-schedule] auto-publish failed to persist lastPublishedAt", r && r.error);
-        }
-      });
-    }
-    // Refresh JUST the "Last published" line so the operator
-    // sees the stamp advance silently. Preserves any existing
-    // clickable URL / copy link the manual publish rendered.
-    const statusEl = document.getElementById("fs-publish-status");
-    if (statusEl) {
-      statusEl.innerHTML = `Last published ${esc(_fsFormatLastPublished(lastPublishedAt))}`;
-      statusEl.className = "mono tiny muted";
-      statusEl.style.textAlign = "right";
-    }
-
-    // If a change queued up during the POST, re-enter without
-    // waiting for another debounce round -- the operator is
-    // actively editing and expects the supplier copy to keep up.
+  const res = await publishFrameScheduleSnapshot(token, html);
+  FRAMESCHED_STATE._autoPublishInFlight = false;
+  if (!res || !res.ok) {
+    console.warn("[frame-schedule] auto-publish POST failed", res && res.error);
+    // Retry -- keep _lastPublishedKey unchanged so the very
+    // next render notices the mismatch.
     if (FRAMESCHED_STATE._autoPublishDirty) {
       FRAMESCHED_STATE._autoPublishDirty = false;
-      _fsAutoPublishFire();
+      _fsAutoPublish();
+    }
+    return;
+  }
+
+  // Success. Match the manual handler's persistence + UI shape
+  // one-for-one, minus the toast.
+  FRAMESCHED_STATE._lastPublishedKey = targetKey;
+  const lastPublishedAt = (typeof res.updatedAt === "string" && res.updatedAt)
+    ? res.updatedAt
+    : new Date().toISOString();
+  if (typeof setFrameScheduleSettingsCloud === "function") {
+    const caps = (s && s.caps) || { crewhd: 0, std: 0 };
+    const bw   = s && Number.isFinite(s.bufferWeeks) ? s.bufferWeeks : undefined;
+    const arg  = {
+      crewhd: Number(caps.crewhd) || 0,
+      std:    Number(caps.std)    || 0,
+      lastPublishedAt,
+    };
+    if (typeof bw === "number") arg.bufferWeeks = bw;
+    setFrameScheduleSettingsCloud(arg).then(r => {
+      if (!r || !r.ok) {
+        console.warn("[frame-schedule] auto-publish failed to persist lastPublishedAt", r && r.error);
+      }
+    });
+  }
+  // Refresh JUST the "Last published" line so the operator sees
+  // the stamp advance silently. Preserves any existing clickable
+  // URL / copy link the manual publish rendered.
+  const statusEl = document.getElementById("fs-publish-status");
+  if (statusEl) {
+    statusEl.innerHTML = `Last published ${esc(_fsFormatLastPublished(lastPublishedAt))}`;
+    statusEl.className = "mono tiny muted";
+    statusEl.style.textAlign = "right";
+  }
+
+  // If a change queued up during the POST, re-enter without
+  // waiting for another debounce round -- the operator is
+  // actively editing and expects the supplier copy to keep up.
+  if (FRAMESCHED_STATE._autoPublishDirty) {
+    FRAMESCHED_STATE._autoPublishDirty = false;
+    _fsAutoPublishFire();
+  }
+}
+
+// v5.1 Fetch css/styles.css and cache it in FRAMESCHED_STATE so
+// a burst of publishes doesn't re-download the same ~1.7k-line
+// file. Concurrent callers share the same in-flight promise so
+// two clicks (or a click + an auto-publish) never race two
+// fetches. Uses the browser cache path (`force-cache`) since
+// the stylesheet ships with the app and rotates only on deploy.
+function _fsFetchSupplierCss() {
+  if (typeof FRAMESCHED_STATE._supplierCssCache === "string") {
+    return Promise.resolve(FRAMESCHED_STATE._supplierCssCache);
+  }
+  if (FRAMESCHED_STATE._supplierCssFetching) {
+    return FRAMESCHED_STATE._supplierCssFetching;
+  }
+  const p = fetch("css/styles.css", { cache: "force-cache" })
+    .then(r => {
+      if (!r.ok) throw new Error(`css/styles.css fetch ${r.status}`);
+      return r.text();
+    })
+    .then(text => {
+      FRAMESCHED_STATE._supplierCssCache = text;
+      FRAMESCHED_STATE._supplierCssFetching = null;
+      return text;
+    })
+    .catch(err => {
+      FRAMESCHED_STATE._supplierCssFetching = null;
+      throw err;
+    });
+  FRAMESCHED_STATE._supplierCssFetching = p;
+  return p;
+}
+
+// v5.1 Walk the cloned #main and strip every affordance the
+// supplier must not be able to touch:
+//   * Publish button + status strip (planner-only chrome).
+//   * <input>, <select>, <textarea> -> <span> preserving classes
+//     and showing the current value / selected option label /
+//     checkbox tick, so the caps + min-cover strip renders
+//     with real numbers but is dead.
+//   * <button> -> <span> preserving classes + inner text so any
+//     label the supplier should see (slot badges labelled inside
+//     buttons, "LOCKED" / "PROPOSED" / "SPLIT" pills, etc.)
+//     survives while the click affordance goes away.
+//   * Any element flagged role="button" -> removed entirely.
+//     These are non-<button> click targets (e.g. the accordion
+//     "copy" span in _fsCopyRc); zero legitimate labels to save.
+//   * Every <script>: removed.
+//   * Every element: on* / href / contenteditable attributes
+//     stripped so nothing responds to clicks / keyboard focus.
+function _fsStripSupplierInteractivity(root) {
+  if (!root) return;
+
+  // 1. Planner-only chrome.
+  const publishBtn = root.querySelector("#fs-publish-btn");
+  if (publishBtn) publishBtn.remove();
+  const publishStatus = root.querySelector("#fs-publish-status");
+  if (publishStatus) publishStatus.remove();
+  const publishStrip = root.querySelector(".fs-publish-strip");
+  if (publishStrip) publishStrip.remove();
+
+  // 2. Nuke any <script>. Defensive -- the frame-schedule tab
+  // shouldn't inject scripts, but a stray one would be a huge
+  // supplier-side surprise.
+  root.querySelectorAll("script").forEach(el => el.remove());
+
+  // 3. role="button" elements: hard remove. These are span/div
+  // click targets with no accessible name we need to preserve.
+  root.querySelectorAll('[role="button"]').forEach(el => el.remove());
+
+  // 4. Form controls -> spans preserving current visible value.
+  root.querySelectorAll("input, select, textarea").forEach(el => {
+    const span = document.createElement("span");
+    if (el.className) span.className = el.className;
+    const tag = el.tagName.toLowerCase();
+    let text = "";
+    if (tag === "select") {
+      const idx = el.selectedIndex;
+      const opt = (el.options && idx >= 0) ? el.options[idx] : null;
+      text = opt ? (opt.textContent || opt.value || "") : "";
+    } else if (tag === "input") {
+      const type = (el.type || "").toLowerCase();
+      if (type === "checkbox" || type === "radio") text = el.checked ? "✓" : "";
+      else text = el.value != null ? el.value : "";
+    } else {
+      text = el.value != null ? el.value : "";
+    }
+    span.textContent = text;
+    if (el.parentNode) el.parentNode.replaceChild(span, el);
+  });
+
+  // 5. Buttons -> spans preserving classes + inner markup so
+  // labels the supplier should see (badges rendered as buttons,
+  // "LOCKED" pills, ...) survive.
+  root.querySelectorAll("button").forEach(el => {
+    const span = document.createElement("span");
+    if (el.className) span.className = el.className;
+    span.innerHTML = el.innerHTML;
+    if (el.parentNode) el.parentNode.replaceChild(span, el);
+  });
+
+  // 6. Strip on* / href / contenteditable from every remaining
+  // element. Snapshot the attribute list first -- mutating the
+  // live NamedNodeMap during iteration is undefined behaviour.
+  root.querySelectorAll("*").forEach(el => {
+    const attrs = Array.from(el.attributes || []);
+    for (const a of attrs) {
+      const name = a.name;
+      if (name.length >= 2 && name.charAt(0) === "o" && name.charAt(1) === "n") {
+        el.removeAttribute(name);
+      } else if (name === "href" || name === "contenteditable") {
+        el.removeAttribute(name);
+      }
     }
   });
 }
 
-// Build the standalone HTML document the supplier will see.
-// Reproduces the same optimizer input the render function uses,
-// then emits a self-contained page (inline CSS, no external
-// assets, no scripts). Called on demand from the Publish button.
-function _fsBuildSupplierHtml() {
-  const rows       = _fsRows();
-  const renderCols = _fsColumns();
-  const simCols    = _fsSimColumns();
-  const slots      = _fsBuildSlots(simCols);
-  const globalCaps = _fsSettingsCaps();
-  const visibleStartIsos = new Set(renderCols.map(c => c.iso));
-  const rateByPn = {};
-  for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
-  const simResult = _fsOptimize(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
-  const scheduledRuns = simResult.scheduledRuns;
+// v5.1 Build the standalone HTML document the supplier will
+// see: a full-tab, read-only copy of what the operator has open
+// in #main. Async because the stylesheet is fetched (and
+// cached) on first call. Throws if #main isn't showing the
+// Frame Schedule tab so an ill-timed auto-publish never
+// captures the wrong page -- the caller's catch treats a throw
+// as "skip this cycle" and leaves _lastPublishedKey unchanged
+// for the next render to retry.
+async function _fsBuildSupplierHtml() {
+  const main = (typeof document !== "undefined") ? document.getElementById("main") : null;
+  if (!main) throw new Error("#main not present");
+  const titleEl = main.querySelector(".page-title");
+  const titleText = titleEl ? String(titleEl.textContent || "") : "";
+  if (!/Frame Schedule/i.test(titleText)) {
+    throw new Error("Frame Schedule tab is not currently rendered in #main");
+  }
 
-  // Per-cell qty: sum of any scheduled runs at (pn, weekIso).
-  // Locked / seed weeks are already reflected inside scheduledRuns
-  // by the optimizer, so a single lookup covers every slot kind.
-  const qtyAt = (pn, iso) => {
-    const runs = scheduledRuns.get(pn) || [];
-    let q = 0;
-    for (const r of runs) if (r.weekIso === iso) q += r.qty;
-    return q;
-  };
+  // 1. Deep-clone #main. Everything from here down operates on
+  // the clone; the live DOM is untouched.
+  const clone = main.cloneNode(true);
 
-  // Header row: week columns as M/D. No "current"-highlight
-  // class -- suppliers don't need to know which week is current
-  // (the date already tells them), and colored highlighting
-  // would encode planner state we're trying to keep out.
-  const headerCells = renderCols.map(c => `<th class="wk">${esc(c.md)}</th>`).join("");
+  // 2. Strip every interactive affordance from the clone.
+  _fsStripSupplierInteractivity(clone);
 
-  // Body rows: 6 frames. Each row = PN + short name. Cells are
-  // the integer quantity to ship or BLANK when nothing is
-  // scheduled. Whole numbers only (packs are already multiples
-  // of 3 upstream, but Math.round guards against any float drift).
-  const bodyRows = rows.map(r => {
-    const short = FRAME_SHORT[r.pn] || "";
-    const cells = renderCols.map(c => {
-      const q = qtyAt(r.pn, c.iso);
-      if (q > 0) return `<td class="run">${Math.round(q)}</td>`;
-      return `<td class="idle"></td>`;
-    }).join("");
-    return `<tr>
-      <td class="pn">
-        <div class="pn-line"><strong>${esc(r.pn)}</strong></div>
-        <div class="pn-sub">${esc(short)}</div>
-      </td>
-      ${cells}
-    </tr>`;
-  }).join("");
+  // 3. Fetch (or read the cache of) css/styles.css and inline
+  // the entire stylesheet so the dark theme, tokens, badge
+  // colors, table layout, etc. all render identically outside
+  // the app. The stylesheet already contains the :root design
+  // tokens and the body background, so a single inline covers
+  // both.
+  const css = await _fsFetchSupplierCss();
 
+  // 4. Assemble the standalone document. Include the exact
+  // Google Fonts <link> tags index.html uses so text uses the
+  // same faces (Instrument Serif / Geist / Geist Mono / Saira).
+  // No <script> anywhere in the output.
   const stamp = _fsSupplierGeneratedStamp(new Date());
-
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>Landmaster Frame Schedule</title>
+<title>Landmaster &#x2014; Frame Schedule</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500;600&amp;family=Saira:ital,wght@1,700;1,800;1,900&amp;display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #ffffff;
-    --fg: #1a1a1a;
-    --muted: #666;
-    --line: #d8d8d8;
-    --hdr-bg: #f2f2f2;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 40px; }
-  .head { border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 18px; }
-  .title { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: 0.02em; }
-  .sub { font-size: 12px; color: var(--muted); }
-  .grid-wrap { overflow-x: auto; }
-  table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.grid th, table.grid td { border: 1px solid var(--line); padding: 6px 8px; text-align: center; white-space: nowrap; }
-  table.grid thead th { background: var(--hdr-bg); font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
-  table.grid td.pn { text-align: left; white-space: normal; min-width: 160px; background: var(--hdr-bg); }
-  table.grid td.pn .pn-line { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-  table.grid td.pn .pn-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
-  table.grid td.run { font-weight: 600; font-variant-numeric: tabular-nums; }
-  table.grid td.idle { color: var(--muted); }
-  .foot { margin-top: 14px; font-size: 12px; color: var(--muted); }
+${css}
+
+/* v5.1 Supplier-snapshot inserts. Static "Generated" line above
+   the cloned tab; the clone itself carries its own styling from
+   the inlined stylesheet above. */
+.fs-supplier-generated {
+  max-width: 1400px;
+  margin: 12px auto 0;
+  padding: 8px 16px;
+  color: var(--t2);
+  font-family: var(--f-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="head">
-      <h1 class="title">LANDMASTER &#x2014; MOR-RYDE Frame Schedule</h1>
-      <div class="sub">Generated ${esc(stamp)}</div>
-    </div>
-    <div class="grid-wrap">
-      <table class="grid">
-        <thead>
-          <tr>
-            <th class="pn">Frame</th>
-            ${headerCells}
-          </tr>
-        </thead>
-        <tbody>
-          ${bodyRows}
-        </tbody>
-      </table>
-    </div>
-    <div class="foot">Quantities are frames to ship per week. Questions: &lt;your contact&gt;.</div>
-  </div>
+<div class="fs-supplier-generated">Generated ${esc(stamp)}</div>
+${clone.outerHTML}
 </body>
 </html>`;
 }
@@ -5005,7 +5132,7 @@ async function _fsPublishSupplier(evt) {
 
   let html;
   try {
-    html = _fsBuildSupplierHtml();
+    html = await _fsBuildSupplierHtml();
   } catch (err) {
     if (btn) btn.disabled = false;
     setStatus("Build failed: " + esc(String(err && err.message || err)), "err");

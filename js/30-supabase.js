@@ -1160,6 +1160,15 @@ async function publishFrameScheduleSnapshot(token, html) {
   if (typeof html !== "string" || html.length === 0) {
     return { ok: false, error: new Error("missing html") };
   }
+  // v5.1 Mirror the server-side 3 MB cap so a runaway payload
+  // fails fast without a round-trip. The supplier snapshot now
+  // embeds the full Frame Schedule tab + inlined stylesheet, so
+  // the payload is meaningfully larger than the old grid-only
+  // page -- but 3 MB is still comfortably above the expected
+  // size.
+  if (html.length > 3000000) {
+    return { ok: false, error: new Error("html too large (>3MB)") };
+  }
   try {
     const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
       method: "POST",
