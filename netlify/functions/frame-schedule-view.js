@@ -43,6 +43,28 @@ exports.handler = async (event) => {
     return { statusCode: 405, body: "GET only" };
   }
 
+  // v5 supplier-site redirect: once the standalone supplier site
+  // is live, every planner-domain view URL becomes a 302 to the
+  // supplier origin's root. This keeps any old bookmarks working
+  // while making sure the supplier ends up on the isolated
+  // domain -- the planner's origin has no login and we do NOT
+  // want a supplier trimming the URL back to reach the app.
+  // ?token= is passed through when present so a specific
+  // published snapshot can still be reached by URL if needed.
+  const supplierSiteUrl = process.env.FS_SUPPLIER_SITE_URL;
+  if (typeof supplierSiteUrl === "string" && supplierSiteUrl.length > 0) {
+    const raw = event && event.queryStringParameters && event.queryStringParameters.token;
+    const base = supplierSiteUrl.replace(/\/+$/, "") + "/";
+    const location = (typeof raw === "string" && raw.length > 0)
+      ? `${base}?token=${encodeURIComponent(raw)}`
+      : base;
+    return {
+      statusCode: 302,
+      headers: { Location: location, "Cache-Control": "no-store" },
+      body: "",
+    };
+  }
+
   const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     log("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");

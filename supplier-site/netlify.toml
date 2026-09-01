@@ -1,0 +1,30 @@
+# Supplier-facing frame-schedule site.
+#
+# This is a SECOND Netlify site deployed from the same repo,
+# configured in Netlify with Base directory = "supplier-site".
+# It exists solely to host the read-only weekly schedule the
+# supplier bookmarks -- separate origin from the planner so a
+# supplier who trims the URL cannot reach the planner app.
+#
+# Root is redirected (200-rewrite) to the view function, which
+# defaults the token from frame_schedule.__settings__.data.publishToken
+# when no ?token=... is on the URL. Nothing else exists on this
+# domain.
+
+[build]
+  publish = "public"
+  command = "npm install"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Rewrite (status 200 + force) so the address bar stays at the
+# clean site root -- the supplier bookmarks "/", not the raw
+# function path. force = true beats the static public/index.html
+# fallback so the root always hits the function.
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/frame-schedule-view"
+  status = 200
+  force = true

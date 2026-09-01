@@ -24,8 +24,23 @@ function _cacheOpen() {
 function _cacheGet(k){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readonly");const r=t.objectStore("kv").get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);})); }
 function _cacheSet(k,v){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readwrite");t.objectStore("kv").put(v,k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error);})); }
 function _cacheDel(k){ return _cacheOpen().then(db=>new Promise((res,rej)=>{const t=db.transaction("kv","readwrite");t.objectStore("kv").delete(k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error);})); }
-const TODAY = new Date(); TODAY.setHours(0,0,0,0);
+// TODAY is `let` (not `const`) so refreshTodayIfRolledOver() in
+// js/05-ui-shell.js can reassign it when the day rolls over on a
+// long-lived tab. Same-day refocus is a no-op; only a real rollover
+// reassigns + bumps the status cache + triggers a re-render. Every
+// other TODAY consumer reads it inline per call, so they pick up
+// the new value automatically after the reassignment.
+let TODAY = new Date(); TODAY.setHours(0,0,0,0);
 const DAY_MS = 86400000;
+
+// v5 Supplier-facing site for the Frame Schedule supplier snapshot.
+// Set this to the URL of the SECOND Netlify site deployed from
+// supplier-site/ (Base directory = "supplier-site") once it goes
+// live -- e.g. "https://landmaster-supplier.netlify.app" -- no
+// trailing slash. When empty, the client falls back to the
+// planner origin + the raw view-function path, which still works
+// but leaves the URL on the planner domain.
+const FS_SUPPLIER_SITE_URL = "";
 
 const DEFAULTS = {
   settings: {

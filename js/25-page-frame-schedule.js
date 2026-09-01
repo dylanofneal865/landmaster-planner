@@ -159,6 +159,23 @@ const FRAMESCHED_STATE = {
   // trip lands; the reader (_fsSettingsBufferWeeks) prefers the
   // cloud value.
   _bufferWeeks: null,
+  // v5 AUTO-PUBLISH state. renderFrameSchedule computes a grid
+  // key from every scheduled cell (pn|iso|qty) and asks
+  // _fsAutoPublish to republish when the key changes vs the last
+  // successful publish. Fields:
+  //   _autoPublishTimer    - debounce handle (3 s)
+  //   _autoPublishInFlight - a POST is currently in flight
+  //   _autoPublishDirty    - a change arrived DURING a POST; the
+  //                          in-flight watcher re-fires when the
+  //                          current POST resolves
+  //   _lastRenderKey       - key from the most recent render
+  //   _lastPublishedKey    - key from the last successful publish
+  //                          (both manual + auto keep this in sync)
+  _autoPublishTimer: null,
+  _autoPublishInFlight: false,
+  _autoPublishDirty: false,
+  _lastRenderKey: null,
+  _lastPublishedKey: null,
 };
 
 /* ============================================================
@@ -3402,7 +3419,7 @@ function renderFrameSchedule() {
           <div class="page-sub mono">${slots.length} SLOT${slots.length === 1 ? "" : "S"} &middot; 12 WEEKS (CURRENT &middot; 11 FUTURE) &middot; LOCK HORIZON ${LOCK_HORIZON_DAYS}D &middot; ANCHOR ${SLOT_ANCHOR_ISO}</div>
         </div>
         <div class="fs-publish-strip" style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
-          <button class="btn" id="fs-publish-btn" onclick="_fsPublishSupplier(event)" title="Publish a read-only snapshot of the schedule grid at a stable URL suppliers can bookmark. Re-clicking republishes to the same URL.">&#x2197; Publish for supplier</button>
+          <button class="btn" id="fs-publish-btn" onclick="_fsPublishSupplier(event)" title="Publish a read-only snapshot of the schedule grid at a stable URL suppliers can bookmark. After the first publish the page stays in sync automatically -- any change to the schedule republishes to the same URL within a few seconds.">&#x2197; Publish for supplier</button>
           <div id="fs-publish-status" class="mono tiny muted" style="text-align:right; min-height:14px;">${_fsRenderPublishStatus()}</div>
         </div>
       </div>
@@ -3452,6 +3469,17 @@ function renderFrameSchedule() {
   // because this call is IMMEDIATELY after _fsOptimize in the same
   // render tick — the gate accepts local ties in that context.
   _fsPersistLockedCrossings(slots, simCols, scheduledRuns, rows, globalCaps, /* jointWinner */ true, visibleStartIsos, rateByPn);
+
+  // v5 AUTO-PUBLISH. Every render captures a stable signature of
+  // the visible grid and hands it to _fsAutoPublish. That helper
+  // decides whether the supplier-facing snapshot needs a fresh
+  // POST (only when a publishToken already exists AND the grid
+  // key differs from the last published one) and debounces so a
+  // burst of edits coalesces into a single upload. Kept OUTSIDE
+  // the try/catch above so a publish glitch never blocks the
+  // planner render.
+  FRAMESCHED_STATE._lastRenderKey = _fsGridKey(rows, renderCols, scheduledRuns);
+  _fsAutoPublish();
 }
 
 /* ============================================================
@@ -4652,6 +4680,171 @@ function _fsRenderPublishStatus() {
   return `Last published ${esc(_fsFormatLastPublished(iso))}`;
 }
 
+// v5 Absolute URL builder for the supplier snapshot. When
+// FS_SUPPLIER_SITE_URL (js/01-config) is set, the supplier lives
+// on a separate origin whose root is rewritten to its own view
+// function -- the supplier bookmarks "/", no token in the URL,
+// and the supplier-site function defaults the token from
+// frame_schedule.__settings__.data.publishToken. When the
+// constant is empty we fall back to the planner origin + the
+// raw relative path returned by the publish function so the
+// feature still works pre-second-site-deploy.
+function _fsSupplierUrl(relPath) {
+  if (typeof FS_SUPPLIER_SITE_URL === "string" && FS_SUPPLIER_SITE_URL.length > 0) {
+    return FS_SUPPLIER_SITE_URL.replace(/\/+$/, "") + "/";
+  }
+  if (typeof window !== "undefined" && window.location && window.location.origin) {
+    return window.location.origin + (relPath || "");
+  }
+  return relPath || "";
+}
+
+// v5 Grid signature -- a compact string covering every non-zero
+// scheduled cell in render order. Used by _fsAutoPublish to
+// decide whether a fresh POST is warranted; matches string-wise
+// means the supplier's copy is already current.
+//
+// Only the RENDERED columns (12 visible weeks) participate --
+// beyond-window optimizer output is invisible to the supplier
+// snapshot and must not force an auto-publish.
+function _fsGridKey(rows, cols, scheduledRuns) {
+  if (!Array.isArray(rows) || !Array.isArray(cols) || !scheduledRuns) return "";
+  const parts = [];
+  for (const r of rows) {
+    const runs = scheduledRuns.get(r.pn) || [];
+    for (const c of cols) {
+      const iso = c.iso;
+      let q = 0;
+      for (const rn of runs) if (rn.weekIso === iso) q += rn.qty;
+      if (q > 0) parts.push(`${r.pn}|${iso}|${Math.round(q)}`);
+    }
+  }
+  return parts.join(",");
+}
+
+// v5 Auto-publish. Called from the tail of renderFrameSchedule
+// after _lastRenderKey has been updated. Behaviour:
+//   1. No-op if there's no publishToken yet -- auto-publish is
+//      opt-in, keyed on the operator having clicked Publish at
+//      least once.
+//   2. No-op if the render key already matches the last
+//      published key -- nothing meaningful changed.
+//   3. Otherwise start (or restart) a 3 s debounce. A burst of
+//      renders (rapid cap edits, buffer scrubbing) coalesces
+//      into a single POST after the operator pauses.
+//   4. When the debounce fires: if a POST is already in flight,
+//      mark _autoPublishDirty and bail; the in-flight watcher
+//      re-fires when the current POST resolves.
+//   5. Otherwise build the supplier HTML, POST it, update
+//      _lastPublishedKey, persist the fresh lastPublishedAt
+//      through setFrameScheduleSettingsCloud (preserving caps
+//      and bufferWeeks the same way the manual handler does),
+//      and refresh the "Last published" stamp WITHOUT a toast.
+//      Auto-publish is background work; the operator shouldn't
+//      get a popup every few seconds.
+function _fsAutoPublish() {
+  const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
+  const token = s && typeof s.publishToken === "string" && _FS_TOKEN_RE.test(s.publishToken)
+    ? s.publishToken
+    : null;
+  if (!token) return;
+  if (FRAMESCHED_STATE._lastRenderKey === FRAMESCHED_STATE._lastPublishedKey) return;
+
+  // Debounce -- reset the timer on every call so a rapid edit
+  // stream doesn't fire N POSTs.
+  if (FRAMESCHED_STATE._autoPublishTimer) clearTimeout(FRAMESCHED_STATE._autoPublishTimer);
+  FRAMESCHED_STATE._autoPublishTimer = setTimeout(() => {
+    FRAMESCHED_STATE._autoPublishTimer = null;
+    _fsAutoPublishFire();
+  }, 3000);
+}
+
+// The debounce-fired half of _fsAutoPublish. Separated so the
+// in-flight watcher can re-enter it directly (bypassing another
+// debounce round) when a change queued up while a POST was live.
+function _fsAutoPublishFire() {
+  const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
+  const token = s && typeof s.publishToken === "string" && _FS_TOKEN_RE.test(s.publishToken)
+    ? s.publishToken
+    : null;
+  if (!token) return;
+
+  const targetKey = FRAMESCHED_STATE._lastRenderKey;
+  if (targetKey === FRAMESCHED_STATE._lastPublishedKey) return;
+
+  if (FRAMESCHED_STATE._autoPublishInFlight) {
+    // A POST is currently running. Mark that a fresh change
+    // arrived so the watcher re-fires on resolve.
+    FRAMESCHED_STATE._autoPublishDirty = true;
+    return;
+  }
+
+  if (typeof publishFrameScheduleSnapshot !== "function") return;
+
+  let html;
+  try {
+    html = _fsBuildSupplierHtml();
+  } catch (err) {
+    console.warn("[frame-schedule] auto-publish build failed", err);
+    return;
+  }
+
+  FRAMESCHED_STATE._autoPublishInFlight = true;
+  FRAMESCHED_STATE._autoPublishDirty = false;
+  publishFrameScheduleSnapshot(token, html).then(res => {
+    FRAMESCHED_STATE._autoPublishInFlight = false;
+    if (!res || !res.ok) {
+      console.warn("[frame-schedule] auto-publish POST failed", res && res.error);
+      // Retry once whatever comes next -- keep _lastPublishedKey
+      // unchanged so the very next render notices the mismatch.
+      if (FRAMESCHED_STATE._autoPublishDirty) {
+        FRAMESCHED_STATE._autoPublishDirty = false;
+        _fsAutoPublish();
+      }
+      return;
+    }
+
+    // Success. Match the manual handler's persistence + UI shape
+    // one-for-one, minus the toast.
+    FRAMESCHED_STATE._lastPublishedKey = targetKey;
+    const lastPublishedAt = (typeof res.updatedAt === "string" && res.updatedAt)
+      ? res.updatedAt
+      : new Date().toISOString();
+    if (typeof setFrameScheduleSettingsCloud === "function") {
+      const caps = (s && s.caps) || { crewhd: 0, std: 0 };
+      const bw   = s && Number.isFinite(s.bufferWeeks) ? s.bufferWeeks : undefined;
+      const arg  = {
+        crewhd: Number(caps.crewhd) || 0,
+        std:    Number(caps.std)    || 0,
+        lastPublishedAt,
+      };
+      if (typeof bw === "number") arg.bufferWeeks = bw;
+      setFrameScheduleSettingsCloud(arg).then(r => {
+        if (!r || !r.ok) {
+          console.warn("[frame-schedule] auto-publish failed to persist lastPublishedAt", r && r.error);
+        }
+      });
+    }
+    // Refresh JUST the "Last published" line so the operator
+    // sees the stamp advance silently. Preserves any existing
+    // clickable URL / copy link the manual publish rendered.
+    const statusEl = document.getElementById("fs-publish-status");
+    if (statusEl) {
+      statusEl.innerHTML = `Last published ${esc(_fsFormatLastPublished(lastPublishedAt))}`;
+      statusEl.className = "mono tiny muted";
+      statusEl.style.textAlign = "right";
+    }
+
+    // If a change queued up during the POST, re-enter without
+    // waiting for another debounce round -- the operator is
+    // actively editing and expects the supplier copy to keep up.
+    if (FRAMESCHED_STATE._autoPublishDirty) {
+      FRAMESCHED_STATE._autoPublishDirty = false;
+      _fsAutoPublishFire();
+    }
+  });
+}
+
 // Build the standalone HTML document the supplier will see.
 // Reproduces the same optimizer input the render function uses,
 // then emits a self-contained page (inline CSS, no external
@@ -4827,12 +5020,13 @@ async function _fsPublishSupplier(evt) {
     return;
   }
 
-  // Server returns a RELATIVE path -- prepend the current origin
-  // so the URL handed back is a full clickable link that works
-  // even when copied/pasted outside this tab.
-  const absoluteUrl = (typeof window !== "undefined" && window.location && window.location.origin)
-    ? window.location.origin + res.url
-    : res.url;
+  // Server returns a RELATIVE path -- turn it into the absolute
+  // URL the operator hands to the supplier. _fsSupplierUrl
+  // prefers FS_SUPPLIER_SITE_URL when set (isolated supplier
+  // origin, no ?token= needed since the supplier-site view
+  // defaults the token from __settings__) and falls back to the
+  // planner origin + relative path otherwise.
+  const absoluteUrl = _fsSupplierUrl(res.url);
 
   // Persist BOTH the token (if newly minted) AND the fresh
   // lastPublishedAt so the page-head "Last published" line
@@ -4858,6 +5052,12 @@ async function _fsPublishSupplier(evt) {
       }
     });
   }
+
+  // v5 AUTO-PUBLISH bookkeeping. A successful manual publish
+  // means the last render's grid key is now the last-published
+  // key -- the auto path must not turn around and re-POST the
+  // same content on the next render tick.
+  FRAMESCHED_STATE._lastPublishedKey = FRAMESCHED_STATE._lastRenderKey;
 
   if (btn) btn.disabled = false;
   const urlAttr = absoluteUrl.replace(/"/g, "&quot;");
