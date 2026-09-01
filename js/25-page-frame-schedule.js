@@ -5075,6 +5075,17 @@ ${css}
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+
+/* v5.1.1 Supplier-snapshot scroll override. The planner's
+   stylesheet sets body { overflow: hidden } because the app
+   scrolls inside .main within a 100vh .app grid; the standalone
+   supplier page has no .app shell so that rule clips the page at
+   the viewport. Undo it here (AFTER the inlined stylesheet so
+   we win) and give .main / #main normal document-flow
+   positioning + a little bottom breathing room. */
+html, body { height: auto; overflow: auto; }
+.main, #main { overflow: visible; height: auto; position: static; }
+.page { padding-bottom: 80px; }
 </style>
 </head>
 <body>
