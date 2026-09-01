@@ -738,25 +738,24 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
     }
 
     // 1. Determine placements.
-    //    v4.8 RULE — Locks fix BOTH pn/pn2 AND persisted qty.
-    //    For a LOCKED slot (including SEED slots — they are
-    //    locked by build definition) with any persisted week qty,
-    //    the sim replays that qty verbatim regardless of whether
-    //    the week is current or future. Only PROPOSED slots get
-    //    the demand-sized packs below.
+    //    v5 RULE — Locks fix pn/pn2 for ALL locked weeks, but
+    //    verbatim qty replay is restricted to the CURRENT
+    //    (in-progress) week only. Future locked weeks — seed or
+    //    otherwise — fall through to normal demand / catch-up
+    //    sizing so a cap edit reprices every future column of
+    //    the grid, not just the tail.
     //
-    //    Rationale: the operator's explicit qty setting (e.g. a
-    //    seed week persisted at 21) must survive re-renders and
-    //    optimizer passes. If caps change, the "re-quantify locked
-    //    future weeks" pass in _fsHandleSettingsCap updates the
-    //    persisted qty; the sim then replays the new value on the
-    //    next render. Verbatim replay here means neither cap
-    //    edits nor demand math silently override a persisted qty.
+    //    Rationale: the current week is already committed on the
+    //    floor (partial receipts, orders in flight), so its
+    //    persisted qty is a fact, not a proposal. Every future
+    //    week is a proposal, and proposals must move when the
+    //    cap that drives them moves — otherwise editing CREW/HD
+    //    21 → 18 leaves 11 of 12 grid columns pinned at 21.
     //
     //    Past weeks aren't simmed (skipped above).
     const wk = _fsWeekData(iso);
     const isLockedWithPersistedQty =
-      slot && slot.locked && wk.qty && Object.keys(wk.qty).length > 0;
+      slot && slot.locked && c.current && wk.qty && Object.keys(wk.qty).length > 0;
 
     // v3.3: split-slot support. week 2 of a split slot runs
     // resolvedPn2 instead of resolvedPn. Each week's cap + filler
@@ -3477,70 +3476,31 @@ function _fsHandleSettingsCap(pool, raw) {
   // toggling a cap doesn't wipe the min-cover setting.
   nextCaps.bufferWeeks = _fsSettingsBufferWeeks();
 
-  // Fire the settings write first (mirror updates synchronously
-  // inside setFrameScheduleSettingsCloud, so the re-quantify sim
-  // below already sees the new caps).
+  // Fire the settings write. Mirror updates synchronously inside
+  // setFrameScheduleSettingsCloud so the next render's sim sees
+  // the new caps immediately.
+  //
+  // v5: the prior "re-quantify locked future weeks" persistence
+  // pass is gone. With the sim gate now restricting verbatim qty
+  // replay to the CURRENT week only (see _fsSimulate), every
+  // future locked week sizes live from current caps on each
+  // render — persisting stale qtys added no display value and
+  // the current week is intentionally frozen (no cap-driven edit
+  // to commit here). Manual per-week edits still persist through
+  // the week-input handlers unchanged.
   const settingsPromise = (typeof setFrameScheduleSettingsCloud === "function")
     ? setFrameScheduleSettingsCloud(nextCaps)
     : Promise.resolve({ ok: false });
 
-  // Re-quantify every LOCKED FUTURE week with the new caps.
-  // Sim under nextCaps (mirror already reflects them). Locked
-  // slots keep their pn/pn2 (build-time resolvedPn from
-  // persistence); open slots re-optimize around them — we don't
-  // persist open slots here, only locked ones.
-  let requantifiedCount = 0;
-  try {
-    const rows = _fsRows();
-    const renderCols = _fsColumns();
-    const simCols = _fsSimColumns();
-    const slots = _fsBuildSlots(simCols);
-    const visibleStartIsos = new Set(renderCols.map(c => c.iso));
-    // Memoize chain-aware rate ONCE — see renderFrameSchedule comment.
-    const rateByPn = {};
-    for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
-    const simResult = _fsOptimize(rows, simCols, slots, nextCaps, visibleStartIsos, rateByPn);
-    const cols = renderCols;   // used by the futureIsoSet builder below
-    const scheduledRuns = simResult.scheduledRuns;
-    // Skip re-quantify if the new caps are degenerate — no
-    // credible numbers to persist. The banner will surface.
-    if (!_fsSimIsDegenerate(simResult, nextCaps)) {
-      const futureIsoSet = new Set(
-        cols.filter(c => !c.past && !c.current).map(c => c.iso)
-      );
-      for (const s of slots) {
-        if (!s.locked || !s.resolvedPn) continue;
-        for (let idx = 0; idx < s.weekIsos.length; idx++) {
-          const wkIso = s.weekIsos[idx];
-          if (!futureIsoSet.has(wkIso)) continue;
-          const isStart = idx === 0;
-          const payload = _fsBuildWeekPayload(wkIso, scheduledRuns, s, isStart);
-          _fsCommitWeek(wkIso, payload);
-          requantifiedCount++;
-        }
-      }
-    }
-  } catch (err) {
-    if (typeof console !== "undefined") {
-      console.warn("[frame-sched] cap-change re-quantify failed", err);
-    }
-  }
-
   settingsPromise.then(res => {
     if (res && res.ok) {
-      const tail = requantifiedCount
-        ? ` · re-quantified ${requantifiedCount} locked wk`
-        : "";
       if (typeof logAudit === "function") {
         logAudit("frame-sched-edit",
-          `Frame schedule: global ${_fsPoolLabel(pool)} cap = ${n}/wk${tail}`,
-          { pool, cap: n, requantifiedWeeks: requantifiedCount });
+          `Frame schedule: global ${_fsPoolLabel(pool)} cap = ${n}/wk`,
+          { pool, cap: n });
       }
-      // Item 9: toast confirms the write landed and how many
-      // downstream weeks it re-quantified. showToast is defined
-      // app-wide (see js/24, js/22). Guarded for absence.
       if (typeof showToast === "function") {
-        showToast(`Caps saved · ${requantifiedCount} future wk re-quantified`, "ok");
+        showToast(`Caps saved`, "ok");
       }
     } else if (typeof showToast === "function") {
       showToast("Cap change failed to save — check connection", "warn");
@@ -4376,13 +4336,12 @@ window._fsDebugSim = function () {
     // Placements (mirror the sim exactly — NO PO credits).
     // v3.3: split slots run frame A in week-1, frame B in week-2.
     // runPn is chosen per-week based on slot.weekIsos[1] === iso.
-    // v4.8: persisted qty is honored for ALL non-past weeks of a
-    // LOCKED slot (including SEED). See _fsSimulate for the full
-    // rationale — TL;DR: operator's explicit qty must survive
-    // renders / optimizer passes; cap edits update persistence
-    // via the re-quantify pass, not via demand sizing here.
+    // v5: verbatim persisted-qty replay is restricted to the
+    // CURRENT week only (see _fsSimulate for the full rationale).
+    // Every future week — locked or not — sizes from current caps
+    // so cap edits reprice the whole grid, not just the tail.
     const wk = _fsWeekData(iso);
-    const isLockedWithPersistedQty = slot && slot.locked && wk.qty && Object.keys(wk.qty).length > 0;
+    const isLockedWithPersistedQty = slot && slot.locked && c.current && wk.qty && Object.keys(wk.qty).length > 0;
     const isWeek2 = !!(slot && slot.weekIsos && slot.weekIsos[1] === iso);
     const runPn = slot && slot.resolvedPn
       ? (isWeek2 && slot.resolvedPn2 ? slot.resolvedPn2 : slot.resolvedPn)
