@@ -4514,6 +4514,12 @@ function renderFrameSchedule() {
           <option value="slots"  ${scheduleMode === "slots"  ? "selected" : ""}>slots</option>
         </select>
       </label>
+      ${scheduleMode === "weekly" ? `
+      <label class="fs-caps-label" style="justify-content:flex-end" title="Release every weekly-auto pin in the mirror and let the greedy re-decide from today's on-hand + caps. Manual pins and per-cell qty overrides are preserved.">
+        <span class="muted tiny">&nbsp;</span>
+        <button class="btn tiny" onclick="_fsHandleReplanHorizon()">&#x21bb; Replan horizon</button>
+      </label>
+      ` : ""}
       <div class="muted tiny" style="margin-left:12px" title="Shared production envelope: standards allowed in a week = floor((1 - crew/HD qty / crew/HD cap) * STD cap) rounded down to a multiple of 3. Crew/HD at cap leaves 0 standards.">Shared envelope: std allowed = f(crew/HD qty) &mdash; this week ${currentCrewhdSumForNote} crew/HD &rarr; <strong>${currentStdAllowedForNote}</strong> std allowed (envelope ${globalCaps.crewhd}/${globalCaps.std})</div>
       <div class="muted tiny" style="margin-left:12px">Locks fix the frame; caps set the quantity &mdash; changes apply from next week.</div>
     </div>`;
@@ -5741,6 +5747,60 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
       });
     }
     if (typeof showToast === "function") showToast(`Weekly pin set: ${_fsMdFromIso(iso)} = ${pn}`, "ok");
+  }
+  renderFrameSchedule();
+}
+
+// v7.3 Release every weekly-auto pin in the mirror so the greedy
+// re-decides the near-term plan against today's on-hand + caps +
+// overrides. Explicitly PRESERVES:
+//   * source:"manual" weekly pins (operator's explicit picks),
+//   * legacy 2-week locked slots (slot mode's rows),
+//   * qty history on every row (past-week receipt-history data),
+//   * qtyOverride maps everywhere (manual per-cell qtys),
+//   * onHandAtClose snapshots (Plan-vs-Actual burn math).
+// Clears the session set (_autoPersistedWeeklyIsos) so the
+// persister's next pass can re-fire cleanly.
+function _fsHandleReplanHorizon() {
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) return;
+
+  if (typeof window !== "undefined" && typeof window.confirm === "function") {
+    const msg = "Release all auto-planned weeks and replan from current data? Manually pinned weeks and manual qty overrides are kept.";
+    if (!window.confirm(msg)) return;
+  }
+
+  // Walk the mirror. Collect target isos first so the mutation
+  // loop doesn't fight the Map iterator's shape.
+  const targets = [];
+  for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+    if (iso === "__settings__") continue;
+    const s = wk && wk.slot;
+    if (!s) continue;
+    if (s.mode !== "weekly") continue;      // never touch legacy 2-week rows
+    if (s.source !== "weekly-auto") continue; // never touch manual pins
+    targets.push(iso);
+  }
+
+  // _fsCommitWeek({slot: null}) clears the slot descriptor and
+  // preserves everything else (qty / qtyOverride / onHandAtClose)
+  // via its preserve-on-omit semantics -- see the helper header.
+  for (const iso of targets) {
+    _fsCommitWeek(iso, { slot: null });
+  }
+
+  // The session set gates the persister's per-render dedupe.
+  // Clearing it lets the persister re-write weekly-auto pins on
+  // the next render pass against the freshly-simmed picks.
+  FRAMESCHED_STATE._autoPersistedWeeklyIsos.clear();
+
+  if (typeof logAudit === "function") {
+    logAudit("frame-sched-replan-horizon",
+      `Frame schedule replan: released ${targets.length} weekly-auto week${targets.length === 1 ? "" : "s"}`,
+      { releasedCount: targets.length, releasedIsos: targets });
+  }
+  if (typeof showToast === "function") {
+    showToast(`Released ${targets.length} weekly-auto week${targets.length === 1 ? "" : "s"} -- replanning`, "ok");
   }
   renderFrameSchedule();
 }
