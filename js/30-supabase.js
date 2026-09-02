@@ -977,6 +977,14 @@ function _populateFrameScheduleFromRows(rows) {
           // spread across a 2-week slot). Absent / anything else
           // reads as the legacy 2-week slot mode.
           mode: d.slot.mode === "weekly" ? "weekly" : null,
+          // v7.2 qty / qty2: optional explicit build quantities
+          // for the weekly-mode scheduler's mix candidates.
+          // Non-negative integers only; drop anything else.
+          // Absent on legacy rows (and on legacy slot mode)
+          // signals the sim should compute qty via its own
+          // demand + catchup math (v7.0 pin behavior).
+          qty:  (typeof d.slot.qty  === "number" && d.slot.qty  >= 0 && Number.isFinite(d.slot.qty))  ? Math.floor(d.slot.qty)  : null,
+          qty2: (typeof d.slot.qty2 === "number" && d.slot.qty2 >= 0 && Number.isFinite(d.slot.qty2)) ? Math.floor(d.slot.qty2) : null,
         }
       : null;
     // v4.1: onHandAtClose = {pn: units, ...} snapshot of each
@@ -1069,6 +1077,21 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
     // legacy 2-week slot rows so their readers stay byte-
     // identical to pre-v7.1 output.
     if (payload.slot.mode === "weekly") slot.mode = "weekly";
+    // v7.2 qty / qty2: explicit build quantities for the
+    // weekly-mode mix candidates. Non-negative integers only;
+    // qty2 only attached when there's a real secondary
+    // placement (slot.pn2 present). Omitted for legacy slot
+    // rows / v7.0 weekly pins that carry just pn -- readers
+    // treat missing qty as "compute via demand + catchup".
+    if (typeof payload.slot.qty === "number" && payload.slot.qty >= 0 && Number.isFinite(payload.slot.qty)) {
+      slot.qty = Math.floor(payload.slot.qty);
+    }
+    if (slot.pn2
+        && typeof payload.slot.qty2 === "number"
+        && payload.slot.qty2 >= 0
+        && Number.isFinite(payload.slot.qty2)) {
+      slot.qty2 = Math.floor(payload.slot.qty2);
+    }
   }
   // v4.1: onHandAtClose = {pn: units} snapshot. Coerced to
   // numbers; non-numeric entries dropped. Present or absent
