@@ -2811,22 +2811,31 @@ function renderFrameSchedule() {
     //   - Recv qty ONLY as the visible number. Whole-cell background
     //     encodes status. Short-week cells show a tiny "-N" corner
     //     (shortfall); over-delivery shows "+N". Nothing else in the
-    //     cell — the browser-title attribute is intentionally omitted
-    //     since the custom hover card carries the rich content.
-    //   - data-fs-hist-* attrs are the tooltip's lookup keys.
-    //   - tabindex="0" on interactive cells so the hover card fires
-    //     on keyboard focus too.
+    //     cell — the custom hover card (fired by data-fs-hist-*
+    //     attrs) carries the rich numeric explanation.
+    //   - data-fs-hist-* attrs are the hover card's lookup keys.
+    //   - tabindex="0" so the hover card fires on keyboard focus too.
     // `variant` in: "ok" | "short" | "over" | "pre" | "none".
+    //
+    // v5.3 Every past-week per-frame cell is BACKFILL-CLICKABLE via
+    // _fsBackfillSched -- click opens a prompt to set the scheduled
+    // qty for this pn+iso. The prior _fsToggleReceiptDetails
+    // accordion trigger moves off past-cell clicks; the "This wk"
+    // cell (separately rendered outside this closure) keeps its
+    // accordion click for current-week receipts detail. The
+    // browser-native `title` tooltip advertises the affordance --
+    // it coexists with the custom hover card, which explains the
+    // numbers themselves. The `clickable` param is retained for
+    // signature stability but no longer gates the onclick -- all
+    // past cells are equally editable, including empty ("none")
+    // cells the operator wants to seed with a scheduled qty.
     const cellHTML = (recv, sched, variant, clickable, pn, iso) => {
       const cls = "fs-hist-cell fs-cell-" + variant;
-      const cur = clickable ? "cursor:pointer;" : "";
-      const clickAttr = clickable
-        ? ` onclick="_fsToggleReceiptDetails('${esc(pn)}','${esc(iso)}',event)"`
-        : "";
-      const focusAttrs = clickable ? ` tabindex="0"` : "";
-      const isOpen = clickable && expanded && expanded.pn === pn && expanded.iso === iso;
+      const isOpen = expanded && expanded.pn === pn && expanded.iso === iso;
       const openCls = isOpen ? " fs-cell-open" : "";
       const dataAttrs = ` data-fs-hist-pn="${esc(pn)}" data-fs-hist-iso="${esc(iso)}" data-fs-hist-variant="${variant}"`;
+      const clickAttr = ` onclick="_fsBackfillSched('${esc(pn)}','${esc(iso)}',event)"`;
+      const titleAttr = ` title="Click to set the scheduled qty for this week (backfill)"`;
       let body;
       if (variant === "none") {
         body = `<span class="fs-cell-dot">&middot;</span>`;
@@ -2843,7 +2852,7 @@ function renderFrameSchedule() {
         }
         body = `<div class="fs-cell-primary">${recv}</div>${corner}`;
       }
-      return `<td class="${cls}${openCls}" style="${cur}"${focusAttrs}${dataAttrs}${clickAttr}>${body}</td>`;
+      return `<td class="${cls}${openCls}" style="cursor:pointer;" tabindex="0"${dataAttrs}${titleAttr}${clickAttr}>${body}</td>`;
     };
 
     // Row per frame in FRAME_PNS order.
@@ -3626,6 +3635,94 @@ function _fsToggleReceiptDetails(pn, iso, evt) {
       renderFrameSchedule();
     });
     FRAMESCHED_STATE._accordionEscInstalled = true;
+  }
+  renderFrameSchedule();
+}
+
+// v5.3 Backfill a past-week scheduled qty from the Receipt-history
+// panel. Every per-frame past-week cell (variant ok/short/over/pre/
+// none) wires its onclick to this handler; the "This wk" (current-
+// week) cell stays owned by the schedule grid and still opens the
+// accordion, not this prompt.
+//
+// Prompt UX: window.prompt pre-filled with the current scheduled
+// value (blank when none). Accepts a non-negative integer; blank
+// or 0 removes that pn from the week's qty map; cancel aborts.
+// gateEdit()'s PIN prompt fires first (same shape as every other
+// operator edit in this file). Detail (receipt-level) accordion
+// row content stays read-only -- this handler only writes into
+// DB.frameSchedule.weeks[iso].qty, never into DB.poReceipts.
+function _fsBackfillSched(pn, iso, evt) {
+  if (evt && typeof evt.stopPropagation === "function") evt.stopPropagation();
+  if (!pn || !iso) return;
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+  if (FRAME_PNS.indexOf(pn) < 0) return;
+
+  // Only past weeks are editable here. Current + future stay
+  // owned by the schedule grid -- persisting through this
+  // handler would bypass the optimizer + slot-lock logic.
+  const cols = _fsColumns();
+  const currentCol = cols.find(c => c.current) || null;
+  let prevMondayAnchor;
+  if (currentCol) {
+    prevMondayAnchor = (typeof addDays === "function")
+      ? addDays(currentCol.date, -7)
+      : new Date(currentCol.date.getTime() - 7 * 86400000);
+  } else {
+    prevMondayAnchor = new Date();
+    prevMondayAnchor.setHours(0, 0, 0, 0);
+    const back = (prevMondayAnchor.getDay() + 6) % 7;
+    prevMondayAnchor.setDate(prevMondayAnchor.getDate() - back - 7);
+  }
+  prevMondayAnchor.setHours(0, 0, 0, 0);
+  const prevMondayIso = _fsIsoMonday(prevMondayAnchor);
+  if (iso > prevMondayIso) return;
+
+  const wk = _fsWeekData(iso);
+  const curQty = (wk && wk.qty) ? wk.qty : {};
+  const curVal = Number(curQty[pn]) || 0;
+  const promptDefault = curVal > 0 ? String(curVal) : "";
+  const weekLabel = _fsMdLongFromIso(iso);
+  const raw = (typeof window !== "undefined" && typeof window.prompt === "function")
+    ? window.prompt(
+        `Scheduled qty for ${pn} · ${weekLabel}\n\nEnter a non-negative integer.\nBlank or 0 removes.`,
+        promptDefault
+      )
+    : null;
+  if (raw === null) return;   // operator hit Cancel
+  const trimmed = String(raw).trim();
+  let newVal;
+  if (trimmed === "") {
+    newVal = 0;
+  } else {
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      if (typeof showToast === "function") {
+        showToast("Enter a non-negative integer", "warn");
+      }
+      return;
+    }
+    newVal = parsed;
+  }
+
+  // Merge: copy every other pn from the current qty map, then
+  // set / drop THIS pn. _fsCommitWeek's "qty" branch replaces
+  // the whole map, so we must re-emit the untouched frames or
+  // they vanish. slot + onHandAtClose are preserved because the
+  // payload doesn't mention them (see _fsCommitWeek header).
+  const merged = {};
+  for (const [k, v] of Object.entries(curQty)) {
+    if (k === pn) continue;
+    const nv = Number(v);
+    if (Number.isFinite(nv) && nv > 0) merged[k] = nv;
+  }
+  if (newVal > 0) merged[pn] = newVal;
+
+  _fsCommitWeek(iso, { qty: merged });
+  if (typeof logAudit === "function") {
+    logAudit("frame-sched-backfill",
+      `Frame schedule backfill: ${pn} · ${iso} sched = ${newVal}`,
+      { pn, weekIso: iso, sched: newVal, prev: curVal });
   }
   renderFrameSchedule();
 }
