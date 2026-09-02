@@ -2707,6 +2707,25 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
     }
     return;
   }
+  // v7.3 GUARD: never overwrite a weekly-mode row. When the
+  // operator toggles scheduleMode from weekly -> slots, the slot
+  // optimizer sees weekly-planned weeks as "no persistedSlot"
+  // (because _fsBuildSlots skips slot.mode==="weekly" rows) and
+  // lays fresh 2-week slots over them. Without this guard the
+  // slots persister then stamped legacy locked-slot rows over
+  // those weeks, which weekly mode later honored as fixed facts
+  // that Replan couldn't touch. Any slot whose weekIsos overlap
+  // an existing slot.mode==="weekly" row is skipped here --
+  // slots mode renders the slot band view-only over those weeks
+  // rather than persisting.
+  const slotOverlapsWeeklyPin = (s) => {
+    if (!s || !Array.isArray(s.weekIsos)) return false;
+    for (const iso of s.weekIsos) {
+      const wk = _fsWeekData(iso);
+      if (wk && wk.slot && wk.slot.mode === "weekly") return true;
+    }
+    return false;
+  };
   // v4: cols may be simCols (20-week horizon) while writes MUST
   // stay scoped to the render window. Caller passes visibleIsoSet
   // for that. Falls back to cols-derived set for pre-v4 callers.
@@ -2715,6 +2734,12 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
     if (!s.locked || !s.resolvedPn) continue;
     if (FRAMESCHED_STATE._autoPersistedSlots.has(s.startIso)) continue;
     if (s.persistedPn === s.resolvedPn) continue;
+    if (slotOverlapsWeeklyPin(s)) {
+      if (typeof console !== "undefined") {
+        console.warn(`[frame-sched] slot ${s.startIso} not persisted: overlaps a weekly-mode row (view-only in slots mode)`);
+      }
+      continue;
+    }
 
     if (!_fsIsOptimalPickForSlot(s, rows, cols, slots, globalCaps, jointWinner, rateByPn)) {
       if (typeof console !== "undefined") {
@@ -2743,12 +2768,18 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
   //
   // Degenerate caps: payload.qty is empty → skip write. So a
   // transient zero-caps render can't stamp a blank current week.
+  //
+  // v7.3 Same weekly-mode guard applies here -- the payload this
+  // pass builds includes a slot descriptor (from _fsBuildWeekPayload
+  // when isStart is true), so writing it would still stamp a
+  // legacy slot over a weekly row.
   const currentCol = cols.find(c => c.current);
   if (currentCol) {
     for (const s of slots) {
       if (!s.locked || !s.resolvedPn) continue;
       const idx = s.weekIsos.indexOf(currentCol.iso);
       if (idx < 0) continue;
+      if (slotOverlapsWeeklyPin(s)) continue;
       const wk = _fsWeekData(currentCol.iso);
       if (wk.qty && Object.keys(wk.qty).length > 0) continue;
       const payload = _fsBuildWeekPayload(currentCol.iso, scheduledRuns, s, idx === 0);
@@ -2833,7 +2864,15 @@ function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visible
     if (existing && existing.pn) {
       // Rule: never overwrite manual / seed / legacy-locked
       // rows, and never overwrite another weekly-auto row
-      // (mismatches are surfaced by _fsFindStaleWeeklyPicks).
+      // (mismatches are surfaced by the render's stale-pick
+      // pill). Any existing row with a slot descriptor is
+      // read-only from here; weekly mode NEVER stamps a
+      // weekly-auto marker over a legacy slot's persisted row,
+      // symmetric with the v7.3 guard in
+      // _fsPersistLockedCrossings which now refuses to stamp a
+      // legacy slot over a weekly-mode row. A temporary visit
+      // to either mode is therefore read-only with respect to
+      // the other mode's persisted plan.
       if (existing.source === "manual" || existing.source === "seed") continue;
       if (existing.mode !== "weekly" && existing.locked) continue;
       if (existing.mode === "weekly") {
@@ -2842,8 +2881,9 @@ function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visible
         FRAMESCHED_STATE._autoPersistedWeeklyIsos.add(c.iso);
         continue;
       }
-      // Legacy 2-week slot rows without lock (rare) -- leave
-      // alone; slot mode's persister may still touch them.
+      // Legacy 2-week slot rows without lock (rare) -- also
+      // leave alone; slot mode's persister may still touch
+      // them once a lock crossing lands.
       continue;
     }
 
@@ -5751,36 +5791,57 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
   renderFrameSchedule();
 }
 
-// v7.3 Release every weekly-auto pin in the mirror so the greedy
-// re-decides the near-term plan against today's on-hand + caps +
-// overrides. Explicitly PRESERVES:
-//   * source:"manual" weekly pins (operator's explicit picks),
-//   * legacy 2-week locked slots (slot mode's rows),
-//   * qty history on every row (past-week receipt-history data),
-//   * qtyOverride maps everywhere (manual per-cell qtys),
-//   * onHandAtClose snapshots (Plan-vs-Actual burn math).
-// Clears the session set (_autoPersistedWeeklyIsos) so the
-// persister's next pass can re-fire cleanly.
+// v7.3 Release every AUTO-planned pin in the mirror so the
+// greedy (or the slot optimizer, if that mode is active) re-
+// decides the near-term plan against today's on-hand + caps +
+// overrides. Two categories are eligible:
+//   * WEEKLY-AUTO pins  -- slot.mode === "weekly" AND
+//                          slot.source === "weekly-auto".
+//   * LEGACY AUTO slots -- slot.mode !== "weekly" AND
+//                          slot.source in {"auto", null,
+//                          undefined}. These are the rows
+//                          _fsPersistLockedCrossings writes
+//                          when a slot crosses the 42-day lock
+//                          horizon. Including them here lets
+//                          one click undo damage from the
+//                          weekly<->slots toggle bug (v7.3
+//                          guard prevents new damage; this
+//                          releases anything already stamped).
+// Explicitly PRESERVES:
+//   * slot.source === "manual" -- operator's explicit picks
+//     in either mode (weekly single-week pins or slot-mode
+//     manual overrides).
+//   * slot.source === "seed"   -- pre-anchor seed runs.
+//   * qty history on every row (past-week receipt data),
+//     qtyOverride maps, and onHandAtClose snapshots.
+// Clears both session sets (_autoPersistedWeeklyIsos and
+// _autoPersistedSlots) so their persisters re-fire cleanly on
+// the next render.
 function _fsHandleReplanHorizon() {
   if (typeof gateEdit === "function" && !gateEdit()) return;
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) return;
 
   if (typeof window !== "undefined" && typeof window.confirm === "function") {
-    const msg = "Release all auto-planned weeks and replan from current data? Manually pinned weeks and manual qty overrides are kept.";
+    const msg = "Release all auto-planned weeks (weekly-auto AND legacy 2-week auto slots) and replan from current data? Manually pinned weeks, seed runs, and manual qty overrides are kept.";
     if (!window.confirm(msg)) return;
   }
 
-  // Walk the mirror. Collect target isos first so the mutation
-  // loop doesn't fight the Map iterator's shape.
-  const targets = [];
+  // Walk the mirror. Collect targets by category so the audit
+  // can name each count separately.
+  const releasedWeeklyAuto = [];
+  const releasedLegacyAuto = [];
   for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
     if (iso === "__settings__") continue;
     const s = wk && wk.slot;
-    if (!s) continue;
-    if (s.mode !== "weekly") continue;      // never touch legacy 2-week rows
-    if (s.source !== "weekly-auto") continue; // never touch manual pins
-    targets.push(iso);
+    if (!s || !s.pn) continue;
+    if (s.source === "manual" || s.source === "seed") continue;   // preserve
+    if (s.mode === "weekly" && s.source === "weekly-auto") {
+      releasedWeeklyAuto.push(iso);
+    } else if (s.mode !== "weekly" && (s.source === "auto" || !s.source)) {
+      releasedLegacyAuto.push(iso);
+    }
   }
+  const targets = releasedWeeklyAuto.concat(releasedLegacyAuto);
 
   // _fsCommitWeek({slot: null}) clears the slot descriptor and
   // preserves everything else (qty / qtyOverride / onHandAtClose)
@@ -5789,18 +5850,27 @@ function _fsHandleReplanHorizon() {
     _fsCommitWeek(iso, { slot: null });
   }
 
-  // The session set gates the persister's per-render dedupe.
-  // Clearing it lets the persister re-write weekly-auto pins on
-  // the next render pass against the freshly-simmed picks.
+  // Clear BOTH session-set dedupers so their persisters can
+  // re-write cleanly on the next render pass.
   FRAMESCHED_STATE._autoPersistedWeeklyIsos.clear();
+  FRAMESCHED_STATE._autoPersistedSlots.clear();
 
   if (typeof logAudit === "function") {
     logAudit("frame-sched-replan-horizon",
-      `Frame schedule replan: released ${targets.length} weekly-auto week${targets.length === 1 ? "" : "s"}`,
-      { releasedCount: targets.length, releasedIsos: targets });
+      `Frame schedule replan: released ${releasedWeeklyAuto.length} weekly-auto + ${releasedLegacyAuto.length} legacy-auto week${targets.length === 1 ? "" : "s"}`,
+      {
+        releasedCount: targets.length,
+        weeklyAutoCount: releasedWeeklyAuto.length,
+        legacyAutoCount: releasedLegacyAuto.length,
+        releasedIsos: targets,
+      });
   }
   if (typeof showToast === "function") {
-    showToast(`Released ${targets.length} weekly-auto week${targets.length === 1 ? "" : "s"} -- replanning`, "ok");
+    const parts = [];
+    if (releasedWeeklyAuto.length > 0) parts.push(`${releasedWeeklyAuto.length} weekly-auto`);
+    if (releasedLegacyAuto.length > 0) parts.push(`${releasedLegacyAuto.length} legacy-auto`);
+    const summary = parts.length ? parts.join(" + ") : "0";
+    showToast(`Released ${summary} week${targets.length === 1 ? "" : "s"} -- replanning`, "ok");
   }
   renderFrameSchedule();
 }
