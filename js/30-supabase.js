@@ -936,6 +936,11 @@ function _populateFrameScheduleFromRows(rows) {
       // before the first publish.
       const rawLp = d && d.lastPublishedAt;
       const lastPublishedAt = (typeof rawLp === "string" && rawLp.length > 0) ? rawLp : null;
+      // v7 scheduleMode: "weekly" or "slots". Default "weekly"
+      // per the v7 cover-driven scheduler ticket; legacy rows
+      // without the field also land on "weekly".
+      const rawSm = d && d.scheduleMode;
+      const scheduleMode = (rawSm === "slots") ? "slots" : "weekly";
       DB.frameSchedule.settings = {
         caps: {
           crewhd: Number(d.caps && d.caps.crewhd) || 0,
@@ -944,6 +949,7 @@ function _populateFrameScheduleFromRows(rows) {
         bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
         publishToken,
         lastPublishedAt,
+        scheduleMode,
         updatedAt: row.updated_at || null,
       };
       continue;
@@ -1155,12 +1161,29 @@ async function setFrameScheduleSettingsCloud(caps) {
   const lastPublishedAt = (typeof lpArg === "string" && lpArg.length > 0)
     ? lpArg
     : (prev && typeof prev.lastPublishedAt === "string" && prev.lastPublishedAt ? prev.lastPublishedAt : null);
+  // v7 scheduleMode: "weekly" | "slots" -- preserve-on-omit like
+  // the other v5+ fields. Only two values are accepted; anything
+  // else (including undefined from a caps-only edit) falls back
+  // to the prior mirror value, then to the "weekly" default.
+  const smArg = caps && caps.scheduleMode;
+  let scheduleMode;
+  if (smArg === "weekly" || smArg === "slots") {
+    scheduleMode = smArg;
+  } else if (prev && (prev.scheduleMode === "weekly" || prev.scheduleMode === "slots")) {
+    scheduleMode = prev.scheduleMode;
+  } else {
+    scheduleMode = "weekly";
+  }
   const nowIso = new Date().toISOString();
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
   if (publishToken !== null) dataOut.publishToken = publishToken;
   if (lastPublishedAt !== null) dataOut.lastPublishedAt = lastPublishedAt;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, updatedAt: nowIso };
+  // Persist scheduleMode unconditionally so a legacy row upgrades
+  // on the first save. The default is "weekly", so an empty-caps
+  // installation still lands on the new scheduler.
+  dataOut.scheduleMode = scheduleMode;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, scheduleMode, updatedAt: nowIso };
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(

@@ -366,6 +366,20 @@ function _fsWeekData(iso) {
   };
 }
 
+// v7 Schedule mode reader. Two values:
+//   "weekly" (default) -- greedy-with-lookahead per-week
+//     scheduler chooses each week's frame by projected min-cover,
+//     with a small changeover bonus to prefer continuity.
+//   "slots" -- the legacy 6^N slot-pn enumerator (still
+//     available as a fallback via the toggle in the caps strip).
+// Persisted in __settings__.data.scheduleMode; legacy rows land
+// on "weekly" per the v7 rollout.
+function _fsSettingsScheduleMode() {
+  const s = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
+  const raw = s ? s.scheduleMode : null;
+  return raw === "slots" ? "slots" : "weekly";
+}
+
 // Global CREW/HD + STD per-week caps from the __settings__ sentinel
 // row. Defaults to 0 when the settings row hasn't been written yet
 // (first-run behavior: no runs placed until user sets caps).
@@ -1090,6 +1104,313 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
 }
 
 /* ============================================================
+   v7 WEEKLY COVER-DRIVEN SCHEDULER
+
+   Alternative to the slot-enumeration optimizer. Walks the sim
+   horizon week by week; at each un-pinned week, picks that week's
+   frame (or idle) by a short-lookahead greedy that maximizes the
+   MINIMUM projected weeks-of-cover across all frames. Subject to
+   the same hard constraints as the slot sim:
+
+     * Shared production envelope (crew/HD at caps.crewhd,
+       standards at caps.std, mixed weeks via _fsStdAllowedPacks).
+     * Pack size 3 (FRAME_PACK).
+     * Manual qtyOverrides as fixed facts.
+     * Min-cover (_fsSettingsBufferWeeks) as the target floor.
+
+   Changeover PREFERENCE (not rule): a small cover bonus if the
+   candidate matches the previous week's frame -- 2-week runs
+   emerge on close calls, but a frame in genuine trouble always
+   wins the week.
+
+   Locks: existing 2-week locked slots are honored as fixed
+   facts here -- pinByIso covers both weeks of a legacy locked
+   slot from the slot descriptor's resolvedPn/resolvedPn2 the
+   slot builder already produced. New weekly-mode single-week
+   pinning would go through the same map; the storage / UI for
+   it is deferred (see the v7 ticket's item 5).
+
+   Return SHAPE is identical to _fsSimulate so every downstream
+   consumer (render, warnings, supplier snapshot, auto-publish
+   grid key, override validation, receipt history) works the
+   same way in both modes -- they only ever read scheduledRuns
+   + onHandTimeline + preOverrideByPnIso off the returned bag.
+   splitCount stays 0 in weekly mode (splits are a slot concept).
+   ============================================================ */
+
+const _FS_WEEKLY_LOOKAHEAD_K = 3;
+const _FS_WEEKLY_CHANGEOVER_BONUS_WEEKS = 0.3;
+
+function _fsSimulateWeekly(rows, cols, slots, globalCaps, rateByPn) {
+  const onHand = new Map();
+  for (const r of rows) onHand.set(r.pn, Number(r.onHand) || 0);
+  const scheduledRuns = new Map();
+  for (const r of rows) scheduledRuns.set(r.pn, []);
+  const onHandTimeline = new Map();
+  for (const r of rows) onHandTimeline.set(r.pn, []);
+  const preOverrideByPnIso = new Map();
+
+  const weeklyBurnByPn = new Map();
+  for (const r of rows) {
+    const rate = rateByPn ? (Number(rateByPn[r.pn]) || 0) : _fsDaily(r);
+    weeklyBurnByPn.set(r.pn, rate * FS_WORKDAYS_PER_WEEK);
+  }
+  const bufferWeeksLocal = _fsSettingsBufferWeeks();
+  let runCount = 0;
+
+  // Per-week pin map: legacy locked 2-week slots pin both of
+  // their weeks (week 2 to resolvedPn2 when the slot is a
+  // split). New weekly-mode single-week pins would slot into
+  // the same map -- see the doc block above.
+  const pinByIso = new Map();
+  if (Array.isArray(slots)) {
+    for (const s of slots) {
+      if (!s.locked || !s.resolvedPn) continue;
+      for (let idx = 0; idx < s.weekIsos.length; idx++) {
+        const wkIso = s.weekIsos[idx];
+        const usePn2 = idx === 1 && !!s.resolvedPn2 && s.resolvedPn2 !== s.resolvedPn;
+        pinByIso.set(wkIso, {
+          pn: usePn2 ? s.resolvedPn2 : s.resolvedPn,
+          source: s.source || "auto",
+          locked: true,
+          fromSlot: true,
+        });
+      }
+    }
+  }
+
+  let previousPn = null;
+
+  for (let i = 0; i < cols.length; i++) {
+    const c = cols[i];
+    if (c.past) continue;
+    const iso = c.iso;
+    const wk = _fsWeekData(iso);
+
+    // Current-week persisted-qty replay: matches the v5 rule in
+    // _fsSimulate -- if the current week is pinned AND already
+    // has persisted qty, replay it verbatim so the floor's
+    // committed number never gets rewritten by the scheduler.
+    const isLockedWithPersistedQty =
+      c.current && pinByIso.has(iso) && wk.qty && Object.keys(wk.qty).length > 0;
+
+    if (isLockedWithPersistedQty) {
+      const pin = pinByIso.get(iso);
+      const runPn = pin.pn;
+      for (const [pn, q] of Object.entries(wk.qty)) {
+        if (!scheduledRuns.has(pn)) continue;
+        const qN = Number(q) || 0;
+        if (qN <= 0) continue;
+        const kind = (pn === runPn) ? "run" : "filler";
+        scheduledRuns.get(pn).push({ weekIso: iso, qty: qN, kind });
+        onHand.set(pn, (onHand.get(pn) || 0) + qN);
+      }
+      previousPn = runPn;
+    } else {
+      let chosenPn;
+      if (pinByIso.has(iso)) {
+        chosenPn = pinByIso.get(iso).pn;
+      } else {
+        chosenPn = _fsWeeklyPickPn(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, slots, cols, iso, rateByPn);
+      }
+
+      if (chosenPn) {
+        const pool = FRAME_POOL[chosenPn] || "std";
+        const cap = pool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
+        const capPacks = Math.floor(cap / FRAME_PACK);
+        const burnRun = weeklyBurnByPn.get(chosenPn) || 0;
+        const ohRun  = Number(onHand.get(chosenPn)) || 0;
+        const poolBehind = _fsPoolBehind(pool, rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeksLocal, iso);
+        // Demand-sized to hit bufferWeeks cover this week end,
+        // then bumped to full cap when the pool is behind (same
+        // catchup rule the slot sim uses).
+        const neededRaw = Math.max(0, burnRun * (1 + bufferWeeksLocal) - ohRun);
+        let neededPacks = Math.ceil(neededRaw / FRAME_PACK);
+        if (poolBehind) neededPacks = capPacks;
+        const placedPacks = Math.min(neededPacks, capPacks);
+        const placedQty = placedPacks * FRAME_PACK;
+        if (placedQty > 0) {
+          scheduledRuns.get(chosenPn).push({
+            weekIso: iso,
+            qty: placedQty,
+            kind: "run",
+            mode: poolBehind ? "catchup" : "demand",
+          });
+          onHand.set(chosenPn, ohRun + placedQty);
+          runCount++;
+        }
+
+        // Std filler on crew/HD weeks -- capped by the shared
+        // production envelope (never the old spareCap = STD -
+        // CREW/HD formula; see _fsStdAllowedPacks).
+        if (pool === "crewhd") {
+          const envelopePacks = _fsStdAllowedPacks(placedQty, globalCaps);
+          if (envelopePacks > 0) {
+            const fillerPn = _fsPickFillerCandidate(rows, onHand, chosenPn, rateByPn);
+            if (fillerPn) {
+              const burnF = weeklyBurnByPn.get(fillerPn) || 0;
+              const ohF   = Number(onHand.get(fillerPn)) || 0;
+              const neededF = Math.max(0, burnF * (1 + bufferWeeksLocal) - ohF);
+              const stdBehind = _fsPoolBehind("std", rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeksLocal, iso);
+              const fillPacks = stdBehind
+                ? envelopePacks
+                : Math.min(Math.ceil(neededF / FRAME_PACK), envelopePacks);
+              const fillQty = fillPacks * FRAME_PACK;
+              if (fillQty > 0) {
+                scheduledRuns.get(fillerPn).push({
+                  weekIso: iso,
+                  qty: fillQty,
+                  kind: "filler",
+                  mode: stdBehind ? "catchup" : "demand",
+                });
+                onHand.set(fillerPn, ohF + fillQty);
+              }
+            }
+          }
+        }
+        previousPn = chosenPn;
+      } else {
+        // Idle week -- valid output when every frame is above
+        // the min-cover floor with room to spare.
+        previousPn = null;
+      }
+    }
+
+    // v5.5 QTY OVERRIDES -- hard constraints layered on top of
+    // whatever the greedy just placed. Identical semantics to
+    // the block in _fsSimulate: erase any placement for that pn
+    // on this iso, add the override, correct onHand in both
+    // directions, and stash the pre-override qty for the render
+    // tooltip.
+    const overrideMap = wk && wk.qtyOverride;
+    if (overrideMap) {
+      for (const [ovPn, ovValRaw] of Object.entries(overrideMap)) {
+        if (!scheduledRuns.has(ovPn)) continue;
+        const ovVal = Math.max(0, Math.floor(Number(ovValRaw) || 0));
+        const runs = scheduledRuns.get(ovPn);
+        let existing = 0;
+        for (let ri = runs.length - 1; ri >= 0; ri--) {
+          if (runs[ri].weekIso === iso) {
+            existing += runs[ri].qty;
+            runs.splice(ri, 1);
+          }
+        }
+        if (existing > 0) onHand.set(ovPn, (Number(onHand.get(ovPn)) || 0) - existing);
+        if (ovVal > 0) {
+          scheduledRuns.get(ovPn).push({ weekIso: iso, qty: ovVal, kind: "override" });
+          onHand.set(ovPn, (Number(onHand.get(ovPn)) || 0) + ovVal);
+        }
+        preOverrideByPnIso.set(ovPn + "|" + iso, existing);
+      }
+    }
+
+    // Burn workweek demand + capture onHandTimeline -- byte-
+    // for-byte identical to _fsSimulate so downstream scorers
+    // and warnings read the same shape.
+    const burnByPn = new Map();
+    for (const r of rows) {
+      const burn = weeklyBurnByPn.get(r.pn) || 0;
+      onHand.set(r.pn, (onHand.get(r.pn) || 0) - burn);
+      burnByPn.set(r.pn, burn);
+    }
+    for (const r of rows) {
+      onHandTimeline.get(r.pn).push({
+        iso,
+        endOh: onHand.get(r.pn) || 0,
+        burn: burnByPn.get(r.pn) || 0,
+      });
+    }
+  }
+
+  return { scheduledRuns, onHandTimeline, splitCount: 0, runCount, preOverrideByPnIso };
+}
+
+// v7 Greedy per-week pick. Score each candidate (each frame +
+// idle) by projected min-cover across all frames after this
+// week's build and a short lookahead of pure burn. Idle wins
+// when nothing needs help; the changeover bonus tiebreaks
+// close calls toward continuity.
+function _fsWeeklyPickPn(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, slots, cols, iso, rateByPn) {
+  const idleScore = _fsWeeklyScore(null, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, rateByPn);
+  // If the worst frame is still at/above the min-cover target
+  // after K weeks of pure burn, this week doesn't need to run
+  // anything -- idle is a valid output per the v7 spec.
+  if (idleScore >= bufferWeeksLocal) return null;
+
+  let bestPn = null;
+  let bestScore = -Infinity;
+  for (const pn of FRAME_PNS) {
+    const score = _fsWeeklyScore(pn, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, rateByPn);
+    if (score > bestScore) {
+      bestScore = score;
+      bestPn = pn;
+    }
+  }
+  // If every build-candidate is worse than idle (rare -- would
+  // require every frame to be beyond saving), fall through to
+  // idle rather than burn capacity on a losing pick.
+  if (idleScore > bestScore) return null;
+  return bestPn;
+}
+
+function _fsWeeklyScore(candidatePn, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, rateByPn) {
+  // Clone onHand so scoring never mutates the real running sim.
+  const simOh = new Map();
+  for (const [pn, oh] of onHand.entries()) simOh.set(pn, oh);
+
+  if (candidatePn) {
+    const pool = FRAME_POOL[candidatePn] || "std";
+    const cap = pool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
+    const capPacks = Math.floor(cap / FRAME_PACK);
+    const burn = weeklyBurnByPn.get(candidatePn) || 0;
+    const oh = Number(simOh.get(candidatePn)) || 0;
+    const needed = Math.max(0, burn * (1 + bufferWeeksLocal) - oh);
+    const placedPacks = Math.min(Math.ceil(needed / FRAME_PACK), capPacks);
+    const placedQty = placedPacks * FRAME_PACK;
+    simOh.set(candidatePn, oh + placedQty);
+    // Filler included in the score so a crew/HD pick's real
+    // std side-effect is reflected in the min-cover projection.
+    if (pool === "crewhd") {
+      const envelopePacks = _fsStdAllowedPacks(placedQty, globalCaps);
+      if (envelopePacks > 0) {
+        const fillerPn = _fsPickFillerCandidate(rows, simOh, candidatePn, rateByPn);
+        if (fillerPn) {
+          const burnF = weeklyBurnByPn.get(fillerPn) || 0;
+          const ohF = Number(simOh.get(fillerPn)) || 0;
+          const neededF = Math.max(0, burnF * (1 + bufferWeeksLocal) - ohF);
+          const fillPacks = Math.min(Math.ceil(neededF / FRAME_PACK), envelopePacks);
+          simOh.set(fillerPn, ohF + fillPacks * FRAME_PACK);
+        }
+      }
+    }
+  }
+
+  // Worst-case lookahead: no further builds for K weeks, just
+  // burn. Whichever candidate keeps the worst frame highest
+  // wins.
+  for (let k = 0; k < _FS_WEEKLY_LOOKAHEAD_K; k++) {
+    for (const r of rows) {
+      simOh.set(r.pn, (simOh.get(r.pn) || 0) - (weeklyBurnByPn.get(r.pn) || 0));
+    }
+  }
+
+  let minCover = Infinity;
+  for (const r of rows) {
+    const burn = weeklyBurnByPn.get(r.pn) || 0;
+    const oh   = simOh.get(r.pn) || 0;
+    const cover = burn > 0 ? (oh / burn) : Infinity;
+    if (cover < minCover) minCover = cover;
+  }
+
+  // Small cover bump for continuity -- 2-week runs emerge on
+  // close calls but a genuinely worse frame still wins.
+  if (candidatePn && candidatePn === previousPn && minCover !== Infinity) {
+    minCover += _FS_WEEKLY_CHANGEOVER_BONUS_WEEKS;
+  }
+  return minCover;
+}
+
+/* ============================================================
    OPTIMIZER
 
    Replaces the greedy per-slot pick with exhaustive enumeration
@@ -1586,6 +1907,20 @@ function _fsOptimize(rows, cols, slots, globalCaps, visibleStartIsos, rateByPn) 
 // minEndingCover measured only the final week; this catches a
 // mid-window near-miss too. Weeks with burn == 0 contribute
 // Infinity (no cover signal).
+// v7 Scheduler dispatch. Reads the persisted scheduleMode and
+// either enumerates slot pn assignments (legacy "slots" mode)
+// or walks the horizon week-by-week greedily ("weekly" mode).
+// Return shape is identical either way -- callers destructure
+// scheduledRuns / onHandTimeline / preOverrideByPnIso without
+// caring which sim produced them.
+function _fsRunScheduler(rows, cols, slots, globalCaps, visibleStartIsos, rateByPn) {
+  const mode = _fsSettingsScheduleMode();
+  if (mode === "weekly") {
+    return _fsSimulateWeekly(rows, cols, slots, globalCaps, rateByPn);
+  }
+  return _fsOptimize(rows, cols, slots, globalCaps, visibleStartIsos, rateByPn);
+}
+
 function _fsScoreSim(rows, simResult, bufferWeeksOverride) {
   const timelines = simResult.onHandTimeline;
   const bufferWeeks = Math.max(0, Number(bufferWeeksOverride != null ? bufferWeeksOverride : _fsSettingsBufferWeeks()) || 0);
@@ -2350,6 +2685,10 @@ function renderFrameSchedule() {
   // persisted; beyond-window slots fall back to greedy inside the
   // sim (see _fsOptimize's beyondSlots handling).
   const visibleStartIsos = new Set(renderCols.map(c => c.iso));
+  // v7 Read scheduleMode ONCE up here so the dispatcher call
+  // below + all slot-only branches (stale-lock detect, band
+  // render, persist-crossings) can read from a single local.
+  const scheduleMode = _fsSettingsScheduleMode();
   // v4.2 PERF: memoize the chain-aware daily rate per frame ONCE
   // per render. Every _fsSimulate call (~46k during Phase 1)
   // consults this map for the per-week burn — WITHOUT it, each
@@ -2366,7 +2705,11 @@ function renderFrameSchedule() {
   // Sim runs WITHOUT PO credits — the schedule is the supply
   // plan. Open POs are surfaced info-only in the warning row
   // (below) via the PO-detail aggregator.
-  const simResult = _fsOptimize(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
+  //
+  // v7 Dispatch: weekly mode routes through _fsSimulateWeekly
+  // (greedy per-week, no 7^N enum); legacy slots mode routes
+  // through _fsOptimize. Both return the same shape.
+  const simResult = _fsRunScheduler(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
   const scheduledRuns = simResult.scheduledRuns;
 
   // Stale-lock detection: LOCKED auto/seed slots whose persisted
@@ -2374,7 +2717,13 @@ function renderFrameSchedule() {
   // would pick today (delta > _FS_STALE_LOCK_DELTA stockout
   // units). Manual overrides excluded. Info-only tag; no auto-
   // unlock — the operator decides via console fsRepickSlot.
-  const staleLocks = _fsFindStaleLocks(slots, rows, simCols, globalCaps, simResult, rateByPn);
+  //
+  // v7 Weekly mode skips this -- "stale lock" is a slot-
+  // optimizer concept (was a better slot pn available under
+  // the 6^N enumerator?). Weekly mode has no equivalent.
+  const staleLocks = (scheduleMode === "weekly")
+    ? new Set()
+    : _fsFindStaleLocks(slots, rows, simCols, globalCaps, simResult, rateByPn);
 
   const weekToSlot = new Map();
   for (const s of slots) {
@@ -2439,7 +2788,83 @@ function renderFrameSchedule() {
   //   coalesce into a single continuous band so the ongoing seed
   //   run (UT101002 through Sun Sep 6 2026) renders as one span
   //   rather than duplicate 2-week bands.
+  // v7 WEEKLY MODE band. Skip the 2-week merge / seed-run
+  // coalescing entirely -- emit one cell per column showing
+  // the greedy pick for that week (frame short name, "idle",
+  // or "run + filler" when a crew/HD week dropped std in).
+  // Slot-locked weeks still get a "locked" pill; splits
+  // display as their per-week pn since a weekly-mode
+  // scheduler has no whole-run stash.
   const bandCells = [];
+  if (scheduleMode === "weekly") {
+    for (let wi = 0; wi < cols.length; wi++) {
+      const c = cols[wi];
+      // Collect placements for this week: primary "run" pn (or
+      // the largest crew placement) + any "filler" or override
+      // std placement.
+      let runPn = null;
+      let runQty = 0;
+      let fillerPn = null;
+      let fillerQty = 0;
+      let hasBuild = false;
+      for (const r of rows) {
+        const runs = scheduledRuns.get(r.pn) || [];
+        for (const rn of runs) {
+          if (rn.weekIso !== c.iso) continue;
+          if (rn.qty <= 0) continue;
+          hasBuild = true;
+          const kind = rn.kind || "run";
+          if (kind === "filler" || (r.pool === "std" && runPn && FRAME_POOL[runPn] === "crewhd")) {
+            if (rn.qty > fillerQty) { fillerPn = r.pn; fillerQty = rn.qty; }
+          } else {
+            if (rn.qty > runQty) { runPn = r.pn; runQty = rn.qty; }
+          }
+        }
+      }
+      const slotPeek = weekToSlot.get(c.iso);
+      const pinnedLocked = !!(slotPeek && slotPeek.locked);
+      let text;
+      let pills = "";
+      if (!hasBuild) {
+        text = `<span class="muted tiny">&mdash; idle</span>`;
+      } else if (runPn && fillerPn) {
+        const shortR = FRAME_SHORT[runPn] || "";
+        const shortF = FRAME_SHORT[fillerPn] || "";
+        text = `<span class="muted tiny">${esc(shortR)}</span>`
+             + `<span class="muted" style="margin:0 3px">+</span>`
+             + `<span class="muted tiny">${esc(shortF)}</span>`;
+      } else if (runPn) {
+        const shortR = FRAME_SHORT[runPn] || "";
+        text = `<span class="mono tiny">${esc(runPn)}</span>`
+             + (shortR ? `<span class="muted tiny" style="margin-left:4px">&middot; ${esc(shortR)}</span>` : "");
+      } else if (fillerPn) {
+        // Filler only (no run) -- unusual but possible from
+        // manual overrides on a std frame during a would-be
+        // idle week.
+        const shortF = FRAME_SHORT[fillerPn] || "";
+        text = `<span class="mono tiny">${esc(fillerPn)}</span>`
+             + (shortF ? `<span class="muted tiny" style="margin-left:4px">&middot; ${esc(shortF)}</span>` : "");
+      } else {
+        text = `<span class="muted tiny">&mdash;</span>`;
+      }
+      if (pinnedLocked) {
+        pills += `<span class="pill info tiny" style="letter-spacing:0.06em">locked</span>`;
+      }
+      const titleParts = [];
+      if (hasBuild) {
+        if (runPn) titleParts.push(`run ${runPn} = ${runQty}`);
+        if (fillerPn) titleParts.push(`filler ${fillerPn} = ${fillerQty}`);
+      } else {
+        titleParts.push("idle -- no build this week");
+      }
+      if (pinnedLocked && slotPeek) titleParts.push(`locked slot (from ${slotPeek.startIso})`);
+      const bandTitle = titleParts.join(" -- ");
+      bandCells.push(`<th class="fs-slot-band" title="${esc(bandTitle)}">
+        <div class="fs-slot-text">${text}</div>
+        <div class="fs-slot-pills">${pills}</div>
+      </th>`);
+    }
+  } else {
   let bi = 0;
   while (bi < cols.length) {
     const c = cols[bi];
@@ -2576,10 +3001,13 @@ function renderFrameSchedule() {
     </th>`);
     bi += span;
   }
+  }   // end else (scheduleMode === "slots") branch
   // DEV ALIGNMENT CHECK: the sum of band-cell colspans MUST equal
   // cols.length. Console-warn on drift so a future regression
   // surfaces immediately (silent in production; benign otherwise).
-  if (typeof console !== "undefined") {
+  // Skipped in weekly mode -- every cell is a 1-week band by
+  // construction (no colspans emitted).
+  if (typeof console !== "undefined" && scheduleMode !== "weekly") {
     let _fsSpanSum = 0;
     for (const cell of bandCells) {
       const m = /colspan="(\d+)"/.exec(cell);
@@ -2589,8 +3017,9 @@ function renderFrameSchedule() {
       console.warn(`[frame-schedule] slot-band colspan sum ${_fsSpanSum} !== cols.length ${cols.length}`);
     }
   }
+  const bandLabel = scheduleMode === "weekly" ? "Week" : "Slot";
   const slotBandRow = `<tr class="fs-slot-band-row">
-    <th class="fs-sticky">Slot</th>
+    <th class="fs-sticky">${bandLabel}</th>
     ${bandCells.join("")}
     <th></th>
   </tr>`;
@@ -3541,6 +3970,9 @@ function renderFrameSchedule() {
   // what actually triggers the settings write via onchange.
   const capKeyHandler = `onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"`;
   const currentBufferWeeks = _fsSettingsBufferWeeks();
+  // scheduleMode is read once at the top of renderFrameSchedule
+  // and referenced here so the toggle dropdown reflects the
+  // active mode.
   // v6 SHARED ENVELOPE example line. Compute the current week's
   // actual crew/HD sum (from the sim's scheduledRuns, which
   // already reflects any manual overrides) so the header note
@@ -3576,6 +4008,14 @@ function renderFrameSchedule() {
                class="input mono fs-caps-input"
                ${capKeyHandler}
                onchange="_fsHandleSettingsBufferWeeks(this.value)">
+      </label>
+      <label class="fs-caps-label" title="Scheduler mode. Weekly: greedy per-week cover-driven picks (default). Slots: legacy 2-week enumerator kept for fallback.">
+        <span class="muted tiny">Mode</span>
+        <select id="fs-cap-schedule-mode" class="input mono fs-caps-input"
+                onchange="_fsHandleSettingsScheduleMode(this.value)">
+          <option value="weekly" ${scheduleMode === "weekly" ? "selected" : ""}>weekly</option>
+          <option value="slots"  ${scheduleMode === "slots"  ? "selected" : ""}>slots</option>
+        </select>
       </label>
       <div class="muted tiny" style="margin-left:12px" title="Shared production envelope: standards allowed in a week = floor((1 - crew/HD qty / crew/HD cap) * STD cap) rounded down to a multiple of 3. Crew/HD at cap leaves 0 standards.">Shared envelope: std allowed = f(crew/HD qty) &mdash; this week ${currentCrewhdSumForNote} crew/HD &rarr; <strong>${currentStdAllowedForNote}</strong> std allowed (envelope ${globalCaps.crewhd}/${globalCaps.std})</div>
       <div class="muted tiny" style="margin-left:12px">Locks fix the frame; caps set the quantity &mdash; changes apply from next week.</div>
@@ -3844,7 +4284,17 @@ function renderFrameSchedule() {
   // sanity check — see _fsIsOptimalPickForSlot. jointWinner=true
   // because this call is IMMEDIATELY after _fsOptimize in the same
   // render tick — the gate accepts local ties in that context.
-  _fsPersistLockedCrossings(slots, simCols, scheduledRuns, rows, globalCaps, /* jointWinner */ true, visibleStartIsos, rateByPn);
+  //
+  // v7 Weekly mode skips this. The persister is designed around
+  // 2-week slot pn assignments and _fsIsOptimalPickForSlot's
+  // "swap this slot's pn under the current optimizer state"
+  // test, both of which are slot-optimizer concepts. Existing
+  // legacy locked slots stay locked (their persisted rows are
+  // untouched); auto-persistence of new crossings is a follow-
+  // up along with weekly-mode single-week pinning.
+  if (scheduleMode !== "weekly") {
+    _fsPersistLockedCrossings(slots, simCols, scheduledRuns, rows, globalCaps, /* jointWinner */ true, visibleStartIsos, rateByPn);
+  }
 
   // v5 AUTO-PUBLISH. Every render captures a stable signature of
   // the visible grid and hands it to _fsAutoPublish. That helper
@@ -3959,6 +4409,35 @@ function _fsHandleSettingsBufferWeeks(raw) {
           }
         } else if (typeof showToast === "function") {
           showToast("Min cover save failed — check connection", "warn");
+        }
+      });
+  }
+  renderFrameSchedule();
+}
+
+// v7 Toggle scheduleMode between "weekly" (cover-driven greedy)
+// and "slots" (legacy 6^N slot enumerator). Persisted via the
+// settings writer (preserve-on-omit for other fields); live re-
+// render so the operator sees the new mode's placement + band
+// row immediately. Any input other than the two accepted values
+// is silently ignored -- the toggle only ever hands us one of
+// the two.
+function _fsHandleSettingsScheduleMode(mode) {
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+  if (mode !== "weekly" && mode !== "slots") return;
+  const cur = _fsSettingsCaps();
+  if (typeof setFrameScheduleSettingsCloud === "function") {
+    setFrameScheduleSettingsCloud({ crewhd: cur.crewhd, std: cur.std, scheduleMode: mode })
+      .then(res => {
+        if (res && res.ok) {
+          if (typeof logAudit === "function") {
+            logAudit("frame-sched-edit", `Frame schedule: mode = ${mode}`, { scheduleMode: mode });
+          }
+          if (typeof showToast === "function") {
+            showToast(`Schedule mode: ${mode}`, "ok");
+          }
+        } else if (typeof showToast === "function") {
+          showToast("Schedule mode save failed -- check connection", "warn");
         }
       });
   }
@@ -4768,11 +5247,12 @@ function _fsHandleSlotOverride(startIso, pn, pn2) {
   // Memoize chain-aware rate ONCE — see renderFrameSchedule comment.
   const rateByPn = {};
   for (const r of rows) rateByPn[r.pn] = _fsDaily(r);
-  // Optimizer: the manual slot is now fixed (build-time
+  // Scheduler: the manual slot is now fixed (build-time
   // resolvedPn / resolvedPn2 from the persisted mirror update
-  // above); remaining open slots re-optimize around it. Sim
+  // above); the rest of the horizon re-plans around it under
+  // the currently-active scheduleMode (weekly or slots). Sim
   // runs without PO credits — see _fsSimulate header.
-  const simResult = _fsOptimize(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
+  const simResult = _fsRunScheduler(rows, simCols, slots, globalCaps, visibleStartIsos, rateByPn);
   const scheduledRuns = simResult.scheduledRuns;
 
   const slot = slots.find(s => s.startIso === startIso);
@@ -4981,10 +5461,13 @@ window._fsDebugSim = function () {
   const weeklyBurnByPn = new Map();
   for (const r of rows) weeklyBurnByPn.set(r.pn, (rateByPn[r.pn] || 0) * FS_WORKDAYS_PER_WEEK);
 
-  // Run the optimizer first so the walk below reflects the SAME
-  // pn per open slot that the render sees (avoids the debug
-  // showing a divergent greedy pick).
-  _fsOptimize(rows, cols, slots, globalCaps, visibleStartIsos, rateByPn);
+  // v7 Run the scheduler under the current mode so the walk
+  // below reflects the SAME per-slot / per-week decisions the
+  // render sees. Weekly mode: _fsSimulateWeekly (doesn't mutate
+  // open slots' resolvedPn but drives the same scheduledRuns);
+  // slots mode: _fsOptimize (mutates open slots as before, so
+  // the walk sees their winning pn).
+  _fsRunScheduler(rows, cols, slots, globalCaps, visibleStartIsos, rateByPn);
 
   // Fresh local sim state — do NOT touch the module's mirrors.
   const onHand = new Map();
