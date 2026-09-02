@@ -3204,25 +3204,15 @@ function renderFrameSchedule() {
     receivedByPnWeek.set(key, (receivedByPnWeek.get(key) || 0) + (Number(rec.qty) || 0));
   }
 
-  // Precompute per-week per-pool nonzero counts for the same-pool
-  // amber flag (spec B). Past weeks read from persisted wk.qty;
-  // current+future weeks read from sim's scheduledRuns.
-  const poolCountByIso = new Map();
-  for (const c of cols) {
-    const iso = c.iso;
-    const wk = _fsWeekData(iso);
-    const counts = { crewhd: 0, std: 0 };
-    for (const r of rows) {
-      let q = 0;
-      if (c.past) q = Number(wk.qty[r.pn]) || 0;
-      else {
-        const runs = scheduledRuns.get(r.pn) || [];
-        for (const rn of runs) if (rn.weekIso === iso) q += rn.qty;
-      }
-      if (q > 0) counts[r.pool]++;
-    }
-    poolCountByIso.set(iso, counts);
-  }
+  // v7.5 The former per-week per-pool nonzero-count precompute
+  // (poolCountByIso) is retired -- it drove the "same-pool amber
+  // flag" that marked two same-pool frames in one week as
+  // suspicious. Under the v6 shared envelope + v7.2 mix engine
+  // that pattern is the SCHEDULER'S INTENDED, envelope-checked
+  // output, so the amber tint was flagging correct plans.
+  // Envelope violations retain their red outline
+  // (weekEnvelopeByIso -> .fs-env-over) and their warnings-panel
+  // "week M/D over envelope" line -- the only capacity flags.
 
   // ---- Slot-band header row.
   //
@@ -3642,10 +3632,6 @@ function renderFrameSchedule() {
         ? Math.max(0, Math.floor(Number(wk.qtyOverride[r.pn]) || 0))
         : null;
       const isOverridden = overrideVal !== null;
-      // Same-pool amber flag: 2+ frames of THIS row's pool have
-      // nonzero placements in this week, AND this cell is nonzero.
-      const counts = poolCountByIso.get(c.iso) || { crewhd: 0, std: 0 };
-      const amber = q > 0 && counts[r.pool] >= 2;
       const dim = c.past ? " dim" : "";
       // v6 SHARED ENVELOPE red flag: any cell with a placement
       // in a week whose crew/HD + std totals over-consume the
@@ -3662,6 +3648,10 @@ function renderFrameSchedule() {
 
       // Rich tooltip (item 6). Rebuilds for every nonzero cell so
       // it stays in sync with the current sim's numbers.
+      // v7.5 The obsolete same-pool amber flag is gone -- two
+      // same-pool frames in one week is the mix engine's intended,
+      // envelope-checked output, not a warning condition. Only
+      // the red envelope-over flag survives as a capacity signal.
       let title = "";
       const envNote = envOver
         ? ` -- ENVELOPE OVER: ${envStatus.crewhdSum} crew/HD + ${envStatus.stdSum} std (allowed ${envStatus.stdAllowed} std at this crew/HD)`
@@ -3683,10 +3673,7 @@ function renderFrameSchedule() {
           ? " (std allowed by envelope at this crew/HD)"
           : ` (cap ${cap})`;
         const eohNote = endOh !== null ? ` · projected on hand at week end: ${endOh}` : "";
-        const amberNote = amber ? ` · flag: two ${_fsPoolLabel(r.pool)} frames scheduled this week` : "";
-        title = ` title="${esc(`${r.pn} · wk ${c.iso} · ${kindLabel} ${q}${capNote}${eohNote}${amberNote}${envNote}`)}"`;
-      } else if (amber) {
-        title = ` title="Two ${_fsPoolLabel(r.pool)} frames scheduled this week — soft flag, doesn't block."`;
+        title = ` title="${esc(`${r.pn} · wk ${c.iso} · ${kindLabel} ${q}${capNote}${eohNote}${envNote}`)}"`;
       } else if (!c.past) {
         // Empty non-past cell -- still clickable for override,
         // just no rich content to explain.
@@ -3698,9 +3685,7 @@ function renderFrameSchedule() {
         ? ""
         : ` onclick="_fsHandleQtyOverride('${esc(r.pn)}','${esc(c.iso)}',event)"`;
       const cursorStyle = c.past ? "" : "cursor:pointer;";
-      const bgStyle = amber ? "background:rgba(255,181,71,0.22);" : "";
-      const styleParts = cursorStyle + bgStyle;
-      const styleAttr = styleParts ? ` style="${styleParts}"` : "";
+      const styleAttr = cursorStyle ? ` style="${cursorStyle}"` : "";
       // v5.5 Corner "M" marker on overridden cells. Sim already
       // placed overrideVal so `q` matches; render the number
       // followed by the corner.
