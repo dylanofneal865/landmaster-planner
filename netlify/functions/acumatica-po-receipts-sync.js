@@ -4,12 +4,22 @@
 //   - "full"        — no OData filter; walks the entire GI (180-day
 //                     window Acumatica exposes). Daily 06:15 UTC via
 //                     the thin wrapper acumatica-po-receipts-full.js.
-//   - "incremental" — adds a `$filter=Date ge datetimeoffset'...'`
-//                     clause with cutoff = today − 4 days. Every 30
+//   - "incremental" — adds a `$filter=Date ge datetime'...'` clause
+//                     (v7.4 -- Edm.DateTime literal, no timezone
+//                     offset) with cutoff = today − 5 days. Every 30
 //                     minutes via acumatica-po-receipts-incremental.js.
 //                     Cheap: only the last few days of receipts come
 //                     back on the wire, so pagination usually finishes
 //                     in one page.
+//
+// v7.4 Filter literal cascade -- some tenants type the GI's Date
+// column as Edm.DateTime (needs `datetime'...'`), others as
+// Edm.DateTimeOffset (needs `datetimeoffset'...Z'`). The fetcher
+// tries the datetime literal first, then datetimeoffset on non-OK,
+// then falls back to a filter-less FULL sweep for that run so
+// receipts still land even when both filter forms are rejected. The
+// full URL of any failing request is logged so debugging doesn't
+// need guesswork.
 //
 // runReceiptsSync(mode) is the exported entry point the wrappers call.
 // exports.handler is still available for manual HTTP triggers — mode
@@ -17,7 +27,7 @@
 //
 // Reconciliation is history-preserving (no delete step) in every mode:
 // the source GI is windowed to ~180 days and the incremental mode is
-// windowed to ~4 days; older rows must survive on the client.
+// windowed to ~5 days; older rows must survive on the client.
 //
 // ISOLATION CONTRACT — read-only reporting feature:
 //   - Writes ONLY to public.po_receipts (and one row to public.audit
@@ -156,24 +166,40 @@ function _receiptFingerprint(data) {
   return JSON.stringify(_canonicalize(data));
 }
 
-// Compute the incremental $filter clause. Acumatica OData is v3, so
-// datetime literals use `datetimeoffset'YYYY-MM-DDTHH:MM:SSZ'`. The
-// Date field name matches the GI's exposed "Date" column (candidate
-// list also tries alt spellings; the filter always uses "Date"
-// because that's the GI-facing column and the filter must reference
-// the OData property name, not any decorated variant).
+// v7.4 Compute the incremental $filter clause. OData v3 has two
+// date-literal forms; which one Acumatica accepts depends on how
+// the underlying column is typed in this tenant's GI:
+//   * "datetime"       -> `datetime'YYYY-MM-DDTHH:MM:SS'`
+//     (Edm.DateTime, no timezone offset, no Z). Preferred first
+//     because most Acumatica GIs expose Date columns as
+//     Edm.DateTime; comparing them against a datetimeoffset
+//     literal returns a generic OData error.
+//   * "datetimeoffset" -> `datetimeoffset'YYYY-MM-DDTHH:MM:SSZ'`
+//     (Edm.DateTimeOffset). Kept as the fallback for tenants
+//     that DO expose the column as offset-aware.
 //
-// Cutoff = midnight UTC N days ago. Deliberately generous by ~1 day
-// vs. the ticket's "4 day window" so a receipt entered at any time
-// on the target window's boundary day is safely inside the filter
-// (a strict `today−4d 00:00 local` cutoff would drop entries stamped
+// The Date field name matches the GI's exposed "Date" column
+// (candidate list also tries alt spellings; the filter always
+// uses "Date" because that's the GI-facing column and the
+// filter must reference the OData property name, not any
+// decorated variant).
+//
+// Cutoff = midnight UTC N days ago. Deliberately generous by ~1
+// day vs. the ticket's window so a receipt entered at any time
+// on the boundary day is safely inside the filter (a strict
+// `today−Nd 00:00 local` cutoff would drop entries stamped
 // slightly before midnight due to server timezone drift).
-function _computeIncrementalFilterClause(daysBack) {
+function _computeIncrementalFilterClause(daysBack, literalForm) {
   const now = new Date();
   const cutoff = new Date(now.getTime() - daysBack * 86400000);
   cutoff.setUTCHours(0, 0, 0, 0);
-  const iso = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-  return `Date ge datetimeoffset'${iso}'`;
+  const isoWithZ = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+  if (literalForm === "datetimeoffset") {
+    return `Date ge datetimeoffset'${isoWithZ}'`;
+  }
+  // Default -- datetime literal (Edm.DateTime), no offset, no Z.
+  const isoNoTz = isoWithZ.replace(/Z$/, "");
+  return `Date ge datetime'${isoNoTz}'`;
 }
 
 // Main runner — shared by both wrappers and the manual HTTP handler.
@@ -202,54 +228,126 @@ async function runReceiptsSync(mode) {
   const company = ACUMATICA_COMPANY || "LIVE";
   const baseUrl = `${ACUMATICA_BASE_URL}/OData/${company}/${giEncoded}`;
 
-  // Incremental filter (Date ge datetimeoffset'...'). Built once and
-  // appended to every page URL. Full mode drops the filter and walks
-  // the whole 180-day GI window.
-  let filterClause = "";
-  if (runMode === "incremental") {
-    filterClause = _computeIncrementalFilterClause(4);
-    log(`incremental $filter: ${filterClause}`);
-  } else {
-    log("full mode — no $filter, walking the entire GI window");
-  }
-  log("Fetching (paginated)", baseUrl);
-
-  // ── Paginated fetch ─────────────────────────────────────────────────
-  // Acumatica OData caps a single response at ~1000 rows. Walk pages
-  // via $top/$skip until a short page reports the feed is drained.
-  // Pattern cloned from acumatica-production-orders-sync.js. In
-  // incremental mode with a 4-day window, pagination almost always
-  // finishes in one page — the loop still handles a busy day gracefully.
+  // v7.4 Incremental $filter form cascade.
+  //   1. "datetime"       -- try first; most tenants type the GI
+  //      Date column as Edm.DateTime.
+  //   2. "datetimeoffset" -- retry once on non-OK, for tenants
+  //      whose column is Edm.DateTimeOffset.
+  //   3. "fallback-full"  -- both filter forms rejected; drop
+  //      $filter entirely and walk the full 180-day GI window
+  //      so receipts still land. Loud log naming the fallback
+  //      so the operator sees the degraded run in the audit.
+  // The successful probe request IS the first page -- no wasted
+  // round trip. Full mode skips the cascade and walks unfiltered.
   const PAGE_SIZE = 1000;
   const MAX_PAGES = 30;
+  const LOOKBACK_DAYS = 5;   // v7.4 bumped 4 -> 5 per operator ask
   let entries = [];
   let pageCount = 0;
-  try {
-    const auth = Buffer.from(`${ACUMATICA_USERNAME}:${ACUMATICA_PASSWORD}`).toString("base64");
-    for (let page = 0, skip = 0; page < MAX_PAGES; page++, skip += PAGE_SIZE) {
-      const qs = [`$top=${PAGE_SIZE}`, `$skip=${skip}`];
-      if (filterClause) qs.push(`$filter=${encodeURIComponent(filterClause)}`);
-      const pageUrl = `${baseUrl}?${qs.join("&")}`;
+  const auth = Buffer.from(`${ACUMATICA_USERNAME}:${ACUMATICA_PASSWORD}`).toString("base64");
+
+  const attemptForms = runMode === "incremental"
+    ? ["datetime", "datetimeoffset", "fallback-full"]
+    : ["none"];
+
+  let firstPageXml = null;
+  let effectiveClause = "";
+  let effectiveForm = "none";
+
+  log("Fetching (paginated)", baseUrl);
+  for (const form of attemptForms) {
+    let clause = "";
+    if (form === "datetime" || form === "datetimeoffset") {
+      clause = _computeIncrementalFilterClause(LOOKBACK_DAYS, form);
+    }
+    const qs = [`$top=${PAGE_SIZE}`, `$skip=0`];
+    if (clause) qs.push(`$filter=${encodeURIComponent(clause)}`);
+    const pageUrl = `${baseUrl}?${qs.join("&")}`;
+    try {
       const resp = await fetch(pageUrl, {
         headers: {
           Authorization: `Basic ${auth}`,
           Accept: "application/atom+xml",
         },
       });
-      if (!resp.ok) {
-        const body = await resp.text();
-        log("Acumatica returned non-OK status", { status: resp.status, page, skip, body: body.slice(0, 200) });
-        return { statusCode: 502, body: JSON.stringify({ mode: runMode, error: "Acumatica auth/fetch failed", status: resp.status, page }) };
+      if (resp.ok) {
+        firstPageXml = await resp.text();
+        effectiveClause = clause;
+        effectiveForm = form;
+        if (form === "fallback-full" && runMode === "incremental") {
+          log(`ALL INCREMENTAL FILTER FORMS FAILED -- FELL BACK to full 180-day sweep so receipts still land. Tenant/GI likely rejects both Edm.DateTime and Edm.DateTimeOffset literals against the Date column; investigate the GI schema.`);
+        } else if (form === "datetime") {
+          log(`incremental $filter form=datetime (Edm.DateTime): ${clause}`);
+        } else if (form === "datetimeoffset") {
+          log(`incremental $filter form=datetimeoffset (Edm.DateTimeOffset -- datetime literal was rejected): ${clause}`);
+        } else if (form === "none") {
+          log("full mode -- no $filter, walking the entire GI window");
+        }
+        break;
       }
-      const pageXml = await resp.text();
-      const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
-      pageCount++;
-      log(`page ${pageCount} (skip=${skip}) returned ${pageEntries.length} entries`);
-      entries.push(...pageEntries);
-      if (pageEntries.length < PAGE_SIZE) break;
+      // Non-OK -- log the FULL URL + full-body slice so the next
+      // debugging session doesn't need guesswork about what URL
+      // we hit.
+      const body = await resp.text();
+      log(`Filter attempt FAILED (form=${form}, status=${resp.status})`, {
+        url: pageUrl,
+        body: body.slice(0, 800),
+      });
+    } catch (err) {
+      log(`Filter attempt THREW (form=${form}): ${err.message}`);
     }
-    if (pageCount === MAX_PAGES && entries.length && entries.length % PAGE_SIZE === 0) {
-      log(`WARNING: hit MAX_PAGES=${MAX_PAGES} without a short page — the feed may have more rows. Raise MAX_PAGES.`);
+  }
+
+  if (!firstPageXml) {
+    log("Every fetch attempt failed (including the filter-less fallback). Bailing.");
+    return {
+      statusCode: 502,
+      body: JSON.stringify({ mode: runMode, error: "Acumatica fetch failed for every filter form + fallback" }),
+    };
+  }
+
+  // ── Paginated fetch (continuation) ─────────────────────────────
+  // First page came in via the probe cascade above. Continue with
+  // the effective filter clause (empty in fallback-full mode).
+  // Acumatica OData caps a single response at ~1000 rows; walk
+  // pages via $top/$skip until a short page reports drained.
+  try {
+    const firstPageEntries = firstPageXml.split(/<entry[^>]*>/i).slice(1);
+    pageCount = 1;
+    log(`page 1 (skip=0, form=${effectiveForm}) returned ${firstPageEntries.length} entries`);
+    entries.push(...firstPageEntries);
+    if (firstPageEntries.length >= PAGE_SIZE) {
+      for (let page = 1, skip = PAGE_SIZE; page < MAX_PAGES; page++, skip += PAGE_SIZE) {
+        const qs = [`$top=${PAGE_SIZE}`, `$skip=${skip}`];
+        if (effectiveClause) qs.push(`$filter=${encodeURIComponent(effectiveClause)}`);
+        const pageUrl = `${baseUrl}?${qs.join("&")}`;
+        const resp = await fetch(pageUrl, {
+          headers: {
+            Authorization: `Basic ${auth}`,
+            Accept: "application/atom+xml",
+          },
+        });
+        if (!resp.ok) {
+          const body = await resp.text();
+          log(`Non-OK on continuation page (form=${effectiveForm}, page=${page}, status=${resp.status})`, {
+            url: pageUrl,
+            body: body.slice(0, 800),
+          });
+          return {
+            statusCode: 502,
+            body: JSON.stringify({ mode: runMode, error: "Acumatica auth/fetch failed", status: resp.status, page }),
+          };
+        }
+        const pageXml = await resp.text();
+        const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
+        pageCount++;
+        log(`page ${pageCount} (skip=${skip}) returned ${pageEntries.length} entries`);
+        entries.push(...pageEntries);
+        if (pageEntries.length < PAGE_SIZE) break;
+      }
+      if (pageCount === MAX_PAGES && entries.length && entries.length % PAGE_SIZE === 0) {
+        log(`WARNING: hit MAX_PAGES=${MAX_PAGES} without a short page — the feed may have more rows. Raise MAX_PAGES.`);
+      }
     }
   } catch (err) {
     log("Fetch threw", err.message);
@@ -340,14 +438,14 @@ async function runReceiptsSync(mode) {
   log(`Parsed ${feedById.size} released receipt lines (rawEntries: ${entries.length}, dropped: ${rowsDroppedNotReleased} not-released, ${rowsDroppedMissingKeys} missing-keys, ${rowsDroppedNoDate} no-date)`);
 
   // Zero-row bailout. For incremental mode a zero-row feed is normal
-  // — nothing happened in the last 4 days. For full mode it usually
+  // — nothing happened in the last 5 days. For full mode it usually
   // means an auth/schema glitch and we bail without touching the
   // table (matches every other sync's zero-row guard).
   if (feedById.size === 0) {
     if (runMode === "full") {
       log("No released receipts parsed from feed — possible schema change or empty GI; bailing without touching the table");
     } else {
-      log("No released receipts in the last 4 days — nothing to reconcile (quiet, no audit row).");
+      log("No released receipts in the last 5 days — nothing to reconcile (quiet, no audit row).");
     }
     return {
       statusCode: 200,

@@ -46,11 +46,13 @@
 [functions."acumatica-po-receipts-full"]
   schedule = "15 6 * * *"
 
-# INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetimeoffset"
-# filter with a 4-day lookback; wire response is typically a single short
-# page. Audit rows only emitted when data actually changed (so 48x/day
-# does not spam the audit table with no-ops). Diffs against a SCOPED
-# existing-row lookup so cost stays O(feedSize) regardless of po_receipts
-# archive size.
+# INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
+# filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
+# to datetimeoffset and then to a full sweep if the tenant rejects
+# both). Wire response is typically a single short page. Audit rows
+# only emitted when data actually changed (so 48x/day does not spam
+# the audit table with no-ops). Diffs against a SCOPED existing-row
+# lookup so cost stays O(feedSize) regardless of po_receipts archive
+# size.
 [functions."acumatica-po-receipts-incremental"]
   schedule = "*/30 * * * *"
