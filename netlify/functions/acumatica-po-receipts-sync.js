@@ -541,7 +541,8 @@ async function runReceiptsSync(mode) {
           detail: {
             source: "netlify-scheduled-function",
             mode: runMode,
-            filter: filterClause || null,
+            filter: effectiveClause || null,
+            filterForm: effectiveForm,
             fetched: entries.length,
             pages: pageCount,
             rowsInFeed: feedById.size,
