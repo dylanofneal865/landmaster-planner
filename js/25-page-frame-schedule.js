@@ -2715,11 +2715,12 @@ function renderFrameSchedule() {
   const prevMondayIso = _fsIsoMonday(prevMondayAnchor);
 
   // Earliest Monday = min of (persisted frame_schedule weeks with
-  // any real frame qty, DB.poReceipts weeks for FRAME_PNS). Also
-  // track earliestSchedIso separately so we can flag pre-schedule
-  // cells as "sched —" rather than "sched 0" (item 1).
+  // any real frame qty, DB.poReceipts weeks for FRAME_PNS). v5.4
+  // no longer separately tracks earliestSchedIso: color/variance
+  // are now decided per-cell against that cell's own persisted
+  // sched, not against an era-wide "pre-schedule" boundary. See
+  // the cell loop below.
   let earliestIso = null;
-  let earliestSchedIso = null;
   if (DB.frameSchedule && DB.frameSchedule.weeks instanceof Map) {
     for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
       if (!wk || !wk.qty) continue;
@@ -2728,7 +2729,6 @@ function renderFrameSchedule() {
       if (!any) continue;
       if (iso > prevMondayIso) continue;
       if (!earliestIso || iso < earliestIso) earliestIso = iso;
-      if (!earliestSchedIso || iso < earliestSchedIso) earliestSchedIso = iso;
     }
   }
   for (const rec of _poReceipts) {
@@ -2808,48 +2808,69 @@ function renderFrameSchedule() {
       : `<span class="pill muted tiny" style="margin-left:6px">STD</span>`;
 
     // Helper: numeric cell renderer.
-    //   - Recv qty ONLY as the visible number. Whole-cell background
-    //     encodes status. Short-week cells show a tiny "-N" corner
-    //     (shortfall); over-delivery shows "+N". Nothing else in the
-    //     cell — the custom hover card (fired by data-fs-hist-*
-    //     attrs) carries the rich numeric explanation.
+    //   - Recv qty is the primary visible number. Whole-cell
+    //     background encodes status; short cells show a "-N"
+    //     corner (shortfall), over-delivery shows a green "+N"
+    //     corner. Nothing else in the cell -- the custom hover
+    //     card (fired by data-fs-hist-* attrs) carries the rich
+    //     numeric explanation.
     //   - data-fs-hist-* attrs are the hover card's lookup keys.
     //   - tabindex="0" so the hover card fires on keyboard focus too.
-    // `variant` in: "ok" | "short" | "over" | "pre" | "none".
     //
-    // v5.3 Every past-week per-frame cell is BACKFILL-CLICKABLE via
-    // _fsBackfillSched -- click opens a prompt to set the scheduled
-    // qty for this pn+iso. The prior _fsToggleReceiptDetails
-    // accordion trigger moves off past-cell clicks; the "This wk"
-    // cell (separately rendered outside this closure) keeps its
-    // accordion click for current-week receipts detail. The
-    // browser-native `title` tooltip advertises the affordance --
-    // it coexists with the custom hover card, which explains the
-    // numbers themselves. The `clickable` param is retained for
-    // signature stability but no longer gates the onclick -- all
-    // past cells are equally editable, including empty ("none")
-    // cells the operator wants to seed with a scheduled qty.
+    // `variant` in: "met" | "short" | "unsched" | "none".
+    //   met     recv >= sched (sched > 0): green tint; +N corner
+    //           only when recv > sched (over-delivery is good and
+    //           collapses into met -- see spec item 2).
+    //   short   recv <  sched (sched > 0): red tint, -N corner.
+    //   unsched sched == 0 && recv > 0: NEUTRAL -- no tint, no
+    //           corner. Received without a schedule recorded.
+    //           Clicking backfills the sched for this week.
+    //   none    both zero: dim center dot.
+    //
+    // v5.3 Every past-week per-frame cell is BACKFILL-CLICKABLE
+    // via _fsBackfillSched. The "This wk" cell (separately
+    // rendered) keeps its accordion click for current-week
+    // receipts detail. The `clickable` param stays in the
+    // signature for stability but doesn't gate the onclick
+    // anymore -- all past cells are equally editable, including
+    // "none" cells the operator wants to seed with a schedule.
+    // v5.4 "over" and "pre" variants dropped: coloring is now
+    // per-cell against that cell's own persisted sched, not
+    // against an era-wide pre-schedule boundary; over-delivery
+    // collapses into met.
     const cellHTML = (recv, sched, variant, clickable, pn, iso) => {
-      const cls = "fs-hist-cell fs-cell-" + variant;
+      let cls;
+      if (variant === "met")        cls = "fs-hist-cell fs-cell-ok";
+      else if (variant === "short") cls = "fs-hist-cell fs-cell-short";
+      else                          cls = "fs-hist-cell fs-cell-none";
       const isOpen = expanded && expanded.pn === pn && expanded.iso === iso;
       const openCls = isOpen ? " fs-cell-open" : "";
       const dataAttrs = ` data-fs-hist-pn="${esc(pn)}" data-fs-hist-iso="${esc(iso)}" data-fs-hist-variant="${variant}"`;
       const clickAttr = ` onclick="_fsBackfillSched('${esc(pn)}','${esc(iso)}',event)"`;
-      const titleAttr = ` title="Click to set the scheduled qty for this week (backfill)"`;
+      // Distinct browser-title on "unsched" cells so hovering
+      // explains the neutral color AND advertises the backfill
+      // affordance in one line. Every other cell gets the
+      // generic backfill hint.
+      const titleText = (variant === "unsched")
+        ? `received ${recv} -- no schedule recorded for this week; click to backfill`
+        : "Click to set the scheduled qty for this week (backfill)";
+      const titleAttr = ` title="${esc(titleText)}"`;
       let body;
       if (variant === "none") {
         body = `<span class="fs-cell-dot">&middot;</span>`;
       } else {
-        // Recv qty is the primary. Corner badge only on short /
-        // over cells — the one-glance shortfall / surplus number.
         let corner = "";
         if (variant === "short") {
-          const short = Math.max(0, sched - recv);
-          if (short > 0) corner = `<span class="fs-cell-corner fs-corner-short">&minus;${short}</span>`;
-        } else if (variant === "over") {
+          const shortAmt = Math.max(0, sched - recv);
+          if (shortAmt > 0) corner = `<span class="fs-cell-corner fs-corner-short">&minus;${shortAmt}</span>`;
+        } else if (variant === "met") {
           const surplus = recv - sched;
+          // Over-delivery: green "+N" marker (fs-corner-over now
+          // takes the ok color -- see stylesheet). No corner on
+          // an exact match.
           if (surplus > 0) corner = `<span class="fs-cell-corner fs-corner-over">+${surplus}</span>`;
         }
+        // "unsched" has no corner marker -- plain received number.
         body = `<div class="fs-cell-primary">${recv}</div>${corner}`;
       }
       return `<td class="${cls}${openCls}" style="cursor:pointer;" tabindex="0"${dataAttrs}${titleAttr}${clickAttr}>${body}</td>`;
@@ -2869,31 +2890,42 @@ function renderFrameSchedule() {
       let hasSchedInRange = false;
 
       // Week cells (newest → oldest).
+      //
+      // v5.4 Coloring + per-frame variance aggregation are decided
+      // PER CELL against that cell's own persisted sched. A pn+week
+      // cell earns a color only when a real sched > 0 exists for
+      // that pn and week; receipts without a sched render neutral
+      // and are excluded from the per-frame tail so a partial
+      // backfill can never skew delivered % / variance / wks-short.
+      // Column footer still totals received across all cells but
+      // the "/ scheduled" only sums sched-having cells (see the
+      // footer render below).
       const weekCellHTML = visibleHistoryIsos.map((iso, colIdx) => {
         const wk = _fsWeekData(iso);
         const sched = Number(wk.qty && wk.qty[pn]) || 0;
         const recv = Number(receivedByPnWeek.get(pn + "|" + iso)) || 0;
-        const preSchedule = earliestSchedIso ? (iso < earliestSchedIso) : true;
-        const clickable = (sched > 0 || recv > 0);
 
         if (sched === 0 && recv === 0) {
           return cellHTML(0, 0, "none", false, pn, iso);
         }
-        if (preSchedule) {
+        if (sched === 0) {
+          // Received without a persisted schedule -- NEUTRAL.
+          // Contribute recv to the column footer's received sum
+          // (the week's visible received total) but SKIP the
+          // per-frame tail entirely.
           colFooterRecv[colIdx] += recv;
-          return cellHTML(recv, 0, "pre", clickable, pn, iso);
+          return cellHTML(recv, 0, "unsched", true, pn, iso);
         }
-        // Post-schedule counted week.
-        hasSchedInRange = hasSchedInRange || (sched > 0);
+        // sched > 0: real scheduled week for this frame.
+        hasSchedInRange = true;
         winSched += sched;
         winRecv += recv;
         colFooterSched[colIdx] += sched;
         colFooterRecv[colIdx] += recv;
         let variant;
-        if (recv > sched) variant = "over";
-        else if (recv < sched) { variant = "short"; weeksShort++; }
-        else variant = "ok";
-        return cellHTML(recv, sched, variant, clickable, pn, iso);
+        if (recv < sched) { variant = "short"; weeksShort++; }
+        else              variant = "met";   // recv >= sched -- met + over collapse
+        return cellHTML(recv, sched, variant, true, pn, iso);
       }).join("");
 
       // "This wk" leftmost live column — dim, received so far.
@@ -2930,7 +2962,9 @@ function renderFrameSchedule() {
       if (hasSchedInRange) {
         const variance = winRecv - winSched;
         const varSign = variance > 0 ? "+" : "";
-        const varCls = variance > 0 ? "fs-cell-over" : variance < 0 ? "fs-cell-short" : "fs-cell-ok";
+        // v5.4 Over-delivery is good -- surplus and exact both
+        // use the ok (green) tint. Only variance < 0 tints red.
+        const varCls = variance < 0 ? "fs-cell-short" : "fs-cell-ok";
         const dPct = winSched > 0 ? Math.round((winRecv / winSched) * 100) : null;
         const pctCls = dPct === null ? "fs-cell-none" : (dPct >= 100 ? "fs-cell-ok" : "fs-cell-short");
         const shortCls = weeksShort > 0 ? "fs-cell-short" : "fs-cell-ok";
@@ -3096,11 +3130,16 @@ function renderFrameSchedule() {
       if (s === 0 && r === 0) {
         return `<td class="fs-hist-cell fs-cell-none"><span class="fs-cell-dot">&middot;</span></td>`;
       }
-      let variant;
-      if (r > s) variant = "over";
-      else if (r < s) variant = "short";
-      else variant = "ok";
-      return `<td class="fs-hist-cell fs-cell-${variant}" title="All frames: received ${r}, scheduled ${s}"><div class="fs-cell-primary">${r}</div><div class="fs-cell-secondary">/ ${s}</div></td>`;
+      if (s === 0) {
+        // v5.4 Received but no scheduled qty for any frame this
+        // week -- render "N / --" (never "/ 0"). Neutral tint;
+        // the received number is real, the schedule is absent.
+        return `<td class="fs-hist-cell fs-cell-none" title="All frames: received ${r}; no schedule recorded for any frame this week"><div class="fs-cell-primary">${r}</div><div class="fs-cell-secondary">/ &mdash;</div></td>`;
+      }
+      // s > 0: over-delivery collapses into ok (green); only
+      // r < s tints red.
+      const cls = r < s ? "fs-cell-short" : "fs-cell-ok";
+      return `<td class="fs-hist-cell ${cls}" title="All frames: received ${r}, scheduled ${s}"><div class="fs-cell-primary">${r}</div><div class="fs-cell-secondary">/ ${s}</div></td>`;
     }).join("");
     const historyFoot = `
       <tfoot>
@@ -3158,15 +3197,17 @@ function renderFrameSchedule() {
         <span class="pill muted tiny" role="button" tabindex="0" style="cursor:pointer;margin-left:8px;letter-spacing:0.05em" onclick="_fsDownloadHistoryCsv()" title="Download scheduled vs received for the shown range">Download CSV</span>
       </div>`;
 
-    // Legend (redesign): one line under the title explaining the
-    // whole-cell background colors — no per-cell text labels.
+    // Legend: one line under the title explaining the whole-cell
+    // background colors -- no per-cell text labels. v5.4 collapses
+    // the amber "over" and "pre-schedule receipt" swatches: over
+    // is now considered met (still green, with a small "+N"
+    // marker), and cells without a persisted sched are neutral
+    // regardless of era.
     const legend = `
       <div class="fs-hist-legend muted tiny">
-        <span class="fs-legend-swatch fs-cell-ok"></span> met
+        <span class="fs-legend-swatch fs-cell-ok"></span> met / over
         <span class="fs-legend-swatch fs-cell-short"></span> short
-        <span class="fs-legend-swatch fs-cell-over"></span> over
-        <span class="fs-legend-swatch fs-cell-pre"></span> pre-schedule receipt
-        <span class="fs-legend-swatch fs-cell-none"></span> no schedule
+        <span class="fs-legend-swatch fs-cell-none"></span> no schedule recorded
       </div>`;
 
     const headerNote = `
@@ -3325,12 +3366,16 @@ function renderFrameSchedule() {
       .fs-cell-dot { color: var(--t2); opacity: 0.35; font-size: 14px; }
       .fs-cell-corner { position: absolute; top: 1px; left: 3px; font-size: 9px; font-family: var(--font-mono, monospace); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; opacity: 0.85; }
       .fs-corner-short { color: var(--crit, #e05a5a); }
-      .fs-corner-over  { color: #b57828; }
-      /* Whole-cell background per status */
+      /* v5.4 over-delivery is good -- the "+N" corner renders in
+         the same green as the met tint so it reads as surplus,
+         not miss. */
+      .fs-corner-over  { color: var(--ok, #5cbf88); }
+      /* Whole-cell background per status. v5.4 dropped fs-cell-over
+         (over collapses into ok) and fs-cell-pre (era-based amber
+         retired now that backfill lets the operator fill in past
+         schedules retroactively). */
       .fs-cell-ok    { background: rgba(80,180,120,0.14); }
       .fs-cell-short { background: rgba(220,60,60,0.18); }
-      .fs-cell-over  { background: rgba(255,181,71,0.20); }
-      .fs-cell-pre   { background: rgba(120,140,200,0.10); }
       .fs-cell-none  { background: transparent; }
       .fs-cell-thiswk { background: rgba(120,140,200,0.10); font-style: italic; }
       .fs-cell-open { outline: 2px solid var(--info, #6ab0ff); outline-offset: -2px; }
@@ -3383,7 +3428,9 @@ function renderFrameSchedule() {
       .fs-tt-value { font-family: var(--font-mono, monospace); font-variant-numeric: tabular-nums; }
       .fs-tt-ok    { color: var(--ok, #4bcc80); }
       .fs-tt-short { color: var(--crit, #e05a5a); }
-      .fs-tt-over  { color: #d9a03a; }
+      /* v5.4 fs-tt-over dropped -- over-delivery collapses into
+         met (fs-tt-ok). fs-tt-pre is repurposed for the neutral
+         "no schedule recorded" branch in the variance row. */
       .fs-tt-pre   { color: #8fa5d9; }
       .fs-tt-hint  { margin-top: 6px; padding-top: 4px; border-top: 1px solid var(--line-soft, #2a2f3d); font-size: 10px; }
       .fs-tt-body  { padding: 2px 0; font-family: var(--font-mono, monospace); }
@@ -3871,8 +3918,8 @@ function _fsHistTooltipHtmlCell(pn, iso, variant) {
       receiptCount++;
     }
   }
-  const preSchedule = variant === "pre";
   const noData = variant === "none";
+  const unsched = variant === "unsched";
   const thisWk = variant === "thiswk";
   const row = (label, value, cls) =>
     `<div class="fs-tt-row"><span class="fs-tt-label">${label}</span><span class="fs-tt-value${cls ? ' ' + cls : ''}">${value}</span></div>`;
@@ -3882,13 +3929,15 @@ function _fsHistTooltipHtmlCell(pn, iso, variant) {
   </div>`;
   const schedText = (sched > 0)
     ? String(sched)
-    : (preSchedule ? "&mdash; (no schedule that week)" : "&mdash;");
+    : (unsched ? "&mdash; (no schedule recorded)" : "&mdash;");
   const recvText = (receiptCount > 0)
     ? `${recv} <span class="muted">(${receiptCount} receipt${receiptCount === 1 ? "" : "s"})</span>`
     : String(recv);
   let variance;
-  if (preSchedule) {
-    variance = `<span class="fs-tt-pre">pre-schedule receipt</span>`;
+  if (unsched) {
+    // v5.4 Received without a persisted sched -- explain the
+    // neutral color + advertise backfill in the hover card too.
+    variance = `<span class="fs-tt-pre">no schedule recorded &mdash; click to backfill</span>`;
   } else if (thisWk) {
     variance = `<span class="muted">partial (this week)</span>`;
   } else if (sched === 0 && recv === 0) {
@@ -3896,13 +3945,15 @@ function _fsHistTooltipHtmlCell(pn, iso, variant) {
   } else if (recv < sched) {
     variance = `<span class="fs-tt-short">&minus;${sched - recv} short</span>`;
   } else if (recv > sched) {
-    variance = `<span class="fs-tt-over">+${recv - sched} over</span>`;
+    // v5.4 Over-delivery is now met -- render green with a
+    // small "+N" note so the surplus still shows at a glance.
+    variance = `<span class="fs-tt-ok">met (+${recv - sched} over)</span>`;
   } else {
     variance = `<span class="fs-tt-ok">met</span>`;
   }
-  // Run kind, only when scheduled and post-schedule.
+  // Run kind, only when a real schedule exists for this cell.
   let runTypeRow = "";
-  if (!preSchedule && !noData && !thisWk && sched > 0) {
+  if (!noData && !unsched && !thisWk && sched > 0) {
     const info = _fsHistoricalSlotForIso(iso);
     let kindText = "";
     if (info && info.slotPn) {
@@ -3938,7 +3989,7 @@ function _fsHistTooltipHtmlTail(tail, target) {
   const pct = winSched > 0 ? Math.round((winRecv / winSched) * 100) : null;
   switch (tail) {
     case "recv-tot":
-      body = `<div class="fs-tt-body">Total received across the shown range.<br><span class="muted">post-schedule weeks only &mdash; pre-schedule receipts feed the per-week column but not this row-tail number.</span><br><strong>${winRecv}</strong> units received across ${nSched} scheduled wk.</div>`;
+      body = `<div class="fs-tt-body">Total received across the shown range.<br><span class="muted">weeks with a persisted sched only &mdash; receipts without a sched feed the per-week column but not this row-tail number.</span><br><strong>${winRecv}</strong> units received across ${nSched} scheduled wk.</div>`;
       break;
     case "sched-tot":
       body = `<div class="fs-tt-body">Total scheduled across the shown range.<br><strong>${winSched}</strong> units scheduled across ${nSched} wk.</div>`;
