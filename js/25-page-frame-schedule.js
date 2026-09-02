@@ -377,6 +377,82 @@ function _fsSettingsCaps() {
   };
 }
 
+/* ============================================================
+   v6 SHARED PRODUCTION ENVELOPE
+
+   A week is ONE production envelope. Crew/HD frames consume it
+   at caps.crewhd per week; standard frames at caps.std per
+   week. Standards allowed alongside a given crew/HD qty:
+
+     stdAllowed = floor((1 - crewhdQty/caps.crewhd) * caps.std)
+                  rounded DOWN to a multiple of FRAME_PACK (3)
+
+   With defaults 25 / 33:
+     crew 24 -> 0 std (was 8/wk under the old filler model)
+     crew 21 -> 3 std
+     crew 18 -> 9 std
+     crew 15 -> 12 std
+     crew  0 -> 33 std
+
+   Crew at cap always leaves 0 std -- the old "spare = STD -
+   CREW/HD" filler is retired. A full standards week (33)
+   requires zero crew/HD builds in the same week.
+
+   Single source of truth: _fsStdAllowedPacks + the derived
+   _fsStdAllowedUnits + _fsWeekEnvelopeStatus are the ONLY
+   places that own this arithmetic. Every consumer -- the sim's
+   filler placement, the debug sim, the header note, the
+   True-Demand panel's "sustained @ mix" lines, the manual
+   qty-override entry validation, and the render-time
+   envelope-violation flag -- calls these three helpers.
+   ============================================================ */
+
+// Std packs allowed in a week that also builds `crewhdQty`
+// CREW/HD units. Rounded DOWN to whole FRAME_PACK stacks --
+// matches the pack-of-3 rule already enforced elsewhere in the
+// sim. Caller multiplies by FRAME_PACK for units.
+function _fsStdAllowedPacks(crewhdQty, caps) {
+  const crewCap = Math.max(0, Number(caps && caps.crewhd) || 0);
+  const stdCap  = Math.max(0, Number(caps && caps.std)    || 0);
+  if (stdCap <= 0) return 0;
+  const crewhd = Math.max(0, Number(crewhdQty) || 0);
+  if (crewCap <= 0) {
+    // No crew/HD capacity at all -- envelope is 100% std as
+    // long as nothing is trying to build crew/HD.
+    return crewhd > 0 ? 0 : Math.floor(stdCap / FRAME_PACK);
+  }
+  const remaining = 1 - (crewhd / crewCap);
+  if (remaining <= 0) return 0;
+  return Math.max(0, Math.floor((remaining * stdCap) / FRAME_PACK));
+}
+function _fsStdAllowedUnits(crewhdQty, caps) {
+  return _fsStdAllowedPacks(crewhdQty, caps) * FRAME_PACK;
+}
+
+// Envelope status for a week given per-pool sums. `over` is
+// true when the week's actual placements exceed the envelope
+// (crew above its cap, OR std above the envelope allowance for
+// that crew level). Used by the render's violation flag + the
+// manual qty-override entry validator. Both paths format their
+// own message from the returned fields.
+function _fsWeekEnvelopeStatus(crewhdSum, stdSum, caps) {
+  const crewCap = Math.max(0, Number(caps && caps.crewhd) || 0);
+  const stdCap  = Math.max(0, Number(caps && caps.std)    || 0);
+  const stdAllowed = _fsStdAllowedUnits(crewhdSum, caps);
+  const crewOver = crewhdSum > crewCap;
+  const stdOver  = stdSum > stdAllowed;
+  return {
+    crewhdSum: Math.max(0, Number(crewhdSum) || 0),
+    stdSum: Math.max(0, Number(stdSum) || 0),
+    crewCap,
+    stdCap,
+    stdAllowed,
+    crewOver,
+    stdOver,
+    over: crewOver || stdOver,
+  };
+}
+
 // v4.1 Safety buffer (min cover in WEEKS) — reads the cloud
 // settings row's `bufferWeeks` field when present; falls back to
 // the session-local FRAMESCHED_STATE._bufferWeeks set by the input
@@ -893,20 +969,25 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
         runCount++;
       }
 
-      // DROP-IN filler — CREW/HD week only. Same catchup rule
-      // applied to the STD pool: when STD pool is behind, spare
-      // capacity fills at FULL PACKS; otherwise demand-sized.
+      // DROP-IN filler — CREW/HD week only. v6 SHARED ENVELOPE:
+      // the std allowance is not a fixed "spare = STD − CREW/HD"
+      // number anymore -- it's driven by whatever crew/HD qty
+      // just landed this week via _fsStdAllowedPacks. So crew at
+      // cap leaves zero room for a std filler (was 8/wk under
+      // the old model), a half-crew week leaves ~half the std
+      // cap, and so on. Catchup still allowed within that
+      // shrunken envelope. See the SHARED PRODUCTION ENVELOPE
+      // doc block above _fsStdAllowedPacks for the rule.
       if (runPool === "crewhd") {
-        const spareCap = Math.max(0, (globalCaps.std || 0) - (globalCaps.crewhd || 0));
-        const spareCapPacks = Math.floor(spareCap / FRAME_PACK);
-        if (spareCapPacks > 0) {
+        const envelopePacks = _fsStdAllowedPacks(placedQty, globalCaps);
+        if (envelopePacks > 0) {
           const fillerPn = _fsPickFillerCandidate(rows, onHand, runPn, rateByPn);
           if (fillerPn) {
             const stdBehind = _fsPoolBehind("std", rows, onHand, slots, cols, weeklyBurnByPn, bufferWeeksLocal, iso);
             let fillQty = 0;
             let fillMode = "demand";
             if (stdBehind) {
-              fillQty = Math.round(spareCapPacks * FRAME_PACK);
+              fillQty = envelopePacks * FRAME_PACK;
               fillMode = "catchup";
             } else {
               const burnFill = weeklyBurnByPn.get(fillerPn) || 0;
@@ -914,8 +995,8 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
               const weeksToNextFill = _fsWeeksToNextRunFor(fillerPn, iso, slots, cols);
               const neededFill = Math.max(0, burnFill * (weeksToNextFill + bufferWeeksLocal) - ohFill);
               const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
-              const fillPacks = Math.min(neededFillPacks, spareCapPacks);
-              fillQty = Math.round(fillPacks * FRAME_PACK);
+              const fillPacks = Math.min(neededFillPacks, envelopePacks);
+              fillQty = fillPacks * FRAME_PACK;
             }
             if (fillQty > 0) {
               scheduledRuns.get(fillerPn).push({ weekIso: iso, qty: fillQty, kind: "filler", mode: fillMode });
@@ -2138,26 +2219,30 @@ function _fsFindStaleLocks(slots, rows, cols, globalCaps, currentSimResult, rate
    keep up with rate × 5 for every frame" view. No sim, no
    persistence — reads part.daily + part.onHand only.
 
-   Per-pool comparison lines share this "sustained @ mix" idea:
-   the one physical line can only run one pool at a time, so the
-   sustainable weekly output of any pool is that pool's CAP scaled
-   by its share of TOTAL frame demand.
+   v6 SHARED ENVELOPE math. Every week is one production
+   envelope. Crew/HD demand consumes (crewhd_demand / crewhd_cap)
+   of it per week; std demand consumes (std_demand / std_cap).
+   Envelope utilization is the sum of the two fractions:
 
-     crewhd_sustained = crewhd_cap × (crewhd_demand / total_demand)
-     std_sustained    = std_cap    × (std_demand    / total_demand)
-                       + drop_in_spare × (crewhd_demand / total_demand)
+     util = crewhd_demand/crewhd_cap + std_demand/std_cap
 
-   where drop_in_spare = max(0, std_cap − crewhd_cap) captures the
-   fact that a CREW/HD-scheduled week has spare capacity that
-   drops in as STD. The bottom line compares TOTAL demand to
-   lineMax (= max(std_cap, crewhd_cap)) — that's the theoretical
-   ceiling of a single-line run.
+   If util ≤ 1 the mix fits with headroom (1 − util). If util
+   > 1 the envelope is over-subscribed and both pools are
+   scaled down proportionally to fit:
+
+     scale = min(1, 1/util)
+     crewhd_sustained = crewhd_demand × scale
+     std_sustained    = std_demand    × scale
+
+   Bottom line reports envelope utilization and headroom/deficit
+   as a percentage. Replaces the old "line makes ~lineMax/wk"
+   framing (which assumed one-pool-per-week) since the envelope
+   allows a mix week explicitly.
    ============================================================ */
 
 function _fsBuildTrueDemandPanel(rows, globalCaps) {
   const crewhdCap = Number(globalCaps && globalCaps.crewhd) || 0;
   const stdCap    = Number(globalCaps && globalCaps.std)    || 0;
-  const lineMax   = Math.max(crewhdCap, stdCap);
 
   // Per-frame burn + cover. Uses _fsDaily so chained frames report
   // their true chain rate (e.g. UT101002 = 0.61 chain vs 0.162
@@ -2178,12 +2263,14 @@ function _fsBuildTrueDemandPanel(rows, globalCaps) {
     if (f.pool === "crewhd") crewhdDemand += f.burn;
     else if (f.pool === "std") stdDemand += f.burn;
   }
-  const totalDemand = crewhdDemand + stdDemand;
-  const crewhdShare = totalDemand > 0 ? crewhdDemand / totalDemand : 0;
-  const stdShare    = totalDemand > 0 ? stdDemand    / totalDemand : 0;
-  const dropInSpare = Math.max(0, stdCap - crewhdCap);
-  const crewhdSustained = crewhdCap * crewhdShare;
-  const stdSustained    = stdCap    * stdShare + dropInSpare * crewhdShare;
+  // v6 Envelope utilization: each pool's demand as a fraction of
+  // its own cap; both fractions sum to the total envelope share.
+  const crewhdUtil = crewhdCap > 0 ? (crewhdDemand / crewhdCap) : (crewhdDemand > 0 ? Infinity : 0);
+  const stdUtil    = stdCap    > 0 ? (stdDemand    / stdCap)    : (stdDemand    > 0 ? Infinity : 0);
+  const totalUtil  = crewhdUtil + stdUtil;
+  const scale      = totalUtil > 1 ? (1 / totalUtil) : 1;
+  const crewhdSustained = crewhdDemand * scale;
+  const stdSustained    = stdDemand    * scale;
 
   // Per-frame table rows.
   const frameLinesHtml = perFrame.map(f => {
@@ -2206,14 +2293,22 @@ function _fsBuildTrueDemandPanel(rows, globalCaps) {
     return `<span class="${cls}"><strong>${word}</strong> ${Math.abs(diff).toFixed(1)}/wk</span>`;
   };
 
-  const crewhdLine = `CREW/HD: need <strong>${crewhdDemand.toFixed(1)}/wk</strong> &middot; cap ${crewhdCap}/wk &middot; sustained @ mix <strong>${crewhdSustained.toFixed(1)}/wk</strong> &middot; ${deltaTxt(crewhdDemand, crewhdSustained)}`;
-  const stdLine    = `STD: need <strong>${stdDemand.toFixed(1)}/wk</strong> &middot; cap ${stdCap}/wk &middot; sustained @ mix <strong>${stdSustained.toFixed(1)}/wk</strong> &middot; ${deltaTxt(stdDemand, stdSustained)}`;
+  const crewhdLine = `CREW/HD: need <strong>${crewhdDemand.toFixed(1)}/wk</strong> &middot; cap ${crewhdCap}/wk &middot; sustained @ envelope <strong>${crewhdSustained.toFixed(1)}/wk</strong> &middot; ${deltaTxt(crewhdDemand, crewhdSustained)}`;
+  const stdLine    = `STD: need <strong>${stdDemand.toFixed(1)}/wk</strong> &middot; cap ${stdCap}/wk &middot; sustained @ envelope <strong>${stdSustained.toFixed(1)}/wk</strong> &middot; ${deltaTxt(stdDemand, stdSustained)}`;
 
-  const overLine = totalDemand > lineMax;
-  const totalDiff = lineMax - totalDemand;
-  const totalWord = totalDiff >= 0 ? "surplus" : "deficit";
+  // v6 Bottom line: envelope utilization + headroom/deficit as a
+  // percentage. `util` = crewhd_demand/crewhd_cap + std_demand/std_cap;
+  // ≤ 100% means the mix fits with headroom, > 100% means over.
+  const overLine = totalUtil > 1;
+  const utilPct  = Number.isFinite(totalUtil) ? (totalUtil * 100) : Infinity;
+  const utilText = Number.isFinite(utilPct) ? `${utilPct.toFixed(0)}%` : "&infin;";
+  const gapText  = Number.isFinite(utilPct)
+    ? (overLine
+        ? `<strong>over ${Math.abs(utilPct - 100).toFixed(0)}%</strong>`
+        : `<strong>headroom ${(100 - utilPct).toFixed(0)}%</strong>`)
+    : `<strong>over &infin;</strong>`;
   const bottomCls = overLine ? "fs-td-bottom fs-td-over" : "fs-td-bottom fs-td-under";
-  const bottomLine = `<div class="${bottomCls}"><strong>Bottom line:</strong> line makes ~${lineMax}/wk, total frame demand ~${totalDemand.toFixed(1)}/wk &mdash; <strong>${totalWord} ${Math.abs(totalDiff).toFixed(1)}/wk</strong></div>`;
+  const bottomLine = `<div class="${bottomCls}"><strong>Bottom line:</strong> envelope utilization ${utilText} (crew/HD ${(crewhdUtil * 100).toFixed(0)}% + std ${(stdUtil * 100).toFixed(0)}%) &mdash; ${gapText}</div>`;
 
   return `
     <div class="fs-true-demand-panel">
@@ -2519,6 +2614,37 @@ function renderFrameSchedule() {
       for (const e of tl) endOhByPnWeek.set(pn + "|" + e.iso, e.endOh);
     }
   }
+
+  // v6 SHARED ENVELOPE per-week status. For each visible week
+  // (past + current + future), sum crew/HD and STD placements
+  // from whichever source that week reads from (past = persisted
+  // wk.qty; current + future = sim's scheduledRuns, which
+  // already reflects manual qty overrides). Feed each sum
+  // through _fsWeekEnvelopeStatus to decide if the week over-
+  // consumes the envelope; the map drives both the red outline
+  // on offending cells and the warnings-panel envelope-over
+  // lines below. Past weeks are included so historical
+  // violations produced under the OLD filler model surface as
+  // red instead of silently persisting.
+  const weekEnvelopeByIso = new Map();
+  for (const c of cols) {
+    let crewhdSum = 0;
+    let stdSum = 0;
+    const wkForEnv = _fsWeekData(c.iso);
+    for (const rr of rows) {
+      let q = 0;
+      if (c.past) {
+        q = Number(wkForEnv.qty && wkForEnv.qty[rr.pn]) || 0;
+      } else {
+        const runs = scheduledRuns.get(rr.pn) || [];
+        for (const rn of runs) if (rn.weekIso === c.iso) q += rn.qty;
+      }
+      if (rr.pool === "crewhd") crewhdSum += q;
+      else if (rr.pool === "std") stdSum += q;
+    }
+    weekEnvelopeByIso.set(c.iso, _fsWeekEnvelopeStatus(crewhdSum, stdSum, globalCaps));
+  }
+
   const frameRows = rows.map(r => {
     let total = 0;
     const cells = cols.map(c => {
@@ -2555,21 +2681,32 @@ function renderFrameSchedule() {
       const counts = poolCountByIso.get(c.iso) || { crewhd: 0, std: 0 };
       const amber = q > 0 && counts[r.pool] >= 2;
       const dim = c.past ? " dim" : "";
+      // v6 SHARED ENVELOPE red flag: any cell with a placement
+      // in a week whose crew/HD + std totals over-consume the
+      // envelope. Both pools' cells in that week flag together
+      // -- the envelope is a shared budget so both contributed
+      // to the over-allocation.
+      const envStatus = weekEnvelopeByIso.get(c.iso) || null;
+      const envOver = !!(envStatus && envStatus.over && q > 0);
       let cls = "";
       if (kind === "filler") cls = " fs-filler";
       else if (q > 0) cls = " fs-run";
       if (isOverridden) cls += " fs-override";
+      if (envOver) cls += " fs-env-over";
 
       // Rich tooltip (item 6). Rebuilds for every nonzero cell so
       // it stays in sync with the current sim's numbers.
       let title = "";
+      const envNote = envOver
+        ? ` -- ENVELOPE OVER: ${envStatus.crewhdSum} crew/HD + ${envStatus.stdSum} std (allowed ${envStatus.stdAllowed} std at this crew/HD)`
+        : "";
       if (isOverridden) {
         // v5.5 Override tooltip: name the manual value, the
         // pre-override sim value, and how to change / clear.
         const preOv = simResult.preOverrideByPnIso && simResult.preOverrideByPnIso.has(r.pn + "|" + c.iso)
           ? Number(simResult.preOverrideByPnIso.get(r.pn + "|" + c.iso))
           : 0;
-        title = ` title="${esc(`manual override ${overrideVal} (optimizer: ${preOv}) -- click to change, blank to clear`)}"`;
+        title = ` title="${esc(`manual override ${overrideVal} (optimizer: ${preOv}) -- click to change, blank to clear${envNote}`)}"`;
       } else if (q > 0) {
         const cap = r.pool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
         const endOh = endOhByPnWeek.has(r.pn + "|" + c.iso)
@@ -2577,11 +2714,11 @@ function renderFrameSchedule() {
           : null;
         const kindLabel = (kind === "filler") ? "filler" : "run";
         const capNote = kindLabel === "filler"
-          ? " (STD spare capacity dropped in on a CREW/HD slot)"
+          ? " (std allowed by envelope at this crew/HD)"
           : ` (cap ${cap})`;
         const eohNote = endOh !== null ? ` · projected on hand at week end: ${endOh}` : "";
         const amberNote = amber ? ` · flag: two ${_fsPoolLabel(r.pool)} frames scheduled this week` : "";
-        title = ` title="${esc(`${r.pn} · wk ${c.iso} · ${kindLabel} ${q}${capNote}${eohNote}${amberNote}`)}"`;
+        title = ` title="${esc(`${r.pn} · wk ${c.iso} · ${kindLabel} ${q}${capNote}${eohNote}${amberNote}${envNote}`)}"`;
       } else if (amber) {
         title = ` title="Two ${_fsPoolLabel(r.pool)} frames scheduled this week — soft flag, doesn't block."`;
       } else if (!c.past) {
@@ -2771,6 +2908,39 @@ function renderFrameSchedule() {
       : `<details class="fs-warn-more"><summary class="muted tiny">+${overflowFrames.length} more frame${overflowFrames.length === 1 ? "" : "s"}</summary>${overflowFrames.map(renderFrameRow).join("")}</details>`;
 
     warningsPanel = `${headerLine}${visibleRows}${overflowHtml}`;
+  }
+
+  // v6 SHARED ENVELOPE violations panel. Prepended to the
+  // coverage warnings so operators see envelope over-allocations
+  // even when coverage is clean. Each violating week gets a line
+  // "week M/D over envelope: <crew> crew/HD + <std> std (allowed
+  // <stdAllowed>)". Weeks are listed newest-first-to-oldest by
+  // ISO. Historical weeks that were legal under the old filler
+  // model now surface here.
+  const envOverIsos = [];
+  for (const c of cols) {
+    const st = weekEnvelopeByIso.get(c.iso);
+    if (st && st.over) envOverIsos.push(c.iso);
+  }
+  let envelopePanel = "";
+  if (envOverIsos.length > 0) {
+    const envLines = envOverIsos.map(iso => {
+      const st = weekEnvelopeByIso.get(iso);
+      const md = _fsMdFromIso(iso);
+      const reason = st.crewOver
+        ? `${st.crewhdSum} crew/HD exceeds cap ${st.crewCap}`
+        : `${st.crewhdSum} crew/HD + ${st.stdSum} std (allowed ${st.stdAllowed})`;
+      return `<div class="fs-warn-line fs-warn-line-envelope">week ${esc(md)} over envelope: ${esc(reason)}</div>`;
+    }).join("");
+    envelopePanel = `
+      <div class="fs-envelope-panel">
+        <div class="fs-warn-summary muted tiny"><strong>${envOverIsos.length}</strong> week${envOverIsos.length === 1 ? "" : "s"} over the shared production envelope</div>
+        ${envLines}
+      </div>`;
+    // Combine: envelope violations shown ABOVE the coverage
+    // panel. Keep the existing warningsPanel as-is; the two
+    // read as separate concerns.
+    warningsPanel = envelopePanel + warningsPanel;
   }
 
   // ---- Receipt History panel (scheduled vs received) ----
@@ -3371,6 +3541,19 @@ function renderFrameSchedule() {
   // what actually triggers the settings write via onchange.
   const capKeyHandler = `onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"`;
   const currentBufferWeeks = _fsSettingsBufferWeeks();
+  // v6 SHARED ENVELOPE example line. Compute the current week's
+  // actual crew/HD sum (from the sim's scheduledRuns, which
+  // already reflects any manual overrides) so the header note
+  // shows a concrete envelope allowance for TODAY.
+  let currentCrewhdSumForNote = 0;
+  if (currentIso) {
+    for (const rr of rows) {
+      if (rr.pool !== "crewhd") continue;
+      const runs = scheduledRuns.get(rr.pn) || [];
+      for (const rn of runs) if (rn.weekIso === currentIso) currentCrewhdSumForNote += rn.qty;
+    }
+  }
+  const currentStdAllowedForNote = _fsStdAllowedUnits(currentCrewhdSumForNote, globalCaps);
   const globalCapsInputs = `
     <div class="fs-global-caps">
       <label class="fs-caps-label">
@@ -3394,7 +3577,7 @@ function renderFrameSchedule() {
                ${capKeyHandler}
                onchange="_fsHandleSettingsBufferWeeks(this.value)">
       </label>
-      <div class="muted tiny" style="margin-left:12px">Filler capacity per CREW/HD slot = max(0, STD &minus; CREW/HD) = <strong>${Math.max(0, globalCaps.std - globalCaps.crewhd)}</strong>/wk</div>
+      <div class="muted tiny" style="margin-left:12px" title="Shared production envelope: standards allowed in a week = floor((1 - crew/HD qty / crew/HD cap) * STD cap) rounded down to a multiple of 3. Crew/HD at cap leaves 0 standards.">Shared envelope: std allowed = f(crew/HD qty) &mdash; this week ${currentCrewhdSumForNote} crew/HD &rarr; <strong>${currentStdAllowedForNote}</strong> std allowed (envelope ${globalCaps.crewhd}/${globalCaps.std})</div>
       <div class="muted tiny" style="margin-left:12px">Locks fix the frame; caps set the quantity &mdash; changes apply from next week.</div>
     </div>`;
 
@@ -3447,6 +3630,18 @@ function renderFrameSchedule() {
         letter-spacing: 0.02em;
         line-height: 1;
       }
+      /* v6 SHARED ENVELOPE over-allocation. Any non-zero cell in
+         a week that over-consumes the shared production envelope
+         gets a red outline. Rendered on top of whatever
+         fs-run / fs-filler / fs-override styling the cell already
+         carries; when both fs-override and fs-env-over apply the
+         red outline wins visually (heavier + wider). */
+      .fs-env-over { position: relative; outline: 2px solid var(--crit, #e05a5a); outline-offset: -2px; }
+      /* v6 Envelope-over line in the warnings panel. Same red
+         accent as the stockout line so envelope violations pull
+         the eye immediately. */
+      .fs-warn-line-envelope { color: var(--crit, #e05a5a); font-family: var(--font-mono, monospace); font-size: 11px; padding: 2px 0; }
+      .fs-envelope-panel { padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--line-soft, #333); }
       .fs-tbl td, .fs-tbl th { white-space: nowrap; }
       /* Receipt-status color palette — reused by the Receipt History
          panel below. Grid cells no longer carry these classes; the
@@ -4413,6 +4608,44 @@ function _fsHandleQtyOverride(pn, iso, evt) {
     newVal = parsed;
   }
 
+  // v6 SHARED ENVELOPE entry validation. Skip on clear (clearing
+  // can only relax constraints; any existing envelope violation
+  // in this week is already surfaced by the render's envelope
+  // panel). For a set / update, compute the effective per-pool
+  // sums with the new value swapped in for THIS pn (other pns
+  // read from wk.qty, which reflects the last render's post-
+  // override placements), and confirm() if that would over-
+  // consume the shared envelope. Never silently clamp -- save
+  // only on OK.
+  if (!clearing) {
+    const globalCapsForCheck = _fsSettingsCaps();
+    const rowsForCheck = _fsRows();
+    const wkForCheck = _fsWeekData(iso);
+    const curQtyMap = (wkForCheck && wkForCheck.qty) || {};
+    let crewhdSum = 0;
+    let stdSum = 0;
+    for (const rr of rowsForCheck) {
+      const q = (rr.pn === pn) ? newVal : (Number(curQtyMap[rr.pn]) || 0);
+      if (rr.pool === "crewhd") crewhdSum += q;
+      else if (rr.pool === "std") stdSum += q;
+    }
+    const status = _fsWeekEnvelopeStatus(crewhdSum, stdSum, globalCapsForCheck);
+    if (status.over) {
+      const wkShort = _fsMdFromIso(iso);
+      let msg;
+      if (status.stdOver && !status.crewOver) {
+        msg = `Week of ${wkShort}: ${status.crewhdSum} CREW/HD leaves room for ${status.stdAllowed} standards (envelope ${status.crewCap}/${status.stdCap}); this schedules ${status.stdSum}. Save anyway?`;
+      } else if (status.crewOver && !status.stdOver) {
+        msg = `Week of ${wkShort}: ${status.crewhdSum} CREW/HD exceeds envelope crew cap ${status.crewCap} (envelope ${status.crewCap}/${status.stdCap}); STD ${status.stdSum} (allowed ${status.stdAllowed}). Save anyway?`;
+      } else {
+        msg = `Week of ${wkShort}: ${status.crewhdSum} CREW/HD (cap ${status.crewCap}) + ${status.stdSum} STD (allowed ${status.stdAllowed}) both exceed envelope ${status.crewCap}/${status.stdCap}. Save anyway?`;
+      }
+      if (typeof window !== "undefined" && typeof window.confirm === "function") {
+        if (!window.confirm(msg)) return;
+      }
+    }
+  }
+
   // Merge into a fresh override map: copy every other pn (drop
   // stale non-numeric entries defensively), then set/drop this
   // pn. Empty result becomes null so js/30 stores the row
@@ -4770,7 +5003,7 @@ window._fsDebugSim = function () {
   // v4.6: mirror the sim's whole-run week-2 stash.
   const slotWeek2Whole = new Map();
 
-  console.log(`[fsDebugSim] Global caps: CREW/HD=${globalCaps.crewhd}/wk · STD=${globalCaps.std}/wk · filler=${Math.max(0, globalCaps.std - globalCaps.crewhd)}/wk`);
+  console.log(`[fsDebugSim] Global caps (shared envelope): CREW/HD=${globalCaps.crewhd}/wk · STD=${globalCaps.std}/wk · std allowed at full crew=${_fsStdAllowedUnits(globalCaps.crewhd, globalCaps)}/wk · std allowed at zero crew=${_fsStdAllowedUnits(0, globalCaps)}/wk`);
   console.log(`[fsDebugSim] Min cover: ${bufferWeeks} wk (0 = feature off) · targetUnits = bufferWeeks × burn(wk)`);
   console.log(`[fsDebugSim] Pack size: ${FRAME_PACK} frames per stack (all qty multiples of ${FRAME_PACK})`);
   console.log(`[fsDebugSim] Slot anchor ${SLOT_ANCHOR_ISO} · lock horizon ${LOCK_HORIZON_DAYS}d · sim horizon ${SIM_HORIZON_WEEKS} wk (render ${renderCols.length} wk)`);
@@ -4871,10 +5104,14 @@ window._fsDebugSim = function () {
         buildCreditsThisWeek.get(runPn).push({ qty: 0, kind: "demand-met", mode: "demand", needed: 0, cap, packs: 0 });
       }
 
+      // v6 SHARED ENVELOPE — std allowance for this week is
+      // driven by the crew/HD qty just placed. See the SHARED
+      // PRODUCTION ENVELOPE doc block near _fsStdAllowedPacks
+      // for the rule and examples.
       if (runPool === "crewhd") {
-        const spareCap = Math.max(0, (globalCaps.std || 0) - (globalCaps.crewhd || 0));
-        const spareCapPacks = Math.floor(spareCap / FRAME_PACK);
-        if (spareCapPacks > 0) {
+        const envelopePacks = _fsStdAllowedPacks(runQty, globalCaps);
+        const envelopeUnits = envelopePacks * FRAME_PACK;
+        if (envelopePacks > 0) {
           const fillerPn = _fsPickFillerCandidate(rows, onHand, runPn, rateByPn);
           if (fillerPn) {
             const burnFill = weeklyBurnByPn.get(fillerPn) || 0;
@@ -4886,17 +5123,17 @@ window._fsDebugSim = function () {
             let fillMode = "demand";
             let fillPacks = 0;
             if (stdBehind) {
-              fillPacks = spareCapPacks;
-              fillQty = Math.round(fillPacks * FRAME_PACK);
+              fillPacks = envelopePacks;
+              fillQty = fillPacks * FRAME_PACK;
               fillMode = "catchup";
             } else {
               const neededFillPacks = Math.ceil(neededFill / FRAME_PACK);
-              fillPacks = Math.min(neededFillPacks, spareCapPacks);
-              fillQty = Math.round(fillPacks * FRAME_PACK);
+              fillPacks = Math.min(neededFillPacks, envelopePacks);
+              fillQty = fillPacks * FRAME_PACK;
             }
             if (fillQty > 0) {
               onHand.set(fillerPn, ohFill + fillQty);
-              buildCreditsThisWeek.get(fillerPn).push({ qty: fillQty, kind: "filler", mode: fillMode, needed: neededFill, cap: spareCap, packs: fillPacks });
+              buildCreditsThisWeek.get(fillerPn).push({ qty: fillQty, kind: "filler", mode: fillMode, needed: neededFill, cap: envelopeUnits, packs: fillPacks });
             }
           }
         }
