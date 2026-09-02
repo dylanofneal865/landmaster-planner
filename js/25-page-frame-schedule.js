@@ -358,6 +358,11 @@ function _fsWeekData(iso) {
   return {
     qty: (wk && wk.qty && typeof wk.qty === "object") ? wk.qty : {},
     slot: (wk && wk.slot && typeof wk.slot === "object") ? wk.slot : null,
+    // v5.5 qtyOverride surfaces the persisted manual per-cell
+    // constraints so both _fsSimulate (which honors them as
+    // hard placements) and the grid render (which draws the
+    // "M" corner) can read them off a single helper.
+    qtyOverride: (wk && wk.qtyOverride && typeof wk.qtyOverride === "object") ? wk.qtyOverride : null,
   };
 }
 
@@ -736,6 +741,14 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
   // each week of a split is packed independently at its own compute.
   const slotWeek2Whole = new Map();
 
+  // v5.5 pre-override capture. Whenever a persisted override
+  // replaces a derived placement below, the sim's pre-override
+  // qty (what it WOULD have placed) is stashed here keyed by
+  // "pn|iso". Rendered as "optimizer: X" in the tooltip of every
+  // overridden grid cell so the operator can see what they're
+  // vetoing.
+  const preOverrideByPnIso = new Map();
+
   for (let i = 0; i < cols.length; i++) {
     const c = cols[i];
     if (c.past) continue;
@@ -916,6 +929,48 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
     // onHand credit, no runCount++. Frames just keep burning
     // below in step 2, which is exactly the "demand-gated" model.
 
+    // v5.5 QTY OVERRIDES — hard constraints layered on top of
+    // the derived placements above. For every (pn, iso) in the
+    // week's persisted qtyOverride map: REPLACE any placed qty
+    // for that pn this week with the override amount (0 = build
+    // nothing). An override on a pn the sim didn't schedule
+    // this week adds that build. onHand is corrected in both
+    // directions (subtract any run we erase, add the override)
+    // so the burn step, onHandTimeline, warning-row builder,
+    // and the scorer all flow from the overridden values.
+    //
+    // OPTIMIZER interaction: this exact block runs INSIDE the
+    // optimizer's per-candidate _fsSimulate call, so slot picks
+    // are made knowing the overrides are fixed -- the optimizer
+    // plans around them instead of pretending they're up for
+    // grabs. See _fsOptimize header.
+    //
+    // Pre-override capture: whatever the sim was about to place
+    // is recorded in preOverrideByPnIso before we erase it. The
+    // render's tooltip on an overridden cell shows "manual
+    // override N (optimizer: X)" straight from this map.
+    const overrideMap = wk && wk.qtyOverride;
+    if (overrideMap) {
+      for (const [ovPn, ovValRaw] of Object.entries(overrideMap)) {
+        if (!scheduledRuns.has(ovPn)) continue;
+        const ovVal = Math.max(0, Math.floor(Number(ovValRaw) || 0));
+        const runs = scheduledRuns.get(ovPn);
+        let existing = 0;
+        for (let ri = runs.length - 1; ri >= 0; ri--) {
+          if (runs[ri].weekIso === iso) {
+            existing += runs[ri].qty;
+            runs.splice(ri, 1);
+          }
+        }
+        if (existing > 0) onHand.set(ovPn, (Number(onHand.get(ovPn)) || 0) - existing);
+        if (ovVal > 0) {
+          scheduledRuns.get(ovPn).push({ weekIso: iso, qty: ovVal, kind: "override" });
+          onHand.set(ovPn, (Number(onHand.get(ovPn)) || 0) + ovVal);
+        }
+        preOverrideByPnIso.set(ovPn + "|" + iso, existing);
+      }
+    }
+
     // 2. Burn workweek demand across all frames using the FLAT
     //    per-week burn (part.daily × 5) — precomputed above. This
     //    is the same number every simulated week; a scheduled rate
@@ -950,7 +1005,7 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
     if (s.resolvedPn2 && s.resolvedPn2 !== s.resolvedPn) splitCount++;
   }
 
-  return { scheduledRuns, onHandTimeline, splitCount, runCount };
+  return { scheduledRuns, onHandTimeline, splitCount, runCount, preOverrideByPnIso };
 }
 
 /* ============================================================
@@ -1792,10 +1847,15 @@ function _fsCommitWeek(iso, payload) {
   const nextQty = ("qty" in payload) ? (payload.qty || {}) : (cur.qty || {});
   const nextSlot = ("slot" in payload) ? (payload.slot || null) : (cur.slot || null);
   const nextSnap = ("onHandAtClose" in payload) ? (payload.onHandAtClose || null) : (cur.onHandAtClose || null);
+  // v5.5 qtyOverride: same preserve-on-omit semantics as slot /
+  // onHandAtClose. An explicit `null` (or empty object handled
+  // downstream in the cloud writer) clears it.
+  const nextOverride = ("qtyOverride" in payload) ? (payload.qtyOverride || null) : (cur.qtyOverride || null);
   DB.frameSchedule.weeks.set(iso, {
     qty: nextQty,
     slot: nextSlot,
     onHandAtClose: nextSnap,
+    qtyOverride: nextOverride,
     updatedAt: cur.updatedAt || null,
   });
   // The cloud writer applies the same preservation semantics —
@@ -1808,6 +1868,8 @@ function _fsCommitWeek(iso, payload) {
   else if (cur.slot) outPayload.slot = cur.slot;
   if ("onHandAtClose" in payload) outPayload.onHandAtClose = payload.onHandAtClose;
   else if (cur.onHandAtClose) outPayload.onHandAtClose = cur.onHandAtClose;
+  if ("qtyOverride" in payload) outPayload.qtyOverride = payload.qtyOverride;
+  else if (cur.qtyOverride) outPayload.qtyOverride = cur.qtyOverride;
   _fsDebouncedWriteWeek(iso, outPayload);
 }
 
@@ -2472,12 +2534,22 @@ function renderFrameSchedule() {
             q += rn.qty;
             // If any run is a "run" (non-filler), the cell reads
             // as a run; only pure-filler placements read as drop-
-            // in (kind stays "filler").
-            kind = (rn.kind === "run") ? "run" : (kind || rn.kind);
+            // in (kind stays "filler"). v5.5: kind "override"
+            // reads as a run for coloring purposes.
+            if (rn.kind === "run" || rn.kind === "override") kind = "run";
+            else if (!kind) kind = rn.kind;
           }
         }
       }
       total += q;
+      // v5.5 Detect manual per-cell override for this pn+week.
+      // Only current + future cells can carry an override edit --
+      // past cells stay owned by the receipt-history panel's
+      // click-to-backfill (js/25 v5.3 handler).
+      const overrideVal = (!c.past && wk.qtyOverride && Object.prototype.hasOwnProperty.call(wk.qtyOverride, r.pn))
+        ? Math.max(0, Math.floor(Number(wk.qtyOverride[r.pn]) || 0))
+        : null;
+      const isOverridden = overrideVal !== null;
       // Same-pool amber flag: 2+ frames of THIS row's pool have
       // nonzero placements in this week, AND this cell is nonzero.
       const counts = poolCountByIso.get(c.iso) || { crewhd: 0, std: 0 };
@@ -2486,11 +2558,19 @@ function renderFrameSchedule() {
       let cls = "";
       if (kind === "filler") cls = " fs-filler";
       else if (q > 0) cls = " fs-run";
+      if (isOverridden) cls += " fs-override";
 
       // Rich tooltip (item 6). Rebuilds for every nonzero cell so
       // it stays in sync with the current sim's numbers.
       let title = "";
-      if (q > 0) {
+      if (isOverridden) {
+        // v5.5 Override tooltip: name the manual value, the
+        // pre-override sim value, and how to change / clear.
+        const preOv = simResult.preOverrideByPnIso && simResult.preOverrideByPnIso.has(r.pn + "|" + c.iso)
+          ? Number(simResult.preOverrideByPnIso.get(r.pn + "|" + c.iso))
+          : 0;
+        title = ` title="${esc(`manual override ${overrideVal} (optimizer: ${preOv}) -- click to change, blank to clear`)}"`;
+      } else if (q > 0) {
         const cap = r.pool === "crewhd" ? (globalCaps.crewhd || 0) : (globalCaps.std || 0);
         const endOh = endOhByPnWeek.has(r.pn + "|" + c.iso)
           ? Math.round(Number(endOhByPnWeek.get(r.pn + "|" + c.iso)))
@@ -2504,9 +2584,28 @@ function renderFrameSchedule() {
         title = ` title="${esc(`${r.pn} · wk ${c.iso} · ${kindLabel} ${q}${capNote}${eohNote}${amberNote}`)}"`;
       } else if (amber) {
         title = ` title="Two ${_fsPoolLabel(r.pool)} frames scheduled this week — soft flag, doesn't block."`;
+      } else if (!c.past) {
+        // Empty non-past cell -- still clickable for override,
+        // just no rich content to explain.
+        title = ` title="Click to set a manual qty override for this week (blank clears)."`;
       }
-      const amberStyle = amber ? ` style="background:rgba(255,181,71,0.22);"` : "";
-      return `<td class="right num mono${cls}${dim}"${amberStyle}${title}>${q || ""}</td>`;
+      // v5.5 Grid-cell click handler for current+future cols.
+      // Past cols stay owned by the receipt-history backfill.
+      const clickAttr = c.past
+        ? ""
+        : ` onclick="_fsHandleQtyOverride('${esc(r.pn)}','${esc(c.iso)}',event)"`;
+      const cursorStyle = c.past ? "" : "cursor:pointer;";
+      const bgStyle = amber ? "background:rgba(255,181,71,0.22);" : "";
+      const styleParts = cursorStyle + bgStyle;
+      const styleAttr = styleParts ? ` style="${styleParts}"` : "";
+      // v5.5 Corner "M" marker on overridden cells. Sim already
+      // placed overrideVal so `q` matches; render the number
+      // followed by the corner.
+      const cornerMarker = isOverridden
+        ? `<span class="fs-cell-corner fs-corner-override" aria-label="manual override">M</span>`
+        : "";
+      const numText = q > 0 ? String(q) : (isOverridden ? "0" : "");
+      return `<td class="right num mono${cls}${dim}"${styleAttr}${title}${clickAttr}>${numText}${cornerMarker}</td>`;
     }).join("");
     const poolTag = r.pool === "crewhd"
       ? `<span class="pill info tiny" style="margin-left:6px">CREW/HD</span>`
@@ -3328,8 +3427,26 @@ function renderFrameSchedule() {
          truncates the visible text so full labels stay in title. */
       .fs-slot-text { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px; }
       .fs-slot-pills { display:block; white-space:nowrap; overflow:hidden; margin-top:1px; min-height:14px; }
-      .fs-run { background: rgba(80,180,120,0.22); font-weight: 600; }
-      .fs-filler { background: rgba(80,180,120,0.08); font-style: italic; }
+      .fs-run { background: rgba(80,180,120,0.22); font-weight: 600; position: relative; }
+      .fs-filler { background: rgba(80,180,120,0.08); font-style: italic; position: relative; }
+      /* v5.5 Manual per-cell qty override -- outline + "M"
+         corner marker so the operator sees at a glance which
+         cells they've pinned. Rendered on top of whatever
+         fs-run / fs-filler background the cell would otherwise
+         carry, so an override on a run week stays green with a
+         blue outline; an override on an empty week (build 0)
+         shows just the outline + a "0" primary. */
+      .fs-override { position: relative; outline: 1px solid var(--info, #6ab0ff); outline-offset: -1px; }
+      .fs-corner-override {
+        position: absolute;
+        top: 1px;
+        left: 3px;
+        font-size: 9px;
+        font-weight: 700;
+        color: var(--info, #6ab0ff);
+        letter-spacing: 0.02em;
+        line-height: 1;
+      }
       .fs-tbl td, .fs-tbl th { white-space: nowrap; }
       /* Receipt-status color palette — reused by the Receipt History
          panel below. Grid cells no longer carry these classes; the
@@ -4200,6 +4317,131 @@ function _fsDownloadHistoryCsv() {
       console.warn("[frame-sched] receipt history CSV export failed", err);
     }
   }
+}
+
+/* ============================================================
+   v5.5 MANUAL PER-CELL QTY OVERRIDES
+
+   Overrides are HARD CONSTRAINTS the optimizer plans AROUND --
+   not decoration on the render.
+
+   Storage: DB.frameSchedule.weeks[iso].qtyOverride = {pn: units}
+   with non-negative integer values. Persisted alongside the row's
+   qty / slot / onHandAtClose via _fsCommitWeek + js/30's
+   setFrameScheduleWeekCloud (preserve-on-omit; see js/30 v5.5).
+
+   Sim integration: at the end of each week's placement step in
+   _fsSimulate, every entry in that week's qtyOverride map
+   REPLACES any placed qty for that pn (including with 0 =
+   "build nothing"). Empty-week overrides ADD the build. onHand
+   is corrected in both directions so the SAME override flows
+   through the burn step, onHandTimeline, warning-row builder,
+   the scorer's stockout / min-cover / cover math, and every
+   candidate the optimizer evaluates. Since overrides live on
+   the mirror and the mirror is read at the top of every sim,
+   slot picks are made KNOWING the overrides are fixed.
+
+   Render: overridden cells show the override number with a
+   corner "M" marker and a tooltip naming the pre-override
+   ("optimizer") qty captured during the sim. Row totals,
+   _fsBuildWeekPayload's persisted qty, the supplier snapshot
+   HTML, and _fsGridKey all read from scheduledRuns (which
+   already reflects overrides), so no separate plumbing.
+
+   Handler: _fsHandleQtyOverride below. Click a current/future
+   grid cell -> gateEdit -> prompt -> persist. Past cols stay
+   owned by the receipt-history backfill (js/25 v5.3).
+   ============================================================ */
+
+// v5.5 Manual per-cell qty override for current + future grid
+// cells. See the doc block above for the full contract.
+//
+// Prompt UX: pre-fill with the currently-displayed number
+// (existing override wins over the sim-placed qty). Non-negative
+// integer sets the override (0 = build nothing that week);
+// blank clears the override back to the optimizer; Cancel
+// aborts. gateEdit fires the PIN prompt first.
+function _fsHandleQtyOverride(pn, iso, evt) {
+  if (evt && typeof evt.stopPropagation === "function") evt.stopPropagation();
+  if (!pn || !iso) return;
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+  if (FRAME_PNS.indexOf(pn) < 0) return;
+
+  // Past cols are OFF-LIMITS: they belong to the receipt-history
+  // backfill handler. Compute the current Monday and refuse
+  // anything strictly earlier.
+  const cols = _fsColumns();
+  const currentCol = cols.find(c => c.current) || null;
+  const currentMondayIso = currentCol
+    ? currentCol.iso
+    : _fsIsoMonday((typeof mondayOfWeek === "function") ? mondayOfWeek(new Date()) : new Date());
+  if (iso < currentMondayIso) return;
+
+  const wk = _fsWeekData(iso);
+  const ovMap = wk && wk.qtyOverride ? wk.qtyOverride : null;
+  const hadOverride = !!(ovMap && Object.prototype.hasOwnProperty.call(ovMap, pn));
+  const curOv = hadOverride ? Number(ovMap[pn]) : null;
+
+  // Pre-fill: current override if set, else the displayed sim
+  // qty (from wk.qty which is persisted by _fsBuildWeekPayload
+  // off scheduledRuns each render).
+  const curPlaced = Number(wk.qty && wk.qty[pn]) || 0;
+  const promptDefault = hadOverride ? String(curOv) : (curPlaced > 0 ? String(curPlaced) : "");
+  const raw = (typeof window !== "undefined" && typeof window.prompt === "function")
+    ? window.prompt(
+        `Manual qty override for ${pn} · ${_fsMdLongFromIso(iso)}\n\n` +
+        `Enter a non-negative integer to fix this week's build (0 = build nothing).\n` +
+        `Blank clears the override back to the optimizer.\n` +
+        `Cancel aborts.`,
+        promptDefault
+      )
+    : null;
+  if (raw === null) return;
+  const trimmed = String(raw).trim();
+  let newVal = null;
+  let clearing = false;
+  if (trimmed === "") {
+    clearing = true;
+  } else {
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      if (typeof showToast === "function") {
+        showToast("Enter a non-negative integer", "warn");
+      }
+      return;
+    }
+    newVal = parsed;
+  }
+
+  // Merge into a fresh override map: copy every other pn (drop
+  // stale non-numeric entries defensively), then set/drop this
+  // pn. Empty result becomes null so js/30 stores the row
+  // without a qtyOverride field.
+  const nextMap = {};
+  if (ovMap) {
+    for (const [k, v] of Object.entries(ovMap)) {
+      if (k === pn) continue;
+      const nv = Math.floor(Number(v));
+      if (Number.isFinite(nv) && nv >= 0) nextMap[k] = nv;
+    }
+  }
+  if (!clearing) nextMap[pn] = newVal;
+  const payloadOverride = Object.keys(nextMap).length > 0 ? nextMap : null;
+
+  _fsCommitWeek(iso, { qtyOverride: payloadOverride });
+  if (typeof logAudit === "function") {
+    const desc = clearing
+      ? `Frame schedule override cleared: ${pn} · ${iso}` + (hadOverride ? ` (was ${curOv})` : "")
+      : `Frame schedule override: ${pn} · ${iso} = ${newVal}` + (hadOverride ? ` (was ${curOv})` : "");
+    logAudit("frame-sched-override-qty", desc, {
+      pn,
+      weekIso: iso,
+      value: newVal,
+      cleared: clearing,
+      prev: hadOverride ? curOv : null,
+    });
+  }
+  renderFrameSchedule();
 }
 
 // Manual slot override. pn === "" clears the override and lets

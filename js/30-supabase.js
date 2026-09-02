@@ -977,10 +977,25 @@ function _populateFrameScheduleFromRows(rows) {
         if (Number.isFinite(n)) onHandAtClose[k] = n;
       }
     }
+    // v5.5 qtyOverride = {pn: units} manual per-cell qty
+    // constraints. Non-negative integers only; empties dropped.
+    // Read here so the sim (which honors overrides as hard
+    // constraints) sees them on the next render. Absent /
+    // legacy rows read as null.
+    let qtyOverride = null;
+    if (d.qtyOverride && typeof d.qtyOverride === "object") {
+      qtyOverride = {};
+      for (const [k, v] of Object.entries(d.qtyOverride)) {
+        const n = Math.floor(Number(v));
+        if (Number.isFinite(n) && n >= 0) qtyOverride[k] = n;
+      }
+      if (Object.keys(qtyOverride).length === 0) qtyOverride = null;
+    }
     DB.frameSchedule.weeks.set(key, {
       qty: (d.qty && typeof d.qty === "object") ? d.qty : {},
       slot,
       onHandAtClose,
+      qtyOverride,
       updatedAt: row.updated_at || null,
     });
   }
@@ -1044,18 +1059,40 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
     }
     if (Object.keys(onHandAtClose).length === 0) onHandAtClose = null;
   }
-  const nowIso = new Date().toISOString();
+  // v5.5 qtyOverride = {pn: units} manual constraints. Written
+  // when the payload names the field; preserved on omission
+  // (same shape as onHandAtClose). A payload with an empty
+  // object or explicit null CLEARS the override map -- distinct
+  // from omitting the field entirely, which preserves prior.
   const prev = DB.frameSchedule.weeks.get(key);
+  let qtyOverride;   // undefined = preserve prior
+  if (payload && Object.prototype.hasOwnProperty.call(payload, "qtyOverride")) {
+    if (payload.qtyOverride && typeof payload.qtyOverride === "object") {
+      const sanitized = {};
+      for (const [k, v] of Object.entries(payload.qtyOverride)) {
+        const n = Math.floor(Number(v));
+        if (Number.isFinite(n) && n >= 0) sanitized[k] = n;
+      }
+      qtyOverride = Object.keys(sanitized).length > 0 ? sanitized : null;
+    } else {
+      qtyOverride = null;   // explicit clear
+    }
+  } else {
+    qtyOverride = (prev && prev.qtyOverride) || null;
+  }
+  const nowIso = new Date().toISOString();
   DB.frameSchedule.weeks.set(key, {
     qty,
     slot,
     onHandAtClose: onHandAtClose || (prev && prev.onHandAtClose) || null,
+    qtyOverride,
     updatedAt: nowIso,
   });
   const dataPayload = { qty };
   if (slot) dataPayload.slot = slot;
   if (onHandAtClose) dataPayload.onHandAtClose = onHandAtClose;
   else if (prev && prev.onHandAtClose) dataPayload.onHandAtClose = prev.onHandAtClose;
+  if (qtyOverride) dataPayload.qtyOverride = qtyOverride;
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(
