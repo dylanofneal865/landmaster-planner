@@ -138,6 +138,12 @@ const FRAMESCHED_STATE = {
   // Track slot startIsos already auto-persisted this session so
   // we don't fire redundant crossing writes on subsequent renders.
   _autoPersistedSlots: new Set(),
+  // v7.1 Same idea for the weekly-mode near-term persister --
+  // once a week has been auto-persisted this session (or the
+  // persister confirmed a prior weekly pin), don't re-scan it.
+  // Weekly pin toggles clear the corresponding entry so the
+  // persister can re-fire cleanly.
+  _autoPersistedWeeklyIsos: new Set(),
   // Receipt History panel: which slice of the full-archive history
   // to render. "8" | "26" | "all"; default 26. In-memory only —
   // reverts on reload, which is fine (a display preference, not a
@@ -653,10 +659,16 @@ function _fsBuildSlots(cols) {
       // Slot info is persisted on the START week (see write path);
       // fall back to the SECOND week if only that is stored (LWW
       // race safety).
+      // v7.1 SKIP mode="weekly" rows -- those are per-week pins
+      // from the weekly-cover scheduler and don't belong to a
+      // 2-week slot bucket. _fsSimulateWeekly picks them up via
+      // its own pinByIso pass off the mirror.
       const wk1 = _fsWeekData(s.weekIsos[0]);
       const wk2 = _fsWeekData(s.weekIsos[1]);
-      const persistedSlot = (wk1.slot && wk1.slot.pn) ? wk1.slot
-                          : (wk2.slot && wk2.slot.pn) ? wk2.slot
+      const wk1SlotEligible = wk1.slot && wk1.slot.pn && wk1.slot.mode !== "weekly";
+      const wk2SlotEligible = wk2.slot && wk2.slot.pn && wk2.slot.mode !== "weekly";
+      const persistedSlot = wk1SlotEligible ? wk1.slot
+                          : wk2SlotEligible ? wk2.slot
                           : null;
       if (persistedSlot) {
         s.persistedPn = persistedSlot.pn;
@@ -1158,10 +1170,17 @@ function _fsSimulateWeekly(rows, cols, slots, globalCaps, rateByPn) {
   const bufferWeeksLocal = _fsSettingsBufferWeeks();
   let runCount = 0;
 
-  // Per-week pin map: legacy locked 2-week slots pin both of
-  // their weeks (week 2 to resolvedPn2 when the slot is a
-  // split). New weekly-mode single-week pins would slot into
-  // the same map -- see the doc block above.
+  // Per-week pin map. Two sources feed into it:
+  //   1. Legacy locked 2-week slots (both weeks pinned; week 2
+  //      to resolvedPn2 for splits). These slots have already
+  //      been filtered to mode !== "weekly" by _fsBuildSlots.
+  //   2. v7.1 weekly-mode per-week pins from persisted rows
+  //      whose slot.mode === "weekly". Two flavors:
+  //         source === "weekly-auto"  -- the near-term
+  //           auto-persist stabilizes the plan.
+  //         source === "manual"       -- the operator hand-
+  //           pinned this week (locked pill in the strip).
+  //      Both act as fixed facts here; the greedy skips them.
   const pinByIso = new Map();
   if (Array.isArray(slots)) {
     for (const s of slots) {
@@ -1176,6 +1195,24 @@ function _fsSimulateWeekly(rows, cols, slots, globalCaps, rateByPn) {
           fromSlot: true,
         });
       }
+    }
+  }
+  if (DB && DB.frameSchedule && DB.frameSchedule.weeks instanceof Map) {
+    for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+      if (iso === "__settings__") continue;
+      const slot = wk && wk.slot;
+      if (!slot || !slot.pn || slot.mode !== "weekly") continue;
+      // A legacy 2-week pin for the same iso already added above
+      // wins by "first placed" (legacy locks are more explicit
+      // than a weekly-auto persist), so only fill in when the
+      // slot slot doesn't already have this iso.
+      if (pinByIso.has(iso)) continue;
+      pinByIso.set(iso, {
+        pn: slot.pn,
+        source: slot.source || "weekly-auto",
+        locked: !!slot.locked,
+        fromWeeklyPin: true,
+      });
     }
   }
 
@@ -2495,6 +2532,125 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
   }
 }
 
+// v7.1 WEEKLY MODE near-term auto-persist. Mirrors the slot-mode
+// _fsPersistLockedCrossings guards: skip when the sim is
+// degenerate (no caps or no runs), skip when the mirror hasn't
+// hydrated yet, never touch manual or legacy locked rows, only
+// write inside the visible-render iso set, and dedupe per session
+// so a burst of re-renders doesn't churn the row.
+//
+// What gets persisted, per week within LOCK_HORIZON_DAYS of
+// today:
+//   * If the week already carries a manual / seed / weekly-manual
+//     slot, LEAVE IT ALONE.
+//   * If the week already carries a legacy 2-week locked slot,
+//     LEAVE IT ALONE (slot mode's persister owns those rows).
+//   * If the week already carries a weekly-auto slot whose pn
+//     matches the sim's current pick, LEAVE IT ALONE.
+//   * If the week already carries a weekly-auto slot with a
+//     DIFFERENT pn, still leave it alone -- the pin is
+//     honored by _fsSimulateWeekly; a mismatch means the
+//     mirror hydrated after this session started. The stale-
+//     pick flag (see _fsFindStaleWeeklyPicks) will surface
+//     that visually so the operator can decide.
+//   * Otherwise (no slot descriptor), write { pn, mode:
+//     "weekly", locked: false, source: "weekly-auto" } with
+//     the week's per-frame qty from scheduledRuns. Idle weeks
+//     (no placements) are skipped -- their absence naturally
+//     reads as "no schedule this week".
+function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visibleIsoSet) {
+  // Mirror the slot persister's guards.
+  if (!(DB && DB.frameSchedule && DB.frameSchedule.loaded)) return;
+  if (_fsSimIsDegenerate({ scheduledRuns }, globalCaps)) {
+    if (typeof console !== "undefined") {
+      console.warn("[frame-sched] weekly persistence suspended: caps missing/zero or no runs placed");
+    }
+    return;
+  }
+  const visibleIsos = visibleIsoSet || new Set(cols.map(c => c.iso));
+
+  // Horizon = current week + LOCK_HORIZON_DAYS out. Compute
+  // both endpoints from the col row so the persister lands on
+  // the same Monday-normalized ISOs the sim / render use.
+  const currentCol = cols.find(c => c.current) || null;
+  if (!currentCol) return;
+  const horizonEnd = (typeof addDays === "function")
+    ? addDays(currentCol.date, LOCK_HORIZON_DAYS)
+    : new Date(currentCol.date.getTime() + LOCK_HORIZON_DAYS * 86400000);
+  const horizonEndIso = _fsIsoMonday(horizonEnd);
+
+  for (const c of cols) {
+    if (c.past) continue;
+    if (c.iso > horizonEndIso) continue;
+    if (!visibleIsos.has(c.iso)) continue;
+    if (FRAMESCHED_STATE._autoPersistedWeeklyIsos.has(c.iso)) continue;
+
+    const wk = _fsWeekData(c.iso);
+    const existing = wk && wk.slot;
+    if (existing && existing.pn) {
+      // Rule: never overwrite manual / seed / legacy-locked
+      // rows, and never overwrite another weekly-auto row
+      // (mismatches are surfaced by _fsFindStaleWeeklyPicks).
+      if (existing.source === "manual" || existing.source === "seed") continue;
+      if (existing.mode !== "weekly" && existing.locked) continue;
+      if (existing.mode === "weekly") {
+        // Weekly pin already present -- respected verbatim.
+        // Mark the session set so we don't scan this iso again.
+        FRAMESCHED_STATE._autoPersistedWeeklyIsos.add(c.iso);
+        continue;
+      }
+      // Legacy 2-week slot rows without lock (rare) -- leave
+      // alone; slot mode's persister may still touch them.
+      continue;
+    }
+
+    // Determine the week's primary run pn: pick the largest
+    // placement (run kind wins ties). Idle weeks (no
+    // placements) are skipped -- no slot marker to write.
+    let primaryPn = null;
+    let primaryQty = 0;
+    let primaryKindRun = false;
+    const qtyOut = {};
+    for (const r of rows) {
+      const runs = scheduledRuns.get(r.pn) || [];
+      for (const rn of runs) {
+        if (rn.weekIso !== c.iso) continue;
+        if (!(rn.qty > 0)) continue;
+        qtyOut[r.pn] = (qtyOut[r.pn] || 0) + rn.qty;
+        const isRun = rn.kind === "run";
+        if (!primaryPn
+            || (isRun && !primaryKindRun)
+            || (rn.qty > primaryQty && (isRun || !primaryKindRun))) {
+          primaryPn = r.pn;
+          primaryQty = rn.qty;
+          primaryKindRun = isRun;
+        }
+      }
+    }
+    if (!primaryPn) continue;   // idle week
+
+    _fsCommitWeek(c.iso, {
+      qty: qtyOut,
+      slot: { pn: primaryPn, mode: "weekly", locked: false, source: "weekly-auto" },
+    });
+    FRAMESCHED_STATE._autoPersistedWeeklyIsos.add(c.iso);
+  }
+
+  // Snapshot on-hand for the current week (parity with the
+  // slot persister). Cheap; idempotent across re-renders.
+  const snap = {};
+  for (const r of rows) snap[r.pn] = Number(r.onHand) || 0;
+  _fsCommitWeek(currentCol.iso, { onHandAtClose: snap });
+}
+
+// v7.1 Stale WEEKLY PIN detection is inlined in the weekly
+// band-cell render (walk scheduledRuns for per-week crew+std
+// sums, compare to _fsWeekEnvelopeStatus, check onHandTimeline
+// for the pinned frame's end-of-week on-hand). Kept there
+// because the render already needs those per-iso sums for the
+// grid's red-outline flag and it avoids a second pass over
+// the same data. Never auto-unpins -- the operator decides.
+
 // Threshold (stockout-units delta) above which a LOCKED
 // auto/seed slot's persisted pn is considered materially worse
 // than the alternative the optimizer would pick if the slot were
@@ -2792,11 +2948,45 @@ function renderFrameSchedule() {
   // coalescing entirely -- emit one cell per column showing
   // the greedy pick for that week (frame short name, "idle",
   // or "run + filler" when a crew/HD week dropped std in).
-  // Slot-locked weeks still get a "locked" pill; splits
-  // display as their per-week pn since a weekly-mode
-  // scheduler has no whole-run stash.
+  //
+  // v7.1 Pin pill states:
+  //   locked (manual)     -- operator explicitly pinned this
+  //                          week. Clears on click.
+  //   auto (weekly-auto)  -- persisted stable near-term pick.
+  //                          Click promotes to manual pin.
+  //   (no pill)           -- outside the horizon or not yet
+  //                          persisted (waits for the next
+  //                          render's persister).
+  //   stale               -- pinned but no longer feasible
+  //                          (envelope over OR frame stocks
+  //                          out anyway). Never auto-unpins.
   const bandCells = [];
   if (scheduleMode === "weekly") {
+    // Precompute per-week envelope status + stockout look-up
+    // for the stale-pick flag. Both walk the same
+    // scheduledRuns + onHandTimeline the render's later
+    // sections use, so this is a small, local mirror.
+    const weeklyBandEnv = new Map();
+    for (const c of cols) {
+      let crewhdSum = 0;
+      let stdSum = 0;
+      for (const r of rows) {
+        const runs = scheduledRuns.get(r.pn) || [];
+        for (const rn of runs) {
+          if (rn.weekIso !== c.iso) continue;
+          if (!(rn.qty > 0)) continue;
+          if (r.pool === "crewhd") crewhdSum += rn.qty;
+          else if (r.pool === "std") stdSum += rn.qty;
+        }
+      }
+      weeklyBandEnv.set(c.iso, _fsWeekEnvelopeStatus(crewhdSum, stdSum, globalCaps));
+    }
+    const weeklyBandEoh = new Map();
+    if (simResult && simResult.onHandTimeline instanceof Map) {
+      for (const [pn, tl] of simResult.onHandTimeline.entries()) {
+        for (const e of tl) weeklyBandEoh.set(pn + "|" + e.iso, e.endOh);
+      }
+    }
     for (let wi = 0; wi < cols.length; wi++) {
       const c = cols[wi];
       // Collect placements for this week: primary "run" pn (or
@@ -2821,8 +3011,30 @@ function renderFrameSchedule() {
           }
         }
       }
-      const slotPeek = weekToSlot.get(c.iso);
-      const pinnedLocked = !!(slotPeek && slotPeek.locked);
+      // Peek at persisted slot for pin state. Legacy slot lock
+      // wins over weekly-mode pin classification.
+      const persistedSlotHere = _fsWeekData(c.iso).slot;
+      const isWeeklyManualPin = !!(persistedSlotHere
+        && persistedSlotHere.mode === "weekly"
+        && persistedSlotHere.source === "manual"
+        && persistedSlotHere.locked);
+      const isWeeklyAutoPin = !!(persistedSlotHere
+        && persistedSlotHere.mode === "weekly"
+        && persistedSlotHere.source === "weekly-auto");
+      const legacySlotPeek = weekToSlot.get(c.iso);
+      const legacyLocked = !!(legacySlotPeek && legacySlotPeek.locked);
+      // Stale-pick detection (envelope over OR pinned frame
+      // stocks out anyway). Only meaningful for pinned weeks.
+      let staleReason = null;
+      if ((isWeeklyManualPin || isWeeklyAutoPin) && persistedSlotHere) {
+        const env = weeklyBandEnv.get(c.iso);
+        if (env && env.over) {
+          staleReason = "envelope over";
+        } else {
+          const eoh = weeklyBandEoh.get(persistedSlotHere.pn + "|" + c.iso);
+          if (Number.isFinite(eoh) && eoh < 0) staleReason = "stockout";
+        }
+      }
       let text;
       let pills = "";
       if (!hasBuild) {
@@ -2847,8 +3059,15 @@ function renderFrameSchedule() {
       } else {
         text = `<span class="muted tiny">&mdash;</span>`;
       }
-      if (pinnedLocked) {
+      if (legacyLocked) {
         pills += `<span class="pill info tiny" style="letter-spacing:0.06em">locked</span>`;
+      } else if (isWeeklyManualPin) {
+        pills += `<span class="pill info tiny" style="letter-spacing:0.06em" title="Manually pinned -- click to unpin">pinned</span>`;
+      } else if (isWeeklyAutoPin) {
+        pills += `<span class="pill muted tiny" style="letter-spacing:0.06em;opacity:0.7" title="Weekly-auto pin (stabilizes the near-term plan) -- click to promote to a manual pin">auto</span>`;
+      }
+      if (staleReason) {
+        pills += `<span class="pill warn tiny" style="margin-left:4px;letter-spacing:0.06em" title="Pinned pick no longer feasible (${esc(staleReason)}) -- click cell to unpin and let the greedy re-decide">&#9888; stale</span>`;
       }
       const titleParts = [];
       if (hasBuild) {
@@ -2857,9 +3076,23 @@ function renderFrameSchedule() {
       } else {
         titleParts.push("idle -- no build this week");
       }
-      if (pinnedLocked && slotPeek) titleParts.push(`locked slot (from ${slotPeek.startIso})`);
+      if (legacyLocked && legacySlotPeek) titleParts.push(`legacy locked slot (from ${legacySlotPeek.startIso})`);
+      else if (isWeeklyManualPin) titleParts.push(`weekly pin: ${persistedSlotHere.pn} (manual)`);
+      else if (isWeeklyAutoPin) titleParts.push(`weekly-auto: ${persistedSlotHere.pn}`);
+      if (staleReason) titleParts.push(`STALE: ${staleReason}`);
+      titleParts.push("click to toggle pin");
       const bandTitle = titleParts.join(" -- ");
-      bandCells.push(`<th class="fs-slot-band" title="${esc(bandTitle)}">
+      // The click handler pins the CURRENT rendered pn (runPn
+      // when present, else fillerPn). Legacy-locked weeks are
+      // click-inert -- refuse rather than mis-target the wrong
+      // row -- the handler itself also refuses.
+      const clickPn = runPn || fillerPn || "";
+      const clickAttr = legacyLocked
+        ? ""
+        : ` onclick="_fsHandleWeeklyPin('${esc(c.iso)}','${esc(clickPn)}',event)"`;
+      const cursorStyle = legacyLocked ? "" : "cursor:pointer;";
+      const styleAttr = cursorStyle ? ` style="${cursorStyle}"` : "";
+      bandCells.push(`<th class="fs-slot-band" title="${esc(bandTitle)}"${styleAttr}${clickAttr}>
         <div class="fs-slot-text">${text}</div>
         <div class="fs-slot-pills">${pills}</div>
       </th>`);
@@ -4285,14 +4518,24 @@ function renderFrameSchedule() {
   // because this call is IMMEDIATELY after _fsOptimize in the same
   // render tick — the gate accepts local ties in that context.
   //
-  // v7 Weekly mode skips this. The persister is designed around
-  // 2-week slot pn assignments and _fsIsOptimalPickForSlot's
-  // "swap this slot's pn under the current optimizer state"
-  // test, both of which are slot-optimizer concepts. Existing
-  // legacy locked slots stay locked (their persisted rows are
-  // untouched); auto-persistence of new crossings is a follow-
-  // up along with weekly-mode single-week pinning.
-  if (scheduleMode !== "weekly") {
+  // v7 Weekly mode skips the slot persister -- that helper is
+  // designed around 2-week slot pn assignments and
+  // _fsIsOptimalPickForSlot's "swap this slot's pn under the
+  // current optimizer state" test, both slot-optimizer concepts.
+  // Existing legacy locked slots stay locked (their persisted
+  // rows are untouched).
+  //
+  // v7.1 Weekly mode has its own persister -- _fsPersistWeeklyNearTerm
+  // writes { pn, mode: "weekly", locked: false, source:
+  // "weekly-auto" } for every un-pinned week inside the 42-day
+  // lock horizon. On the NEXT render, _fsSimulateWeekly picks
+  // those rows up via pinByIso and honors them as fixed facts,
+  // stabilizing the near-term plan across renders. The
+  // Receipt-history panel reads the persisted qty on the same
+  // rows once the week rolls into "past".
+  if (scheduleMode === "weekly") {
+    _fsPersistWeeklyNearTerm(rows, simCols, scheduledRuns, globalCaps, visibleStartIsos);
+  } else {
     _fsPersistLockedCrossings(slots, simCols, scheduledRuns, rows, globalCaps, /* jointWinner */ true, visibleStartIsos, rateByPn);
   }
 
@@ -5161,6 +5404,70 @@ function _fsHandleQtyOverride(pn, iso, evt) {
 // values force the slot's pn and mark it source="manual".
 // Persists BOTH weeks of the slot with the same slot info on the
 // start week, computed qty on both.
+// v7.1 Toggle a WEEKLY PIN. Called from the weekly-mode band
+// cell's onclick. Three cases:
+//   1. Currently NO slot descriptor (or a weekly-auto one) --
+//      pin as { pn, mode: "weekly", locked: true,
+//      source: "manual" }. Operator's explicit "keep this
+//      week's plan even if cover picture changes".
+//   2. Currently a MANUALLY pinned weekly week -- unpin by
+//      clearing the slot descriptor. Next render's weekly-auto
+//      persister writes a fresh weekly-auto marker based on
+//      the greedy pick.
+//   3. Currently a legacy 2-week locked slot -- refuse (slot
+//      mode owns that row; the operator can switch to slots
+//      mode to edit).
+// Reuses gateEdit and the audit pattern; the session-set
+// entry for the toggled iso is cleared so the persister can
+// re-fire cleanly next render.
+function _fsHandleWeeklyPin(iso, pn, evt) {
+  if (evt && typeof evt.stopPropagation === "function") evt.stopPropagation();
+  if (!iso) return;
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+
+  const wk = _fsWeekData(iso);
+  const cur = wk && wk.slot;
+  const legacyLocked = !!(cur && cur.pn && cur.mode !== "weekly" && cur.locked);
+  if (legacyLocked) {
+    if (typeof showToast === "function") {
+      showToast("Legacy 2-week locked slot -- switch to slots mode to edit", "warn");
+    }
+    return;
+  }
+  const manuallyPinned = !!(cur && cur.mode === "weekly" && cur.source === "manual" && cur.locked);
+  const nowIso = new Date().toISOString();
+  void nowIso;   // reserved for future audit payloads
+
+  if (manuallyPinned) {
+    _fsCommitWeek(iso, { slot: null });
+    FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
+    if (typeof logAudit === "function") {
+      logAudit("frame-sched-weekly-pin",
+        `Frame schedule weekly pin cleared: ${iso}` + (cur ? ` (was ${cur.pn})` : ""),
+        { weekIso: iso, action: "clear", prev: cur ? cur.pn : null });
+    }
+    if (typeof showToast === "function") showToast(`Weekly pin cleared for ${_fsMdFromIso(iso)}`, "ok");
+  } else {
+    if (!pn || FRAME_PNS.indexOf(pn) < 0) {
+      if (typeof showToast === "function") {
+        showToast("Nothing to pin -- this week is idle. Manual qty override sets the build.", "warn");
+      }
+      return;
+    }
+    _fsCommitWeek(iso, {
+      slot: { pn, mode: "weekly", locked: true, source: "manual" },
+    });
+    FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
+    if (typeof logAudit === "function") {
+      logAudit("frame-sched-weekly-pin",
+        `Frame schedule weekly pin: ${iso} = ${pn}`,
+        { weekIso: iso, action: "pin", pn });
+    }
+    if (typeof showToast === "function") showToast(`Weekly pin set: ${_fsMdFromIso(iso)} = ${pn}`, "ok");
+  }
+  renderFrameSchedule();
+}
+
 function _fsHandleSlotOverride(startIso, pn, pn2) {
   if (typeof gateEdit === "function" && !gateEdit()) return;
   if (pn && FRAME_PNS.indexOf(pn) < 0) return;

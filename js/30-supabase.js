@@ -967,7 +967,16 @@ function _populateFrameScheduleFromRows(rows) {
           // pn2 continue to read as whole runs.
           pn2: (typeof d.slot.pn2 === "string" && d.slot.pn2) ? d.slot.pn2 : null,
           locked: !!d.slot.locked,
-          source: (d.slot.source === "manual" || d.slot.source === "seed") ? d.slot.source : "auto",
+          // v7.1 source accepts "weekly-auto" alongside the
+          // legacy set. Anything else falls back to "auto"
+          // so unknown values from a future writer read safely.
+          source: (d.slot.source === "manual" || d.slot.source === "seed" || d.slot.source === "weekly-auto")
+                    ? d.slot.source : "auto",
+          // v7.1 mode: "weekly" marks a single-week pin from the
+          // weekly-cover scheduler (persisted per-week, not
+          // spread across a 2-week slot). Absent / anything else
+          // reads as the legacy 2-week slot mode.
+          mode: d.slot.mode === "weekly" ? "weekly" : null,
         }
       : null;
     // v4.1: onHandAtClose = {pn: units, ...} snapshot of each
@@ -1043,7 +1052,11 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
     slot = {
       pn: String(payload.slot.pn),
       locked: !!payload.slot.locked,
-      source: (payload.slot.source === "manual" || payload.slot.source === "seed") ? payload.slot.source : "auto",
+      // v7.1 source accepts "weekly-auto" from the weekly
+      // scheduler's per-week auto-persist, alongside the legacy
+      // "manual"/"seed" set. Unknown values default to "auto".
+      source: (payload.slot.source === "manual" || payload.slot.source === "seed" || payload.slot.source === "weekly-auto")
+                ? payload.slot.source : "auto",
     };
     // v3.3: attach pn2 ONLY when it's a real split (present and
     // different from pn). Whole runs omit the field so old
@@ -1051,6 +1064,11 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
     if (typeof payload.slot.pn2 === "string" && payload.slot.pn2 && payload.slot.pn2 !== slot.pn) {
       slot.pn2 = payload.slot.pn2;
     }
+    // v7.1 mode: "weekly" marks a single-week pin from the
+    // weekly-cover scheduler (v7 ticket item 5). Omitted for
+    // legacy 2-week slot rows so their readers stay byte-
+    // identical to pre-v7.1 output.
+    if (payload.slot.mode === "weekly") slot.mode = "weekly";
   }
   // v4.1: onHandAtClose = {pn: units} snapshot. Coerced to
   // numbers; non-numeric entries dropped. Present or absent
