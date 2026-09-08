@@ -326,10 +326,42 @@ exports.handler = async (event) => {
   });
 
   const gridKey = FrameScheduler.gridKey(rows, renderCols, scheduledRuns, globalCaps, bufferWeeks);
+
+  // DETERMINISM SELF-TEST. Run the scheduler a SECOND time from
+  // the same loaded inputs (fresh factory, fresh slot descriptors,
+  // fresh sim result -- everything the first pass mutated is
+  // rebuilt) and assert the gridKey matches. Logs one line per
+  // run: DETERMINISM OK / DETERMINISM FAIL <gk1> vs <gk2>. A FAIL
+  // means an in-process ordering nondeterminism has crept back in
+  // (Map iteration order, unsorted tie-break, floating-point sum
+  // order); the shadow write still proceeds so the compare tool
+  // can still surface the exact per-cell diff.
+  let determinismLine;
+  try {
+    const sched2 = FrameScheduler.forContext(ctx);
+    const cols2 = sched2.simColumns();
+    const renderCols2 = sched2.renderColumns();
+    const visible2 = new Set(renderCols2.map(c => c.iso));
+    const slots2 = sched2.buildSlots(cols2);
+    const res2 = sched2.runScheduler(rows, cols2, slots2, globalCaps, visible2, rateByPn);
+    const gridKey2 = FrameScheduler.gridKey(rows, renderCols2, res2.scheduledRuns, globalCaps, bufferWeeks);
+    if (gridKey === gridKey2) {
+      determinismLine = "DETERMINISM OK";
+      log(determinismLine);
+    } else {
+      determinismLine = "DETERMINISM FAIL";
+      log(`${determinismLine} gridKey1 vs gridKey2`, { g1: gridKey, g2: gridKey2 });
+    }
+  } catch (err) {
+    determinismLine = "DETERMINISM SELF-TEST THREW";
+    log(determinismLine, err && err.message);
+  }
+
   const summary = {
     ok: true,
     inputHash,
     gridKey,
+    determinism: determinismLine,
     simFirstIso: simCols[0] ? simCols[0].iso : null,
     simLastIso: simCols[simCols.length - 1] ? simCols[simCols.length - 1].iso : null,
     weeks: simCols.length,
