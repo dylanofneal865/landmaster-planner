@@ -153,6 +153,12 @@ const FRAMESCHED_STATE = {
   // read by nothing else -- the DOM element is idempotent so
   // repeated calls are cheap.
   _writeBlockedBannerShown: false,
+  // v7.11 Server-side edit token. Prompted once per session on
+  // the first write; kept ONLY in memory (never localStorage /
+  // IndexedDB) so a compromised device forgets the token on
+  // close. Cleared on 401 from the server so the next write
+  // re-prompts.
+  _editToken: null,
   // Receipt History panel: which slice of the full-archive history
   // to render. "8" | "26" | "all"; default 26. In-memory only —
   // reverts on reload, which is fine (a display preference, not a
@@ -272,6 +278,32 @@ function _fsCheckWriteBlockedAndBanner() {
 if (typeof window !== "undefined") {
   window._fsCheckWriteBlockedAndBanner = _fsCheckWriteBlockedAndBanner;
   window._fsWriteBlocked = _fsWriteBlocked;
+}
+
+// v7.11 Edit-token helpers. The token is a shared secret set on
+// the Netlify site as FS_EDIT_TOKEN; every frame-schedule cloud
+// write includes it as x-fs-edit-token. Prompted from the
+// browser once per session, kept in memory only.
+function _fsGetEditToken(opts) {
+  const force = !!(opts && opts.force);
+  if (!force && typeof FRAMESCHED_STATE._editToken === "string" && FRAMESCHED_STATE._editToken.length > 0) {
+    return FRAMESCHED_STATE._editToken;
+  }
+  if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
+  const msg = force
+    ? "Frame Schedule edit token (server rejected the previous one). Paste the value from Netlify site env FS_EDIT_TOKEN:"
+    : "Frame Schedule edit token (one-time-per-session). Paste the value from Netlify site env FS_EDIT_TOKEN:";
+  const raw = window.prompt(msg, "");
+  if (raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  FRAMESCHED_STATE._editToken = trimmed;
+  return trimmed;
+}
+function _fsClearEditToken() { FRAMESCHED_STATE._editToken = null; }
+if (typeof window !== "undefined") {
+  window._fsGetEditToken = _fsGetEditToken;
+  window._fsClearEditToken = _fsClearEditToken;
 }
 
 /* ============================================================
@@ -2784,6 +2816,88 @@ function _fsCommitWeek(iso, payload) {
   return { ok: true };
 }
 
+// v7.11 Batch variant of _fsCommitWeek. Runs the same client-side
+// guards (write-blocked, manual-pin) per write, mutates the mirror
+// per write, then fires ONE frame-schedule-write batch call. Used
+// by Replan horizon and the two persister passes so a stale-mirror
+// bulk operation is one HTTP round-trip and per-week server-side
+// rejections come back as { skipped: true, reason } for that iso.
+//
+// Callers pass an array of { iso, payload }. Returns { ok,
+// wrote, skipped, results } summary; individual isos that hit
+// the CLIENT-side manual-pin guard also count as skipped and
+// the mirror mutation is refused. Results carry per-iso status
+// so callers can log which weeks the server refused.
+function _fsCommitWeekBatch(writes) {
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsCommitWeekBatch"); return Promise.resolve({ ok: false, error: new Error("write blocked") }); }
+  if (!Array.isArray(writes) || writes.length === 0) return Promise.resolve({ ok: true, wrote: 0, skipped: 0, results: [] });
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+  }
+  const toSend = [];
+  const clientSkipped = [];
+  for (const w of writes) {
+    if (!w || typeof w.iso !== "string") continue;
+    const iso = w.iso;
+    const payload = w.payload || {};
+    const cur = DB.frameSchedule.weeks.get(iso) || {};
+    // Client-side manual-pin guard mirrors _fsCommitWeek.
+    const payloadHasSlot = Object.prototype.hasOwnProperty.call(payload, "slot");
+    if (payloadHasSlot
+        && cur.slot && cur.slot.source === "manual"
+        && !_fsSlotsEqual(payload.slot, cur.slot)
+        && payload.allowManualSlotChange !== true) {
+      console.warn(`[frame-schedule] _fsCommitWeekBatch REFUSED (client-side) iso=${iso}: manually pinned; caller did not set allowManualSlotChange:true`);
+      clientSkipped.push({ iso, ok: true, skipped: true, reason: "client-manual-pin" });
+      continue;
+    }
+    // Mirror mutation (optimistic).
+    const nextQty      = ("qty" in payload) ? (payload.qty || {}) : (cur.qty || {});
+    const nextSlot     = ("slot" in payload) ? (payload.slot || null) : (cur.slot || null);
+    const nextSnap     = ("onHandAtClose" in payload) ? (payload.onHandAtClose || null) : (cur.onHandAtClose || null);
+    const nextOverride = ("qtyOverride" in payload) ? (payload.qtyOverride || null) : (cur.qtyOverride || null);
+    DB.frameSchedule.weeks.set(iso, {
+      qty: nextQty,
+      slot: nextSlot,
+      onHandAtClose: nextSnap,
+      qtyOverride: nextOverride,
+      updatedAt: cur.updatedAt || null,
+    });
+    // Build the outbound payload (same preserve-on-omit rules
+    // as the per-iso path).
+    const out = {};
+    if ("qty" in payload) out.qty = payload.qty;
+    else out.qty = cur.qty || {};
+    if ("slot" in payload) out.slot = payload.slot;
+    else if (cur.slot) out.slot = cur.slot;
+    if ("onHandAtClose" in payload) out.onHandAtClose = payload.onHandAtClose;
+    else if (cur.onHandAtClose) out.onHandAtClose = cur.onHandAtClose;
+    if ("qtyOverride" in payload) out.qtyOverride = payload.qtyOverride;
+    else if (cur.qtyOverride) out.qtyOverride = cur.qtyOverride;
+    if (payload.allowManualSlotChange === true) out.allowManualSlotChange = true;
+    toSend.push({ iso, payload: out });
+  }
+  if (toSend.length === 0) {
+    return Promise.resolve({
+      ok: true, wrote: 0,
+      skipped: clientSkipped.length,
+      results: clientSkipped,
+    });
+  }
+  if (typeof setFrameScheduleWriteBatch !== "function") {
+    return Promise.resolve({ ok: false, error: new Error("cloud not ready (setFrameScheduleWriteBatch)") });
+  }
+  return setFrameScheduleWriteBatch(toSend).then(res => {
+    if (!res || !res.ok) {
+      return { ok: false, error: res && res.error, results: clientSkipped };
+    }
+    const results = clientSkipped.concat(Array.isArray(res.results) ? res.results : []);
+    const skipped = results.filter(r => r.skipped).length;
+    const wrote = results.filter(r => r.ok && !r.skipped).length;
+    return { ok: true, wrote, skipped, results };
+  });
+}
+
 function _fsDebouncedWriteWeek(iso, payload) {
   const prev = FRAMESCHED_STATE._writeTimers.get(iso);
   if (prev) clearTimeout(prev);
@@ -2972,7 +3086,10 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
       if (!visibleIsos.has(iso)) continue;
       const isStart = idx === 0;
       const payload = _fsBuildWeekPayload(iso, scheduledRuns, s, isStart);
-      _fsCommitWeek(iso, payload);
+      // v7.11 Queue into the batch; the flush at the end sends
+      // ONE HTTP call. Per-week server rejections come back as
+      // { skipped:true }; log and continue.
+      _fsPersistLockedCrossings_batchPending.push({ iso, payload });
     }
   }
 
@@ -3002,7 +3119,8 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
       if (wk.qty && Object.keys(wk.qty).length > 0) continue;
       const payload = _fsBuildWeekPayload(currentCol.iso, scheduledRuns, s, idx === 0);
       if (payload.qty && Object.keys(payload.qty).length > 0) {
-        _fsCommitWeek(currentCol.iso, payload);
+        // v7.11 Queue instead of firing per-iso.
+        _fsPersistLockedCrossings_batchPending.push({ iso: currentCol.iso, payload });
       }
     }
   }
@@ -3020,9 +3138,24 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
   if (currentCol) {
     const snap = {};
     for (const r of rows) snap[r.pn] = Number(r.onHand) || 0;
-    _fsCommitWeek(currentCol.iso, { onHandAtClose: snap });
+    _fsPersistLockedCrossings_batchPending.push({ iso: currentCol.iso, payload: { onHandAtClose: snap } });
+  }
+
+  // v7.11 Flush the whole persister pass in one HTTP call.
+  if (_fsPersistLockedCrossings_batchPending.length > 0) {
+    const batch = _fsPersistLockedCrossings_batchPending;
+    _fsPersistLockedCrossings_batchPending = [];
+    _fsCommitWeekBatch(batch).then(res => {
+      if (res && res.results && res.results.length > 0) {
+        const skippedIsos = res.results.filter(r => r.skipped).map(r => r.iso);
+        if (skippedIsos.length > 0) {
+          console.log(`[frame-schedule] slot-crossings persister: ${skippedIsos.length} week(s) skipped as manual pins:`, skippedIsos);
+        }
+      }
+    });
   }
 }
+let _fsPersistLockedCrossings_batchPending = [];
 
 // v7.1 WEEKLY MODE near-term auto-persist. Mirrors the slot-mode
 // _fsPersistLockedCrossings guards: skip when the sim is
@@ -3153,16 +3286,42 @@ function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visible
       slotDesc.pn2 = secondary.pn;
       slotDesc.qty2 = secondary.qty;
     }
-    _fsCommitWeek(c.iso, { qty: qtyOut, slot: slotDesc });
+    // v7.11 Queue into batch below; add to session set so a
+    // re-render inside the same tick doesn't re-scan.
+    _fsPersistWeeklyNearTerm_batchPending.push({
+      iso: c.iso,
+      payload: { qty: qtyOut, slot: slotDesc },
+    });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.add(c.iso);
   }
 
-  // Snapshot on-hand for the current week (parity with the
-  // slot persister). Cheap; idempotent across re-renders.
+  // Snapshot on-hand for the current week (parity with the slot
+  // persister). Cheap; idempotent across re-renders.
   const snap = {};
   for (const r of rows) snap[r.pn] = Number(r.onHand) || 0;
-  _fsCommitWeek(currentCol.iso, { onHandAtClose: snap });
+  _fsPersistWeeklyNearTerm_batchPending.push({
+    iso: currentCol.iso,
+    payload: { onHandAtClose: snap },
+  });
+
+  // v7.11 Single-batch flush. Per-week server-side rejections
+  // (DB says the row is manually pinned) come back as
+  // { skipped:true }; log them and continue -- a stale mirror
+  // can no longer overwrite the DB's manual pins.
+  if (_fsPersistWeeklyNearTerm_batchPending.length > 0) {
+    const batch = _fsPersistWeeklyNearTerm_batchPending;
+    _fsPersistWeeklyNearTerm_batchPending = [];
+    _fsCommitWeekBatch(batch).then(res => {
+      if (res && res.results && res.results.length > 0) {
+        const skippedIsos = res.results.filter(r => r.skipped).map(r => r.iso);
+        if (skippedIsos.length > 0) {
+          console.log(`[frame-schedule] weekly persister: ${skippedIsos.length} week(s) skipped as manual pins:`, skippedIsos);
+        }
+      }
+    });
+  }
 }
+let _fsPersistWeeklyNearTerm_batchPending = [];
 
 // v7.1 Stale WEEKLY PIN detection is inlined in the weekly
 // band-cell render (walk scheduledRuns for per-week crew+std
@@ -6140,12 +6299,21 @@ function _fsHandleReplanHorizon() {
   }
   const targets = releasedWeeklyAuto.concat(releasedLegacyAuto);
 
-  // _fsCommitWeek({slot: null}) clears the slot descriptor and
-  // preserves everything else (qty / qtyOverride / onHandAtClose)
-  // via its preserve-on-omit semantics -- see the helper header.
-  for (const iso of targets) {
-    _fsCommitWeek(iso, { slot: null });
-  }
+  // v7.11 Batch the entire release in ONE HTTP round-trip via
+  // _fsCommitWeekBatch. Per-week server-side rejections (a
+  // stale mirror thought the row was auto but the DB has it as
+  // manual) come back as { skipped: true, reason:"manual-pin" }
+  // and are logged; the pass continues past them. Never carries
+  // allowManualSlotChange -- if the DB says manual, we honor it.
+  const batchWrites = targets.map(iso => ({ iso, payload: { slot: null } }));
+  _fsCommitWeekBatch(batchWrites).then(res => {
+    if (res && res.results && res.results.length > 0) {
+      const skippedIsos = res.results.filter(r => r.skipped).map(r => r.iso);
+      if (skippedIsos.length > 0) {
+        console.log(`[frame-schedule] Replan horizon: ${skippedIsos.length} week(s) skipped as manual pins:`, skippedIsos);
+      }
+    }
+  });
 
   // Clear BOTH session-set dedupers so their persisters can
   // re-write cleanly on the next render pass.

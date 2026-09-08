@@ -1090,152 +1090,111 @@ function _fsSlotsEqual(a, b) {
       && String(a.source || "") === String(b.source || "");
 }
 
+// v7.11 Shared POST helper for frame_schedule writes. Routes
+// through the frame-schedule-write Netlify function (which
+// enforces token + build + manual-pin against DB truth via the
+// service key). Handles the 401/token-retry loop and the 409
+// build-stale banner.
+async function _fsPostFrameScheduleWrite(body) {
+  const getToken = (typeof window !== "undefined" && typeof window._fsGetEditToken === "function")
+    ? window._fsGetEditToken
+    : (() => null);
+  const clearToken = (typeof window !== "undefined" && typeof window._fsClearEditToken === "function")
+    ? window._fsClearEditToken
+    : (() => {});
+  let attempts = 0;
+  while (attempts < 2) {
+    attempts++;
+    const token = getToken(attempts > 1 ? { force: true } : undefined);
+    if (!token) {
+      return { ok: false, error: new Error("edit token required (operator canceled)") };
+    }
+    let resp;
+    try {
+      resp = await fetch("/.netlify/functions/frame-schedule-write", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-fs-edit-token": token,
+          "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      return { ok: false, error: err };
+    }
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* not json */ }
+    if (resp.status === 401) {
+      clearToken();
+      if (attempts >= 2) return { ok: false, error: new Error("edit token rejected twice; giving up") };
+      continue;
+    }
+    if (resp.status === 409) {
+      // Build stale -- raise the write-blocked banner (same UX
+      // as the client-side minWriteBuild check).
+      if (typeof window !== "undefined" && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+        try { window._fsCheckWriteBlockedAndBanner(); } catch (_) {}
+      }
+      console.warn("[frame-schedule cloud] 409 -- app build stale vs DB minWriteBuild=" + (json && json.minWriteBuild));
+      return { ok: false, error: new Error("app build stale"), status: 409, minWriteBuild: json && json.minWriteBuild };
+    }
+    if (!resp.ok) {
+      const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+      return { ok: false, error: new Error(`frame-schedule-write ${resp.status}: ${detail}`), status: resp.status };
+    }
+    return { ok: true, ...json };
+  }
+  return { ok: false, error: new Error("edit token retries exhausted") };
+}
+
+// v7.11 Batch API: submit an array of { iso, payload }. Returns
+// { ok, results: [{iso, ok, skipped?, reason?, error?}, ...] }.
+// Callers with bulk work (Replan horizon, persister passes) use
+// this so a whole pass is ONE HTTP round trip.
+async function setFrameScheduleWriteBatch(writes) {
+  if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleWriteBatch");
+  if (!Array.isArray(writes) || writes.length === 0) {
+    return { ok: true, results: [] };
+  }
+  const res = await _fsPostFrameScheduleWrite({ writes });
+  if (!res.ok) return res;
+  const results = Array.isArray(res.results) ? res.results : [];
+  // Toast the skipped-count so a stale-mirror bulk pass reports
+  // "N weeks skipped -- manually pinned elsewhere" instead of
+  // failing silently.
+  const skipped = results.filter(r => r && r.skipped).length;
+  if (skipped > 0 && typeof showToast === "function") {
+    showToast(`${skipped} week${skipped === 1 ? "" : "s"} skipped -- manually pinned elsewhere`, "warn");
+  }
+  return res;
+}
+
 async function setFrameScheduleWeekCloud(isoMonday, payload) {
   if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleWeekCloud");
-  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
-  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
-    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
-  }
   const key = String(isoMonday || "");
-  // Guard: the settings sentinel belongs to setFrameScheduleSettingsCloud.
-  // A stray call here would clobber the caps blob.
   if (key === "__settings__") {
-    return { ok: false, error: new Error("reserved key — use setFrameScheduleSettingsCloud") };
+    return { ok: false, error: new Error("reserved key -- use setFrameScheduleSettingsCloud") };
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) {
     return { ok: false, error: new Error("invalid iso Monday key") };
   }
-
-  // v7.10 MANUAL-PIN IMMUTABILITY (cloud-layer backstop). Second
-  // gate for callers that bypass _fsCommitWeek's mirror path
-  // (there aren't any today, but a future direct call to
-  // setFrameScheduleWeekCloud must NOT be able to nuke a manual
-  // pin either). The pass-through case (_fsCommitWeek already
-  // mutated the mirror to match the payload) sees payload.slot
-  // === mirror.slot and skips the rejection.
-  const mirrorRow = DB.frameSchedule.weeks.get(key);
-  const payloadHasSlot = payload && Object.prototype.hasOwnProperty.call(payload, "slot");
-  if (payloadHasSlot
-      && mirrorRow && mirrorRow.slot && mirrorRow.slot.source === "manual"
-      && !_fsSlotsEqual(payload.slot, mirrorRow.slot)
-      && payload.allowManualSlotChange !== true) {
-    console.warn(`[frame-schedule cloud] setFrameScheduleWeekCloud REFUSED: week ${key} is manually pinned (${mirrorRow.slot.pn || "?"}${mirrorRow.slot.pn2 ? " + " + mirrorRow.slot.pn2 : ""}). Pass allowManualSlotChange:true to override.`);
-    return { ok: false, error: new Error("week is manually pinned") };
+  // v7.11 Route through the batch API. Single-week caller sees
+  // the same shape it always did; the batch result's per-iso
+  // status is unpacked into a top-level ok/error.
+  const res = await setFrameScheduleWriteBatch([{ iso: key, payload }]);
+  if (!res.ok) return res;
+  const perIso = Array.isArray(res.results) && res.results[0];
+  if (perIso && perIso.skipped) {
+    // Server refused THIS iso (manual-pin at DB); surface it
+    // to the caller so mirror-revert logic can react. The
+    // skipped-toast already fired in setFrameScheduleWriteBatch.
+    console.warn(`[frame-schedule cloud] server skipped ${key}: ${perIso.reason}`);
+    return { ok: false, error: new Error(`week is manually pinned (${perIso.reason || "server"})`), skipped: true, reason: perIso.reason };
   }
-  // v2.1: no per-week caps. Payload carries {qty, slot?, onHandAtClose?}.
-  const qty = {};
-  if (payload && payload.qty && typeof payload.qty === "object") {
-    for (const [k, v] of Object.entries(payload.qty)) {
-      const n = Math.max(0, Number(v) || 0);
-      if (n > 0) qty[k] = n;
-    }
-  }
-  // slot descriptor: present ONLY on the slot-START week. Non-start
-  // weeks omit the field; the read path treats missing slot as null.
-  let slot = null;
-  if (payload && payload.slot && typeof payload.slot === "object" && payload.slot.pn) {
-    slot = {
-      pn: String(payload.slot.pn),
-      locked: !!payload.slot.locked,
-      // v7.1 source accepts "weekly-auto" from the weekly
-      // scheduler's per-week auto-persist, alongside the legacy
-      // "manual"/"seed" set. Unknown values default to "auto".
-      source: (payload.slot.source === "manual" || payload.slot.source === "seed" || payload.slot.source === "weekly-auto")
-                ? payload.slot.source : "auto",
-    };
-    // v3.3: attach pn2 ONLY when it's a real split (present and
-    // different from pn). Whole runs omit the field so old
-    // readers that don't know about pn2 are unaffected.
-    if (typeof payload.slot.pn2 === "string" && payload.slot.pn2 && payload.slot.pn2 !== slot.pn) {
-      slot.pn2 = payload.slot.pn2;
-    }
-    // v7.1 mode: "weekly" marks a single-week pin from the
-    // weekly-cover scheduler (v7 ticket item 5). Omitted for
-    // legacy 2-week slot rows so their readers stay byte-
-    // identical to pre-v7.1 output.
-    if (payload.slot.mode === "weekly") slot.mode = "weekly";
-    // v7.2 qty / qty2: explicit build quantities for the
-    // weekly-mode mix candidates. Non-negative integers only;
-    // qty2 only attached when there's a real secondary
-    // placement (slot.pn2 present). Omitted for legacy slot
-    // rows / v7.0 weekly pins that carry just pn -- readers
-    // treat missing qty as "compute via demand + catchup".
-    if (typeof payload.slot.qty === "number" && payload.slot.qty >= 0 && Number.isFinite(payload.slot.qty)) {
-      slot.qty = Math.floor(payload.slot.qty);
-    }
-    if (slot.pn2
-        && typeof payload.slot.qty2 === "number"
-        && payload.slot.qty2 >= 0
-        && Number.isFinite(payload.slot.qty2)) {
-      slot.qty2 = Math.floor(payload.slot.qty2);
-    }
-  }
-  // v4.1: onHandAtClose = {pn: units} snapshot. Coerced to
-  // numbers; non-numeric entries dropped. Present or absent
-  // independently of slot/qty — pn writers omit slot, snapshot
-  // writers may omit qty (though callers today send both).
-  let onHandAtClose = null;
-  if (payload && payload.onHandAtClose && typeof payload.onHandAtClose === "object") {
-    onHandAtClose = {};
-    for (const [k, v] of Object.entries(payload.onHandAtClose)) {
-      const n = Number(v);
-      if (Number.isFinite(n)) onHandAtClose[k] = n;
-    }
-    if (Object.keys(onHandAtClose).length === 0) onHandAtClose = null;
-  }
-  // v5.5 qtyOverride = {pn: units} manual constraints. Written
-  // when the payload names the field; preserved on omission
-  // (same shape as onHandAtClose). A payload with an empty
-  // object or explicit null CLEARS the override map -- distinct
-  // from omitting the field entirely, which preserves prior.
-  const prev = DB.frameSchedule.weeks.get(key);
-  let qtyOverride;   // undefined = preserve prior
-  if (payload && Object.prototype.hasOwnProperty.call(payload, "qtyOverride")) {
-    if (payload.qtyOverride && typeof payload.qtyOverride === "object") {
-      const sanitized = {};
-      for (const [k, v] of Object.entries(payload.qtyOverride)) {
-        const n = Math.floor(Number(v));
-        if (Number.isFinite(n) && n >= 0) sanitized[k] = n;
-      }
-      qtyOverride = Object.keys(sanitized).length > 0 ? sanitized : null;
-    } else {
-      qtyOverride = null;   // explicit clear
-    }
-  } else {
-    qtyOverride = (prev && prev.qtyOverride) || null;
-  }
-  const nowIso = new Date().toISOString();
-  DB.frameSchedule.weeks.set(key, {
-    qty,
-    slot,
-    onHandAtClose: onHandAtClose || (prev && prev.onHandAtClose) || null,
-    qtyOverride,
-    updatedAt: nowIso,
-  });
-  const dataPayload = { qty };
-  if (slot) dataPayload.slot = slot;
-  if (onHandAtClose) dataPayload.onHandAtClose = onHandAtClose;
-  else if (prev && prev.onHandAtClose) dataPayload.onHandAtClose = prev.onHandAtClose;
-  if (qtyOverride) dataPayload.qtyOverride = qtyOverride;
-  const { error } = await _supa
-    .from("frame_schedule")
-    .upsert(
-      {
-        fg_sku:     key,
-        weekly_qty: 0,          // unused for frame_schedule; column NOT NULL
-        data:       dataPayload,
-        updated_at: nowIso,
-      },
-      { onConflict: "fg_sku" }
-    );
-  if (error) {
-    if (prev) DB.frameSchedule.weeks.set(key, prev);
-    else DB.frameSchedule.weeks.delete(key);
-    console.error("[cloud] frame_schedule upsert failed:", error);
-    if (typeof showToast === "function") {
-      showToast("Frame schedule save failed: " + error.message, "crit");
-    }
-    return { ok: false, error };
+  if (perIso && perIso.ok === false) {
+    return { ok: false, error: new Error(perIso.error || "server rejected the write") };
   }
   return { ok: true };
 }
@@ -1248,7 +1207,6 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
 // targets) end to end.
 async function setFrameScheduleSettingsCloud(caps) {
   if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleSettingsCloud");
-  if (!_supa) return { ok: false, error: new Error("cloud not ready") };
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
   }
@@ -1313,24 +1271,24 @@ async function setFrameScheduleSettingsCloud(caps) {
   dataOut.scheduleMode = scheduleMode;
   if (minWriteBuild > 0) dataOut.minWriteBuild = minWriteBuild;
   DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
-  const { error } = await _supa
-    .from("frame_schedule")
-    .upsert(
-      {
-        fg_sku:     "__settings__",
-        weekly_qty: 0,          // sentinel — not read; column NOT NULL
-        data:       dataOut,
-        updated_at: nowIso,
-      },
-      { onConflict: "fg_sku" }
-    );
-  if (error) {
+  // v7.11 Route the settings write through the frame-schedule-write
+  // Netlify function (service key + token + build guard). The
+  // function re-sanitizes the settings payload against the CURRENT
+  // DB row so its minWriteBuild raise is authoritative even if
+  // this client's mirror is stale.
+  const settingsForFn = { crewhd, std, appBuild: (typeof APP_BUILD === "number" ? APP_BUILD : 0) };
+  if (bufferWeeks !== null) settingsForFn.bufferWeeks = bufferWeeks;
+  if (publishToken !== null) settingsForFn.publishToken = publishToken;
+  if (lastPublishedAt !== null) settingsForFn.lastPublishedAt = lastPublishedAt;
+  settingsForFn.scheduleMode = scheduleMode;
+  const res = await _fsPostFrameScheduleWrite({ settings: settingsForFn });
+  if (!res.ok) {
     DB.frameSchedule.settings = prev;
-    console.error("[cloud] frame_schedule settings upsert failed:", error);
+    console.error("[cloud] frame_schedule settings write failed:", res.error);
     if (typeof showToast === "function") {
-      showToast("Frame schedule caps save failed: " + error.message, "crit");
+      showToast("Frame schedule caps save failed: " + (res.error && res.error.message || "server error"), "crit");
     }
-    return { ok: false, error };
+    return { ok: false, error: res.error };
   }
   return { ok: true };
 }
@@ -1359,29 +1317,57 @@ async function publishFrameScheduleSnapshot(token, html) {
   if (html.length > 3000000) {
     return { ok: false, error: new Error("html too large (>3MB)") };
   }
-  try {
-    const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token, html }),
-    });
-    const text = await resp.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch (_) { /* not json */ }
-    if (!resp.ok) {
-      const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
-      return { ok: false, error: new Error(`publish returned ${resp.status}: ${detail}`) };
+  // v7.11 Include the shared edit token + build header so the
+  // publish function's token guard passes. The token cache and
+  // 401 retry loop mirror _fsPostFrameScheduleWrite.
+  const getToken = (typeof window !== "undefined" && typeof window._fsGetEditToken === "function")
+    ? window._fsGetEditToken
+    : (() => null);
+  const clearToken = (typeof window !== "undefined" && typeof window._fsClearEditToken === "function")
+    ? window._fsClearEditToken
+    : (() => {});
+  let attempts = 0;
+  while (attempts < 2) {
+    attempts++;
+    const editToken = getToken(attempts > 1 ? { force: true } : undefined);
+    if (!editToken) {
+      return { ok: false, error: new Error("edit token required (operator canceled)") };
     }
-    if (!json || !json.url) {
-      return { ok: false, error: new Error("publish returned no url") };
+    try {
+      const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-fs-edit-token": editToken,
+          "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
+        },
+        body: JSON.stringify({ token, html }),
+      });
+      const text = await resp.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch (_) { /* not json */ }
+      if (resp.status === 401) {
+        clearToken();
+        if (attempts >= 2) return { ok: false, error: new Error("edit token rejected twice; giving up") };
+        continue;
+      }
+      if (!resp.ok) {
+        const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+        return { ok: false, error: new Error(`publish returned ${resp.status}: ${detail}`) };
+      }
+      if (!json || !json.url) {
+        return { ok: false, error: new Error("publish returned no url") };
+      }
+      return { ok: true, url: json.url, updatedAt: json.updated_at || null, bytes: json.bytes || 0 };
+    } catch (err) {
+      return { ok: false, error: err };
     }
-    return { ok: true, url: json.url, updatedAt: json.updated_at || null, bytes: json.bytes || 0 };
-  } catch (err) {
-    return { ok: false, error: err };
   }
+  return { ok: false, error: new Error("publish edit-token retries exhausted") };
 }
 
 window.setFrameScheduleWeekCloud     = setFrameScheduleWeekCloud;
+window.setFrameScheduleWriteBatch    = setFrameScheduleWriteBatch;
 window.setFrameScheduleSettingsCloud = setFrameScheduleSettingsCloud;
 window.publishFrameScheduleSnapshot  = publishFrameScheduleSnapshot;
 

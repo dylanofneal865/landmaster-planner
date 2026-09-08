@@ -37,12 +37,14 @@ const TOKEN_RE = /^[A-Za-z0-9._-]{24,128}$/;
 // strictly need CORS but the browser preflight fires on POSTs with
 // content-type: application/json, so we echo the Origin header and
 // list the methods + headers we accept.
+// v7.11 x-fs-edit-token added to Allow-Headers so the client can
+// send the same edit token frame-schedule-write requires.
 function corsHeaders(event) {
   const origin = (event && event.headers && (event.headers.origin || event.headers.Origin)) || "*";
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type, x-fs-edit-token, x-app-build",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -65,13 +67,33 @@ exports.handler = async (event) => {
     };
   }
 
-  const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
+  const { SUPABASE_URL, SUPABASE_SERVICE_KEY, FS_EDIT_TOKEN } = process.env;
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     log("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
     return {
       statusCode: 500,
       headers: { ...cors, "content-type": "application/json" },
       body: JSON.stringify({ error: "Missing env vars" }),
+    };
+  }
+  // v7.11 Same edit-token check as frame-schedule-write.
+  // frame_schedule_published writes share the token with the
+  // frame_schedule writes -- both are operator-only surfaces.
+  if (!FS_EDIT_TOKEN) {
+    log("Missing FS_EDIT_TOKEN env");
+    return {
+      statusCode: 500,
+      headers: { ...cors, "content-type": "application/json" },
+      body: JSON.stringify({ error: "server not configured (edit token)" }),
+    };
+  }
+  const headersIn = event.headers || {};
+  const tokenIn = headersIn["x-fs-edit-token"] || headersIn["X-Fs-Edit-Token"] || "";
+  if (String(tokenIn) !== String(FS_EDIT_TOKEN)) {
+    return {
+      statusCode: 401,
+      headers: { ...cors, "content-type": "application/json" },
+      body: JSON.stringify({ error: "invalid or missing x-fs-edit-token" }),
     };
   }
 
