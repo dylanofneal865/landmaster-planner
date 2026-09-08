@@ -7154,6 +7154,12 @@ async function _fsBuildSupplierHtml() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<!-- v7.7 Self-refresh every 10 minutes so an open supplier tab
+     picks up the latest publish without the operator sending a
+     new link. Meta-refresh keeps the page script-free; the view
+     Netlify function already serves Cache-Control: no-store so
+     each reload lands fresh HTML. -->
+<meta http-equiv="refresh" content="600">
 <title>Landmaster &#x2014; Frame Schedule</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -7174,6 +7180,19 @@ ${css}
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
+/* v7.7 Sub-line under the Generated stamp explaining the
+   self-refresh so a supplier who lands on this URL knows the
+   link is durable and the page will keep itself current. */
+.fs-supplier-refresh-note {
+  max-width: 1400px;
+  margin: 0 auto 4px;
+  padding: 0 16px 6px;
+  color: var(--t2);
+  font-family: var(--f-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  opacity: 0.75;
+}
 
 /* v5.1.1 Supplier-snapshot scroll override. The planner's
    stylesheet sets body { overflow: hidden } because the app
@@ -7189,6 +7208,7 @@ html, body { height: auto; overflow: auto; }
 </head>
 <body>
 <div class="fs-supplier-generated">Generated ${esc(stamp)}</div>
+<div class="fs-supplier-refresh-note">This page refreshes automatically &mdash; the link never changes.</div>
 ${clone.outerHTML}
 </body>
 </html>`;
