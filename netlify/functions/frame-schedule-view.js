@@ -2,16 +2,30 @@
 //
 // GET /.netlify/functions/frame-schedule-view?token=<string>
 // -> serves the stored HTML from public.frame_schedule_published.
-// 404 with a plain "Not found" body (still text/html so a browser
-// renders it, not a raw string) when the token is missing,
-// malformed, or has no matching row. Cache-Control: no-store so
-// suppliers always see the latest publish.
+//
+// TOKEN-ALIAS SEMANTICS (v7.13):
+//   The URL's token is looked up against the CURRENT
+//   __settings__.publishToken value:
+//     * If they match, we serve that token's row directly.
+//     * If they differ but the URL's token EVER existed in
+//       frame_schedule_published (any historical publish), we
+//       treat the URL token as an ALIAS for the current page --
+//       we serve the CURRENT token's row. This fixes stale
+//       supplier bookmarks after a __settings__ corruption
+//       forced a fresh mint: the old link keeps working and
+//       shows today's plan instead of a frozen orphan snapshot.
+//     * If the URL's token never existed in
+//       frame_schedule_published, we 404 -- someone typed junk.
+//   404 also fires for shape-invalid tokens (before any DB hit),
+//   and for the case where the URL token IS current but its row
+//   was somehow lost.
 //
 // Auth: TOKEN IS THE CREDENTIAL. Row-level security on
 // frame_schedule_published denies anon; only this function reads it
-// via the service key. The URL is unguessable because the token is
-// a "fs-<uuid>" string minted on first publish (via crypto.randomUUID)
-// and stashed in the __settings__ row.
+// via the service key. Aliasing is safe under this model -- to
+// reach an alias you still need a URL-shaped token that WAS at
+// some point granted to a supplier, so we're not turning random
+// bytes into a valid page.
 //
 // Env + Supabase client mirror acumatica-po-receipts-sync.js exactly.
 //
@@ -71,17 +85,63 @@ exports.handler = async (event) => {
     return { statusCode: 500, body: "Server not configured" };
   }
 
-  const token = event && event.queryStringParameters && event.queryStringParameters.token;
-  if (typeof token !== "string" || !TOKEN_RE.test(token)) return NOT_FOUND;
+  const urlToken = event && event.queryStringParameters && event.queryStringParameters.token;
+  if (typeof urlToken !== "string" || !TOKEN_RE.test(urlToken)) return NOT_FOUND;
 
   const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
+  // Resolve the CURRENT token from __settings__ so we can decide
+  // whether the URL token points at today's page or an orphaned
+  // old row (see TOKEN-ALIAS SEMANTICS in the header).
+  const { data: settingsRow, error: settingsErr } = await supa
+    .from("frame_schedule")
+    .select("data")
+    .eq("fg_sku", "__settings__")
+    .maybeSingle();
+  if (settingsErr) {
+    log("settings select failed", { code: settingsErr.code, message: settingsErr.message });
+    return { statusCode: 500, body: "Read failed" };
+  }
+  const rawCur = settingsRow && settingsRow.data && settingsRow.data.publishToken;
+  const currentToken = (typeof rawCur === "string" && TOKEN_RE.test(rawCur)) ? rawCur : null;
+
+  // Serve token = whichever one currently owns the live page.
+  // For URL === current: obvious. For URL !== current but URL was
+  // historically published: alias to current. For URL never
+  // published: 404. When currentToken is null (no page has been
+  // published at all), only exact-URL still works so a bookmark
+  // to the very first snapshot before this migration lands is
+  // not silently broken.
+  let serveToken;
+  if (currentToken && urlToken === currentToken) {
+    serveToken = currentToken;
+  } else {
+    const { data: existsRow, error: existsErr } = await supa
+      .from("frame_schedule_published")
+      .select("token")
+      .eq("token", urlToken)
+      .maybeSingle();
+    if (existsErr) {
+      log("alias existence check failed", { code: existsErr.code, message: existsErr.message });
+      return { statusCode: 500, body: "Read failed" };
+    }
+    if (!existsRow) return NOT_FOUND;   // token never seen -- someone typed junk
+    // URL token WAS published sometime. Alias to current if we
+    // have one; otherwise fall back to serving the URL token's
+    // own row (may itself be an old snapshot -- best we can do
+    // without a current pointer).
+    serveToken = currentToken || urlToken;
+    if (currentToken && serveToken !== urlToken) {
+      log(`aliasing orphaned token ...${urlToken.slice(-6)} -> current ...${currentToken.slice(-6)}`);
+    }
+  }
+
   const { data, error } = await supa
     .from("frame_schedule_published")
     .select("html, updated_at")
-    .eq("token", token)
+    .eq("token", serveToken)
     .maybeSingle();
 
   if (error) {

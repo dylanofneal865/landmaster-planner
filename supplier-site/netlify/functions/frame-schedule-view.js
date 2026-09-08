@@ -7,21 +7,34 @@
 // site origin.
 //
 // Behavior:
-//   - If ?token=<string> is on the URL, use it directly (same
-//     shape gate as the planner-side function).
+//   - If ?token=<string> is on the URL:
+//       * If it matches the CURRENT __settings__.publishToken,
+//         serve that token's row (bookmark lands on today's page).
+//       * If it differs but the URL token EVER existed in
+//         frame_schedule_published (any historical publish),
+//         serve the CURRENT token's row instead -- the URL token
+//         is treated as an ALIAS for the current page. Fixes
+//         stale supplier bookmarks after a __settings__
+//         corruption forced a fresh mint; old links keep working
+//         and show today's plan rather than a frozen orphan.
+//       * If it never existed in frame_schedule_published, 404 --
+//         someone typed junk.
 //   - If ?token is missing, look up the default token from
 //     public.frame_schedule where fg_sku = '__settings__' and
 //     take data.publishToken. This is the operator's stable
 //     token minted client-side on first publish; it makes the
 //     bare "/" URL work without the supplier ever handling one.
-//   - Fetch the corresponding row from
-//     public.frame_schedule_published and return its stored HTML.
-//   - 404 (text/html "Not found") when the token is missing,
-//     malformed, or has no matching published row.
+//   - Fetch the resolved token's HTML from
+//     public.frame_schedule_published and return it.
+//   - 404 (text/html "Not found") when the resolved token has
+//     no matching row.
 //
 // Auth: TOKEN IS THE CREDENTIAL. Row-level security on both
 // tables denies anon; only this function reads them via the
-// service key.
+// service key. Aliasing is safe under this model -- reaching an
+// alias still requires a URL-shaped token that was at some point
+// granted to a supplier, so this is not turning random bytes
+// into a valid page.
 //
 // Required env:
 //   SUPABASE_URL          e.g. https://rqvswdxfebhlyouozltk.supabase.co
@@ -60,29 +73,60 @@ exports.handler = async (event) => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  // Prefer the query-string token; fall back to the default
-  // stashed in the __settings__ row.
-  let token = event && event.queryStringParameters && event.queryStringParameters.token;
-  if (typeof token !== "string" || !TOKEN_RE.test(token)) {
-    // No usable token on the URL -- look up the default.
-    const { data: settingsRow, error: settingsErr } = await supa
-      .from("frame_schedule")
-      .select("data")
-      .eq("fg_sku", "__settings__")
+  // Resolve the current publishToken from __settings__ once.
+  // Used for both the token-missing default AND the alias check
+  // (see header for TOKEN-ALIAS semantics).
+  const { data: settingsRow, error: settingsErr } = await supa
+    .from("frame_schedule")
+    .select("data")
+    .eq("fg_sku", "__settings__")
+    .maybeSingle();
+  if (settingsErr) {
+    log("settings select failed", { code: settingsErr.code, message: settingsErr.message });
+    return { statusCode: 500, body: "Read failed" };
+  }
+  const rawCur = settingsRow && settingsRow.data && settingsRow.data.publishToken;
+  const currentToken = (typeof rawCur === "string" && TOKEN_RE.test(rawCur)) ? rawCur : null;
+
+  const urlToken = event && event.queryStringParameters && event.queryStringParameters.token;
+  const hasUrlToken = (typeof urlToken === "string" && TOKEN_RE.test(urlToken));
+
+  // Decide what token to serve.
+  //   * No URL token -> serve current (the bare "/" default).
+  //   * URL === current -> serve current.
+  //   * URL differs but exists in frame_schedule_published ->
+  //     alias, serve current's row.
+  //   * URL never existed -> 404.
+  let serveToken;
+  if (!hasUrlToken) {
+    if (!currentToken) return NOT_FOUND;
+    serveToken = currentToken;
+  } else if (currentToken && urlToken === currentToken) {
+    serveToken = currentToken;
+  } else {
+    const { data: existsRow, error: existsErr } = await supa
+      .from("frame_schedule_published")
+      .select("token")
+      .eq("token", urlToken)
       .maybeSingle();
-    if (settingsErr) {
-      log("settings select failed", { code: settingsErr.code, message: settingsErr.message });
+    if (existsErr) {
+      log("alias existence check failed", { code: existsErr.code, message: existsErr.message });
       return { statusCode: 500, body: "Read failed" };
     }
-    const rawTok = settingsRow && settingsRow.data && settingsRow.data.publishToken;
-    if (typeof rawTok !== "string" || !TOKEN_RE.test(rawTok)) return NOT_FOUND;
-    token = rawTok;
+    if (!existsRow) return NOT_FOUND;
+    // Alias to current if we have one; otherwise fall back to the
+    // URL token itself (may itself be an old snapshot -- best we
+    // can do without a current pointer).
+    serveToken = currentToken || urlToken;
+    if (currentToken && serveToken !== urlToken) {
+      log(`aliasing orphaned token ...${urlToken.slice(-6)} -> current ...${currentToken.slice(-6)}`);
+    }
   }
 
   const { data, error } = await supa
     .from("frame_schedule_published")
     .select("html, updated_at")
-    .eq("token", token)
+    .eq("token", serveToken)
     .maybeSingle();
 
   if (error) {

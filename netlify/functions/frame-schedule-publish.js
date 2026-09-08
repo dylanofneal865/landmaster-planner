@@ -141,6 +141,38 @@ exports.handler = async (event) => {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
+  // v7.13 FRESH-MINT DETECTION. If this token has no row yet AND
+  // any other tokens already exist, this is a re-mint (usually
+  // driven by a lost / corrupted __settings__.publishToken).
+  // Re-mints are supposed to be RARE and DELIBERATE; log LOUDLY
+  // so an unexpected one shows up in the function logs before a
+  // supplier notices their old link goes stale. The view function
+  // aliases old tokens to the current page (see
+  // frame-schedule-view.js TOKEN-ALIAS semantics), so old
+  // bookmarks keep working, but the log line is the "why did the
+  // token rotate?" audit trail.
+  const { data: preRows, error: preErr } = await supa
+    .from("frame_schedule_published")
+    .select("token, updated_at");
+  if (preErr) {
+    // Non-fatal -- the upsert can still proceed. Just log so we
+    // notice the audit trail is degraded.
+    log("pre-publish token scan failed (non-fatal)", { code: preErr.code, message: preErr.message });
+  } else {
+    const already = (preRows || []).some(r => r && r.token === token);
+    const others = (preRows || []).filter(r => r && r.token !== token);
+    if (!already && others.length > 0) {
+      const otherTails = others.map(r => "..." + String(r.token).slice(-6)).join(", ");
+      console.warn(
+        `[frame-schedule-publish] LOUD: FRESH MINT of token ...${token.slice(-6)} ` +
+        `while ${others.length} old published row(s) already exist (${otherTails}). ` +
+        `This is a token ROTATION -- suppliers holding an old URL will silently be aliased ` +
+        `to the new snapshot by the view function. If this rotation was NOT intended, the ` +
+        `__settings__.publishToken row is probably corrupted; verify with a Supabase console query.`
+      );
+    }
+  }
+
   const nowIso = new Date().toISOString();
   const { error } = await supa
     .from("frame_schedule_published")
@@ -153,6 +185,25 @@ exports.handler = async (event) => {
       headers: { ...cors, "content-type": "application/json" },
       body: JSON.stringify({ error: "publish failed", detail: error.message }),
     };
+  }
+
+  // v7.13 CLEANUP. Sweep any published rows that are neither the
+  // current token nor were updated in the last 30 days. Keeps the
+  // table small (and eventually stops aliasing tokens no one has
+  // touched in a month). Non-fatal on error -- the publish itself
+  // succeeded so we still return ok.
+  const cutoffIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { data: deleted, error: delErr } = await supa
+    .from("frame_schedule_published")
+    .delete()
+    .neq("token", token)
+    .lt("updated_at", cutoffIso)
+    .select("token");
+  if (delErr) {
+    log("cleanup delete failed (non-fatal)", { code: delErr.code, message: delErr.message });
+  } else if (deleted && deleted.length > 0) {
+    const tails = deleted.map(r => "..." + String(r.token).slice(-6)).join(", ");
+    log(`cleanup swept ${deleted.length} stale row(s) older than 30 days: ${tails}`);
   }
 
   const url = `/.netlify/functions/frame-schedule-view?token=${token}`;
