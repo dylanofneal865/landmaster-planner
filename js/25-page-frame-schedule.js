@@ -153,11 +153,11 @@ const FRAMESCHED_STATE = {
   // read by nothing else -- the DOM element is idempotent so
   // repeated calls are cheap.
   _writeBlockedBannerShown: false,
-  // v7.11 Server-side edit token. Prompted once per session on
-  // the first write; kept ONLY in memory (never localStorage /
-  // IndexedDB) so a compromised device forgets the token on
-  // close. Cleared on 401 from the server so the next write
-  // re-prompts.
+  // v7.12 The interactive edit-token prompt is retired. The
+  // token now ships in the client bundle as FS_EDIT_TOKEN_CLIENT
+  // (js/01-config.js) -- see the honest note there. Field kept
+  // for backward compatibility with older window callers that
+  // still check FRAMESCHED_STATE._editToken; unused otherwise.
   _editToken: null,
   // Receipt History panel: which slice of the full-archive history
   // to render. "8" | "26" | "all"; default 26. In-memory only —
@@ -280,31 +280,8 @@ if (typeof window !== "undefined") {
   window._fsWriteBlocked = _fsWriteBlocked;
 }
 
-// v7.11 Edit-token helpers. The token is a shared secret set on
-// the Netlify site as FS_EDIT_TOKEN; every frame-schedule cloud
-// write includes it as x-fs-edit-token. Prompted from the
-// browser once per session, kept in memory only.
-function _fsGetEditToken(opts) {
-  const force = !!(opts && opts.force);
-  if (!force && typeof FRAMESCHED_STATE._editToken === "string" && FRAMESCHED_STATE._editToken.length > 0) {
-    return FRAMESCHED_STATE._editToken;
-  }
-  if (typeof window === "undefined" || typeof window.prompt !== "function") return null;
-  const msg = force
-    ? "Frame Schedule edit token (server rejected the previous one). Paste the value from Netlify site env FS_EDIT_TOKEN:"
-    : "Frame Schedule edit token (one-time-per-session). Paste the value from Netlify site env FS_EDIT_TOKEN:";
-  const raw = window.prompt(msg, "");
-  if (raw === null) return null;
-  const trimmed = String(raw).trim();
-  if (!trimmed) return null;
-  FRAMESCHED_STATE._editToken = trimmed;
-  return trimmed;
-}
-function _fsClearEditToken() { FRAMESCHED_STATE._editToken = null; }
-if (typeof window !== "undefined") {
-  window._fsGetEditToken = _fsGetEditToken;
-  window._fsClearEditToken = _fsClearEditToken;
-}
+
+
 
 /* ============================================================
    DATA UTILS

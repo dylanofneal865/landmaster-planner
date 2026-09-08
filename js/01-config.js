@@ -46,6 +46,26 @@ const DAY_MS = 86400000;
 // tab bumps the settings row.
 const APP_BUILD = 1789171200;   // 2026-09-08 04:00:00 UTC
 
+// v7.12 Frame-schedule edit token, sent on every call to the
+// frame-schedule-write / frame-schedule-publish Netlify functions
+// as x-fs-edit-token. Set the SAME value on the planner Netlify
+// site's FS_EDIT_TOKEN env var so the server-side check passes.
+//
+// HONEST NOTE: this is NOT a secret in any meaningful sense --
+// the value ships in the client bundle and anyone with a browser
+// can read it out of js/01-config.js. It functions as an APP-BUILD
+// CREDENTIAL: it gates out stale browsers running an older bundle
+// with a different token (or no token) and it gates out non-app
+// writers (curl, another site's script) that don't know to send it.
+// It does NOT stop a determined human. That job belongs to the
+// server-side manual-pin guard and the minWriteBuild build gate,
+// which live in netlify/functions/frame-schedule-write.js and are
+// enforced against the CURRENT DB row -- not the client's claim.
+// Rotate this value whenever the server-side FS_EDIT_TOKEN rotates
+// (bump APP_BUILD in the same commit so old tabs go read-only
+// immediately via the write-version banner).
+const FS_EDIT_TOKEN_CLIENT = "853b9c08-ede3-4c07-ab41-93938edd9a2f-8fc226b7-055d-40d4-a88f-6269f5d7e0ee";
+
 // v5 Supplier-facing site for the Frame Schedule supplier snapshot.
 // Set this to the URL of the SECOND Netlify site deployed from
 // supplier-site/ (Base directory = "supplier-site") once it goes

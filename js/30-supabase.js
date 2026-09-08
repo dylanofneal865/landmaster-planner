@@ -1090,63 +1090,60 @@ function _fsSlotsEqual(a, b) {
       && String(a.source || "") === String(b.source || "");
 }
 
-// v7.11 Shared POST helper for frame_schedule writes. Routes
+// v7.12 Shared POST helper for frame_schedule writes. Routes
 // through the frame-schedule-write Netlify function (which
 // enforces token + build + manual-pin against DB truth via the
-// service key). Handles the 401/token-retry loop and the 409
-// build-stale banner.
+// service key). The x-fs-edit-token header is read directly from
+// FS_EDIT_TOKEN_CLIENT in js/01-config.js -- no user prompt,
+// same value every request. The token is a build credential, not
+// a secret (see the honest note in js/01-config.js).
 async function _fsPostFrameScheduleWrite(body) {
-  const getToken = (typeof window !== "undefined" && typeof window._fsGetEditToken === "function")
-    ? window._fsGetEditToken
-    : (() => null);
-  const clearToken = (typeof window !== "undefined" && typeof window._fsClearEditToken === "function")
-    ? window._fsClearEditToken
-    : (() => {});
-  let attempts = 0;
-  while (attempts < 2) {
-    attempts++;
-    const token = getToken(attempts > 1 ? { force: true } : undefined);
-    if (!token) {
-      return { ok: false, error: new Error("edit token required (operator canceled)") };
-    }
-    let resp;
-    try {
-      resp = await fetch("/.netlify/functions/frame-schedule-write", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-fs-edit-token": token,
-          "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
-        },
-        body: JSON.stringify(body),
-      });
-    } catch (err) {
-      return { ok: false, error: err };
-    }
-    const text = await resp.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch (_) { /* not json */ }
-    if (resp.status === 401) {
-      clearToken();
-      if (attempts >= 2) return { ok: false, error: new Error("edit token rejected twice; giving up") };
-      continue;
-    }
-    if (resp.status === 409) {
-      // Build stale -- raise the write-blocked banner (same UX
-      // as the client-side minWriteBuild check).
-      if (typeof window !== "undefined" && typeof window._fsCheckWriteBlockedAndBanner === "function") {
-        try { window._fsCheckWriteBlockedAndBanner(); } catch (_) {}
-      }
-      console.warn("[frame-schedule cloud] 409 -- app build stale vs DB minWriteBuild=" + (json && json.minWriteBuild));
-      return { ok: false, error: new Error("app build stale"), status: 409, minWriteBuild: json && json.minWriteBuild };
-    }
-    if (!resp.ok) {
-      const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
-      return { ok: false, error: new Error(`frame-schedule-write ${resp.status}: ${detail}`), status: resp.status };
-    }
-    return { ok: true, ...json };
+  const token = (typeof FS_EDIT_TOKEN_CLIENT === "string" && FS_EDIT_TOKEN_CLIENT) ? FS_EDIT_TOKEN_CLIENT : "";
+  if (!token) {
+    console.warn("[frame-schedule cloud] FS_EDIT_TOKEN_CLIENT missing from js/01-config.js -- server will 401");
   }
-  return { ok: false, error: new Error("edit token retries exhausted") };
+  let resp;
+  try {
+    resp = await fetch("/.netlify/functions/frame-schedule-write", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fs-edit-token": token,
+        "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (_) { /* not json */ }
+  if (resp.status === 401) {
+    // Server rejected the bundle's token -- almost always means
+    // FS_EDIT_TOKEN_CLIENT (js/01-config.js) drifted from the
+    // Netlify env FS_EDIT_TOKEN. Loud console + friendly toast
+    // so the operator files a bug instead of getting a silent
+    // no-write. No prompt / retry loop -- the token isn't user
+    // input anymore.
+    console.error("[frame-schedule cloud] 401 -- FS_EDIT_TOKEN_CLIENT (js/01-config.js) does not match Netlify site env FS_EDIT_TOKEN. Rotate both together.");
+    if (typeof showToast === "function") {
+      showToast("Frame schedule write blocked: app token mismatch (deploy issue).", "crit");
+    }
+    return { ok: false, error: new Error("edit token rejected by server (config mismatch)"), status: 401 };
+  }
+  if (resp.status === 409) {
+    if (typeof window !== "undefined" && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+      try { window._fsCheckWriteBlockedAndBanner(); } catch (_) {}
+    }
+    console.warn("[frame-schedule cloud] 409 -- app build stale vs DB minWriteBuild=" + (json && json.minWriteBuild));
+    return { ok: false, error: new Error("app build stale"), status: 409, minWriteBuild: json && json.minWriteBuild };
+  }
+  if (!resp.ok) {
+    const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+    return { ok: false, error: new Error(`frame-schedule-write ${resp.status}: ${detail}`), status: resp.status };
+  }
+  return { ok: true, ...json };
 }
 
 // v7.11 Batch API: submit an array of { iso, payload }. Returns
@@ -1317,53 +1314,47 @@ async function publishFrameScheduleSnapshot(token, html) {
   if (html.length > 3000000) {
     return { ok: false, error: new Error("html too large (>3MB)") };
   }
-  // v7.11 Include the shared edit token + build header so the
-  // publish function's token guard passes. The token cache and
-  // 401 retry loop mirror _fsPostFrameScheduleWrite.
-  const getToken = (typeof window !== "undefined" && typeof window._fsGetEditToken === "function")
-    ? window._fsGetEditToken
-    : (() => null);
-  const clearToken = (typeof window !== "undefined" && typeof window._fsClearEditToken === "function")
-    ? window._fsClearEditToken
-    : (() => {});
-  let attempts = 0;
-  while (attempts < 2) {
-    attempts++;
-    const editToken = getToken(attempts > 1 ? { force: true } : undefined);
-    if (!editToken) {
-      return { ok: false, error: new Error("edit token required (operator canceled)") };
-    }
-    try {
-      const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-fs-edit-token": editToken,
-          "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
-        },
-        body: JSON.stringify({ token, html }),
-      });
-      const text = await resp.text();
-      let json = null;
-      try { json = JSON.parse(text); } catch (_) { /* not json */ }
-      if (resp.status === 401) {
-        clearToken();
-        if (attempts >= 2) return { ok: false, error: new Error("edit token rejected twice; giving up") };
-        continue;
-      }
-      if (!resp.ok) {
-        const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
-        return { ok: false, error: new Error(`publish returned ${resp.status}: ${detail}`) };
-      }
-      if (!json || !json.url) {
-        return { ok: false, error: new Error("publish returned no url") };
-      }
-      return { ok: true, url: json.url, updatedAt: json.updated_at || null, bytes: json.bytes || 0 };
-    } catch (err) {
-      return { ok: false, error: err };
-    }
+  // v7.12 Include the shared edit token + build header so the
+  // publish function's token guard passes. Token is the same
+  // FS_EDIT_TOKEN_CLIENT that _fsPostFrameScheduleWrite uses --
+  // no user prompt, no retry loop. See the honest note in
+  // js/01-config.js about what the token actually gates.
+  const editToken = (typeof FS_EDIT_TOKEN_CLIENT === "string" && FS_EDIT_TOKEN_CLIENT) ? FS_EDIT_TOKEN_CLIENT : "";
+  if (!editToken) {
+    console.warn("[frame-schedule cloud] FS_EDIT_TOKEN_CLIENT missing from js/01-config.js -- publish will 401");
   }
-  return { ok: false, error: new Error("publish edit-token retries exhausted") };
+  try {
+    const resp = await fetch("/.netlify/functions/frame-schedule-publish", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fs-edit-token": editToken,
+        "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
+      },
+      body: JSON.stringify({ token, html }),
+    });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) { /* not json */ }
+    if (resp.status === 401) {
+      // Same config-mismatch story as _fsPostFrameScheduleWrite.
+      console.error("[frame-schedule publish] 401 -- FS_EDIT_TOKEN_CLIENT (js/01-config.js) does not match Netlify env FS_EDIT_TOKEN.");
+      if (typeof showToast === "function") {
+        showToast("Publish blocked: app token mismatch (deploy issue).", "crit");
+      }
+      return { ok: false, error: new Error("edit token rejected by server (config mismatch)"), status: 401 };
+    }
+    if (!resp.ok) {
+      const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+      return { ok: false, error: new Error(`publish returned ${resp.status}: ${detail}`) };
+    }
+    if (!json || !json.url) {
+      return { ok: false, error: new Error("publish returned no url") };
+    }
+    return { ok: true, url: json.url, updatedAt: json.updated_at || null, bytes: json.bytes || 0 };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
 }
 
 window.setFrameScheduleWeekCloud     = setFrameScheduleWeekCloud;
