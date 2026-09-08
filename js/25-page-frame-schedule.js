@@ -5969,12 +5969,37 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
   const manuallyPinned = !!(cur && cur.mode === "weekly" && cur.source === "manual" && cur.locked);
 
   if (manuallyPinned) {
+    // v7.9 Confirm-before-unpin. Unpinning demotes the row to
+    // weekly-auto, which the persister then overwrites with a
+    // fresh sim pick -- a stray click has twice silently
+    // undone a hand-restored schedule. Pinning stays one-click
+    // (no confirm) since it's constructive.
+    const prevPn   = cur ? cur.pn : null;
+    const prevQty  = (cur && Number.isFinite(cur.qty))  ? cur.qty  : null;
+    const prevPn2  = (cur && cur.pn2) ? cur.pn2 : null;
+    const prevQty2 = (cur && Number.isFinite(cur.qty2)) ? cur.qty2 : null;
+    const label = prevPn2
+      ? `${prevPn}${prevQty ? ` ${prevQty}` : ""} + ${prevPn2}${prevQty2 ? ` ${prevQty2}` : ""}`
+      : `${prevPn || "?"}${prevQty ? ` ${prevQty}` : ""}`;
+    if (typeof window !== "undefined" && typeof window.confirm === "function") {
+      const proceed = window.confirm(`Unpin week ${iso} (${label})? The scheduler will replan it automatically.`);
+      if (!proceed) return;
+    }
     _fsCommitWeek(iso, { slot: null });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       logAudit("frame-sched-weekly-pin",
-        `Frame schedule weekly pin cleared: ${iso}` + (cur ? ` (was ${cur.pn})` : ""),
-        { weekIso: iso, action: "clear", prev: cur ? cur.pn : null });
+        `Frame schedule weekly pin cleared: ${iso}` + (prevPn ? ` (was ${label})` : ""),
+        {
+          weekIso: iso, action: "clear",
+          // v7.9 Full before-state so the audit trail names
+          // exactly what got dropped, not just the primary pn.
+          prev: prevPn,
+          prevQty: prevQty,
+          prevPn2: prevPn2,
+          prevQty2: prevQty2,
+          prevLabel: label,
+        });
     }
     if (typeof showToast === "function") showToast(`Weekly pin cleared for ${_fsMdFromIso(iso)}`, "ok");
   } else {
