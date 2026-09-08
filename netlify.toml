@@ -56,6 +56,17 @@
 [functions."frame-schedule-snapshot"]
   schedule = "45 5 * * *"
 
+# Phase-A SERVER-SIDE COMPUTE -- every 15 minutes. Runs the shared
+# scheduler (lib/frame-scheduler.js) against the same inputs the
+# browser uses (frame_schedule + parts) and writes the projected
+# plan into frame_schedule_shadow ONLY. Never modifies existing
+# tables. Also callable on demand via HTTP (POST/GET); pass
+# ?dry=1 to preview without writing. Set env FS_COMPUTE_ENABLED=0
+# to disable without deleting the function; remove this stanza to
+# stop the cron entirely.
+[functions."frame-schedule-compute"]
+  schedule = "*/15 * * * *"
+
 # INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
 # filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
 # to datetimeoffset and then to a full sweep if the tenant rejects
