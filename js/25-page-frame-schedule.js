@@ -1232,8 +1232,22 @@ function _fsSimulate(rows, cols, slots, globalCaps, rateByPn) {
    splitCount stays 0 in weekly mode (splits are a slot concept).
    ============================================================ */
 
-const _FS_WEEKLY_LOOKAHEAD_K = 3;
+const _FS_WEEKLY_LOOKAHEAD_K = 3;   // legacy; kept for _fsWeeklyBaselineMinCover (overshoot cap floor)
 const _FS_WEEKLY_CHANGEOVER_BONUS_WEEKS = 0.3;
+// v7.8 Full-horizon discounted scoring. K=3 lookahead in v7.2
+// was too short: once no frame is urgent within 3 weeks, the
+// changeover bonus repeatedly hands consecutive full runs to
+// the same frame while a pool-mate quietly drains toward
+// stockout at week 6-12 -- invisible to the K=3 score.
+// v7.8 replaces the fixed K burn with a horizon-length
+// projection whose per-week discount emphasizes near-term
+// trouble but still surfaces far-term stockouts. Weight
+// per week w (1-indexed from the sim's next-week end) = 0.9^(w-1);
+// with a 20-week sim horizon that's ~0.14 at the far edge, so
+// a -5wk stockout at week 12 still weighs -0.7 -- worse than
+// any healthy near-term dip and easily separable from a
+// candidate that avoids the stockout.
+const _FS_WEEKLY_HORIZON_DISCOUNT = 0.9;
 
 /* ============================================================
    v7.2 WEEKLY MODE MIX CANDIDATES + SCORING FLOW GUARDS
@@ -1405,7 +1419,7 @@ function _fsSimulateWeekly(rows, cols, slots, globalCaps, rateByPn) {
           legacyPinPn = pin.pn;
         }
       } else {
-        assignment = _fsWeeklyPickAssignment(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps);
+        assignment = _fsWeeklyPickAssignment(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, cols, i);
       }
 
       if (assignment) {
@@ -1658,58 +1672,108 @@ function _fsWeeklyEnumerateCandidates(rows, onHand, weeklyBurnByPn, globalCaps) 
   return candidates;
 }
 
-// v7.2 Score an assignment (idle | pure run | mix). Higher is
-// better; the picker picks the max. See the WEEKLY MODE MIX
-// CANDIDATES doc block for the full contract.
-function _fsWeeklyScore(candidate, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, baselineMinCover) {
-  // Clone onHand so scoring never mutates the real running sim.
-  const simOh = new Map();
-  for (const [pn, oh] of onHand.entries()) simOh.set(pn, oh);
+// v7.8 Memoized baseline projection over the remaining sim
+// horizon: for each frame, no-build cover per week. Two Maps
+// keyed by pn:
+//   perFrameDiscMin  -- min over w of (cover_w * 0.9^(w-1))
+//   perFrameRawMin   -- min over w of raw cover (used by the
+//                       tie-break to prefer candidates that
+//                       raise the lowest projected end-of-
+//                       horizon cover most).
+// Called once per week from the picker; candidates only
+// recompute their OWN touched frames' trajectories, so cost
+// stays O(rows * horizon) once + O(2 * horizon) per candidate.
+function _fsWeeklyBaselineHorizonProjection(rows, onHand, weeklyBurnByPn, remainingWeeks) {
+  const perFrameDiscMin = new Map();
+  const perFrameRawMin  = new Map();
+  for (const r of rows) {
+    const burn = weeklyBurnByPn.get(r.pn) || 0;
+    const oh   = Number(onHand.get(r.pn)) || 0;
+    let minDisc = Infinity;
+    let minRaw  = Infinity;
+    let discountFactor = 1;
+    for (let w = 1; w <= remainingWeeks; w++) {
+      const ohAfter = oh - burn * w;
+      const cover = burn > 0 ? (ohAfter / burn) : Infinity;
+      const disc = Number.isFinite(cover) ? cover * discountFactor : Infinity;
+      if (disc < minDisc) minDisc = disc;
+      if (cover < minRaw) minRaw = cover;
+      discountFactor *= _FS_WEEKLY_HORIZON_DISCOUNT;
+    }
+    perFrameDiscMin.set(r.pn, minDisc);
+    perFrameRawMin.set(r.pn, minRaw);
+  }
+  return { perFrameDiscMin, perFrameRawMin };
+}
 
+// v7.8 Score an assignment against the FULL remaining sim
+// horizon (was: K=3 lookahead in v7.2). Discount per week
+// 0.9^(w-1) emphasizes near-term trouble but keeps a stockout
+// 12 weeks out visible enough to beat any healthy candidate.
+// Returns { score, horizonMinRaw } -- score for the primary
+// comparison, raw min for the tie-break.
+function _fsWeeklyScore(candidate, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, baselineMinCover, remainingWeeks, baselineProjection) {
+  // Placements from the assignment. Sum-per-pn so a std+std
+  // candidate that mentions the same pn twice (shouldn't
+  // happen but defensive) doesn't get short-changed.
+  const addedByPn = new Map();
   if (candidate && !candidate.isIdle) {
     if (candidate.pn && candidate.qty > 0) {
-      simOh.set(candidate.pn, (Number(simOh.get(candidate.pn)) || 0) + candidate.qty);
+      addedByPn.set(candidate.pn, (addedByPn.get(candidate.pn) || 0) + candidate.qty);
     }
     if (candidate.pn2 && candidate.qty2 > 0) {
-      simOh.set(candidate.pn2, (Number(simOh.get(candidate.pn2)) || 0) + candidate.qty2);
+      addedByPn.set(candidate.pn2, (addedByPn.get(candidate.pn2) || 0) + candidate.qty2);
     }
   }
 
-  // Snapshot cover AFTER placement (BEFORE lookahead burn) so
-  // the overshoot penalty measures against next-week cover,
-  // not the K-week-later projection.
+  // Per-frame discounted + raw min over the remaining horizon.
+  // Untouched frames read from the memoized baseline; touched
+  // frames recompute their trajectory with the extra qty.
+  let minDiscountedCover = Infinity;
+  let horizonMinRaw = Infinity;
   const coverAfterThisWeek = new Map();
   for (const r of rows) {
     const burn = weeklyBurnByPn.get(r.pn) || 0;
-    const oh   = simOh.get(r.pn) || 0;
-    coverAfterThisWeek.set(r.pn, burn > 0 ? (oh / burn) : Infinity);
-  }
+    const baseOh = Number(onHand.get(r.pn)) || 0;
+    const added = addedByPn.get(r.pn) || 0;
+    const startOh = baseOh + added;
+    // Cover-after-this-week (before any lookahead burn) -- used
+    // by the overshoot penalty and reflects the placement.
+    const coverThis = burn > 0 ? (startOh / burn) : Infinity;
+    coverAfterThisWeek.set(r.pn, coverThis);
 
-  // Worst-case lookahead: no further builds for K weeks.
-  for (let k = 0; k < _FS_WEEKLY_LOOKAHEAD_K; k++) {
-    for (const r of rows) {
-      simOh.set(r.pn, (simOh.get(r.pn) || 0) - (weeklyBurnByPn.get(r.pn) || 0));
+    let frameDiscMin;
+    let frameRawMin;
+    if (added > 0) {
+      // Touched frame -- recompute discounted + raw min.
+      let mDisc = Infinity;
+      let mRaw  = Infinity;
+      let df = 1;
+      for (let w = 1; w <= remainingWeeks; w++) {
+        const ohAfter = startOh - burn * w;
+        const cover = burn > 0 ? (ohAfter / burn) : Infinity;
+        const disc = Number.isFinite(cover) ? cover * df : Infinity;
+        if (disc < mDisc) mDisc = disc;
+        if (cover < mRaw) mRaw = cover;
+        df *= _FS_WEEKLY_HORIZON_DISCOUNT;
+      }
+      frameDiscMin = mDisc;
+      frameRawMin  = mRaw;
+    } else {
+      // Untouched frame -- fetch from the memo.
+      frameDiscMin = baselineProjection.perFrameDiscMin.get(r.pn);
+      frameRawMin  = baselineProjection.perFrameRawMin.get(r.pn);
     }
+    if (frameDiscMin < minDiscountedCover) minDiscountedCover = frameDiscMin;
+    if (frameRawMin  < horizonMinRaw)      horizonMinRaw      = frameRawMin;
   }
 
-  let minCoverAfter = Infinity;
-  for (const r of rows) {
-    const burn = weeklyBurnByPn.get(r.pn) || 0;
-    const oh   = simOh.get(r.pn) || 0;
-    const cover = burn > 0 ? (oh / burn) : Infinity;
-    if (cover < minCoverAfter) minCoverAfter = cover;
-  }
+  let score = minDiscountedCover;
 
-  let score = minCoverAfter;
-
-  // Overshoot penalty: any frame the assignment BUILT whose
-  // cover-after exceeds (overshootFloor + horizon) costs per
-  // excess week. Prevents topping up slow burners to 20+ weeks
-  // while another frame is at 3. Floor is clamped to
-  // max(bufferWeeksLocal, baselineMinCover) so a deep-negative
-  // baseline (frames already stocked out) doesn't shove the
-  // cap into nonsense territory where every build looks like
-  // overshoot.
+  // Overshoot penalty (unchanged v7.2 semantics). Floor is
+  // clamped to max(bufferWeeks, baselineMinCover) so a deep-
+  // negative baseline doesn't shove the cap into nonsense
+  // territory where every build looks like overshoot.
   const rawBaseline = Number.isFinite(baselineMinCover) ? baselineMinCover : 0;
   const overshootFloor = Math.max(Number(bufferWeeksLocal) || 0, rawBaseline);
   const overshootCap = overshootFloor + _FS_WEEKLY_OVERSHOOT_HORIZON_WEEKS;
@@ -1721,7 +1785,7 @@ function _fsWeeklyScore(candidate, rows, onHand, previousPn, weeklyBurnByPn, buf
   };
   if (candidate && !candidate.isIdle) {
     if (candidate.pn && candidate.qty > 0) penalizeOvershoot(candidate.pn);
-    if (candidate.pn2 && candidate.qty2 > 0) penalizeOvershoot(candidate.pn2);
+    if (candidate.pn2 && candidate.qty2 > 0 && candidate.pn2 !== candidate.pn) penalizeOvershoot(candidate.pn2);
   }
 
   // Mix penalty: fixed cost per extra frame in the assignment.
@@ -1729,41 +1793,64 @@ function _fsWeeklyScore(candidate, rows, onHand, previousPn, weeklyBurnByPn, buf
     score -= _FS_WEEKLY_MIX_PENALTY_WEEKS;
   }
 
-  // Changeover bonus: PRIMARY (largest-qty) frame matches
-  // previous week's primary.
+  // Changeover bonus stays in the score; the picker's tie-break
+  // no longer lets it decide by itself (see _fsWeeklyPickAssignment).
   if (candidate && !candidate.isIdle && candidate.pn && candidate.pn === previousPn && Number.isFinite(score)) {
     score += _FS_WEEKLY_CHANGEOVER_BONUS_WEEKS;
   }
 
-  return score;
+  return { score, horizonMinRaw };
 }
 
-// v7.2 Pick the best assignment for this week. Returns
-// {pn, qty, pn2, qty2, isMix} or null (idle). Tie-break within
-// an epsilon prefers FEWER distinct frames, then LARGER primary
-// run -- reads as full runs by default, mixes only when they
-// earn it.
-function _fsWeeklyPickAssignment(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps) {
+// v7.8 Pick the best assignment for this week. Returns
+// {pn, qty, pn2, qty2, isMix} or null (idle).
+//
+// Tie-break within an epsilon (v7.8 order):
+//   1. horizonMinRaw HIGHER  -- prefer the candidate that most
+//      raises the LOWEST projected end-of-horizon cover.
+//   2. Fewer distinct frames -- read as full runs by default.
+//   3. Larger primary qty     -- when even that ties.
+// The changeover bonus stays baked into the score but no longer
+// decides ties on its own; before v7.8 a same-as-previous run
+// won every eps-close tie and produced consecutive full-cap
+// runs on the same frame (three straight AMP STD 33s while
+// GAS STD drained) -- see the v7.8 ticket for the pathology.
+function _fsWeeklyPickAssignment(rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, cols, currentColIdx) {
   const baselineMinCover = _fsWeeklyBaselineMinCover(rows, onHand, weeklyBurnByPn);
+  // Remaining weeks in the sim horizon INCLUDING this week's
+  // build (which is already applied by the score's placement
+  // step). Clamp to at least 1 so a call from the final week
+  // still projects a single burn step.
+  const remainingWeeks = Math.max(1, (Array.isArray(cols) ? cols.length : 0) - (Number.isFinite(currentColIdx) ? currentColIdx : 0));
+  const baselineProjection = _fsWeeklyBaselineHorizonProjection(rows, onHand, weeklyBurnByPn, remainingWeeks);
   const candidates = _fsWeeklyEnumerateCandidates(rows, onHand, weeklyBurnByPn, globalCaps);
 
   let best = null;
   let bestScore = -Infinity;
+  let bestHorizonMin = -Infinity;
   for (const cand of candidates) {
-    const score = _fsWeeklyScore(cand, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, baselineMinCover);
+    const { score, horizonMinRaw } = _fsWeeklyScore(cand, rows, onHand, previousPn, weeklyBurnByPn, bufferWeeksLocal, globalCaps, baselineMinCover, remainingWeeks, baselineProjection);
     if (best === null) {
-      best = cand; bestScore = score;
+      best = cand; bestScore = score; bestHorizonMin = horizonMinRaw;
       continue;
     }
     if (score > bestScore + _FS_WEEKLY_TIEBREAK_EPS) {
-      best = cand; bestScore = score;
+      best = cand; bestScore = score; bestHorizonMin = horizonMinRaw;
     } else if (Math.abs(score - bestScore) <= _FS_WEEKLY_TIEBREAK_EPS) {
-      const framesBest = (best.pn ? 1 : 0) + (best.pn2 ? 1 : 0);
-      const framesCand = (cand.pn ? 1 : 0) + (cand.pn2 ? 1 : 0);
-      if (framesCand < framesBest) {
-        best = cand; bestScore = score;
-      } else if (framesCand === framesBest && (cand.qty || 0) > (best.qty || 0)) {
-        best = cand; bestScore = score;
+      // v7.8 tie-break: horizonMinRaw > best (strict), then
+      // fewer frames, then larger primary. Changeover bonus is
+      // already baked into `score` -- letting it also win ties
+      // was the pathology.
+      if (horizonMinRaw > bestHorizonMin) {
+        best = cand; bestScore = score; bestHorizonMin = horizonMinRaw;
+      } else if (horizonMinRaw === bestHorizonMin) {
+        const framesBest = (best.pn ? 1 : 0) + (best.pn2 ? 1 : 0);
+        const framesCand = (cand.pn ? 1 : 0) + (cand.pn2 ? 1 : 0);
+        if (framesCand < framesBest) {
+          best = cand; bestScore = score; bestHorizonMin = horizonMinRaw;
+        } else if (framesCand === framesBest && (cand.qty || 0) > (best.qty || 0)) {
+          best = cand; bestScore = score; bestHorizonMin = horizonMinRaw;
+        }
       }
     }
   }
