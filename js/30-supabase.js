@@ -1074,6 +1074,22 @@ function _fsRefuseWrite(pathName) {
   return { ok: false, error: new Error("write blocked: newer version elsewhere") };
 }
 
+// v7.10 Slot-equality helper mirrored from js/25 for the manual-
+// pin immutability guard. See _fsSlotsEqual in js/25 for the
+// contract; kept intentionally inlined here to avoid cross-file
+// load-order coupling.
+function _fsSlotsEqual(a, b) {
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return String(a.pn || "")     === String(b.pn || "")
+      && String(a.pn2 || "")    === String(b.pn2 || "")
+      && (Number(a.qty)  || 0)  === (Number(b.qty)  || 0)
+      && (Number(a.qty2) || 0)  === (Number(b.qty2) || 0)
+      && String(a.mode || "")   === String(b.mode || "")
+      && !!a.locked             === !!b.locked
+      && String(a.source || "") === String(b.source || "");
+}
+
 async function setFrameScheduleWeekCloud(isoMonday, payload) {
   if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleWeekCloud");
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
@@ -1088,6 +1104,23 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) {
     return { ok: false, error: new Error("invalid iso Monday key") };
+  }
+
+  // v7.10 MANUAL-PIN IMMUTABILITY (cloud-layer backstop). Second
+  // gate for callers that bypass _fsCommitWeek's mirror path
+  // (there aren't any today, but a future direct call to
+  // setFrameScheduleWeekCloud must NOT be able to nuke a manual
+  // pin either). The pass-through case (_fsCommitWeek already
+  // mutated the mirror to match the payload) sees payload.slot
+  // === mirror.slot and skips the rejection.
+  const mirrorRow = DB.frameSchedule.weeks.get(key);
+  const payloadHasSlot = payload && Object.prototype.hasOwnProperty.call(payload, "slot");
+  if (payloadHasSlot
+      && mirrorRow && mirrorRow.slot && mirrorRow.slot.source === "manual"
+      && !_fsSlotsEqual(payload.slot, mirrorRow.slot)
+      && payload.allowManualSlotChange !== true) {
+    console.warn(`[frame-schedule cloud] setFrameScheduleWeekCloud REFUSED: week ${key} is manually pinned (${mirrorRow.slot.pn || "?"}${mirrorRow.slot.pn2 ? " + " + mirrorRow.slot.pn2 : ""}). Pass allowManualSlotChange:true to override.`);
+    return { ok: false, error: new Error("week is manually pinned") };
   }
   // v2.1: no per-week caps. Payload carries {qty, slot?, onHandAtClose?}.
   const qty = {};

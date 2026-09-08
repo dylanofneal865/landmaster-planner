@@ -2704,17 +2704,52 @@ function _fsBuildWeekPayload(iso, scheduledRuns, slot, isSlotStart) {
 // a snapshot (payload = {onHandAtClose:...}) keeps the row's qty
 // and slot intact; a caller writing qty keeps the row's existing
 // snapshot intact.
+// v7.10 Slot-equality helper for the manual-pin immutability
+// guard. Two slot descriptors are equal iff every persisted
+// field matches after coercion (nullish -> ""; qty/qty2 -> 0).
+// Kept intentionally boring so a subtle field-drift diff always
+// counts as "differs".
+function _fsSlotsEqual(a, b) {
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return String(a.pn || "")     === String(b.pn || "")
+      && String(a.pn2 || "")    === String(b.pn2 || "")
+      && (Number(a.qty)  || 0)  === (Number(b.qty)  || 0)
+      && (Number(a.qty2) || 0)  === (Number(b.qty2) || 0)
+      && String(a.mode || "")   === String(b.mode || "")
+      && !!a.locked             === !!b.locked
+      && String(a.source || "") === String(b.source || "");
+}
+
 function _fsCommitWeek(iso, payload) {
   // v7.6 Every mirror-mutating path funnels through _fsCommitWeek,
   // so this one guard covers per-week writes, the persisters, the
   // pin toggles, the qty-override handler, and Replan horizon. A
   // blocked tab bails silently after raising the banner; nothing
   // changes locally or in the cloud.
-  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsCommitWeek"); return; }
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsCommitWeek"); return { ok: false, error: new Error("write blocked") }; }
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
   }
   const cur = DB.frameSchedule.weeks.get(iso) || {};
+
+  // v7.10 MANUAL-PIN IMMUTABILITY (write-layer backstop).
+  // A manually pinned week's slot descriptor is untouchable
+  // unless the caller passes allowManualSlotChange:true. This
+  // gate fires BEFORE the mirror mutation so a rejection leaves
+  // both the mirror and the cloud queue untouched. Payloads
+  // that don't mention `slot` at all (qty history, qtyOverride,
+  // onHandAtClose) pass through unchanged. Payloads with a slot
+  // that's byte-identical to the current one also pass (no-op).
+  const payloadHasSlot = payload && Object.prototype.hasOwnProperty.call(payload, "slot");
+  if (payloadHasSlot
+      && cur.slot && cur.slot.source === "manual"
+      && !_fsSlotsEqual(payload.slot, cur.slot)
+      && payload.allowManualSlotChange !== true) {
+    console.warn(`[frame-schedule] _fsCommitWeek REFUSED: week ${iso} is manually pinned (${cur.slot.pn || "?"}${cur.slot.pn2 ? " + " + cur.slot.pn2 : ""}). Pass allowManualSlotChange:true to override -- see the CONSOLE-ONLY ESCAPE HATCHES restore recipe.`);
+    return { ok: false, error: new Error("week is manually pinned") };
+  }
+
   const nextQty = ("qty" in payload) ? (payload.qty || {}) : (cur.qty || {});
   const nextSlot = ("slot" in payload) ? (payload.slot || null) : (cur.slot || null);
   const nextSnap = ("onHandAtClose" in payload) ? (payload.onHandAtClose || null) : (cur.onHandAtClose || null);
@@ -2741,7 +2776,12 @@ function _fsCommitWeek(iso, payload) {
   else if (cur.onHandAtClose) outPayload.onHandAtClose = cur.onHandAtClose;
   if ("qtyOverride" in payload) outPayload.qtyOverride = payload.qtyOverride;
   else if (cur.qtyOverride) outPayload.qtyOverride = cur.qtyOverride;
+  // v7.10 Forward the allowManualSlotChange flag to the cloud
+  // writer's own belt-and-suspenders guard so a manual-over-
+  // manual write survives the second gate too.
+  if (payload.allowManualSlotChange === true) outPayload.allowManualSlotChange = true;
   _fsDebouncedWriteWeek(iso, outPayload);
+  return { ok: true };
 }
 
 function _fsDebouncedWriteWeek(iso, payload) {
@@ -3542,7 +3582,7 @@ function renderFrameSchedule() {
       if (legacyLocked) {
         pills += `<span class="pill info tiny" style="letter-spacing:0.06em">locked</span>`;
       } else if (isWeeklyManualPin) {
-        pills += `<span class="pill info tiny" style="letter-spacing:0.06em" title="Manually pinned -- click to unpin">pinned</span>`;
+        pills += `<span class="pill info tiny" style="letter-spacing:0.06em" title="Pinned -- click to unpin (asks first)">&#x1F512; pinned</span>`;
       } else if (isWeeklyAutoPin) {
         pills += `<span class="pill muted tiny" style="letter-spacing:0.06em;opacity:0.7" title="Weekly-auto pin (stabilizes the near-term plan) -- click to promote to a manual pin">auto</span>`;
       }
@@ -5936,7 +5976,9 @@ function _fsExpirePastManualPins() {
     if (s.pn2) demotedSlot.pn2 = s.pn2;
     if (Number.isFinite(s.qty)  && s.qty  > 0) demotedSlot.qty  = s.qty;
     if (Number.isFinite(s.qty2) && s.qty2 > 0) demotedSlot.qty2 = s.qty2;
-    _fsCommitWeek(iso, { slot: demotedSlot });
+    // v7.10 Sanctioned demotion (the ONE automatic path allowed
+    // to modify a manual pin). Date-gated to weeks >2wk past.
+    _fsCommitWeek(iso, { slot: demotedSlot, allowManualSlotChange: true });
     demoted++;
     demotedIsos.push(iso);
   }
@@ -5985,7 +6027,9 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
       const proceed = window.confirm(`Unpin week ${iso} (${label})? The scheduler will replan it automatically.`);
       if (!proceed) return;
     }
-    _fsCommitWeek(iso, { slot: null });
+    // v7.10 Sanctioned unpin -- carries the manual-slot override
+    // flag so the write-layer guard lets it through.
+    _fsCommitWeek(iso, { slot: null, allowManualSlotChange: true });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       logAudit("frame-sched-weekly-pin",
@@ -6019,7 +6063,14 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
         slotDesc.qty2 = qty2Num;
       }
     }
-    _fsCommitWeek(iso, { slot: slotDesc });
+    // v7.10 Sanctioned (re-)pin -- carries the manual-slot
+    // override flag so a future band click that lands on this
+    // branch while an existing manual pin sits underneath still
+    // succeeds. Today the unpin branch above intercepts
+    // manuallyPinned first (via confirm), so this line only
+    // runs when the current row is not manually pinned; the
+    // flag is a belt-and-suspenders no-op in that case.
+    _fsCommitWeek(iso, { slot: slotDesc, allowManualSlotChange: true });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       const desc = slotDesc.pn2
@@ -6346,6 +6397,25 @@ registerRoute("frameschedule", renderFrameSchedule);
    optimize + persist flow, exactly as they did when they had
    rendered buttons. No UI paths render these — grep the file
    for onclick handlers to confirm.
+
+   ---------------------------------------------------------------
+   v7.10 MANUAL-PIN RESTORE RECIPE (weekly mode)
+   ---------------------------------------------------------------
+
+   Direct _fsCommitWeek calls that write source:"manual" over an
+   EXISTING manual pin need the override flag -- otherwise the
+   write-layer guard rejects them:
+
+     _fsCommitWeek("2026-11-02", {
+       slot: { pn: "UT101003", qty: 21, pn2: "UT101001", qty2: 12,
+               mode: "weekly", locked: true, source: "manual" },
+       allowManualSlotChange: true,
+     });
+
+   Writing a manual pin over a non-manual row (weekly-auto or
+   empty) does NOT need the flag; the guard only fires when the
+   CURRENT row is manual. When in doubt, always pass the flag on
+   restore paths -- it's a no-op if the target isn't manual.
    ============================================================ */
 window.fsOverrideSlot = _fsHandleSlotOverride;
 window.fsRepickSlot   = _fsHandleSlotRepick;
