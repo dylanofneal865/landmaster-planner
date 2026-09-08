@@ -137,25 +137,198 @@ function ingestFrameSchedule(rows) {
   return { weekDataByIso, settings };
 }
 
-// Build the 6-row FRAME_PNS row set from parts. onHand + daily
-// come from parts.data.
+/* ============================================================
+   AUDIT: browser path from raw parts data -> scheduler inputs.
+
+   The browser's renderFrameSchedule builds its scheduler inputs
+   from DB.parts like this:
+
+     _fsRows()           -- for each FRAME_PN:
+                            { pn,
+                              onHand:  Number(part.onHand) || 0,
+                              daily:   Number(part.daily)  || 0,   RAW
+                              pool:    FRAME_POOL[pn] || "std",
+                              part:    the DB.parts entry (used
+                                       downstream by _fsDaily) }
+     rateByPn[r.pn]      -- _fsDaily(r), which is chain-aware:
+                              chainDisplayDaily(part) when the
+                              part is in an ACTIVELY-TRANSITIONING
+                              supersession chain (lineage.length
+                              >= 2 AND at least one member has
+                              phasingOut). Otherwise Number(part.daily).
+                              For UT101002 (which IS in a chain
+                              transitioning to a newer PN) the
+                              browser burns at chainDisplayDaily
+                              (anchor.daily, higher) NOT part.daily.
+                              This is the field whose divergence
+                              produced the fsCompareShadow diff at
+                              the first freely-scheduled week.
+     weeklyBurn          -- rateByPn[pn] * FS_WORKDAYS_PER_WEEK (5).
+                            Computed inside the scheduler; not a
+                            separate input.
+
+   Per _fsDaily's own docblock and every explicit callsite audit
+   in js/25 (search for `rateByPn`), rate STEPS (scheduled ramps
+   in js/03) are INTENTIONALLY IGNORED here -- the schedule DRIVES
+   production toward the current full rate immediately rather than
+   honoring a historical ramp date. That means the scheduler input
+   is chainDisplayDaily(part), not chainedDailyDaily-at-week-N.
+
+   Every other browser input to the scheduler (caps, bufferWeeks,
+   scheduleMode, week pins, qtyOverrides, slot data) comes from
+   the __settings__ row and the per-week frame_schedule rows,
+   which we already ingest byte-for-byte via ingestFrameSchedule.
+
+   REPLICATED on the server (this file):
+     * onHand         -- raw parts.data.onHand (identical shape).
+     * daily raw      -- raw parts.data.daily  (identical shape).
+     * chain daily    -- chainDisplayDailyServer, faithful port of
+                         js/03 chainDisplayDaily + supersessionLineage.
+                         Loads supersededBy + phasingOut from
+                         parts.data across ALL parts (not just the
+                         6 frames) because the lineage walk goes
+                         BACKWARD to find predecessors whose
+                         supersededBy points at the current pn.
+     * pool           -- FrameScheduler.FRAME_POOL (const).
+     * ingest         -- ingestFrameSchedule (mirrors
+                         js/30 _populateFrameScheduleFromRows).
+
+   EXCLUDED on the server (with justification):
+     * rate steps     -- js/03's schedule of dated rate changes.
+                         Browser's _fsDaily explicitly ignores them
+                         per the FS_WORKDAYS_PER_WEEK doc block.
+                         Excluding here matches the browser.
+     * kit BOM math   -- kits are consumed differently from
+                         frames; FRAME_PNS are non-kit assemblies.
+                         chainDisplayDailyServer inputs are the
+                         same fields (part.daily) whether or not
+                         the part is a kit component; there is no
+                         BOM-level rate adjustment applied by the
+                         browser to _fsDaily.
+     * PO receipts    -- explicitly excluded from the sim on BOTH
+                         sides (`NO PO CREDITS` doc block in js/25).
+     * TZ handling    -- Date construction identical between sides
+                         (local midnight; timezone-agnostic ISO
+                         Monday string keys everywhere).
+   ============================================================ */
+
+// Faithful port of js/03 supersessionChain (forward walk following
+// part.supersededBy). Same cycle guard. `byPn` is Map<pn -> partData>.
+function supersessionChainServer(pn, byPn) {
+  const out = [];
+  const visited = new Set();
+  let cur = pn ? String(pn).trim() : "";
+  while (cur && !visited.has(cur)) {
+    out.push(cur);
+    visited.add(cur);
+    const p = byPn.get(cur);
+    const next = (p && p.supersededBy) ? String(p.supersededBy).trim() : "";
+    if (!next || next === cur) break;
+    cur = next;
+  }
+  return out;
+}
+
+// Faithful port of js/03 supersessionLineage (BACKWARD via
+// predecessors whose supersededBy points at me, THEN FORWARD via
+// supersessionChain). Returns anchor-first ordered pn list.
+function supersessionLineageServer(pn, byPn, allEntries) {
+  const start = pn ? String(pn).trim() : "";
+  if (!start) return [];
+  const back = [];
+  const seen = new Set([start]);
+  let cur = start;
+  while (true) {
+    // O(N) scan mirrors js/03 (same Array.find shape).
+    let pred = null;
+    for (const [predPn, predData] of allEntries) {
+      if (predData && predData.supersededBy && String(predData.supersededBy).trim() === cur) {
+        pred = { pn: predPn };
+        break;
+      }
+    }
+    if (!pred) break;
+    if (seen.has(pred.pn)) break;   // cycle guard
+    back.unshift(pred.pn);
+    seen.add(pred.pn);
+    cur = pred.pn;
+  }
+  const forward = supersessionChainServer(start, byPn);
+  return [...back, ...forward];
+}
+
+// Faithful port of js/03 chainDisplayDaily. Returns anchor.daily
+// when the part is in an actively-transitioning chain (lineage
+// >= 2 AND any member has phasingOut). Otherwise returns own daily.
+// Also returns metadata for the compute-time inputs snapshot.
+function chainDisplayDailyServer(pn, byPn, allEntries) {
+  const own = byPn.get(pn) || {};
+  const ownDaily = Number(own.daily) || 0;
+  const lineage = supersessionLineageServer(pn, byPn, allEntries);
+  if (lineage.length < 2) {
+    return { daily: ownDaily, ownDaily, chainMembers: lineage, chainTransitioning: false, chainAnchorPn: null };
+  }
+  const transitioning = lineage.some(memberPn => {
+    const m = byPn.get(memberPn);
+    return !!(m && m.phasingOut);
+  });
+  const anchorPn = lineage[0];
+  if (!transitioning) {
+    return { daily: ownDaily, ownDaily, chainMembers: lineage, chainTransitioning: false, chainAnchorPn: anchorPn };
+  }
+  const anchor = byPn.get(anchorPn);
+  const daily = anchor ? (Number(anchor.daily) || 0) : ownDaily;
+  return { daily, ownDaily, chainMembers: lineage, chainTransitioning: true, chainAnchorPn: anchorPn };
+}
+
+// Build the 6-row FRAME_PNS row set from parts + return the
+// per-frame inputs snapshot that will be stored in the shadow
+// __settings__ sentinel (see the AUDIT block above for what's
+// replicated vs excluded).
 function buildFrameRows(partsRows) {
   const byPn = new Map();
   for (const r of partsRows || []) {
     if (!r || !r.pn) continue;
     byPn.set(String(r.pn), r.data || {});
   }
-  return FRAME_PNS.map(pn => {
+  const allEntries = [...byPn.entries()];   // reused by lineage walks
+  const rows = [];
+  const perFrameInputs = {};                 // exported to __settings__
+  for (const pn of FRAME_PNS) {
     const d = byPn.get(pn) || {};
-    return {
+    const chain = chainDisplayDailyServer(pn, byPn, allEntries);
+    const dailyEffective = chain.daily;      // what the scheduler sees
+    const weeklyBurn = dailyEffective * FrameScheduler.FS_WORKDAYS_PER_WEEK;
+    rows.push({
       pn,
       desc: (d && d.desc) || "",
       pool: FrameScheduler.FRAME_POOL[pn] || "std",
       onHand: Number(d.onHand) || 0,
-      daily:  Number(d.daily)  || 0,
+      daily:  Number(d.daily)  || 0,          // RAW, matches _fsRows
       inCatalog: byPn.has(pn),
+    });
+    perFrameInputs[pn] = {
+      onHand: Number(d.onHand) || 0,
+      dailyRaw: Number(d.daily) || 0,
+      dailyEffective,
+      weeklyBurn,
+      chainMembers: chain.chainMembers,
+      chainAnchorPn: chain.chainAnchorPn,
+      chainTransitioning: chain.chainTransitioning,
+      // ingestAdjustments captures anything the ingest pipeline
+      // does to the raw parts.data fields. Currently we take
+      // onHand + daily verbatim, chain-adjust daily -> dailyEffective,
+      // and nothing else. If a future ingest step massages onHand
+      // (e.g. subtracting a reserved allocation), record it here.
+      ingestAdjustments: {
+        onHand: "raw parts.data.onHand",
+        daily: chain.chainTransitioning
+          ? `chain-anchor daily from ${chain.chainAnchorPn} (chain: ${chain.chainMembers.join(",")})`
+          : "raw parts.data.daily",
+      },
     };
-  });
+  }
+  return { rows, perFrameInputs };
 }
 
 function computeInputHash(frameSchedRows, partsRows, settings) {
@@ -208,12 +381,15 @@ exports.handler = async (event) => {
   }
 
   const { weekDataByIso, settings } = ingestFrameSchedule(frameSchedRows);
-  const rows = buildFrameRows(partsRows);
+  const { rows, perFrameInputs } = buildFrameRows(partsRows);
   const globalCaps = settings.caps || { crewhd: 0, std: 0 };
   const bufferWeeks = (typeof settings.bufferWeeks === "number" && Number.isFinite(settings.bufferWeeks) && settings.bufferWeeks >= 0)
     ? settings.bufferWeeks : 1.0;
 
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  const todayIso = today.getFullYear() + "-"
+    + String(today.getMonth() + 1).padStart(2, "0") + "-"
+    + String(today.getDate()).padStart(2, "0");
   const ctx = {
     weekDataByIso,
     bufferWeeks,
@@ -222,19 +398,29 @@ exports.handler = async (event) => {
     parseDateLocal,
     addDays,
     mondayOfWeek,
-    // Compute environment doesn't have chainDisplayDaily -- the
-    // browser passes it via dailyFor. Here dailyFor falls back to
-    // Number(row.daily) which for FRAME_PNS is the correct
-    // per-workday rate: none of them participate in a
-    // supersession chain (each frame pn is its own consumption
-    // node).
-    dailyFor: (row) => Number(row && row.daily) || 0,
+    // dailyFor is the fallback path the scheduler uses when
+    // rateByPn is not passed. Chain-aware -- mirrors js/25's
+    // _fsDaily. Every hot-path caller passes rateByPn (built
+    // below from perFrameInputs) so this fallback rarely fires,
+    // but keep it correct so a bare simulate() call from a test
+    // or a future caller doesn't silently pick the raw rate.
+    dailyFor: (row) => {
+      const rec = row && row.pn ? perFrameInputs[row.pn] : null;
+      if (rec && Number.isFinite(rec.dailyEffective)) return rec.dailyEffective;
+      return Number(row && row.daily) || 0;
+    },
   };
   const sched = FrameScheduler.forContext(ctx);
 
-  // rateByPn matches the browser's memoized rate table (per-workday).
+  // rateByPn feeds the scheduler's per-workday rate table. Reads
+  // dailyEffective (chain-adjusted, mirrors browser _fsDaily) NOT
+  // the raw parts.data.daily. This was the fsCompareShadow
+  // divergence: reading raw daily here burned UT101002 at ~0.16/d
+  // while the browser burned it at ~0.61/d (anchor's rate), so
+  // the two plans agreed through pinned weeks and forked at the
+  // first freely-scheduled week.
   const rateByPn = {};
-  for (const r of rows) rateByPn[r.pn] = Number(r.daily) || 0;
+  for (const r of rows) rateByPn[r.pn] = perFrameInputs[r.pn].dailyEffective;
 
   const simCols = sched.simColumns();
   const renderCols = sched.renderColumns();
@@ -306,24 +492,66 @@ exports.handler = async (event) => {
       input_hash: inputHash,
     });
   }
-  // Also write a __settings__ sentinel so the browser-side
-  // fsCompareShadow can see caps/mode/buffer + the input_hash.
-  shadowRows.push({
-    fg_sku: "__settings__",
-    weekly_qty: null,
-    data: {
-      caps: globalCaps,
-      bufferWeeks,
-      scheduleMode: settings.scheduleMode,
-      simHorizonWeeks: FrameScheduler.SIM_HORIZON_WEEKS,
-      simFirstIso: simCols[0] ? simCols[0].iso : null,
-      simLastIso: simCols[simCols.length - 1] ? simCols[simCols.length - 1].iso : null,
-      framePns: FRAME_PNS,
-    },
-    updated_at: nowIso,
-    computed_at: nowIso,
-    input_hash: inputHash,
-  });
+  // Build the list of week rows honored as pins. Two sources
+  // (mirrors simulateWeekly's pinByIso construction):
+  //   (a) legacy 2-week locked slots (source: "seed" | "auto" |
+  //       "manual"; both weeks pinned)
+  //   (b) v7.1 per-week weekly-mode pins (slot.mode === "weekly";
+  //       source: "weekly-auto" | "manual")
+  // qtyOverride entries piggyback on any week that carries one so
+  // the fsCompareShadow tool can see WHAT constraint the sim saw.
+  const weeklyPins = [];
+  const seenPinIsos = new Set();
+  for (const s of slots) {
+    if (!s.locked || !s.resolvedPn) continue;
+    for (let idx = 0; idx < s.weekIsos.length; idx++) {
+      const iso = s.weekIsos[idx];
+      if (seenPinIsos.has(iso)) continue;
+      seenPinIsos.add(iso);
+      const wk = weekDataByIso.get(iso) || {};
+      const usePn2 = idx === 1 && !!s.resolvedPn2 && s.resolvedPn2 !== s.resolvedPn;
+      weeklyPins.push({
+        iso,
+        pn: usePn2 ? s.resolvedPn2 : s.resolvedPn,
+        source: s.source || "auto",
+        fromSlot: true,
+        qty: (wk.qty && typeof wk.qty === "object") ? wk.qty : {},
+        qtyOverride: (wk.qtyOverride && typeof wk.qtyOverride === "object") ? wk.qtyOverride : null,
+      });
+    }
+  }
+  const isosSorted = [...weekDataByIso.keys()].sort();
+  for (const iso of isosSorted) {
+    if (iso === "__settings__") continue;
+    if (seenPinIsos.has(iso)) continue;
+    const wk = weekDataByIso.get(iso) || {};
+    const slot = wk && wk.slot;
+    if (!slot || !slot.pn || slot.mode !== "weekly") {
+      // Not a pin, but if a qtyOverride is set, surface it -- the
+      // sim honors those as hard placements too.
+      if (wk.qtyOverride && Object.keys(wk.qtyOverride).length > 0) {
+        weeklyPins.push({
+          iso,
+          pn: null,
+          source: "qtyOverride-only",
+          fromSlot: false,
+          qty: (wk.qty && typeof wk.qty === "object") ? wk.qty : {},
+          qtyOverride: wk.qtyOverride,
+        });
+      }
+      continue;
+    }
+    weeklyPins.push({
+      iso,
+      pn: slot.pn,
+      source: slot.source || "weekly-auto",
+      fromSlot: false,
+      qty: (typeof slot.qty === "number") ? slot.qty : null,
+      pn2: (slot.pn2 && slot.pn2 !== slot.pn) ? slot.pn2 : null,
+      qty2: (typeof slot.qty2 === "number") ? slot.qty2 : null,
+      qtyOverride: (wk.qtyOverride && typeof wk.qtyOverride === "object") ? wk.qtyOverride : null,
+    });
+  }
 
   const gridKey = FrameScheduler.gridKey(rows, renderCols, scheduledRuns, globalCaps, bufferWeeks);
 
@@ -356,6 +584,42 @@ exports.handler = async (event) => {
     determinismLine = "DETERMINISM SELF-TEST THREW";
     log(determinismLine, err && err.message);
   }
+
+  // Stamp the __settings__ sentinel with EVERYTHING the browser
+  // needs to diff its own inputs against ours. fsCompareShadow
+  // reads this first -- an INPUT DIFF surfaces a divergence at
+  // the ingest layer BEFORE the plan diff table. Fields the
+  // browser mirrors 1:1:
+  //   perFrameInputs[pn] -> onHand, dailyRaw, dailyEffective,
+  //                         weeklyBurn, chainMembers,
+  //                         chainAnchorPn, chainTransitioning,
+  //                         ingestAdjustments.
+  //   anchorIso          -- FrameScheduler.SLOT_ANCHOR_ISO const.
+  //   todayIso           -- the "today" the sim saw (local
+  //                         midnight, ISO YYYY-MM-DD).
+  //   determinism        -- DETERMINISM OK / FAIL from above.
+  //   weeklyPins         -- every honored pin + qtyOverride entry.
+  shadowRows.push({
+    fg_sku: "__settings__",
+    weekly_qty: null,
+    data: {
+      caps: globalCaps,
+      bufferWeeks,
+      scheduleMode: settings.scheduleMode,
+      simHorizonWeeks: FrameScheduler.SIM_HORIZON_WEEKS,
+      simFirstIso: simCols[0] ? simCols[0].iso : null,
+      simLastIso: simCols[simCols.length - 1] ? simCols[simCols.length - 1].iso : null,
+      framePns: FRAME_PNS,
+      anchorIso: FrameScheduler.SLOT_ANCHOR_ISO,
+      todayIso,
+      determinism: determinismLine,
+      perFrameInputs,
+      weeklyPins,
+    },
+    updated_at: nowIso,
+    computed_at: nowIso,
+    input_hash: inputHash,
+  });
 
   const summary = {
     ok: true,

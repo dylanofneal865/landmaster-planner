@@ -5120,7 +5120,7 @@ window.fsCompareShadow = async function (opts) {
     if (data.length < PAGE) break;
     from += PAGE;
   }
-  // Server QTY: {iso -> {pn -> qty}}
+  // Server QTY: {iso -> {pn -> qty}}, plus __settings__ blob.
   const serverQty = new Map();
   let serverSettings = null;
   for (const row of all) {
@@ -5163,12 +5163,147 @@ window.fsCompareShadow = async function (opts) {
     }
   }
 
-  // Compare -- for each week in simCols (server or browser), list
-  // each FRAME_PN and mark MATCH / DIFF.
+  /* ==========================================================
+     STEP 1 -- INPUT DIFF (runs BEFORE the plan diff).
+
+     A stable structured plan diff whose input_hash also changes
+     across fresh computes is a strong signal the SIM is
+     deterministic but the INGEST feeds different per-frame
+     inputs. This step compares, for each frame:
+       onHand, dailyRaw, dailyEffective, weeklyBurn, chainMembers,
+       chainAnchorPn, chainTransitioning
+     against the server's __settings__.perFrameInputs snapshot.
+     Prints "INPUTS MATCH" if every field ties across every frame;
+     otherwise a per-frame table showing srv vs brw for each
+     differing field. Also compares scalar/misc inputs (caps,
+     bufferWeeks, scheduleMode, anchorIso, todayIso).
+     ========================================================== */
+  const browserToday = (function () { const t = new Date(); t.setHours(0, 0, 0, 0); return t; })();
+  const browserTodayIso = browserToday.getFullYear() + "-"
+    + String(browserToday.getMonth() + 1).padStart(2, "0") + "-"
+    + String(browserToday.getDate()).padStart(2, "0");
+  const browserBufferWeeks = _fsSettingsBufferWeeks();
+  const browserScheduleMode = _fsSettingsScheduleMode();
+
+  const browserPerFrameInputs = {};
+  for (const r of rows) {
+    const dailyEffective = _fsDaily(r);   // chain-aware
+    const dailyRaw = Number(r.daily) || 0;
+    const part = r.part || null;
+    // Walk lineage via js/03 helpers when they exist (they always
+    // do in the browser; the guard is defensive).
+    let chainMembers = [];
+    let chainAnchorPn = null;
+    let chainTransitioning = false;
+    if (part && typeof supersessionLineage === "function") {
+      chainMembers = supersessionLineage(r.pn) || [];
+      if (chainMembers.length >= 2) {
+        chainAnchorPn = chainMembers[0];
+        const partsByPn = new Map((DB && Array.isArray(DB.parts)) ? DB.parts.map(p => [p.pn, p]) : []);
+        chainTransitioning = chainMembers.some(pn => {
+          const p = partsByPn.get(pn);
+          return !!(p && p.phasingOut);
+        });
+      }
+    }
+    browserPerFrameInputs[r.pn] = {
+      onHand: Number(r.onHand) || 0,
+      dailyRaw,
+      dailyEffective,
+      weeklyBurn: dailyEffective * (typeof FS_WORKDAYS_PER_WEEK === "number" ? FS_WORKDAYS_PER_WEEK : 5),
+      chainMembers,
+      chainAnchorPn,
+      chainTransitioning,
+    };
+  }
+
+  const srvIn = (serverSettings && serverSettings.data) || {};
+  const srvPerFrame = srvIn.perFrameInputs || {};
+  const eqNum = (a, b) => {
+    const na = Number(a), nb = Number(b);
+    if (!Number.isFinite(na) && !Number.isFinite(nb)) return true;
+    if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
+    // Snap to 6 decimals -- floats can differ in last ulp
+    // between browser and Node even after identical arithmetic.
+    return Math.abs(na - nb) < 1e-6;
+  };
+  const eqStr = (a, b) => String(a || "") === String(b || "");
+  const eqBool = (a, b) => !!a === !!b;
+  const eqArr = (a, b) => {
+    const aa = Array.isArray(a) ? a : [];
+    const bb = Array.isArray(b) ? b : [];
+    if (aa.length !== bb.length) return false;
+    for (let i = 0; i < aa.length; i++) if (String(aa[i]) !== String(bb[i])) return false;
+    return true;
+  };
+
+  const inputDiffs = [];
+  const inputTbl = [];
+  // Scalar inputs first -- caps / bufferWeeks / scheduleMode /
+  // anchorIso / todayIso / determinism.
+  const scalarChecks = [
+    ["caps.crewhd",    globalCaps.crewhd,        (srvIn.caps && srvIn.caps.crewhd),     eqNum],
+    ["caps.std",       globalCaps.std,           (srvIn.caps && srvIn.caps.std),        eqNum],
+    ["bufferWeeks",    browserBufferWeeks,       srvIn.bufferWeeks,                     eqNum],
+    ["scheduleMode",   browserScheduleMode,      srvIn.scheduleMode,                    eqStr],
+    ["anchorIso",      (typeof SLOT_ANCHOR_ISO !== "undefined" ? SLOT_ANCHOR_ISO : ""), srvIn.anchorIso, eqStr],
+    ["todayIso",       browserTodayIso,          srvIn.todayIso,                        eqStr],
+  ];
+  for (const [name, brw, srv, eq] of scalarChecks) {
+    if (!eq(brw, srv)) {
+      inputDiffs.push({ scope: "scalar", key: name, browser: brw, server: srv });
+      inputTbl.push({ scope: "scalar", key: name, browser: String(brw), server: String(srv) });
+    }
+  }
+  // Per-frame inputs.
+  for (const pn of FRAME_PNS) {
+    const b = browserPerFrameInputs[pn] || {};
+    const s = srvPerFrame[pn] || {};
+    const perFrame = [
+      ["onHand",             b.onHand,             s.onHand,             eqNum],
+      ["dailyRaw",           b.dailyRaw,           s.dailyRaw,           eqNum],
+      ["dailyEffective",     b.dailyEffective,     s.dailyEffective,     eqNum],
+      ["weeklyBurn",         b.weeklyBurn,         s.weeklyBurn,         eqNum],
+      ["chainAnchorPn",      b.chainAnchorPn,      s.chainAnchorPn,      eqStr],
+      ["chainTransitioning", b.chainTransitioning, s.chainTransitioning, eqBool],
+      ["chainMembers",       b.chainMembers,       s.chainMembers,       eqArr],
+    ];
+    for (const [key, brw, srv, eq] of perFrame) {
+      if (!eq(brw, srv)) {
+        inputDiffs.push({ scope: pn, key, browser: brw, server: srv });
+        inputTbl.push({
+          scope: FRAME_SHORT[pn] || pn,
+          key,
+          browser: Array.isArray(brw) ? brw.join(",") : String(brw),
+          server:  Array.isArray(srv) ? srv.join(",") : String(srv),
+        });
+      }
+    }
+  }
+
+  console.log(`[fsCompareShadow] shadow rows: ${all.length}`);
+  console.log(`[fsCompareShadow] server settings:`, serverSettings ? {
+    computed_at: serverSettings.computed_at,
+    input_hash: serverSettings.input_hash,
+    determinism: srvIn.determinism || "(unknown)",
+    scheduleMode: srvIn.scheduleMode,
+    caps: srvIn.caps,
+    bufferWeeks: srvIn.bufferWeeks,
+    anchorIso: srvIn.anchorIso,
+    todayIso: srvIn.todayIso,
+  } : "(no settings row in shadow)");
+  if (inputDiffs.length === 0) {
+    console.log("[fsCompareShadow] INPUTS MATCH -- server and browser fed the scheduler byte-identical per-frame inputs");
+  } else {
+    console.warn(`[fsCompareShadow] INPUT DIFF -- ${inputDiffs.length} field(s) diverge; the plan diff below will follow from these:`);
+    console.table(inputTbl);
+  }
+
+  /* ==========================================================
+     STEP 2 -- PLAN DIFF (unchanged from previous behavior).
+     ========================================================== */
   const cap = Math.max(1, Number(opts.weeks) || simCols.length);
   const allIsos = simCols.slice(0, cap).map(c => c.iso);
-  // Include server-only weeks (e.g. weekly-mode isos outside the
-  // browser's simCols window would surface here).
   for (const iso of serverQty.keys()) {
     if (!allIsos.includes(iso)) allIsos.push(iso);
   }
@@ -5199,24 +5334,20 @@ window.fsCompareShadow = async function (opts) {
     if (anyDiff || opts.verbose) rowsTbl.push(cellPerFrame);
   }
 
-  console.log(`[fsCompareShadow] shadow rows: ${all.length}; compared ${allIsos.length} weeks x ${FRAME_PNS.length} frames`);
-  console.log(`[fsCompareShadow] server settings:`, serverSettings ? {
-    computed_at: serverSettings.computed_at,
-    input_hash: serverSettings.input_hash,
-    scheduleMode: serverSettings.data && serverSettings.data.scheduleMode,
-    caps: serverSettings.data && serverSettings.data.caps,
-    bufferWeeks: serverSettings.data && serverSettings.data.bufferWeeks,
-  } : "(no settings row in shadow)");
   if (rowsTbl.length) console.table(rowsTbl);
   const verdict = diffCells === 0 ? "MATCH" : "MISMATCH";
-  console.log(`[fsCompareShadow] ${verdict} -- ${matchCells} matching cells, ${diffCells} diffs`);
+  const inputVerdict = inputDiffs.length === 0 ? "INPUTS MATCH" : "INPUTS DIFFER";
+  console.log(`[fsCompareShadow] ${inputVerdict}; plan ${verdict} -- ${matchCells} matching cells, ${diffCells} diffs`);
   return {
     ok: true,
+    inputVerdict,
+    inputDiffs,
     verdict,
     matchCells,
     diffCells,
     diffs,
     serverSettings,
+    browserPerFrameInputs,
     weeks: allIsos.length,
   };
 };
