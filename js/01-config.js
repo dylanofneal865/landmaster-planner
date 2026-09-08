@@ -33,6 +33,19 @@ function _cacheDel(k){ return _cacheOpen().then(db=>new Promise((res,rej)=>{cons
 let TODAY = new Date(); TODAY.setHours(0,0,0,0);
 const DAY_MS = 86400000;
 
+// v7.6 Write-version guard. Every ship of the planner bumps
+// this unix timestamp. When a client saves settings, the
+// settings writer raises frame_schedule.__settings__.data
+// .minWriteBuild to APP_BUILD; any client whose APP_BUILD is
+// STRICTLY LESS THAN the hydrated minWriteBuild refuses to
+// write and shows the "newer version elsewhere" banner. Reads
+// stay allowed regardless. Bump this constant whenever a
+// deploy changes what's safe to write (schema changes,
+// scheduler-model swaps, guard adjustments) so any tab still
+// running yesterday's code goes read-only the moment a fresh
+// tab bumps the settings row.
+const APP_BUILD = 1789171200;   // 2026-09-08 04:00:00 UTC
+
 // v5 Supplier-facing site for the Frame Schedule supplier snapshot.
 // Set this to the URL of the SECOND Netlify site deployed from
 // supplier-site/ (Base directory = "supplier-site") once it goes

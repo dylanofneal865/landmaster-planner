@@ -46,6 +46,16 @@
 [functions."acumatica-po-receipts-full"]
   schedule = "15 6 * * *"
 
+# Frame Schedule nightly snapshot -- 05:45 UTC. Copies every
+# frame_schedule row (including __settings__) into
+# frame_schedule_snapshots with a snapshot_date column so a
+# stale-tab clobber like the Sep 5-7 incident is a one-query
+# restore instead of a manual rebuild. Retains 60 days; anything
+# older is deleted the same tick. See the function header for the
+# CREATE TABLE SQL + restore query.
+[functions."frame-schedule-snapshot"]
+  schedule = "45 5 * * *"
+
 # INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
 # filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
 # to datetimeoffset and then to a full sweep if the tenant rejects

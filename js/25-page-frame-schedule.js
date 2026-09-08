@@ -144,6 +144,15 @@ const FRAMESCHED_STATE = {
   // Weekly pin toggles clear the corresponding entry so the
   // persister can re-fire cleanly.
   _autoPersistedWeeklyIsos: new Set(),
+  // v7.6 One-time cleanup: manual weekly pins whose week is >2wk
+  // in the past get demoted to weekly-auto by the render so old
+  // restores don't accumulate as permanent pins. Session flag
+  // prevents the render from re-scanning the mirror every tick.
+  _expiredManualPinsScanned: false,
+  // v7.6 Banner visibility set by _fsCheckWriteBlockedAndBanner;
+  // read by nothing else -- the DOM element is idempotent so
+  // repeated calls are cheap.
+  _writeBlockedBannerShown: false,
   // Receipt History panel: which slice of the full-archive history
   // to render. "8" | "26" | "all"; default 26. In-memory only —
   // reverts on reload, which is fine (a display preference, not a
@@ -191,6 +200,79 @@ const FRAMESCHED_STATE = {
   _supplierCssCache: null,
   _supplierCssFetching: null,
 };
+
+/* ============================================================
+   v7.6 WRITE-VERSION GUARD
+
+   Two collaborators run here in tandem:
+
+     _fsWriteBlocked()                 -- true when a newer
+       planner has raised __settings__.minWriteBuild past this
+       tab's APP_BUILD. Every write path (per-week commits,
+       persisters, publish helpers, auto-publish, handlers)
+       consults this before touching the mirror or the cloud.
+
+     _fsCheckWriteBlockedAndBanner()   -- run on hydration and
+       every realtime / poll refresh (exposed via window so
+       js/30's hydration path can call it). Idempotent: makes
+       the fixed-position banner appear once and stay.
+
+   Reads stay allowed regardless. The banner text mirrors the
+   one the spec named so the operator sees the recovery step
+   without paging through docs.
+   ============================================================ */
+function _fsWriteBlocked() {
+  try {
+    if (typeof APP_BUILD !== "number") return false;
+    if (typeof DB === "undefined" || !DB || !DB.frameSchedule || !DB.frameSchedule.settings) return false;
+    const minB = Number(DB.frameSchedule.settings.minWriteBuild) || 0;
+    return minB > APP_BUILD;
+  } catch (_) { return false; }
+}
+function _fsRefuseWrite(pathName) {
+  console.warn(`[frame-schedule] write refused (${pathName}): a newer planner version wrote minWriteBuild=${(DB && DB.frameSchedule && DB.frameSchedule.settings && DB.frameSchedule.settings.minWriteBuild) || 0} > APP_BUILD=${APP_BUILD}. Reload to keep working.`);
+  _fsCheckWriteBlockedAndBanner();
+}
+function _fsCheckWriteBlockedAndBanner() {
+  if (typeof document === "undefined") return;
+  const blocked = _fsWriteBlocked();
+  const existing = document.getElementById("fs-write-blocked-banner");
+  if (!blocked) {
+    if (existing) existing.remove();
+    FRAMESCHED_STATE._writeBlockedBannerShown = false;
+    return;
+  }
+  if (existing) return;   // idempotent -- one banner
+  const banner = document.createElement("div");
+  banner.id = "fs-write-blocked-banner";
+  banner.setAttribute("role", "alert");
+  banner.style.cssText = [
+    "position: fixed",
+    "top: 0",
+    "left: 0",
+    "right: 0",
+    "z-index: 99999",
+    "padding: 10px 16px",
+    "background: #b02020",
+    "color: #fff",
+    "font-family: var(--f-ui, sans-serif)",
+    "font-size: 13px",
+    "font-weight: 600",
+    "text-align: center",
+    "letter-spacing: 0.02em",
+    "box-shadow: 0 2px 6px rgba(0,0,0,0.35)",
+    "cursor: default",
+  ].join(";");
+  banner.textContent = "A newer version of the planner is running elsewhere — reload this page (Ctrl+Shift+R) to keep working.";
+  (document.body || document.documentElement).appendChild(banner);
+  FRAMESCHED_STATE._writeBlockedBannerShown = true;
+}
+// Expose so js/30's hydration path (and realtime refresh) can
+// fire the banner without introducing a hard import order.
+if (typeof window !== "undefined") {
+  window._fsCheckWriteBlockedAndBanner = _fsCheckWriteBlockedAndBanner;
+  window._fsWriteBlocked = _fsWriteBlocked;
+}
 
 /* ============================================================
    DATA UTILS
@@ -2536,6 +2618,12 @@ function _fsBuildWeekPayload(iso, scheduledRuns, slot, isSlotStart) {
 // and slot intact; a caller writing qty keeps the row's existing
 // snapshot intact.
 function _fsCommitWeek(iso, payload) {
+  // v7.6 Every mirror-mutating path funnels through _fsCommitWeek,
+  // so this one guard covers per-week writes, the persisters, the
+  // pin toggles, the qty-override handler, and Replan horizon. A
+  // blocked tab bails silently after raising the banner; nothing
+  // changes locally or in the cloud.
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsCommitWeek"); return; }
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
   }
@@ -2697,6 +2785,9 @@ function _fsIsOptimalPickForSlot(slot, rows, cols, slots, globalCaps, jointWinne
 // accepts ties (this slot's pn IS the joint-optimal pick).
 // false/omitted: gate requires strict improvement.
 function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps, jointWinner, visibleIsoSet, rateByPn) {
+  // v7.6 Write-version guard: bail early so a stale tab doesn't
+  // even LOOK at slot crossings against fresh weekly rows.
+  if (_fsWriteBlocked()) { _fsCheckWriteBlockedAndBanner(); return; }
   // DEGENERATE-STATE GUARD: no caps or no runs placed → any
   // "winner" is meaningless; freezing it would write garbage.
   // Suspend persistence entirely and warn once. Next render with
@@ -2833,6 +2924,9 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
 //     (no placements) are skipped -- their absence naturally
 //     reads as "no schedule this week".
 function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visibleIsoSet) {
+  // v7.6 Write-version guard: bail early so a stale tab can't
+  // stamp weekly-auto pins over the newer planner's plan.
+  if (_fsWriteBlocked()) { _fsCheckWriteBlockedAndBanner(); return; }
   // Mirror the slot persister's guards.
   if (!(DB && DB.frameSchedule && DB.frameSchedule.loaded)) return;
   if (_fsSimIsDegenerate({ scheduledRuns }, globalCaps)) {
@@ -3125,6 +3219,15 @@ function _fsBuildTrueDemandPanel(rows, globalCaps) {
    ============================================================ */
 
 function renderFrameSchedule() {
+  // v7.6 First render (or first render after hydration) sweeps
+  // stale manual pins (>2wk past) down to weekly-auto so they
+  // stop misleading and don't resist a future Replan horizon.
+  // Idempotent -- guarded by a session flag inside.
+  _fsExpirePastManualPins();
+  // v7.6 Also re-check the write-blocked banner so a tab that
+  // becomes stale mid-session (a fresher deploy hydrates via
+  // realtime) sees the banner without waiting for a write.
+  _fsCheckWriteBlockedAndBanner();
   const rows = _fsRows();
   // v4 SIM vs RENDER cols: sim walks SIM_HORIZON_WEEKS ahead so
   // late-window stockouts influence today's slot picks; the grid
@@ -5717,9 +5820,54 @@ function _fsHandleQtyOverride(pn, iso, evt) {
 // should encode qty/qty2 as URL-safe integers via the band-cell
 // onclick; blank -> 0 -> the sim falls back to demand+catchup
 // (v7.0 pin behavior kept for parity).
+// v7.6 One-time-per-session sweep: manual weekly pins whose week
+// is >2wk in the past have no forward planning value (past weeks
+// aren't sim inputs anyway), and left as source:"manual" they'd
+// resist Replan horizon forever. Demote them to weekly-auto so
+// they still record what happened but a future Replan can touch
+// them if data structures ever need cleanup. Current + future
+// manual pins are LEFT ALONE. Guarded by _fsWriteBlocked so a
+// stale tab doesn't run the sweep.
+function _fsExpirePastManualPins() {
+  if (FRAMESCHED_STATE._expiredManualPinsScanned) return;
+  if (_fsWriteBlocked()) { _fsCheckWriteBlockedAndBanner(); return; }
+  if (!(DB && DB.frameSchedule && DB.frameSchedule.loaded)) return;
+  if (!(DB.frameSchedule.weeks instanceof Map)) return;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const cutoff = new Date(today.getTime() - 14 * 86400000);
+  cutoff.setHours(0, 0, 0, 0);
+  const cutoffIso = _fsIsoMonday(cutoff);
+  let demoted = 0;
+  const demotedIsos = [];
+  for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+    if (iso === "__settings__") continue;
+    if (iso >= cutoffIso) continue;   // current + future + last 2 wks untouched
+    const s = wk && wk.slot;
+    if (!s || s.mode !== "weekly" || s.source !== "manual") continue;
+    const demotedSlot = { pn: s.pn, mode: "weekly", locked: false, source: "weekly-auto" };
+    if (s.pn2) demotedSlot.pn2 = s.pn2;
+    if (Number.isFinite(s.qty)  && s.qty  > 0) demotedSlot.qty  = s.qty;
+    if (Number.isFinite(s.qty2) && s.qty2 > 0) demotedSlot.qty2 = s.qty2;
+    _fsCommitWeek(iso, { slot: demotedSlot });
+    demoted++;
+    demotedIsos.push(iso);
+  }
+  FRAMESCHED_STATE._expiredManualPinsScanned = true;
+  if (demoted > 0) {
+    console.log(`[frame-schedule] v7.6 demoted ${demoted} past-manual weekly pin(s) to weekly-auto:`, demotedIsos);
+    if (typeof logAudit === "function") {
+      logAudit("frame-sched-manual-pin-expire",
+        `Demoted ${demoted} past manual weekly pin(s) (>2wk past) to weekly-auto`,
+        { demoted, demotedIsos });
+    }
+  }
+}
+
 function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
   if (evt && typeof evt.stopPropagation === "function") evt.stopPropagation();
   if (!iso) return;
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsHandleWeeklyPin"); return; }
   if (typeof gateEdit === "function" && !gateEdit()) return;
 
   const wk = _fsWeekData(iso);
@@ -5803,6 +5951,7 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
 // _autoPersistedSlots) so their persisters re-fire cleanly on
 // the next render.
 function _fsHandleReplanHorizon() {
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsHandleReplanHorizon"); return; }
   if (typeof gateEdit === "function" && !gateEdit()) return;
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) return;
 
@@ -6755,6 +6904,8 @@ function _fsAutoPublish() {
 // concurrent render that lands during the build correctly marks
 // the run dirty for a follow-up.
 async function _fsAutoPublishFire() {
+  // v7.6 Write-version guard: no auto-publish from stale tabs.
+  if (_fsWriteBlocked()) { _fsCheckWriteBlockedAndBanner(); return; }
   const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
   const token = s && typeof s.publishToken === "string" && _FS_TOKEN_RE.test(s.publishToken)
     ? s.publishToken
@@ -7054,6 +7205,7 @@ ${clone.outerHTML}
 // into #fs-publish-status.
 async function _fsPublishSupplier(evt) {
   if (evt && typeof evt.preventDefault === "function") evt.preventDefault();
+  if (_fsWriteBlocked()) { _fsRefuseWrite("_fsPublishSupplier"); return; }
   const btn    = document.getElementById("fs-publish-btn");
   const status = document.getElementById("fs-publish-status");
   const setStatus = (html, kind) => {

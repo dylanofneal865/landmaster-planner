@@ -941,6 +941,13 @@ function _populateFrameScheduleFromRows(rows) {
       // without the field also land on "weekly".
       const rawSm = d && d.scheduleMode;
       const scheduleMode = (rawSm === "slots") ? "slots" : "weekly";
+      // v7.6 minWriteBuild: highest APP_BUILD any client has
+      // ever pushed. Any newer settings writer raises this to
+      // its own APP_BUILD; clients running an older APP_BUILD
+      // refuse to write and show the write-blocked banner.
+      const rawMwb = d && d.minWriteBuild;
+      const minWriteBuild = (typeof rawMwb === "number" && Number.isFinite(rawMwb) && rawMwb >= 0)
+        ? Math.floor(rawMwb) : 0;
       DB.frameSchedule.settings = {
         caps: {
           crewhd: Number(d.caps && d.caps.crewhd) || 0,
@@ -950,8 +957,17 @@ function _populateFrameScheduleFromRows(rows) {
         publishToken,
         lastPublishedAt,
         scheduleMode,
+        minWriteBuild,
         updatedAt: row.updated_at || null,
       };
+      // v7.6 Fire the banner (defined in js/25) when hydration
+      // arrives on a stale tab. Also runs on every realtime /
+      // poll refresh -- the banner helper is idempotent so a
+      // repeated call is cheap.
+      if (typeof window !== "undefined"
+          && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+        try { window._fsCheckWriteBlockedAndBanner(); } catch (_) { /* never fatal */ }
+      }
       continue;
     }
     // Regular per-week row. v2 added `slot: {pn, locked, source}`
@@ -1031,7 +1047,35 @@ function _populateFrameScheduleFromRows(rows) {
 // different qty is a genuine conflict; the later write is the intent
 // to accept. The full week payload replaces the row so a qty that
 // drops to 0 disappears from the qty map (see caller filtering).
+// v7.6 Shared write-blocked check. True when the hydrated
+// __settings__ row carries a minWriteBuild strictly greater than
+// this client's APP_BUILD -- some other tab is running a newer
+// planner and would clobber its work. All frame_schedule cloud
+// writers call this; a true result short-circuits the write with
+// a clear error, console warn, and (via the banner helper) a
+// persistent UI banner. Reads stay allowed regardless.
+function _fsWriteBlocked() {
+  try {
+    if (typeof APP_BUILD !== "number") return false;
+    if (!DB || !DB.frameSchedule || !DB.frameSchedule.settings) return false;
+    const minB = Number(DB.frameSchedule.settings.minWriteBuild) || 0;
+    return minB > APP_BUILD;
+  } catch (_) { return false; }
+}
+function _fsRaiseBanner() {
+  if (typeof window !== "undefined"
+      && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+    try { window._fsCheckWriteBlockedAndBanner(); } catch (_) { /* never fatal */ }
+  }
+}
+function _fsRefuseWrite(pathName) {
+  console.warn(`[frame-schedule] write refused (${pathName}): a newer planner version wrote minWriteBuild=${(DB && DB.frameSchedule && DB.frameSchedule.settings && DB.frameSchedule.settings.minWriteBuild) || 0} > APP_BUILD=${APP_BUILD}. Reload to keep working.`);
+  _fsRaiseBanner();
+  return { ok: false, error: new Error("write blocked: newer version elsewhere") };
+}
+
 async function setFrameScheduleWeekCloud(isoMonday, payload) {
+  if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleWeekCloud");
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
@@ -1170,6 +1214,7 @@ async function setFrameScheduleWeekCloud(isoMonday, payload) {
 // prevails. Mirrors setBuildPlanSettingsCloud (js/30 build_plan
 // targets) end to end.
 async function setFrameScheduleSettingsCloud(caps) {
+  if (_fsWriteBlocked()) return _fsRefuseWrite("setFrameScheduleSettingsCloud");
   if (!_supa) return { ok: false, error: new Error("cloud not ready") };
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
@@ -1215,6 +1260,15 @@ async function setFrameScheduleSettingsCloud(caps) {
   } else {
     scheduleMode = "weekly";
   }
+  // v7.6 Raise minWriteBuild to max(prev, APP_BUILD). Older
+  // tabs whose APP_BUILD is lower will refuse to write on their
+  // next attempt (or immediately show the banner on the
+  // realtime tick that hydrates this row). Never lowers -- an
+  // older client with a smaller APP_BUILD would also be blocked
+  // by _fsWriteBlocked before this line runs.
+  const prevMinWriteBuild = (prev && Number.isFinite(prev.minWriteBuild)) ? Number(prev.minWriteBuild) : 0;
+  const myBuild = (typeof APP_BUILD === "number" && Number.isFinite(APP_BUILD)) ? APP_BUILD : 0;
+  const minWriteBuild = Math.max(prevMinWriteBuild, myBuild);
   const nowIso = new Date().toISOString();
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
@@ -1224,7 +1278,8 @@ async function setFrameScheduleSettingsCloud(caps) {
   // on the first save. The default is "weekly", so an empty-caps
   // installation still lands on the new scheduler.
   dataOut.scheduleMode = scheduleMode;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, scheduleMode, updatedAt: nowIso };
+  if (minWriteBuild > 0) dataOut.minWriteBuild = minWriteBuild;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
   const { error } = await _supa
     .from("frame_schedule")
     .upsert(
@@ -1255,6 +1310,7 @@ async function setFrameScheduleSettingsCloud(caps) {
 // after this call so republishes reuse the same URL). Pure HTTP;
 // no direct Supabase call here.
 async function publishFrameScheduleSnapshot(token, html) {
+  if (_fsWriteBlocked()) return _fsRefuseWrite("publishFrameScheduleSnapshot");
   if (typeof token !== "string" || !/^[A-Za-z0-9._-]{24,128}$/.test(token)) {
     return { ok: false, error: new Error("invalid token") };
   }
