@@ -206,11 +206,29 @@ exports.handler = async (event) => {
   const todayDateForChain = new Date(today + "T00:00:00");
   todayDateForChain.setHours(0, 0, 0, 0);
 
+  // Local helper: "does this part's own transitionStartDate say
+  // it's still pre-launch today?" -- byte-for-byte with js/03
+  // isPreLaunch(part) semantics (parse as local midnight, future
+  // start = pre-launch; missing or past = not). Chained-successor
+  // pre-launch is decided by classifyChainMember above and its
+  // successor.transitionStartDate check, which reads the same
+  // field the same way -- so the two callsites agree.
+  function _isStandalonePreLaunch(d) {
+    const raw = d && d.transitionStartDate;
+    if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(raw)) return false;
+    const [y, mo, da] = raw.slice(0, 10).split("-").map(Number);
+    const dt = new Date(y, mo - 1, da);
+    dt.setHours(0, 0, 0, 0);
+    if (isNaN(dt.getTime())) return false;
+    return dt.getTime() > todayDateForChain.getTime();
+  }
+
   const partsByPn = new Map();
   let excludedNonBaseBom = 0;
   let excludedPhasingOut = 0;   // count only; retained in partsByPn -- see note
   let excludedVmi = 0;
   let excludedPreLaunchSuccessor = 0;
+  let excludedPreLaunchStandalone = 0;
   for (const p of partsRows) {
     if (!p || !p.pn) continue;
     const d = p.data || {};
@@ -227,6 +245,18 @@ exports.handler = async (event) => {
     const chain = classifyChainMember(String(p.pn), allPartsData, allEntries, todayDateForChain);
     if (chain.role === "successor" && chain.preLaunchSuccessor) {
       excludedPreLaunchSuccessor++;
+      continue;
+    }
+    // v-cc-loc-3 -- STANDALONE pre-launch parts (own
+    // transitionStartDate in the future, no chain / not a chain
+    // successor) also get excluded from HOT. Same reason: zero
+    // on-hand is the expected state until cut-in -- flagging it
+    // burns a slot on the daily list for no audit value. The
+    // policy sweep gives these rows their own note so they can
+    // be told apart from chain-successors in the log:
+    //   "pre-launch -- excluded until cut-in window"
+    if (_isStandalonePreLaunch(d)) {
+      excludedPreLaunchStandalone++;
       continue;
     }
     // Fix 3b: phasingOut is normally dropped from RUNWAY / ROTATION
@@ -249,7 +279,7 @@ exports.handler = async (event) => {
       chain,   // pre-computed so the HOT loop reads it O(1)
     });
   }
-  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedPreLaunchSuccessor} pre-launch-successor (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them)`);
+  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedPreLaunchSuccessor} pre-launch-successor, ${excludedPreLaunchStandalone} pre-launch-standalone (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them)`);
 
   // Pre-compute onPO per pn from the loaded pos rows -- used by the
   // handoff-watch (fix 3c). PO shape (mirrors the client's DB.pos):
@@ -299,6 +329,7 @@ exports.handler = async (event) => {
     if (d.phasingOut) return "phasing-out -- excluded by policy";
     const chain = classifyChainMember(pn, allPartsData, allEntries, todayDateForChain);
     if (chain.role === "successor" && chain.preLaunchSuccessor) return "pre-launch successor -- excluded by policy";
+    if (_isStandalonePreLaunch(d)) return "pre-launch -- excluded until cut-in window";
     return "non-BaseBOM -- excluded by policy";
   }
 
@@ -356,6 +387,7 @@ exports.handler = async (event) => {
     excludedNonBaseBom,
     excludedVmi,
     excludedPreLaunchSuccessor,
+    excludedPreLaunchStandalone,
     excludedPhasingOut,
     backlogCleaned: cleanedOpen,
     cleanedByPolicy,

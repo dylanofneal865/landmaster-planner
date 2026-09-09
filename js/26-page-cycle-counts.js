@@ -230,7 +230,14 @@ function _ccMondayIso(dateOrIso) {
 function _isAutoSweptSkip(item) {
   if (!item || item.status !== "skipped") return false;
   const note = String(item.note || "").toLowerCase();
-  return /excluded by policy/.test(note);
+  // Two cron-emitted phrases (kept in sync with cycle-count-
+  // assign's _sweepNoteFor):
+  //   "excluded by policy"           -- non-BaseBOM, vendor-managed,
+  //                                     phasing-out, chain-successor
+  //                                     pre-launch
+  //   "excluded until cut-in window" -- standalone pre-launch
+  // Operator skips carry a typed reason that matches neither.
+  return /excluded by policy/.test(note) || /excluded until cut-in window/.test(note);
 }
 
 function _ccSummary() {
