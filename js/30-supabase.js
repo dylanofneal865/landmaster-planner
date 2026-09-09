@@ -1384,6 +1384,77 @@ async function _refetchCycleCounts() {
   }
   return DB.cycleCounts;
 }
+
+/* ============================================================
+   v-cc-live -- SUPERVISOR REALTIME (js/26 live feed).
+
+   Dedicated channel "cc-supervisor" separate from the main
+   landmaster-sync channel so its subscribe status can be exposed
+   to the supervisor tab's pulse dot without entangling the
+   reconnect logic of the main app-wide channel.
+
+   Enable in Supabase (needed once):
+     ALTER PUBLICATION supabase_realtime
+       ADD TABLE cycle_count_items, cycle_count_log,
+                 cycle_count_item_locations;
+   Until that's run, subscribe() will fire CHANNEL_ERROR /
+   TIMED_OUT and cycleCountLiveState() returns "polling" so the
+   pulse dot goes amber. The 60s poll fallback in js/26 keeps
+   the feed fresh regardless.
+
+   Public API:
+     ccLiveSubscribe(onChange)  -- subscribe (idempotent). Calls
+       onChange(sourceTable) whenever a cc-* row changes AND on
+       first subscribe status.
+     ccLiveState()              -- "subscribed" | "polling" |
+       "connecting" | "unavailable" -- for the pulse dot.
+     ccLiveUnsubscribe()        -- teardown; no-op when idle.
+   ============================================================ */
+let _ccLiveChannel = null;
+let _ccLiveState = "connecting";
+let _ccLiveOnChange = null;
+function ccLiveState() { return _ccLiveState; }
+function ccLiveSubscribe(onChange) {
+  if (typeof onChange === "function") _ccLiveOnChange = onChange;
+  if (_ccLiveChannel) {
+    // Already subscribed -- fire an initial state ping so a fresh
+    // caller renders the current dot state.
+    if (_ccLiveOnChange) _ccLiveOnChange("state");
+    return;
+  }
+  if (!_supa || typeof _supa.channel !== "function") {
+    _ccLiveState = "unavailable";
+    if (_ccLiveOnChange) _ccLiveOnChange("state");
+    return;
+  }
+  _ccLiveState = "connecting";
+  const fire = (src) => { if (_ccLiveOnChange) _ccLiveOnChange(src); };
+  const chan = _supa
+    .channel("cc-supervisor")
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_items" }, () => fire("items"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_log" }, () => fire("log"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_item_locations" }, () => fire("item_locs"));
+  chan.subscribe((status) => {
+    if (status === "SUBSCRIBED")       _ccLiveState = "subscribed";
+    else if (status === "CHANNEL_ERROR"
+          || status === "TIMED_OUT"
+          || status === "CLOSED")      _ccLiveState = "polling";
+    fire("state");
+  });
+  _ccLiveChannel = chan;
+}
+async function ccLiveUnsubscribe() {
+  if (!_ccLiveChannel) return;
+  const c = _ccLiveChannel;
+  _ccLiveChannel = null;
+  _ccLiveState = "connecting";
+  try { await _supa.removeChannel(c); } catch (_) {}
+}
+if (typeof window !== "undefined") {
+  window.ccLiveSubscribe = ccLiveSubscribe;
+  window.ccLiveUnsubscribe = ccLiveUnsubscribe;
+  window.ccLiveState = ccLiveState;
+}
 if (typeof window !== "undefined") window._refetchCycleCounts = _refetchCycleCounts;
 
 // POST helper -- mirrors _fsPostFrameScheduleWrite. Same env

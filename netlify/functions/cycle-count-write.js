@@ -419,6 +419,82 @@ async function _applyOp(supa, w, i, log) {
         return { index: i, ok: true, kind: "reconcileFromLive", itemId };
       }
 
+      case "verifyLog": {
+        // Supervisor attestation: stamp reviewed_by + reviewed_at on
+        // a cycle_count_log row. NEVER writes on-hand -- this is
+        // attestation only; Acumatica adjustment still happens
+        // manually or via the SoR's usual channel. Idempotent when
+        // called twice by the same reviewer (upserts fresh
+        // timestamp; a different reviewer overwrites).
+        const logId = String(w.logId || "").trim();
+        const reviewer = String(w.reviewed_by || "").trim();
+        if (!logId) return { index: i, ok: false, error: "verifyLog: logId required" };
+        if (!reviewer) return { index: i, ok: false, error: "verifyLog: reviewed_by required" };
+        const { error } = await supa
+          .from("cycle_count_log")
+          .update({ reviewed_by: reviewer, reviewed_at: nowIso })
+          .eq("id", logId);
+        if (error) return { index: i, ok: false, error: "verifyLog: update failed: " + error.message };
+        return { index: i, ok: true, kind: "verifyLog", logId };
+      }
+
+      case "requestRecount": {
+        // Supervisor manually spawns a recount child for a
+        // parent item AND flips the parent's status to "recount"
+        // so the UI marks it as recount-pending. Idempotent: if
+        // a pending/recount child already exists for this parent
+        // we return { skipped: true } with the existing child id
+        // instead of stacking duplicates.
+        const parentId = String(w.itemId || "").trim();
+        const requester = String(w.requested_by || "").trim();
+        if (!parentId) return { index: i, ok: false, error: "requestRecount: itemId required" };
+        const { data: parent, error: pErr } = await supa
+          .from("cycle_count_items")
+          .select("id, pn, assigned_date, tier, reason, system_qty_at_assign, note, status, counted_by")
+          .eq("id", parentId)
+          .maybeSingle();
+        if (pErr) return { index: i, ok: false, error: "requestRecount: parent read failed: " + pErr.message };
+        if (!parent) return { index: i, ok: false, error: "requestRecount: item not found" };
+        const { data: existing, error: eErr } = await supa
+          .from("cycle_count_items")
+          .select("id, status")
+          .eq("recount_of", parentId)
+          .in("status", ["pending", "recount"])
+          .maybeSingle();
+        if (eErr) return { index: i, ok: false, error: "requestRecount: existing check failed: " + eErr.message };
+        if (existing && existing.id) {
+          return { index: i, ok: true, kind: "requestRecount", skipped: true, reason: "recount already pending", existingChildId: existing.id };
+        }
+        const today = nowIso.slice(0, 10);
+        const reasonText = requester
+          ? "supervisor requested recount (via " + requester + ")"
+          : "supervisor requested recount";
+        const { data: child, error: cErr } = await supa
+          .from("cycle_count_items")
+          .insert({
+            assigned_date: today,
+            tier: "flagged",
+            reason: reasonText,
+            pn: parent.pn,
+            system_qty_at_assign: parent.system_qty_at_assign,
+            status: "pending",
+            recount_of: parentId,
+            note: parent.note || null,
+          })
+          .select("id")
+          .single();
+        if (cErr) return { index: i, ok: false, error: "requestRecount: insert failed: " + cErr.message };
+        // Bump parent's status to "recount" so the supervisor UI
+        // renders it as recount-pending. Non-fatal on error --
+        // the child was created, that's the important part.
+        const { error: uErr } = await supa
+          .from("cycle_count_items")
+          .update({ status: "recount", updated_at: nowIso })
+          .eq("id", parentId);
+        if (uErr) log("requestRecount: parent status update failed (non-fatal): " + uErr.message);
+        return { index: i, ok: true, kind: "requestRecount", childId: child.id };
+      }
+
       default:
         return { index: i, ok: false, error: "unknown op: " + String(w.op) };
     }

@@ -54,11 +54,24 @@ const CC_NAME_KEY = "landmaster.cycleCount.counter";
    ============================================================ */
 
 const CC_STATE = {
-  // Which section is expanded / focused. "today" | "runway" | "rotation" | "completed"
+  // v-cc-live -- supervisor tab is now REPORT + LIVE-FEED shaped.
+  // Retained tab-switch state for the collapsed open-queue below.
   _tab: "today",
-  // Show-completed toggle within each tier (default hides
-  // counted/reconciled to focus on pending work).
+  // Vestigial from the old "show completed" toggle; kept for any
+  // legacy caller. New surface routes completed items through the
+  // live feed instead.
   _showCompleted: false,
+  // v-cc-live UI state.
+  _openQueueExpanded: false,       // collapsed by default per ticket
+  _trendExpanded: false,            // 8-week trend behind an expander
+  _chimeOn: false,                   // localStorage-backed on init
+  _feedExpanded: new Set(),         // log ids whose bin breakdown is open
+  _attnExpanded: new Set(),          // needs-attention item ids whose bins are open
+  _liveSubscribed: false,
+  _lastSeenLogAt: null,              // ISO -- rows newer flash on render
+  _pollTimer: null,
+  _lastAttnPendingIds: new Set(),    // used for chime debounce
+  _initedFromLS: false,
   // Auto-reconcile scan debounce (fires once after hydration or
   // after the operator submits a count, to catch any items whose
   // live on-hand has already converged).
@@ -944,11 +957,400 @@ function _ccRenderSummaryStrip(s) {
   `;
 }
 
+/* ============================================================
+   v-cc-live -- SUPERVISOR HELPERS (live feed, needs-attention,
+   pulse dot, chime, verify/recount actions).
+   ============================================================ */
+const CC_CHIME_LS = "landmaster.cycleCount.chime";
+const CC_LAST_SEEN_LS = "landmaster.cycleCount.lastSeenLogAt";
+
+function _ccInitLocalState() {
+  if (CC_STATE._initedFromLS) return;
+  CC_STATE._initedFromLS = true;
+  try { CC_STATE._chimeOn = localStorage.getItem(CC_CHIME_LS) === "1"; } catch (_) {}
+  try { CC_STATE._lastSeenLogAt = localStorage.getItem(CC_LAST_SEEN_LS) || null; } catch (_) {}
+}
+function _ccPersistLastSeen(atIso) {
+  if (!atIso) return;
+  const cur = CC_STATE._lastSeenLogAt || "";
+  if (atIso > cur) {
+    CC_STATE._lastSeenLogAt = atIso;
+    try { localStorage.setItem(CC_LAST_SEEN_LS, atIso); } catch (_) {}
+  }
+}
+function _ccToggleChime() {
+  CC_STATE._chimeOn = !CC_STATE._chimeOn;
+  try { localStorage.setItem(CC_CHIME_LS, CC_STATE._chimeOn ? "1" : "0"); } catch (_) {}
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._ccToggleChime = _ccToggleChime;
+function _ccPlayChime() {
+  if (!CC_STATE._chimeOn) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = new AC();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.15);
+    gain.gain.setValueAtTime(0.001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.22, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(); osc.stop(ctx.currentTime + 0.3);
+  } catch (_) {}
+}
+
+/* ---- action wrappers -------------------------------------- */
+async function _ccVerifyLog(logId, rowBtn) {
+  const reviewer = _ccName();
+  if (!reviewer) { if (typeof showToast === "function") showToast("Enter your name at the top before verifying", "warn"); return; }
+  if (rowBtn) { rowBtn.disabled = true; rowBtn.textContent = "..."; }
+  const res = await postCycleCountBatch([{ op: "verifyLog", logId, reviewed_by: reviewer }]);
+  if (!res || !res.ok) {
+    if (typeof showToast === "function") showToast("Verify failed: " + ((res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown"), "warn");
+    if (rowBtn) { rowBtn.disabled = false; rowBtn.textContent = "Verified"; }
+    return;
+  }
+  if (typeof showToast === "function") showToast("Verified -- send the adjustment to Acumatica manually.", "ok");
+  if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._ccVerifyLog = _ccVerifyLog;
+
+async function _ccRequestRecount(itemId, rowBtn) {
+  const requester = _ccName();
+  if (rowBtn) { rowBtn.disabled = true; rowBtn.textContent = "..."; }
+  const res = await postCycleCountBatch([{ op: "requestRecount", itemId, requested_by: requester }]);
+  if (!res || !res.ok) {
+    if (typeof showToast === "function") showToast("Recount request failed: " + ((res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown"), "warn");
+    if (rowBtn) { rowBtn.disabled = false; rowBtn.textContent = "Request recount"; }
+    return;
+  }
+  const r = res.results && res.results[0];
+  if (r && r.skipped) { if (typeof showToast === "function") showToast("A recount is already pending for this item.", ""); }
+  else if (typeof showToast === "function") showToast("Recount created -- next counter (other than the original) will pick it up.", "ok");
+  if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._ccRequestRecount = _ccRequestRecount;
+
+/* ---- live feed data -------------------------------------- */
+function _ccRecentLogRows(limit) {
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  return log.slice(0, Math.max(1, limit || 40));
+}
+function _ccLogRowIsAttention(row) {
+  if (!row) return false;
+  if (row.outcome !== "counted" && row.outcome !== "recount") return false;
+  if (typeof row.counted_qty !== "number") return false;
+  if (row.reviewed_by) return false;  // already verified
+  return _ccBeyondTolerance(row.system_qty_at_assign, row.counted_qty);
+}
+function _ccDollarImpactFor(row) {
+  const pn = row && row.pn;
+  const v = (typeof row.variance === "number") ? row.variance : ((Number(row.counted_qty) || 0) - (Number(row.system_qty_at_assign) || 0));
+  if (typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) return { units: v, dollars: null, cost: null };
+  const p = DB.parts.find(x => x && x.pn === pn);
+  const cost = p ? (Number(p.cost) || 0) : 0;
+  return { units: v, dollars: cost * Math.abs(v), cost };
+}
+function _ccItemHasPendingRecount(parentItemId) {
+  if (!(DB && DB.cycleCounts && DB.cycleCounts.items instanceof Map)) return false;
+  for (const it of DB.cycleCounts.items.values()) {
+    if (it && it.recount_of === parentItemId && (it.status === "pending" || it.status === "recount")) return true;
+  }
+  return false;
+}
+
+/* ---- render fragments ------------------------------------ */
+function _ccPulseDot(state) {
+  const color = state === "subscribed" ? "var(--ok,#3a7)"
+              : state === "polling"    ? "var(--warn,#c85)"
+              : state === "connecting" ? "var(--dim,#888)"
+              : /* unavailable */        "var(--crit,#c33)";
+  const label = state === "subscribed" ? "realtime connected"
+              : state === "polling"    ? "polling fallback (realtime unavailable)"
+              : state === "connecting" ? "connecting..."
+              : "realtime unavailable";
+  return `<span class="cc-pulse-dot" data-state="${esc(state)}" title="${esc(label)}" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};box-shadow:0 0 8px ${color};vertical-align:middle;margin-left:8px;animation:${state === "subscribed" ? "cc-pulse 2s infinite" : "none"}"></span>`;
+}
+
+function _ccBinBreakdownRow(row) {
+  // Reads row.locations (jsonb from cycle_count_log). Returns HTML
+  // for a bin-breakdown block; empty string when no location data.
+  if (!row || !Array.isArray(row.locations) || row.locations.length === 0) return "";
+  // Match each bin to a snapshot system qty via cycle_count_item_locations.
+  const snapshot = (DB.cycleCountItemLocations instanceof Map)
+    ? (DB.cycleCountItemLocations.get(row.item_id) || [])
+    : [];
+  const sysByLoc = new Map(snapshot.map(s => [s.location, Number(s.system_qty_at_assign) || 0]));
+  const body = row.locations.map(l => {
+    const cnt = Math.round(Number(l.counted_qty) || 0);
+    const sys = sysByLoc.has(l.location) ? sysByLoc.get(l.location) : (l.foundElsewhere ? 0 : null);
+    const v = sys == null ? null : (cnt - sys);
+    const cls = (v == null) ? "dim" : (Math.abs(v) > CC_VAR_TOLERANCE_UNITS ? "text-warn bold" : (v === 0 ? "dim" : ""));
+    return `<tr>
+      <td class="mono">${esc(l.location)}${l.foundElsewhere ? ' <span class="pill tiny warn">found</span>' : ""}</td>
+      <td class="right num dim">${sys == null ? "-" : Math.round(sys)}</td>
+      <td class="right num">${cnt}</td>
+      <td class="right num ${cls}">${v == null ? "-" : (v > 0 ? "+" : "") + v}</td>
+    </tr>`;
+  }).join("");
+  return `
+    <div style="padding:6px 0 6px 12px">
+      <div class="tbl-wrap"><table class="tbl" style="max-width:520px">
+        <thead><tr><th>Bin</th><th class="right">Sys</th><th class="right">Counted</th><th class="right">Variance</th></tr></thead>
+        <tbody>${body}</tbody>
+      </table></div>
+    </div>
+  `;
+}
+
+function _ccRenderLiveFeed() {
+  const rows = _ccRecentLogRows(60);
+  if (rows.length === 0) {
+    return `<div class="empty" style="padding:16px"><div class="empty-title muted">No counts logged yet. New submissions appear here as they arrive.</div></div>`;
+  }
+  const lastSeen = CC_STATE._lastSeenLogAt || "";
+  const body = rows.map(r => {
+    const at = r.counted_at || "";
+    const isNew = at && at > lastSeen;
+    const v = (typeof r.variance === "number") ? r.variance : 0;
+    const sys = Math.abs(Number(r.system_qty_at_assign) || 0);
+    const pct = sys < 1e-9 ? (r.counted_qty === 0 ? 0 : 1) : Math.abs(v) / sys;
+    const beyond = (typeof r.counted_qty === "number") ? _ccBeyondTolerance(r.system_qty_at_assign, r.counted_qty) : false;
+    const vCls = beyond ? "text-warn bold" : (v === 0 ? "dim" : "");
+    const statusLabel = r.reviewed_by ? "verified"
+                     : r.outcome === "recount" ? "recount"
+                     : r.outcome === "reconciled" ? "reconciled"
+                     : r.outcome === "skipped" ? "skipped"
+                     : "counted";
+    const statusCls = statusLabel === "verified" ? "ok"
+                   : statusLabel === "recount" ? "warn"
+                   : statusLabel === "reconciled" ? "ok"
+                   : statusLabel === "skipped" ? "muted"
+                   : "";
+    const desc = _ccPartDesc(r.pn);
+    const hasBins = Array.isArray(r.locations) && r.locations.length > 0;
+    const expanded = CC_STATE._feedExpanded.has(r.id);
+    const rowHtml = `
+      <tr class="${isNew ? "cc-new-flash" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
+        <td class="dim tiny mono">${esc((at || "").slice(11, 16))}</td>
+        <td>${esc(r.counted_by || "-")}</td>
+        <td>
+          <span class="mono">${esc(r.pn)}</span>${hasBins ? ` <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"} ${r.locations.length} bin${r.locations.length === 1 ? "" : "s"}</span>` : ""}
+          <div class="dim tiny">${esc(desc)}</div>
+        </td>
+        <td class="right num">${r.system_qty_at_assign == null ? "-" : Math.round(r.system_qty_at_assign)}</td>
+        <td class="right num">${r.counted_qty == null ? "-" : Math.round(r.counted_qty)}</td>
+        <td class="right num ${vCls}">${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span></td>
+        <td><span class="pill tiny ${statusCls}">${statusLabel.toUpperCase()}</span>${r.reviewed_by ? `<div class="dim tiny">by ${esc(r.reviewed_by)}</div>` : ""}</td>
+      </tr>`;
+    const breakdown = (hasBins && expanded)
+      ? `<tr class="cc-breakdown-row"><td colspan="7" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(r)}</td></tr>`
+      : "";
+    return rowHtml + breakdown;
+  }).join("");
+  return `
+    <div class="tbl-wrap">
+      <table class="tbl cc-feed-table">
+        <thead><tr>
+          <th>Time</th><th>Counter</th><th>Part / description</th>
+          <th class="right">SYS ON-HAND</th><th class="right">Counted</th><th class="right">Variance</th>
+          <th>Status</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+function _ccToggleFeedExpand(id) {
+  if (CC_STATE._feedExpanded.has(id)) CC_STATE._feedExpanded.delete(id);
+  else CC_STATE._feedExpanded.add(id);
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._ccToggleFeedExpand = _ccToggleFeedExpand;
+
+function _ccRenderNeedsAttention() {
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  // Only consider the LATEST log row per item (recounts supersede).
+  const latestByItem = new Map();
+  for (const r of log) {
+    if (!r || !r.item_id) continue;
+    const prev = latestByItem.get(r.item_id);
+    if (!prev || (r.counted_at || "") > (prev.counted_at || "")) latestByItem.set(r.item_id, r);
+  }
+  const attn = [];
+  for (const r of latestByItem.values()) {
+    if (!_ccLogRowIsAttention(r)) continue;
+    const impact = _ccDollarImpactFor(r);
+    attn.push({ row: r, impact });
+  }
+  attn.sort((a, b) => (Number(b.impact.dollars) || 0) - (Number(a.impact.dollars) || 0));
+  if (attn.length === 0) {
+    return `<div class="empty" style="padding:12px"><div class="empty-title muted">No open variances -- every count within tolerance (or already verified).</div></div>`;
+  }
+  const rows = attn.map(({ row, impact }) => {
+    const v = impact.units;
+    const pendingRecount = _ccItemHasPendingRecount(row.item_id);
+    const dollarTxt = impact.dollars == null || impact.cost == null || impact.cost === 0
+      ? `<span class="dim">no cost</span>`
+      : `${(v < 0 ? "-" : "")}$${Math.abs(impact.dollars).toFixed(2)}`;
+    const expanded = CC_STATE._attnExpanded.has(row.item_id);
+    const desc = _ccPartDesc(row.pn);
+    const cls = _ccPartClass(row.pn);
+    const hasBins = Array.isArray(row.locations) && row.locations.length > 0;
+    const mainRow = `
+      <tr>
+        <td>
+          <div><span class="mono bold">${esc(row.pn)}</span>${cls ? `<span class="pill tiny muted" style="margin-left:6px">${esc(cls)}</span>` : ""}</div>
+          <div class="dim tiny">${esc(desc)}</div>
+          ${hasBins ? `<button class="btn xs ghost" onclick="_ccToggleAttnExpand('${esc(row.item_id)}')">${expanded ? "hide" : "show"} bins</button>` : ""}
+        </td>
+        <td class="dim tiny">${esc((row.counted_at || "").slice(0, 16).replace("T", " "))}<div>${esc(row.counted_by || "")}</div></td>
+        <td class="right num">${row.system_qty_at_assign == null ? "-" : Math.round(row.system_qty_at_assign)}</td>
+        <td class="right num">${row.counted_qty == null ? "-" : Math.round(row.counted_qty)}</td>
+        <td class="right num text-warn bold">${v > 0 ? "+" : ""}${v}</td>
+        <td class="right num bold">${dollarTxt}</td>
+        <td class="right" style="white-space:nowrap">
+          <button class="btn xs primary" onclick="_ccVerifyLog('${esc(row.id)}', this)" title="Attest that this variance is real and adjustment should be sent to Acumatica. Writes reviewed_by/at on the log row; NEVER writes on-hand.">Verified &mdash; send to Acumatica</button>
+          <button class="btn xs" onclick="_ccRequestRecount('${esc(row.item_id)}', this)" ${pendingRecount ? "disabled title='Recount already pending'" : "title='Spawn a recount for a different counter'"}>${pendingRecount ? "Recount pending" : "Request recount"}</button>
+        </td>
+      </tr>`;
+    const breakdown = (hasBins && expanded)
+      ? `<tr><td colspan="7" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(row)}</td></tr>`
+      : "";
+    return mainRow + breakdown;
+  }).join("");
+  return `
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr>
+        <th>Part</th><th>When / counter</th>
+        <th class="right">SYS ON-HAND</th><th class="right">Counted</th><th class="right">Variance</th><th class="right">$ impact</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  `;
+}
+function _ccToggleAttnExpand(id) {
+  if (CC_STATE._attnExpanded.has(id)) CC_STATE._attnExpanded.delete(id);
+  else CC_STATE._attnExpanded.add(id);
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._ccToggleAttnExpand = _ccToggleAttnExpand;
+
+function _ccRenderTightSummary(s) {
+  const complText = (Math.round(s.weekCompletion * 1000) / 10) + "%";
+  const iraText = s.ira == null ? "-" : (Math.round(s.ira * 1000) / 10) + "%";
+  const trendBtn = `<button class="btn xs ghost" onclick="_ccToggleTrend()">${CC_STATE._trendExpanded ? "&#9650; hide 8-wk trend" : "&#9660; show 8-wk trend"}</button>`;
+  const trendHtml = CC_STATE._trendExpanded ? _ccRenderTrend(s) : "";
+  const offCount = s.repeatOffenders.length;
+  const driftCount = s.driftFlags.length;
+  return `
+    <div class="row gap-md" style="align-items:stretch;margin:12px 0;flex-wrap:wrap">
+      <div class="card" style="padding:10px 14px;min-width:160px"><div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Week completion</div><div class="head-lg mono">${complText}</div><div class="dim tiny">${s.weekCounted}/${s.weekActive} counted, ${s.weekOpen} open</div></div>
+      <div class="card" style="padding:10px 14px;min-width:160px"><div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Accuracy (week)</div><div class="head-lg mono">${iraText}</div><div class="dim tiny">within max(${Math.round(CC_VAR_TOLERANCE_PCT*100)}%, ${CC_VAR_TOLERANCE_UNITS} units)</div></div>
+      <div class="card" style="padding:10px 14px;min-width:150px"><div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Repeat offenders</div><div class="head-lg mono">${offCount}</div><div class="dim tiny">last 60 days</div></div>
+      <div class="card" style="padding:10px 14px;min-width:150px"><div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Drift flags</div><div class="head-lg mono">${driftCount}</div><div class="dim tiny">check BOM / backflush</div></div>
+      <div class="card" style="padding:10px 14px;min-width:170px;display:flex;align-items:center;justify-content:center">${trendBtn}</div>
+    </div>
+    ${trendHtml}
+  `;
+}
+function _ccRenderTrend(s) {
+  const trendHtml = s.trend.map(w => {
+    const pct = w.ira == null ? null : Math.round(w.ira * 100);
+    const h = w.ira == null ? 3 : Math.max(4, Math.round(w.ira * 60));
+    const color = w.ira == null ? "var(--t3,#999)" : w.ira >= 0.95 ? "var(--ok,#3a7)" : w.ira >= 0.85 ? "var(--warn,#c85)" : "var(--crit,#c33)";
+    const label = w.ira == null ? "no counts" : `${pct}% (n=${w.n})`;
+    const short = w.mondayIso.slice(5);
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px" title="Week of ${w.mondayIso} -- ${label}">
+      <div style="width:22px;height:64px;background:var(--surf-2,#eee);border-radius:3px;position:relative;overflow:hidden">
+        <div style="position:absolute;bottom:0;left:0;right:0;height:${h}px;background:${color}"></div>
+      </div>
+      <div class="dim tiny">${short}</div>
+    </div>`;
+  }).join("");
+  return `<div class="card" style="padding:14px;margin-bottom:12px"><div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Inventory record accuracy -- last 8 weeks</div><div style="display:flex;gap:12px;align-items:flex-end">${trendHtml}</div></div>`;
+}
+function _ccToggleTrend() { CC_STATE._trendExpanded = !CC_STATE._trendExpanded; if (typeof refresh === "function") refresh(); }
+if (typeof window !== "undefined") window._ccToggleTrend = _ccToggleTrend;
+
+function _ccOpenQueueSummary() {
+  const items = _ccAllItems().filter(i => i && (i.status === "pending" || i.status === "recount"));
+  const byTier = { hot: 0, runway: 0, rotation: 0, flagged: 0 };
+  for (const i of items) byTier[i.tier] = (byTier[i.tier] || 0) + 1;
+  const parts = [];
+  if (byTier.hot)      parts.push(`${byTier.hot} hot`);
+  if (byTier.flagged)  parts.push(`${byTier.flagged} flagged`);
+  if (byTier.runway)   parts.push(`${byTier.runway} runway`);
+  if (byTier.rotation) parts.push(`${byTier.rotation} rotation`);
+  return `${items.length} open${parts.length ? " -- " + parts.join(" / ") : ""}`;
+}
+function _ccToggleOpenQueue() { CC_STATE._openQueueExpanded = !CC_STATE._openQueueExpanded; if (typeof refresh === "function") refresh(); }
+if (typeof window !== "undefined") window._ccToggleOpenQueue = _ccToggleOpenQueue;
+
+function _ccRenderOpenQueueBody() {
+  const todayItems = _ccTodayHotAndFlagged();
+  const runwayItems = _ccOpenByTier("runway");
+  const rotationItems = _ccOpenByTier("rotation");
+  return `
+    <div class="dr-section" style="margin-top:12px">Today (HOT + operator flags)</div>
+    ${_ccRenderTable(todayItems, { emptyMsg: "Nothing hot today." })}
+    <div class="dr-section" style="margin-top:12px">This week -- Runway (< 60d cover, not counted in 45d)</div>
+    ${_ccRenderTable(runwayItems, { emptyMsg: "No open runway rows." })}
+    <div class="dr-section" style="margin-top:12px">This week -- Rotation (LRU + frame 30d cycle)</div>
+    ${_ccRenderTable(rotationItems, { emptyMsg: "No open rotation rows." })}
+  `;
+}
+
+/* ---- realtime hookup + poll fallback --------------------- */
+function _ccOnLiveEvent(source) {
+  // Realtime event OR poll -- refetch + rerender if we're on
+  // this route. If the source is a state ping only, don't refetch.
+  if (source === "state") {
+    // Only update the pulse dot -- avoid a full re-render on every
+    // heartbeat. The dot ID is stable so target it directly.
+    const dot = document.querySelector(".cc-pulse-dot");
+    if (dot) {
+      const state = (typeof ccLiveState === "function") ? ccLiveState() : "connecting";
+      dot.outerHTML = _ccPulseDot(state);
+    }
+    return;
+  }
+  if (typeof _refetchCycleCounts !== "function") return;
+  _refetchCycleCounts().then(() => {
+    if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE !== "cycle-counts") return;
+    // Detect any new attention row we haven't chimed for.
+    const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+    const lastSeen = CC_STATE._lastSeenLogAt || "";
+    const newest = log[0] && log[0].counted_at;
+    if (newest && newest > lastSeen) {
+      _ccPlayChime();
+    }
+    if (typeof refresh === "function") refresh();
+  }).catch(() => {});
+}
+function _ccEnsureLiveWiring() {
+  if (CC_STATE._liveSubscribed) return;
+  CC_STATE._liveSubscribed = true;
+  if (typeof ccLiveSubscribe === "function") {
+    ccLiveSubscribe(_ccOnLiveEvent);
+  }
+  // 60s poll fallback -- runs regardless of realtime state so a
+  // silently-dropped socket still sees new counts within a minute.
+  if (CC_STATE._pollTimer) clearInterval(CC_STATE._pollTimer);
+  CC_STATE._pollTimer = setInterval(() => _ccOnLiveEvent("poll"), 60000);
+}
+
 function renderCycleCounts() {
   const main = document.getElementById("main");
   if (!main) return;
-  // If the hydration hasn't landed yet, render a placeholder and
-  // fire a fetch -- realtime will re-refresh on completion.
+  _ccInitLocalState();
+  _ccEnsureLiveWiring();
   if (!(DB && DB.cycleCounts) || !DB.cycleCounts.loaded) {
     main.innerHTML = `<div class="page" data-page="cycle-counts"><div class="empty"><div class="empty-title muted">Loading cycle counts...</div></div></div>`;
     if (typeof _refetchCycleCounts === "function") {
@@ -957,59 +1359,65 @@ function renderCycleCounts() {
     return;
   }
   const s = _ccSummary();
-  const todayItems = _ccTodayHotAndFlagged();
-  const runwayItems = _ccOpenByTier("runway");
-  const rotationItems = _ccOpenByTier("rotation");
-  const doneItems = CC_STATE._showCompleted
-    ? [..._ccCompletedByTier("hot"), ..._ccCompletedByTier("flagged"), ..._ccCompletedByTier("runway"), ..._ccCompletedByTier("rotation")]
-        .sort((a, b) => String(b.counted_at || b.updated_at || "").localeCompare(String(a.counted_at || a.updated_at || "")))
-        .slice(0, 60)
-    : [];
   const name = _ccName();
+  const liveState = (typeof ccLiveState === "function") ? ccLiveState() : "connecting";
   const html = `
+    <style>
+      @keyframes cc-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+      @keyframes cc-flash-in {
+        0%   { background: color-mix(in srgb, var(--ok,#3a7) 25%, transparent); }
+        100% { background: transparent; }
+      }
+      .cc-new-flash td { animation: cc-flash-in 3.5s ease-out forwards; }
+      .cc-feed-table tr td { vertical-align: top; }
+      .cc-feed-table tr.cc-breakdown-row td { padding: 0 !important; }
+    </style>
     <div class="page" data-page="cycle-counts">
       <div class="page-hd">
         <div>
-          <h1>Cycle Counts</h1>
-          <p class="muted">Weekly + daily audit lists. Never writes on-hand -- Acumatica stays the system of record; sync brings adjusted truth back.</p>
+          <h1>Cycle Counts ${_ccPulseDot(liveState)}</h1>
+          <p class="muted">Supervisor review of counts as they arrive. Counters submit through <a href="/count" target="_blank" rel="noopener">/count</a> on their phones.</p>
         </div>
         <div class="row gap-sm">
+          <label class="row gap-sm" style="align-items:center;cursor:pointer">
+            <span class="muted tiny">Chime on new count</span>
+            <input type="checkbox" class="chk" ${CC_STATE._chimeOn ? "checked" : ""} onchange="_ccToggleChime()">
+          </label>
           <label class="row gap-sm" style="align-items:center">
             <span class="muted tiny">Your name</span>
             <input class="input" id="cc-name-input" value="${esc(name)}" placeholder="e.g. Marisol" style="width:180px" onchange="_ccOnNameInput(this.value)">
           </label>
-          <button class="btn" onclick="_ccToggleCompleted()">${CC_STATE._showCompleted ? "Hide completed" : "Show completed"}</button>
         </div>
       </div>
 
-      ${_ccRenderSummaryStrip(s)}
+      ${_ccRenderTightSummary(s)}
 
-      ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before submitting counts -- it's stamped on every log row (and enforces the blind-recount rule).</div>` : ""}
+      ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before verifying counts -- it's stamped on every reviewed log row.</div>` : ""}
 
-      <div class="dr-section" style="margin-top:16px">Today (HOT + operator flags)</div>
-      ${_ccRenderTable(todayItems, { emptyMsg: "Nothing hot today. Refill from Acumatica sync as new negatives / critical parts land, or flag a part from its drawer." })}
+      <div class="dr-section" style="margin-top:16px">Needs attention</div>
+      ${_ccRenderNeedsAttention()}
 
-      <div class="dr-section" style="margin-top:16px">This week -- Runway (< 60d cover, not counted in 45d)</div>
-      ${_ccRenderTable(runwayItems, { emptyMsg: "No open runway rows. Mondays' cron fills this list." })}
+      <div class="dr-section" style="margin-top:20px">Counts as they come in</div>
+      ${_ccRenderLiveFeed()}
 
-      <div class="dr-section" style="margin-top:16px">This week -- Rotation (LRU + frame 30d cycle)</div>
-      ${_ccRenderTable(rotationItems, { emptyMsg: "No open rotation rows this week." })}
-
-      ${CC_STATE._showCompleted ? `
-        <div class="dr-section" style="margin-top:16px">Completed / skipped / reconciled (most recent 60)</div>
-        ${_ccRenderTable(doneItems, { emptyMsg: "No completed rows yet." })}
+      <div class="dr-section" style="margin-top:20px;cursor:pointer" onclick="_ccToggleOpenQueue()">
+        Open queue -- ${_ccOpenQueueSummary()} ${CC_STATE._openQueueExpanded ? "&#9650;" : "&#9660;"}
+      </div>
+      ${CC_STATE._openQueueExpanded ? `
+        <p class="muted tiny">Supervisor override tools. Prefer /count on a phone for routine counting.</p>
+        ${_ccRenderOpenQueueBody()}
       ` : ""}
 
       ${_ccMobileAppBlock()}
     </div>
   `;
   main.innerHTML = html;
-  // QR must render after the canvas is in the DOM.
   _ccRenderMobileQR();
-  // Kick a reconcile scan on every render (debounced) so an
-  // Acumatica sync that lands mid-session reconciles counted rows
-  // without waiting for another action.
   _ccScheduleReconcileScan();
+  // Advance last-seen watermark after render so the next redraw's
+  // flash class only lands on rows that arrived AFTER this one.
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  if (log[0] && log[0].counted_at) _ccPersistLastSeen(log[0].counted_at);
 }
 function _ccOnNameInput(v) { _ccSetName(v); if (typeof refresh === "function") refresh(); }
 function _ccToggleCompleted() { CC_STATE._showCompleted = !CC_STATE._showCompleted; if (typeof refresh === "function") refresh(); }
