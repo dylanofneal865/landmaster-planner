@@ -366,14 +366,81 @@ exports.handler = async (event) => {
     };
   }
 
-  // Batched insert (Supabase can eat 200+ rows in one call).
-  const { error: insErr } = await supa.from("cycle_count_items").insert(plans);
+  // Batched insert (Supabase can eat 200+ rows in one call). We
+  // ask for `id` back so the location-snapshot pass below can key
+  // its inserts to each fresh item row.
+  const { data: insertedRows, error: insErr } = await supa
+    .from("cycle_count_items")
+    .insert(plans)
+    .select("id, pn, tier, system_qty_at_assign");
   if (insErr) {
     log("insert failed", insErr);
     return { statusCode: 500, body: JSON.stringify({ error: "insert failed", detail: insErr.message }) };
   }
 
-  log(`inserted ${plans.length} items in ${Date.now() - t0}ms`);
+  // v-cc-loc-1 phase 1 -- LOCATION SNAPSHOT.
+  //
+  // For every fresh cycle_count_item we just inserted, snapshot
+  // the current part_locations rows into cycle_count_item_locations
+  // so the count card shows the buyer's real bin list AND the
+  // system_qty_at_assign per bin is frozen at assignment time
+  // (subsequent Acumatica syncs won't move the goalposts on the
+  // counter mid-shift).
+  //
+  // Parts with no part_locations row (aggregate-only pn, or
+  // legacy pre-per-location parts) get ZERO snapshot rows and
+  // fall through to the existing single-total flow -- the UI
+  // renders them the same way it did in the previous release.
+  const insertedIds = (insertedRows || []).map(r => r.id);
+  const insertedPns = [...new Set((insertedRows || []).map(r => r.pn))];
+  let locSnapshotCount = 0;
+  if (insertedIds.length > 0 && insertedPns.length > 0) {
+    const { data: locRows, error: locErr } = await supa
+      .from("part_locations")
+      .select("pn, location, location_desc, qty")
+      .in("pn", insertedPns);
+    if (locErr) {
+      log("part_locations fetch failed for snapshot (non-fatal)", locErr.message);
+    } else {
+      const locsByPn = new Map();
+      for (const r of (locRows || [])) {
+        if (!r || !r.pn) continue;
+        let arr = locsByPn.get(r.pn);
+        if (!arr) { arr = []; locsByPn.set(r.pn, arr); }
+        arr.push(r);
+      }
+      const snapshotRows = [];
+      for (const item of (insertedRows || [])) {
+        const locs = locsByPn.get(item.pn) || [];
+        for (const l of locs) {
+          snapshotRows.push({
+            item_id: item.id,
+            pn: item.pn,
+            location: l.location,
+            location_desc: l.location_desc || null,
+            system_qty_at_assign: Number(l.qty) || 0,
+            counted_qty: null,
+            counted_at: null,
+          });
+        }
+      }
+      if (snapshotRows.length > 0) {
+        // Batched insert -- chunk at 500 for wire-size safety.
+        const CHUNK = 500;
+        for (let i = 0; i < snapshotRows.length; i += CHUNK) {
+          const batch = snapshotRows.slice(i, i + CHUNK);
+          const { error: sErr } = await supa.from("cycle_count_item_locations").insert(batch);
+          if (sErr) {
+            log("cycle_count_item_locations insert failed (non-fatal)", { chunk: i, message: sErr.message });
+            continue;
+          }
+          locSnapshotCount += batch.length;
+        }
+      }
+    }
+  }
+
+  log(`inserted ${plans.length} items (+ ${locSnapshotCount} location snapshots) in ${Date.now() - t0}ms`);
   return {
     statusCode: 200,
     body: JSON.stringify({
@@ -383,6 +450,7 @@ exports.handler = async (event) => {
       isCron,
       summary,
       inserted: plans.length,
+      locationSnapshots: locSnapshotCount,
       tookMs: Date.now() - t0,
     }),
   };

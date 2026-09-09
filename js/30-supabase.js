@@ -1164,6 +1164,111 @@ async function _fsPostFrameScheduleWrite(body) {
        after every write via _refetchCycleCounts().
    ============================================================ */
 
+// v-cc-loc-1 phase 1 -- part_locations hydration. Poll-only.
+// Populated by acumatica-sync's per-location pass; NEVER written
+// by the client. Feeds the cycle-count mobile card + the part
+// drawer's "current locations" block. Byte-order matters: shape is
+//   DB.partLocations = Map<pn, Array<{location, location_desc, qty, synced_at}>>
+async function _fetchAllPartLocations() {
+  if (!_supa) return null;
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("part_locations")
+      .select("pn, location, location_desc, qty, synced_at")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] part_locations fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+function _populatePartLocationsFromRows(rows) {
+  const m = new Map();
+  if (Array.isArray(rows)) {
+    for (const r of rows) {
+      if (!r || !r.pn) continue;
+      let arr = m.get(r.pn);
+      if (!arr) { arr = []; m.set(r.pn, arr); }
+      arr.push({
+        location: r.location,
+        location_desc: r.location_desc || null,
+        qty: Number(r.qty) || 0,
+        synced_at: r.synced_at || null,
+      });
+    }
+    // Deterministic per-pn order: location asc.
+    for (const arr of m.values()) {
+      arr.sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0));
+    }
+  }
+  DB.partLocations = m;
+}
+async function _refetchPartLocations() {
+  const rows = await _fetchAllPartLocations();
+  if (rows !== null) _populatePartLocationsFromRows(rows);
+  return DB.partLocations;
+}
+if (typeof window !== "undefined") window._refetchPartLocations = _refetchPartLocations;
+
+// v-cc-loc-1 phase 1 -- cycle_count_item_locations hydration.
+// Poll-only, refreshed by _refetchCycleCounts. Rows are snapshotted
+// at assignment by cycle-count-assign and updated on submitCount by
+// cycle-count-write.
+//   DB.cycleCountItemLocations = Map<item_id, Array<{id, location, location_desc,
+//                                                    system_qty_at_assign,
+//                                                    counted_qty, counted_at}>>
+async function _fetchAllCycleCountItemLocations() {
+  if (!_supa) return null;
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("cycle_count_item_locations")
+      .select("id, item_id, pn, location, location_desc, system_qty_at_assign, counted_qty, counted_at")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] cycle_count_item_locations fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+function _populateCycleCountItemLocationsFromRows(rows) {
+  const m = new Map();
+  if (Array.isArray(rows)) {
+    for (const r of rows) {
+      if (!r || !r.item_id) continue;
+      let arr = m.get(r.item_id);
+      if (!arr) { arr = []; m.set(r.item_id, arr); }
+      arr.push({
+        id: r.id,
+        location: r.location,
+        location_desc: r.location_desc || null,
+        system_qty_at_assign: Number(r.system_qty_at_assign) || 0,
+        counted_qty: (r.counted_qty == null) ? null : Number(r.counted_qty),
+        counted_at: r.counted_at || null,
+      });
+    }
+    for (const arr of m.values()) {
+      arr.sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0));
+    }
+  }
+  DB.cycleCountItemLocations = m;
+}
+
 async function _fetchAllCycleCountItems() {
   if (!_supa) return null;
   const all = [];
@@ -1247,15 +1352,21 @@ function _populateCycleCountsFromRows(items, logs) {
   DB.cycleCounts.loaded = true;
 }
 
-// Refetch both tables in one shot. Callable from js/26 after a
-// write; also useful for a manual "reload" button later.
+// Refetch every cycle-count table in one shot. Callable from
+// js/26 after a write; also useful for a manual "reload" button.
+// v-cc-loc-1 phase 1 -- also refreshes cycle_count_item_locations
+// so a fresh count / recount snapshot appears immediately.
 async function _refetchCycleCounts() {
-  const [items, log] = await Promise.all([
+  const [items, log, itemLocs] = await Promise.all([
     _fetchAllCycleCountItems(),
     _fetchAllCycleCountLog(),
+    _fetchAllCycleCountItemLocations(),
   ]);
   if (items !== null || log !== null) {
     _populateCycleCountsFromRows(items || [], log || []);
+  }
+  if (itemLocs !== null) {
+    _populateCycleCountItemLocationsFromRows(itemLocs);
   }
   return DB.cycleCounts;
 }
@@ -1905,10 +2016,17 @@ async function cloudInit() {
   }
 
   // ---- Cycle Counts (v-cc-1) ----
-  // Sidecar tables cycle_count_items + cycle_count_log. Poll-only
-  // (mirror of build_plan_targets + frame_schedule initial pattern).
-  // js/26 refetches after every write via _refetchCycleCounts.
-  const [ccItems, ccLog] = await Promise.all([_fetchAllCycleCountItems(), _fetchAllCycleCountLog()]);
+  // Sidecar tables cycle_count_items + cycle_count_log +
+  // cycle_count_item_locations. Also part_locations (populated by
+  // acumatica-sync's per-location pass; read-only for the client).
+  // Poll-only. js/26 refetches after every write via
+  // _refetchCycleCounts.
+  const [ccItems, ccLog, ccItemLocs, partLocs] = await Promise.all([
+    _fetchAllCycleCountItems(),
+    _fetchAllCycleCountLog(),
+    _fetchAllCycleCountItemLocations(),
+    _fetchAllPartLocations(),
+  ]);
   if (ccItems !== null || ccLog !== null) {
     _populateCycleCountsFromRows(ccItems || [], ccLog || []);
     console.log(`[cloud] loaded cycle counts: ${DB.cycleCounts.items.size} item(s), ${DB.cycleCounts.log.length} log row(s)`);
@@ -1917,6 +2035,18 @@ async function cloudInit() {
     if (!DB.cycleCounts || !(DB.cycleCounts.items instanceof Map)) {
       DB.cycleCounts = { items: new Map(), log: [], loaded: false };
     }
+  }
+  if (ccItemLocs !== null) {
+    _populateCycleCountItemLocationsFromRows(ccItemLocs);
+    console.log(`[cloud] loaded cycle_count_item_locations for ${DB.cycleCountItemLocations.size} item(s)`);
+  } else if (!(DB.cycleCountItemLocations instanceof Map)) {
+    DB.cycleCountItemLocations = new Map();
+  }
+  if (partLocs !== null) {
+    _populatePartLocationsFromRows(partLocs);
+    console.log(`[cloud] loaded part_locations for ${DB.partLocations.size} pn(s)`);
+  } else if (!(DB.partLocations instanceof Map)) {
+    DB.partLocations = new Map();
   }
 
   // ---- PO Receipts (last 26 weeks, read-only overlay) ----

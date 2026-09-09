@@ -349,10 +349,254 @@ async function flagPartForCount(pn, note) {
 }
 if (typeof window !== "undefined") window.flagPartForCount = flagPartForCount;
 
+/* ============================================================
+   v-cc-loc-1 phase 1 -- MOBILE FULL-SCREEN COUNT CARD.
+
+   Rendered when the counter taps a row for an item that has
+   cycle_count_item_locations snapshotted at assignment time.
+   Full-screen modal with:
+     * Part header (pn, desc, tier badge, reason)
+     * One row per snapshotted location: location code, desc,
+       system qty at assign, large numeric input (inputmode=numeric
+       so the tablet's number pad opens), live per-location
+       variance below.
+     * "Add other location (found elsewhere)" -- reveals a
+       location + qty pair the counter can enter for stock that
+       turned up in an unexpected bin.
+     * Live total (sum of listed + extras) with variance vs the
+       item's system_qty_at_assign.
+     * Submit -- requires EVERY listed location filled (0 valid).
+       Payload posts locations[] via postCycleCountBatch; the
+       write function enforces the same "all bins filled" rule
+       + sum-matches-counted_qty rule against DB truth.
+
+   Items WITHOUT any location snapshot rows (aggregate-only pns)
+   fall through to the existing single-total inline input --
+   nothing changes for them.
+   ============================================================ */
+function _ccHasLocations(itemId) {
+  if (!(DB && DB.cycleCountItemLocations instanceof Map)) return false;
+  const rows = DB.cycleCountItemLocations.get(itemId);
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+function _ccBumpCardSum() {
+  const inputs = document.querySelectorAll(".cc-loc-input");
+  let sum = 0;
+  let missing = 0;
+  for (const inp of inputs) {
+    const raw = String(inp.value || "").trim();
+    if (raw === "") missing++;
+    const n = Math.round(Number(raw));
+    if (Number.isFinite(n) && n >= 0) sum += n;
+    // Update per-row variance cell if present.
+    const row = inp.closest("[data-loc-row]");
+    if (row) {
+      const sys = Number(row.getAttribute("data-sys")) || 0;
+      const varCell = row.querySelector(".cc-loc-var");
+      if (varCell) {
+        if (raw === "") { varCell.textContent = "-"; varCell.className = "cc-loc-var dim mono"; }
+        else {
+          const v = n - sys;
+          varCell.textContent = (v > 0 ? "+" : "") + v;
+          varCell.className = "cc-loc-var mono " + (v === 0 ? "dim" : (Math.abs(v) > CC_VAR_TOLERANCE_UNITS ? "text-warn bold" : ""));
+        }
+      }
+    }
+  }
+  const sumEl = document.getElementById("cc-card-sum");
+  const varEl = document.getElementById("cc-card-var");
+  const submitBtn = document.getElementById("cc-card-submit");
+  const item = CC_STATE._card && CC_STATE._card.item;
+  if (sumEl) sumEl.textContent = String(sum);
+  if (item && varEl) {
+    const sys = Number(item.system_qty_at_assign) || 0;
+    const v = sum - sys;
+    varEl.textContent = (v > 0 ? "+" : "") + v + " vs system " + sys;
+    varEl.className = "mono " + (v === 0 ? "dim" : (_ccBeyondTolerance(sys, sum) ? "text-warn bold" : ""));
+  }
+  if (submitBtn) {
+    submitBtn.disabled = missing > 0 || !_ccName();
+    submitBtn.title = missing > 0 ? `Fill every listed location first (${missing} left)`
+                    : !_ccName()  ? "Enter your name on the Cycle Counts tab first"
+                    : "";
+  }
+}
+function _ccCardAddExtra() {
+  const wrap = document.getElementById("cc-card-extras");
+  if (!wrap) return;
+  const idx = wrap.children.length;
+  const row = document.createElement("div");
+  row.className = "row gap-sm";
+  row.setAttribute("data-loc-row", "extra");
+  row.setAttribute("data-sys", "0");
+  row.setAttribute("data-extra", "1");
+  row.style.cssText = "padding:12px;background:var(--surf-2,#f3f4f6);border-radius:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap";
+  row.innerHTML = `
+    <input class="input" placeholder="Location code (e.g. R12/A03)" data-loc-extra-code style="min-width:180px;font-size:16px;padding:10px" />
+    <span class="dim mono tiny" style="min-width:60px">system 0</span>
+    <input class="input num cc-loc-input" type="number" inputmode="numeric" min="0" step="1" placeholder="counted" data-loc-extra-qty style="width:110px;font-size:20px;padding:12px;text-align:right" oninput="_ccBumpCardSum()" />
+    <span class="cc-loc-var mono dim">-</span>
+    <button class="btn xs ghost" onclick="this.closest('[data-loc-row]').remove(); _ccBumpCardSum();" title="Remove this extra location">remove</button>
+  `;
+  wrap.appendChild(row);
+  const codeInput = row.querySelector("[data-loc-extra-code]");
+  if (codeInput) codeInput.focus();
+  _ccBumpCardSum();
+}
+if (typeof window !== "undefined") {
+  window._ccBumpCardSum = _ccBumpCardSum;
+  window._ccCardAddExtra = _ccCardAddExtra;
+}
+
+async function _ccOpenCountCard(itemId) {
+  const item = DB.cycleCounts.items.get(itemId);
+  if (!item) return;
+  const locs = (DB.cycleCountItemLocations instanceof Map)
+    ? (DB.cycleCountItemLocations.get(itemId) || [])
+    : [];
+  if (locs.length === 0) {
+    // Fall back to single-total flow -- caller shouldn't have
+    // reached here, but be defensive.
+    return _ccSubmitCount(itemId);
+  }
+  CC_STATE._card = { item, itemId };
+  const desc = _ccPartDesc(item.pn);
+  const cls = _ccPartClass(item.pn);
+  const rowsHtml = locs.map(l => `
+    <div class="row gap-sm" data-loc-row data-loc="${esc(l.location)}" data-sys="${l.system_qty_at_assign}" style="padding:14px;background:var(--surf-2,#f3f4f6);border-radius:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
+      <div style="min-width:150px;flex:1">
+        <div class="mono" style="font-size:18px;font-weight:600">${esc(l.location)}</div>
+        ${l.location_desc ? `<div class="dim tiny">${esc(l.location_desc)}</div>` : ""}
+      </div>
+      <div class="dim mono" style="min-width:80px;text-align:right">system <b>${Math.round(l.system_qty_at_assign)}</b></div>
+      <input class="input num cc-loc-input" type="number" inputmode="numeric" min="0" step="1" placeholder="qty"
+             data-loc="${esc(l.location)}" style="width:110px;font-size:22px;padding:12px;text-align:right"
+             oninput="_ccBumpCardSum()"
+             onkeydown="if(event.key==='Enter'){const n=this.closest('[data-loc-row]').nextElementSibling; if(n){const ni=n.querySelector('input');if(ni)ni.focus();}}" />
+      <span class="cc-loc-var mono dim" style="min-width:70px;text-align:right">-</span>
+    </div>
+  `).join("");
+  const nameOk = !!_ccName();
+  const html = `
+    <div class="modal-head" style="padding:14px 16px;background:var(--surf-1,#f9fafb);border-bottom:1px solid var(--border,#e5e7eb);position:sticky;top:0;z-index:2">
+      <div class="row gap-sm" style="align-items:flex-start;justify-content:space-between">
+        <div>
+          <div class="mono" style="font-size:22px;font-weight:700">${esc(item.pn)}</div>
+          <div class="dim" style="margin-top:2px">${esc(desc)}</div>
+          <div class="row gap-sm" style="margin-top:6px">
+            <span class="pill ${item.tier === "hot" ? "crit" : item.tier === "runway" ? "warn" : "muted"}">${esc((item.tier || "").toUpperCase())}</span>
+            ${cls ? `<span class="pill muted">${esc(cls)}</span>` : ""}
+            ${item.recount_of ? `<span class="pill warn">RECOUNT (blind)</span>` : ""}
+          </div>
+          ${item.reason ? `<div class="dim tiny" style="margin-top:6px">${esc(item.reason)}</div>` : ""}
+        </div>
+        <button class="btn ghost" data-close style="font-size:20px;line-height:1;padding:8px 14px">Cancel</button>
+      </div>
+    </div>
+    <div class="modal-body" style="padding:16px;max-height:calc(100vh - 220px);overflow-y:auto">
+      ${!nameOk ? `<div class="banner warn" style="margin-bottom:12px">Enter your name on the Cycle Counts tab first -- required before Submit.</div>` : ""}
+      <div class="dr-section" style="margin-top:0">Locations (${locs.length}) -- every listed bin must be counted (0 is valid).</div>
+      ${rowsHtml}
+      <div class="dr-section" style="margin-top:14px">Found elsewhere</div>
+      <p class="dim tiny">Stock in a bin that isn't on the assignment list? Add it here -- an audit log row records it.</p>
+      <div id="cc-card-extras"></div>
+      <button class="btn" onclick="_ccCardAddExtra()">+ Add other location</button>
+    </div>
+    <div class="modal-foot" style="padding:14px 16px;background:var(--surf-1,#f9fafb);border-top:1px solid var(--border,#e5e7eb);position:sticky;bottom:0;z-index:2;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <div style="flex:1;min-width:180px">
+        <div class="dim tiny">Counted total</div>
+        <div><span id="cc-card-sum" class="mono" style="font-size:26px;font-weight:700">0</span> <span id="cc-card-var" class="mono dim" style="margin-left:8px">- vs system ${item.system_qty_at_assign}</span></div>
+      </div>
+      <button class="btn primary" id="cc-card-submit" style="font-size:18px;padding:14px 22px;min-width:140px" ${nameOk ? "" : "disabled"} onclick="_ccSubmitCardCount('${esc(itemId)}')">Submit count</button>
+    </div>
+  `;
+  if (typeof openModal === "function") openModal(html);
+  _ccBumpCardSum();
+}
+if (typeof window !== "undefined") window._ccOpenCountCard = _ccOpenCountCard;
+
+async function _ccSubmitCardCount(itemId) {
+  if (CC_STATE._pending.has(itemId)) return;
+  const item = DB.cycleCounts.items.get(itemId);
+  if (!item) return;
+  const counter = _ccName();
+  if (!counter) { if (typeof showToast === "function") showToast("Enter your name on the Cycle Counts tab first", "warn"); return; }
+  const rows = document.querySelectorAll("[data-loc-row]");
+  const locations = [];
+  let sum = 0;
+  for (const r of rows) {
+    const isExtra = r.getAttribute("data-extra") === "1";
+    const codeInput = isExtra ? r.querySelector("[data-loc-extra-code]") : null;
+    const location = isExtra ? String((codeInput && codeInput.value) || "").trim() : String(r.getAttribute("data-loc") || "").trim();
+    const qtyInput = r.querySelector(".cc-loc-input");
+    const raw = qtyInput ? String(qtyInput.value || "").trim() : "";
+    if (isExtra && !location) continue;   // blank extra: skip
+    if (!location) return; // shouldn't happen for listed rows
+    if (raw === "") {
+      if (typeof showToast === "function") showToast(`Location ${location} is empty -- 0 is valid but a value is required`, "warn");
+      if (qtyInput) qtyInput.focus();
+      return;
+    }
+    const n = Math.round(Number(raw));
+    if (!Number.isFinite(n) || n < 0) {
+      if (typeof showToast === "function") showToast(`Location ${location} qty must be a non-negative number`, "warn");
+      if (qtyInput) qtyInput.focus();
+      return;
+    }
+    sum += n;
+    const payloadRow = { location, counted_qty: n };
+    if (isExtra) payloadRow.foundElsewhere = true;
+    locations.push(payloadRow);
+  }
+  if (locations.length === 0) {
+    if (typeof showToast === "function") showToast("Nothing to submit", "warn");
+    return;
+  }
+  if (item.recount_of) {
+    const parent = DB.cycleCounts.items.get(item.recount_of);
+    if (parent && parent.counted_by && parent.counted_by.trim().toLowerCase() === counter.toLowerCase()) {
+      if (typeof showToast === "function") showToast(`Recount must be a different counter than ${parent.counted_by}`, "warn");
+      return;
+    }
+  }
+  CC_STATE._pending.add(itemId);
+  const btn = document.getElementById("cc-card-submit");
+  if (btn) { btn.disabled = true; btn.textContent = "Submitting..."; }
+  const res = await postCycleCountBatch([{
+    op: "submitCount",
+    itemId,
+    counted_qty: sum,
+    counted_by: counter,
+    locations,
+  }]);
+  CC_STATE._pending.delete(itemId);
+  if (!res || !res.ok) {
+    const err = (res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown";
+    if (typeof showToast === "function") showToast("Submit failed: " + err, "warn");
+    if (btn) { btn.disabled = false; btn.textContent = "Submit count"; }
+    return;
+  }
+  const r = res.results[0];
+  if (r.status === "recount") {
+    if (typeof showToast === "function") showToast(`Variance beyond tolerance -- recount spawned for ${item.pn}`, "warn", "Recount required");
+  } else {
+    if (typeof showToast === "function") showToast(`Counted ${item.pn} = ${sum}`, "ok");
+  }
+  if (typeof closeModal === "function") closeModal();
+  if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
+  if (typeof refresh === "function") refresh();
+  _ccScheduleReconcileScan();
+}
+if (typeof window !== "undefined") window._ccSubmitCardCount = _ccSubmitCardCount;
+
 async function _ccSubmitCount(itemId) {
   if (CC_STATE._pending.has(itemId)) return;
   const item = DB.cycleCounts.items.get(itemId);
   if (!item) return;
+  // v-cc-loc-1 -- route location-aware items to the full-screen
+  // count card instead of the single-input inline flow.
+  if (_ccHasLocations(itemId)) return _ccOpenCountCard(itemId);
   const input = document.getElementById(`cc-in-${itemId}`);
   const raw = input ? input.value : "";
   const val = Number(raw);
@@ -505,6 +749,8 @@ function _ccRenderItemRow(item, opts) {
   const drift = _ccDriftFor(item.pn);
   const isOpen = item.status === "pending" || item.status === "recount";
   const nameDisabled = !_ccName();
+  const locs = (DB.cycleCountItemLocations instanceof Map) ? (DB.cycleCountItemLocations.get(item.id) || []) : [];
+  const hasLocs = locs.length > 0;
   return `
     <tr data-cc-id="${esc(item.id)}">
       <td class="pn">
@@ -512,6 +758,7 @@ function _ccRenderItemRow(item, opts) {
         ${cls ? `<span class="pill tiny muted" style="margin-left:6px">${esc(cls)}</span>` : ""}
         ${blindRecount ? `<span class="pill tiny warn" style="margin-left:6px" title="BLIND recount -- first count hidden until this row is completed by a different counter">RECOUNT</span>` : ""}
         ${drift ? `<span class="pill tiny warn" style="margin-left:6px" title="Systematic drift -- ${drift.consecutive} consecutive ${drift.direction} counts, avg ${drift.avgPerCount.toFixed(1)}/count. Check BOM/backflush.">DRIFT</span>` : ""}
+        ${hasLocs ? `<span class="pill tiny" style="margin-left:6px;background:var(--accent-soft,#eef);color:var(--accent,#36c)" title="Item has ${locs.length} location snapshot(s); tap Count to open the per-location card">${locs.length} bins</span>` : ""}
       </td>
       <td class="dim" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(desc)}</td>
       <td>
@@ -522,7 +769,9 @@ function _ccRenderItemRow(item, opts) {
       <td class="right num dim">${live == null ? "-" : Math.round(live)}</td>
       <td class="right">
         ${isOpen
-          ? `<input class="input num" type="number" min="0" step="1" id="cc-in-${esc(item.id)}" placeholder="qty" style="width:88px;text-align:right" ${nameDisabled ? "disabled" : ""} onkeydown="if(event.key==='Enter')_ccSubmitCount('${esc(item.id)}')">`
+          ? (hasLocs
+              ? `<span class="dim tiny">use Count</span>`
+              : `<input class="input num" type="number" inputmode="numeric" min="0" step="1" id="cc-in-${esc(item.id)}" placeholder="qty" style="width:88px;text-align:right;font-size:16px" ${nameDisabled ? "disabled" : ""} onkeydown="if(event.key==='Enter')_ccSubmitCount('${esc(item.id)}')">`)
           : `<span class="num">${item.counted_qty == null ? "-" : Math.round(item.counted_qty)}</span>`}
       </td>
       ${_ccVarianceCell(item)}
@@ -532,7 +781,7 @@ function _ccRenderItemRow(item, opts) {
       </td>
       <td class="right" style="white-space:nowrap">
         ${isOpen ? `
-          <button class="btn xs primary" id="cc-submit-${esc(item.id)}" onclick="_ccSubmitCount('${esc(item.id)}')" ${nameDisabled ? "disabled title='Enter your name at the top first'" : ""}>Submit</button>
+          <button class="btn xs primary" id="cc-submit-${esc(item.id)}" onclick="_ccSubmitCount('${esc(item.id)}')" ${nameDisabled ? "disabled title='Enter your name at the top first'" : ""}>${hasLocs ? "Count" : "Submit"}</button>
           <button class="btn xs" onclick="_ccSkip('${esc(item.id)}')">Skip</button>
         ` : `
           <button class="btn xs ghost" onclick="openPartDetail('${esc(item.pn)}')">Open part</button>
@@ -707,12 +956,44 @@ if (typeof window !== "undefined") {
    PART-DRAWER HOOKS -- called from js/10-page-parts.js.
    ============================================================ */
 
-// Render the "last 5 counts" table for a part. Returns "" if the
-// pn has never been counted (js/10 hides the section then).
+// Render the "current locations" block above the count history.
+// Returns "" if the pn has no part_locations rows -- keeps the
+// drawer visually calm for aggregate-only parts. Reads from
+// DB.partLocations populated by js/30 out of the part_locations
+// table (populated by acumatica-sync's per-location pass).
+function _ccRenderPartLocationsBlock(pn) {
+  if (!(DB && DB.partLocations instanceof Map)) return "";
+  const locs = DB.partLocations.get(pn) || [];
+  if (locs.length === 0) return "";
+  const syncedAt = locs.reduce((max, l) => (l.synced_at && (!max || l.synced_at > max)) ? l.synced_at : max, null);
+  const total = locs.reduce((s, l) => s + (Number(l.qty) || 0), 0);
+  const body = locs.map(l => `
+    <tr>
+      <td class="mono">${esc(l.location)}</td>
+      <td class="dim">${esc(l.location_desc || "")}</td>
+      <td class="right num">${Math.round(Number(l.qty) || 0)}</td>
+    </tr>
+  `).join("");
+  return `
+    <div class="dr-section">Current locations (${locs.length})</div>
+    <div class="dim tiny" style="margin-bottom:6px">On-hand by bin per the last Acumatica sync${syncedAt ? ` (${esc(syncedAt.slice(0, 16).replace("T", " "))})` : ""}. Aggregate on-hand = ${Math.round(total)}.</div>
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th>Location</th><th>Description</th><th class="right">Qty</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+  `;
+}
+
+// Render the "last 5 counts" table for a part. When the most
+// recent count carries a locations breakdown in the log's
+// `locations` jsonb column, expand that row inline so the buyer
+// sees the per-bin call. Returns "" only when BOTH the locations
+// block AND the history are empty (js/10 hides the section then).
 function renderPartCycleCountHistory(pn) {
-  if (!(DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log))) return "";
+  const locBlock = _ccRenderPartLocationsBlock(pn);
+  if (!(DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log))) return locBlock;
   const rows = DB.cycleCounts.log.filter(r => r && r.pn === pn).slice(0, 5);
-  if (rows.length === 0) return "";
+  if (rows.length === 0) return locBlock;
   const drift = _ccDriftFor(pn);
   const driftLine = drift
     ? `<div class="banner warn tiny" style="margin-bottom:8px">Systematic drift detected -- ${drift.consecutive} consecutive ${drift.direction} counts, avg ${drift.avgPerCount.toFixed(1)}/count. Check BOM / backflush.</div>`
@@ -721,17 +1002,20 @@ function renderPartCycleCountHistory(pn) {
     const v = (typeof r.variance === "number") ? r.variance : null;
     const sign = (v == null) ? "" : (v > 0 ? "+" : "");
     const pct = (typeof r.variance_pct === "number") ? (Math.round(r.variance_pct * 1000) / 10) + "%" : "-";
+    const locsBreak = (r.locations && Array.isArray(r.locations) && r.locations.length > 0)
+      ? `<div class="dim tiny" style="margin-top:2px">${r.locations.map(l => `${esc(l.location)}=${Math.round(Number(l.counted_qty) || 0)}${l.foundElsewhere ? "*" : ""}`).join(", ")}</div>`
+      : "";
     return `<tr>
       <td class="dim tiny">${esc((r.counted_at || "").slice(0, 16).replace("T", " "))}</td>
       <td>${esc(r.counted_by || "")}</td>
       <td class="dim tiny">${esc(r.tier || "")} ${esc(r.reason || "")}</td>
       <td class="right num">${r.system_qty_at_assign == null ? "-" : Math.round(r.system_qty_at_assign)}</td>
-      <td class="right num">${r.counted_qty == null ? "-" : Math.round(r.counted_qty)}</td>
+      <td class="right num">${r.counted_qty == null ? "-" : Math.round(r.counted_qty)}${locsBreak}</td>
       <td class="right num ${v != null && Math.abs(v) > CC_VAR_TOLERANCE_UNITS ? "text-warn" : "dim"}">${v == null ? "-" : (sign + v)} <span class="dim tiny">${pct}</span></td>
       <td>${_ccPill(r.outcome)}</td>
     </tr>`;
   }).join("");
-  return `
+  const historyBlock = `
     <div class="dr-section">Cycle count history (last 5)</div>
     ${driftLine}
     <div class="tbl-wrap"><table class="tbl">
@@ -742,6 +1026,7 @@ function renderPartCycleCountHistory(pn) {
       <tbody>${body}</tbody>
     </table></div>
   `;
+  return locBlock + historyBlock;
 }
 if (typeof window !== "undefined") window.renderPartCycleCountHistory = renderPartCycleCountHistory;
 

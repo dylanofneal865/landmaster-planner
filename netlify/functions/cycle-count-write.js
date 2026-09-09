@@ -128,9 +128,26 @@ async function _applyOp(supa, w, i, log) {
         //   * if THIS item has recount_of set (a recount child),
         //     counted_by MUST NOT equal parent.counted_by (blind).
         //   * append a cycle_count_log row (append-only).
+        //
+        // v-cc-loc-1 phase 1 -- accepts optional `locations` array:
+        //   locations: [{ location, counted_qty, foundElsewhere? }]
+        // When present:
+        //   * Every LISTED cycle_count_item_locations row for this
+        //     item MUST be present in the payload (all bins filled).
+        //   * `foundElsewhere: true` rows are new bins the counter
+        //     discovered stock in -- inserted as new rows with
+        //     system_qty_at_assign = 0.
+        //   * item.counted_qty is REQUIRED to equal
+        //     sum(locations.counted_qty). We enforce this here so
+        //     a broken client can't submit a mismatched total.
+        //   * log row carries `locations` jsonb breakdown so
+        //     drift + per-bin history queries have real data.
+        // Items with no cycle_count_item_locations rows keep the
+        // single-total flow -- the payload's `locations` is ignored.
         const itemId = String(w.itemId || "").trim();
         const counter = String(w.counted_by || "").trim();
         const countedRaw = Number(w.counted_qty);
+        const locationsIn = Array.isArray(w.locations) ? w.locations : null;
         if (!itemId) return { index: i, ok: false, error: "submitCount: itemId required" };
         if (!counter) return { index: i, ok: false, error: "submitCount: counted_by required" };
         if (!Number.isFinite(countedRaw) || countedRaw < 0) {
@@ -188,6 +205,86 @@ async function _applyOp(supa, w, i, log) {
           if (childErr) return { index: i, ok: false, error: "submitCount: recount child spawn failed: " + childErr.message };
           childId = child.id;
         }
+        // v-cc-loc-1 phase 1 -- location persistence, must happen
+        // BEFORE the item update so a failure here aborts the whole
+        // op (no half-written item row).
+        let locationsBreakdown = null;   // for log row
+        if (locationsIn) {
+          // Load existing snapshot rows for this item.
+          const { data: existingLocs, error: locFetchErr } = await supa
+            .from("cycle_count_item_locations")
+            .select("id, location, system_qty_at_assign, counted_qty")
+            .eq("item_id", itemId);
+          if (locFetchErr) return { index: i, ok: false, error: "submitCount: locations fetch failed: " + locFetchErr.message };
+          const existingByLoc = new Map();
+          for (const r of (existingLocs || [])) existingByLoc.set(String(r.location), r);
+          // Validate + partition payload rows.
+          const seen = new Set();
+          const updates = [];
+          const inserts = [];
+          for (const loc of locationsIn) {
+            if (!loc || typeof loc.location !== "string" || !loc.location.trim()) {
+              return { index: i, ok: false, error: "submitCount: locations[].location required" };
+            }
+            const locName = loc.location.trim();
+            const locQtyRaw = Number(loc.counted_qty);
+            if (!Number.isFinite(locQtyRaw) || locQtyRaw < 0) {
+              return { index: i, ok: false, error: `submitCount: locations[${locName}].counted_qty must be a non-negative number` };
+            }
+            if (seen.has(locName)) {
+              return { index: i, ok: false, error: `submitCount: duplicate location ${locName} in payload` };
+            }
+            seen.add(locName);
+            const locQty = Math.round(locQtyRaw);
+            const existing = existingByLoc.get(locName);
+            if (existing) {
+              updates.push({ id: existing.id, counted_qty: locQty, system: Number(existing.system_qty_at_assign) || 0 });
+            } else if (loc.foundElsewhere) {
+              // Counter discovered stock in an unlisted bin.
+              inserts.push({
+                item_id: itemId,
+                pn: item.pn,
+                location: locName,
+                location_desc: (typeof loc.location_desc === "string") ? loc.location_desc.trim() || null : null,
+                system_qty_at_assign: 0,
+                counted_qty: locQty,
+                counted_at: nowIso,
+              });
+            } else {
+              return { index: i, ok: false, error: `submitCount: location ${locName} is not in this item's snapshot; pass foundElsewhere: true to add it` };
+            }
+          }
+          // Every LISTED bin must be filled.
+          for (const [locName] of existingByLoc.entries()) {
+            if (!seen.has(locName)) {
+              return { index: i, ok: false, error: `submitCount: location ${locName} missing from payload (all listed bins must be counted)` };
+            }
+          }
+          // Sum-match against the item counted_qty.
+          const payloadSum = locationsIn.reduce((s, l) => s + (Math.round(Number(l.counted_qty)) || 0), 0);
+          if (payloadSum !== counted) {
+            return { index: i, ok: false, error: `submitCount: counted_qty ${counted} != sum(locations) ${payloadSum}` };
+          }
+          // Persist updates + inserts.
+          for (const u of updates) {
+            const { error: uErr } = await supa
+              .from("cycle_count_item_locations")
+              .update({ counted_qty: u.counted_qty, counted_at: nowIso })
+              .eq("id", u.id);
+            if (uErr) return { index: i, ok: false, error: "submitCount: location update failed: " + uErr.message };
+          }
+          if (inserts.length > 0) {
+            const { error: iErr } = await supa.from("cycle_count_item_locations").insert(inserts);
+            if (iErr) return { index: i, ok: false, error: "submitCount: location inserts failed: " + iErr.message };
+          }
+          // Build the breakdown for the log row (post-write).
+          locationsBreakdown = locationsIn.map(l => ({
+            location: l.location.trim(),
+            counted_qty: Math.round(Number(l.counted_qty) || 0),
+            foundElsewhere: !!l.foundElsewhere,
+          }));
+        }
+
         const { error: upErr } = await supa
           .from("cycle_count_items")
           .update({
@@ -202,24 +299,26 @@ async function _applyOp(supa, w, i, log) {
         if (upErr) return { index: i, ok: false, error: "submitCount: update failed: " + upErr.message };
         // Append log row.
         const outcomeLog = (newStatus === "recount") ? "recount" : "counted";
+        const logRow = {
+          item_id: itemId,
+          pn: item.pn,
+          assigned_date: item.assigned_date,
+          counted_at: nowIso,
+          counted_by: counter,
+          tier: item.tier,
+          reason: item.reason || null,
+          system_qty_at_assign: item.system_qty_at_assign,
+          counted_qty: counted,
+          variance,
+          variance_pct: variancePct,
+          outcome: outcomeLog,
+          note: item.note || null,
+          recount_of: item.recount_of || null,
+        };
+        if (locationsBreakdown) logRow.locations = locationsBreakdown;
         const { error: logErr } = await supa
           .from("cycle_count_log")
-          .insert({
-            item_id: itemId,
-            pn: item.pn,
-            assigned_date: item.assigned_date,
-            counted_at: nowIso,
-            counted_by: counter,
-            tier: item.tier,
-            reason: item.reason || null,
-            system_qty_at_assign: item.system_qty_at_assign,
-            counted_qty: counted,
-            variance,
-            variance_pct: variancePct,
-            outcome: outcomeLog,
-            note: item.note || null,
-            recount_of: item.recount_of || null,
-          });
+          .insert(logRow);
         if (logErr) {
           // Non-fatal but surface it -- the count update landed.
           log("submitCount: log insert failed (non-fatal): " + logErr.message);

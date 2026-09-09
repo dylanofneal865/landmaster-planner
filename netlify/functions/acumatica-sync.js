@@ -227,6 +227,17 @@ exports.handler = async (event) => {
   }
 
   const dedupe = new Map();
+  // v-cc-loc-1 phase 1 -- per-location collection alongside the
+  // (unchanged) aggregate dedupe. Structure:
+  //   locByPn: Map<pn, Map<"warehouse|location", {warehouse,
+  //                       location, location_desc, qty}>>
+  // Each per-location entry SUMS across LotSerialNbr rows so lot
+  // tracking doesn't inflate the per-location qty. The aggregate
+  // path (dedupe) is untouched -- its keep-first-row semantics on
+  // QtyAvailableinWarehouse still yields byte-identical output
+  // because that field is the per-pn aggregate that repeats
+  // identically on every location row for a given pn.
+  const locByPn = new Map();
   for (const raw of entries) {
     const { get, isNull } = makeFieldGetters(raw);
 
@@ -241,6 +252,32 @@ exports.handler = async (event) => {
 
     if (!dedupe.has(pn)) {
       dedupe.set(pn, qtyAvail);
+    }
+
+    // Per-location collection. Prefer Location; fall back to
+    // LocationID. LocationDescription kept as a display field.
+    // qty from QtyOnHandinLocation per the phase 1 ticket.
+    // LotSerialNbr rows collapse via the composite key
+    // (warehouse|location), summing qty. Zero-qty rows dropped at
+    // emit time so empty bins don't accumulate part_locations rows.
+    const warehouse = String(get("Warehouse") || "").trim();
+    const location = String(get("Location") || get("LocationID") || "").trim();
+    if (!location) continue;
+    const locDesc = String(get("LocationDescription") || "").trim();
+    const locQtyStr = isNull("QtyOnHandinLocation") ? null : get("QtyOnHandinLocation");
+    if (locQtyStr === null) continue;
+    const locQty = parseFloat(locQtyStr);
+    if (!isFinite(locQty)) continue;
+    const key = warehouse + "|" + location;
+    let byLoc = locByPn.get(pn);
+    if (!byLoc) { byLoc = new Map(); locByPn.set(pn, byLoc); }
+    const prev = byLoc.get(key);
+    if (prev) {
+      prev.qty += locQty;
+      // Prefer a non-empty description if we see one later.
+      if (!prev.location_desc && locDesc) prev.location_desc = locDesc;
+    } else {
+      byLoc.set(key, { warehouse, location, location_desc: locDesc, qty: locQty });
     }
   }
 
@@ -370,6 +407,108 @@ exports.handler = async (event) => {
     }
     totalUpserted += batch.length;
   }
+
+  // v-cc-loc-1 phase 1 -- part_locations upsert.
+  //
+  // Emit rows: per pn, use the wh+loc dedupe map. Label:
+  //   * pn touches > 1 warehouse -> location = "WAREHOUSE/LOC"
+  //   * pn touches 1 warehouse (or an empty warehouse column) ->
+  //     location = LOC only
+  // Skip zero-qty locations (empty bins).
+  //
+  // Guard: for every pn we compare sum(per-location OnHand) against
+  //   the aggregate the existing dedupe kept (QtyAvailableinWarehouse).
+  //   These are DIFFERENT fields (OnHand vs Available) so a
+  //   difference doesn't imply a bug; it just means Reserved /
+  //   Allocated qty exists. We log the tally so the operator has
+  //   an audit trail. If disagreement is extreme (> 50% of pns
+  //   AND large avg gap), the LotSerialNbr sum-collapse above is
+  //   suspect and we surface a WARN.
+  //
+  // Delete-then-insert pattern per the ticket: any pn we see in
+  // this run has its old rows deleted first, then the fresh ones
+  // inserted. Pns NOT in this run stay untouched (a tombstoned pn
+  // whose parts row was scrubbed will keep its stale
+  // part_locations rows -- add a tombstone scrub here in a later
+  // pass if that becomes a problem).
+  const partLocationRows = [];
+  const nowIsoLoc = new Date().toISOString();
+  const touchedPnsForLocs = [];
+  let disagreePns = 0;
+  let agreePns = 0;
+  let totalDeltaAbs = 0;
+  let widestDelta = 0;
+  let widestDeltaPn = null;
+  for (const [pn, byLoc] of locByPn.entries()) {
+    // Tombstoned parts skipped -- matches the aggregate path.
+    if (tombstoned.has(pn)) continue;
+    // Only emit rows for parts we know about (parts row exists).
+    if (!existingMap.has(pn)) continue;
+    const rowsPerLoc = [...byLoc.values()];
+    const warehouseSet = new Set(rowsPerLoc.map(r => r.warehouse).filter(Boolean));
+    const useWarehousePrefix = warehouseSet.size > 1;
+    const nonZero = rowsPerLoc.filter(r => Math.abs(r.qty) > 1e-9);
+    if (nonZero.length === 0) {
+      // pn exists in the location feed but has zero everywhere --
+      // still schedule a delete of prior rows so vacated bins
+      // disappear.
+      touchedPnsForLocs.push(pn);
+      continue;
+    }
+    const sumLoc = nonZero.reduce((s, r) => s + r.qty, 0);
+    const agg = Number(dedupe.get(pn)) || 0;
+    if (Math.abs(sumLoc - agg) > 0.5) {
+      disagreePns++;
+      const delta = Math.abs(sumLoc - agg);
+      totalDeltaAbs += delta;
+      if (delta > widestDelta) { widestDelta = delta; widestDeltaPn = pn; }
+    } else {
+      agreePns++;
+    }
+    for (const r of nonZero) {
+      const displayLoc = useWarehousePrefix && r.warehouse
+        ? `${r.warehouse}/${r.location}`
+        : r.location;
+      partLocationRows.push({
+        pn,
+        location: displayLoc,
+        location_desc: r.location_desc || null,
+        qty: r.qty,
+        synced_at: nowIsoLoc,
+      });
+    }
+    touchedPnsForLocs.push(pn);
+  }
+  log(`[LOC] collected ${partLocationRows.length} location row(s) across ${touchedPnsForLocs.length} pn(s); ${agreePns} agree / ${disagreePns} disagree vs aggregate (worst ${widestDeltaPn ? widestDeltaPn + " delta=" + widestDelta.toFixed(1) : "n/a"})`);
+  if (disagreePns > agreePns && disagreePns > 20) {
+    log(`[LOC] WARN: disagreement widespread (${disagreePns} vs ${agreePns}). Available-vs-OnHand normally explains a gap; if this ratio persists after Reserved qty is checked, suspect LotSerialNbr rows still double-counting despite the wh+loc collapse.`);
+  }
+
+  // Delete existing rows for touched pns, then batch-insert fresh.
+  // Chunked to stay under the ~16 KB PostgREST URL ceiling.
+  const LOC_CHUNK = 200;
+  let locDeleted = 0;
+  for (let i = 0; i < touchedPnsForLocs.length; i += LOC_CHUNK) {
+    const batch = touchedPnsForLocs.slice(i, i + LOC_CHUNK);
+    const { error: delErr } = await supa.from("part_locations").delete().in("pn", batch);
+    if (delErr) {
+      log(`[LOC] delete chunk ${i}-${i + batch.length - 1} failed (non-fatal)`, delErr.message);
+      continue;
+    }
+    locDeleted += batch.length;
+  }
+  const LOC_INS_BATCH = 500;
+  let locInserted = 0;
+  for (let i = 0; i < partLocationRows.length; i += LOC_INS_BATCH) {
+    const batch = partLocationRows.slice(i, i + LOC_INS_BATCH);
+    const { error: insErr } = await supa.from("part_locations").insert(batch);
+    if (insErr) {
+      log(`[LOC] insert chunk ${i}-${i + batch.length - 1} failed (non-fatal)`, insErr.message);
+      continue;
+    }
+    locInserted += batch.length;
+  }
+  log(`[LOC] refreshed part_locations: cleared ${locDeleted} pn(s), inserted ${locInserted} row(s)`);
 
   if (rows.length > 0) {
     const auditId = `audit_acumatica_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
