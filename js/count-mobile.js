@@ -373,14 +373,33 @@
     }
     const locs = S.locsByItem.get(next.id) || [];
     const binCount = locs.length;
+    // v-cc-loc-5 fix 1c -- compact bin list under the description so
+    // the counter can plan their walk before tapping START. Up to
+    // 4 bin codes, then "+N more"; "no bin on file" when the pn
+    // has no location rows so the counter knows to hunt.
+    let binsLine;
+    if (binCount === 0) {
+      binsLine = `<div class="dim" style="margin: 6px 0 12px; font-size: 15px">No bin on file &mdash; count all stock for this part wherever it lives.</div>`;
+    } else {
+      const shown = locs.slice(0, 4).map(l => esc(l.location)).join(", ");
+      const rest = binCount > 4 ? ` <span class="dim">+${binCount - 4} more</span>` : "";
+      binsLine = `<div style="margin: 6px 0 12px; font-size: 15px"><span class="dim">Bins:</span> <span class="mono">${shown}</span>${rest}</div>`;
+    }
+    // Chip: "1 BIN" when there's exactly one location (not "single
+    // total" -- there IS a bin, it's just one); "N BINS" for
+    // multi-bin; "NO BIN ON FILE" for aggregate-only.
+    const binChip = binCount === 0
+      ? `<span class="chip">no bin on file</span>`
+      : `<span class="chip">${binCount} bin${binCount === 1 ? "" : "s"}</span>`;
     slot.innerHTML = `
       <div class="part-card">
         <div class="part-pn mono">${esc(next.pn)}</div>
         <div class="part-desc">${esc(next.desc || "(no description)")}</div>
+        ${binsLine}
         <div class="chip-row">
           ${tierChip(next)}
           ${partClsChip(next)}
-          ${binCount > 0 ? `<span class="chip">${binCount} bin${binCount === 1 ? "" : "s"}</span>` : `<span class="chip">single total</span>`}
+          ${binChip}
         </div>
         <div class="part-reason ${next.recount_of ? "recount" : ""}">${esc(humanReason(next))}</div>
       </div>
@@ -428,13 +447,46 @@
     $("count-desc").textContent = item.desc || "";
     const body = $("count-body");
 
-    if (S.binValues.length === 0 && S.extraBins.length === 0) {
-      // Single-total flow.
+    // v-cc-loc-5 fix 1a/1b -- three modes:
+    //
+    //   MODE 0 (no bin on file): S.binValues.length === 0 AND
+    //     S.extraBins.length === 0. Show a "no bin on file"
+    //     explainer where the bin header would be; single-total
+    //     input; found-elsewhere still available so a counter who
+    //     finds stock can still record the bin they found it in.
+    //     Submit routes through submitSingle when no extras exist,
+    //     submitMulti when the counter added a found-elsewhere row
+    //     (the write function accepts locations[] against an item
+    //     with zero snapshot rows -- all inserts go through the
+    //     foundElsewhere:true path).
+    //
+    //   MODE 1 (exactly one bin, no extras): S.binValues.length
+    //     === 1 AND S.extraBins.length === 0. Show the bin header
+    //     prominently ("LOCATION A-14 (Rack 3)") the same way
+    //     multi-bin does. No Prev/Next chrome, no bin-progress
+    //     ("bin 1 of 1" would be noise), no running total (it's
+    //     the input's value). Found-elsewhere still available.
+    //     Submit routes through submitMulti so the count goes
+    //     into cycle_count_item_locations with the bin name.
+    //
+    //   MODE 2 (multi-bin): >=2 bins in either binValues or
+    //     extras. Unchanged from prior release -- Prev/Next,
+    //     bin-progress indicator, running total.
+    const allBins = S.binValues.concat(S.extraBins.map(e => ({ ...e, isExtra: true })));
+    const totalBins = allBins.length;
+
+    if (totalBins === 0) {
+      // MODE 0: no bin on file.
       $("bin-progress").textContent = item.recount_of ? "RECOUNT" : "";
       body.innerHTML = `
-        <div class="system-say" ${item.recount_of ? 'style="visibility:hidden"' : ''}>
+        <div class="bin-header" style="border-color:var(--dim);background:var(--surf-2)">
+          <div class="bin-label">Bin</div>
+          <div class="bin-code" style="font-size:22px;color:var(--ink-2)">No bin on file</div>
+          <div class="bin-desc">Count all stock for this part wherever it lives.</div>
+        </div>
+        <div class="system-say">
           <div class="label">System says</div>
-          <div class="num" id="sys-say">${item.recount_of ? "?" : Math.round(item.system_qty_at_assign)}</div>
+          <div class="num">${Math.round(item.system_qty_at_assign)}</div>
         </div>
         <div class="count-input-wrap">
           <input class="count-input" id="qty-input" type="number" inputmode="numeric" min="0" step="1" placeholder="0" value="" />
@@ -445,6 +497,7 @@
             <button class="quick-btn" data-inc="12">+12</button>
           </div>
         </div>
+        <button class="found-elsewhere-btn" id="btn-found">+ Found stock in a specific bin</button>
       `;
       const input = $("qty-input");
       const updateSubmit = () => { $("count-submit").disabled = input.value === ""; };
@@ -457,6 +510,7 @@
         }
         updateSubmit();
       });
+      $("btn-found").onclick = () => openFoundElsewhere();
       updateSubmit();
       $("count-submit").textContent = "SUBMIT";
       $("count-submit").onclick = () => submitSingle(item, Math.max(0, Math.round(Number(input.value) || 0)));
@@ -464,12 +518,56 @@
       return;
     }
 
-    // Multi-bin flow -- one bin at a time.
-    const allBins = S.binValues.concat(S.extraBins.map(e => ({ ...e, isExtra: true })));
-    const total = allBins.length;
-    if (S.binIdx >= total) S.binIdx = total - 1;
+    if (totalBins === 1) {
+      // MODE 1: single bin -- show location context without the
+      // multi-bin chrome.
+      const cur = allBins[0];
+      S.binIdx = 0;
+      $("bin-progress").textContent = item.recount_of ? "RECOUNT" : "";
+      body.innerHTML = `
+        <div class="bin-header">
+          <div class="bin-label">Location</div>
+          <div class="bin-code mono">${esc(cur.location || "(unnamed)")}</div>
+          ${cur.location_desc ? `<div class="bin-desc">${esc(cur.location_desc)}</div>` : ""}
+        </div>
+        <div class="system-say" ${item.recount_of ? 'style="visibility:hidden"' : ''}>
+          <div class="label">System says</div>
+          <div class="num">${item.recount_of ? "?" : Math.round(cur.system)}</div>
+        </div>
+        <div class="count-input-wrap">
+          <input class="count-input" id="qty-input" type="number" inputmode="numeric" min="0" step="1" placeholder="0" value="${esc(cur.entered)}" />
+          <div class="quick-btns">
+            <button class="quick-btn zero" data-set="0">0</button>
+            <button class="quick-btn" data-inc="1">+1</button>
+            <button class="quick-btn" data-inc="3">+3</button>
+            <button class="quick-btn" data-inc="12">+12</button>
+          </div>
+        </div>
+        <button class="found-elsewhere-btn" id="btn-found">+ Found stock in another bin</button>
+      `;
+      const input = $("qty-input");
+      const updateSubmit = () => {
+        cur.entered = input.value;
+        $("count-submit").disabled = input.value === "";
+      };
+      input.oninput = updateSubmit;
+      body.querySelectorAll(".quick-btn").forEach(b => b.onclick = () => {
+        if (b.dataset.set != null) input.value = b.dataset.set;
+        else input.value = String((Number(input.value) || 0) + Number(b.dataset.inc || 0));
+        updateSubmit();
+      });
+      $("btn-found").onclick = () => openFoundElsewhere();   // adds a bin -> switches to MODE 2 on next render
+      $("count-submit").textContent = "SUBMIT";
+      $("count-submit").disabled = cur.entered === "";
+      $("count-submit").onclick = () => submitMulti(item);
+      setTimeout(() => input.focus(), 50);
+      return;
+    }
+
+    // MODE 2: multi-bin.
+    if (S.binIdx >= totalBins) S.binIdx = totalBins - 1;
     const cur = allBins[S.binIdx];
-    $("bin-progress").textContent = `bin ${S.binIdx + 1} of ${total}${item.recount_of ? " (RECOUNT)" : ""}`;
+    $("bin-progress").textContent = `bin ${S.binIdx + 1} of ${totalBins}${item.recount_of ? " (RECOUNT)" : ""}`;
     const runningTotal = allBins.reduce((s, b) => s + (Number(b.entered) || 0), 0);
     const allFilled = allBins.every(b => b.entered !== "");
     body.innerHTML = `
@@ -478,9 +576,9 @@
         <div class="bin-code mono">${esc(cur.location || "(unnamed)")}</div>
         ${cur.location_desc ? `<div class="bin-desc">${esc(cur.location_desc)}</div>` : ""}
       </div>
-      <div class="system-say" ${item.recount_of ? 'style="visibility:hidden"' : ''}>
+      <div class="system-say">
         <div class="label">System says</div>
-        <div class="num">${item.recount_of ? "?" : Math.round(cur.system)}</div>
+        <div class="num">${Math.round(cur.system)}</div>
       </div>
       <div class="count-input-wrap">
         <input class="count-input" id="qty-input" type="number" inputmode="numeric" min="0" step="1" placeholder="0" value="${esc(cur.entered)}" />
@@ -494,7 +592,7 @@
       <div class="running-total">running total <span class="num" id="run-total">${runningTotal}</span></div>
       <div class="bin-nav">
         <button id="bin-prev" ${S.binIdx === 0 ? "disabled" : ""}>&larr; Prev</button>
-        <button id="bin-next" class="btn-primary" style="font-size:18px;min-height:56px">${S.binIdx === total - 1 ? "Last bin" : "Next &rarr;"}</button>
+        <button id="bin-next" class="btn-primary" style="font-size:18px;min-height:56px">${S.binIdx === totalBins - 1 ? "Last bin" : "Next &rarr;"}</button>
       </div>
       <button class="found-elsewhere-btn" id="btn-found">+ Found stock somewhere else</button>
     `;
@@ -516,10 +614,10 @@
     });
     $("bin-prev").onclick = () => { S.binIdx = Math.max(0, S.binIdx - 1); renderCountScreen(); };
     $("bin-next").onclick = () => {
-      if (S.binIdx < total - 1) { S.binIdx += 1; renderCountScreen(); }
+      if (S.binIdx < totalBins - 1) { S.binIdx += 1; renderCountScreen(); }
     };
     $("btn-found").onclick = () => openFoundElsewhere();
-    $("count-submit").textContent = allFilled ? "SUBMIT" : `Fill all ${total} bins to submit`;
+    $("count-submit").textContent = allFilled ? "SUBMIT" : `Fill all ${totalBins} bins to submit`;
     $("count-submit").disabled = !allFilled;
     $("count-submit").onclick = () => submitMulti(item);
     setTimeout(() => input.focus(), 50);
@@ -529,6 +627,17 @@
     if (locName === null) return;
     const clean = String(locName || "").trim();
     if (!clean) { flash("Location required"); return; }
+    // v-cc-loc-5 -- if we're in MODE 0 (no bin on file) with a
+    // typed total, promote it to an "(unspecified)" bin so the
+    // switch into bin-mode doesn't lose the counter's work.
+    // Server accepts arbitrary location strings under foundElsewhere.
+    if (S.binValues.length === 0 && S.extraBins.length === 0) {
+      const typedInput = document.getElementById("qty-input");
+      const typed = typedInput ? String(typedInput.value || "").trim() : "";
+      if (typed !== "") {
+        S.extraBins.push({ location: "(unspecified)", location_desc: "counted before adding bin detail", system: 0, entered: typed });
+      }
+    }
     S.extraBins.push({ location: clean, location_desc: "", system: 0, entered: "" });
     S.binIdx = S.binValues.length + S.extraBins.length - 1;
     renderCountScreen();

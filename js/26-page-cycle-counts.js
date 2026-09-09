@@ -999,9 +999,13 @@ function renderCycleCounts() {
         <div class="dr-section" style="margin-top:16px">Completed / skipped / reconciled (most recent 60)</div>
         ${_ccRenderTable(doneItems, { emptyMsg: "No completed rows yet." })}
       ` : ""}
+
+      ${_ccMobileAppBlock()}
     </div>
   `;
   main.innerHTML = html;
+  // QR must render after the canvas is in the DOM.
+  _ccRenderMobileQR();
   // Kick a reconcile scan on every render (debounced) so an
   // Acumatica sync that lands mid-session reconciles counted rows
   // without waiting for another action.
@@ -1110,6 +1114,70 @@ function flagForCountButton(pn, opts) {
   return `<button class="${cls}" title="${esc(title)}" onclick="${stop}(function(){const n=prompt('Optional note (why is this flagged?)',''); if(n===null)return; flagPartForCount('${esc(pn)}', n||'');})()">${esc(label)}</button>`;
 }
 if (typeof window !== "undefined") window.flagForCountButton = flagForCountButton;
+
+/* ============================================================
+   MOBILE APP CARD -- URL + Copy + QR (lib/qr-encoder.js).
+   Renders one big card at the bottom of the supervisor tab so
+   any counter can scan and land on /count without typing. QR
+   drawn client-side to a plain canvas -- no CDN, no external
+   image API. Copy button falls back to a hidden textarea +
+   execCommand when navigator.clipboard is blocked.
+   ============================================================ */
+function _ccMobileAppBlock() {
+  const origin = (typeof location !== "undefined" && location.origin) ? location.origin : "";
+  const url = origin + "/count";
+  return `
+    <div class="dr-section" style="margin-top:24px">Mobile counting app</div>
+    <div class="card" style="padding:16px;display:flex;gap:20px;align-items:center;flex-wrap:wrap">
+      <canvas id="cc-mobile-qr" width="180" height="180" style="background:#fff;border:1px solid var(--border,#ddd);border-radius:8px;flex:0 0 auto"></canvas>
+      <div style="flex:1;min-width:240px">
+        <div class="mono" style="font-size:16px;font-weight:600;word-break:break-all;margin-bottom:8px">${esc(url)}</div>
+        <div class="row gap-sm" style="margin-bottom:12px">
+          <button class="btn" onclick="_ccCopyMobileUrl(this)">Copy URL</button>
+          <a class="btn ghost" href="${esc(url)}" target="_blank" rel="noopener">Open</a>
+        </div>
+        <div class="muted tiny">Counters: scan with your phone camera, then Add to Home Screen.</div>
+      </div>
+    </div>
+  `;
+}
+function _ccCopyMobileUrl(btn) {
+  const origin = (typeof location !== "undefined" && location.origin) ? location.origin : "";
+  const url = origin + "/count";
+  const done = (ok) => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = ok ? "Copied!" : "Copy failed";
+    setTimeout(() => { btn.textContent = orig; }, 1400);
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(() => done(true)).catch(() => done(false));
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = url; document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy"); ta.remove(); done(ok);
+    }
+  } catch (_) { done(false); }
+}
+function _ccRenderMobileQR() {
+  if (typeof QREncoder === "undefined" || !QREncoder || typeof QREncoder.toCanvas !== "function") {
+    console.warn("[cc] QREncoder not loaded (lib/qr-encoder.js) -- QR skipped");
+    return;
+  }
+  const canvas = document.getElementById("cc-mobile-qr");
+  if (!canvas) return;
+  const origin = (typeof location !== "undefined" && location.origin) ? location.origin : "";
+  try {
+    QREncoder.toCanvas(canvas, origin + "/count", { moduleSize: 5, margin: 3 });
+  } catch (err) {
+    console.warn("[cc] QR render failed:", err && err.message);
+  }
+}
+if (typeof window !== "undefined") {
+  window._ccCopyMobileUrl = _ccCopyMobileUrl;
+  window._ccRenderMobileQR = _ccRenderMobileQR;
+}
 
 /* ============================================================
    ROUTE REGISTRATION
