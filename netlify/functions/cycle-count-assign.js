@@ -161,25 +161,89 @@ exports.handler = async (event) => {
     if (!prev || String(r.counted_at) > String(prev)) lastCountedByPn.set(r.pn, r.counted_at);
   }
 
-  // Live catalog map. Only include parts that would be plausibly
-  // countable (skip do-not-order, kits, phasing-out).
+  // Live catalog map. Cycle counts are for PRODUCTION parts only --
+  // Base BOM per the part drawer's ITEM TYPE selector (js/10, field
+  // part.itemType stored as the lowercase string "base_bom"). The
+  // six FRAME_PNS are already tagged base_bom so they carry through
+  // unchanged. Excludes: Options, Service, Kit, Do Not Order, and
+  // any parts with no itemType set (untagged catalog rows are not
+  // production-eligible until an operator classifies them).
+  //
+  // Also drop phasingOut parts -- they're being burned down and
+  // aren't on the audit rhythm. (Kits are already excluded by the
+  // base_bom gate; the earlier standalone `d.isKit` filter was
+  // never firing because parts.data doesn't carry `isKit` -- it's
+  // a computed field injected by partsWithStatus in the browser.)
   const partsByPn = new Map();
+  let excludedNonBaseBom = 0;
+  let excludedPhasingOut = 0;
   for (const p of partsRows) {
     if (!p || !p.pn) continue;
     const d = p.data || {};
-    if (d.itemType === "do_not_order") continue;
-    if (d.isKit) continue;
-    if (d.phasingOut) continue;
+    const itemType = String(d.itemType || "").toLowerCase().trim();
+    if (itemType !== "base_bom") { excludedNonBaseBom++; continue; }
+    if (d.phasingOut) { excludedPhasingOut++; continue; }
     partsByPn.set(String(p.pn), {
       pn: String(p.pn),
       onHand: Number(d.onHand) || 0,
       daily: Number(d.daily) || 0,
       partClass: d.partClass || "",
+      itemType,
     });
+  }
+  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedPhasingOut} phasing-out`);
+
+  // BACKLOG CLEANUP -- any currently-pending item whose pn is no
+  // longer eligible (item type flipped off base_bom, or was on the
+  // list before this policy took effect) gets marked "skipped" with
+  // reason "non-BaseBOM -- excluded by policy" so the tab
+  // self-cleans. Runs BEFORE the plan below so today's assignment
+  // sees a clean slate. Also skips items whose pn no longer exists
+  // in the catalog at all -- same policy shape ("no longer
+  // eligible"), so the reason line is the same.
+  //
+  // NOTE: we intentionally do NOT append a cycle_count_log row for
+  // these -- log rows are supposed to represent completed audit
+  // work, and a policy sweep isn't audit work. The updated_at bump
+  // + status flip is enough to surface the change in the UI.
+  const openItems = todaysItems.filter(r => r && (r.status === "pending" || r.status === "recount"));
+  const ineligibleOpenPns = openItems
+    .filter(r => !partsByPn.has(String(r.pn)))
+    .map(r => String(r.pn));
+  let cleanedOpen = 0;
+  if (ineligibleOpenPns.length > 0 && !dryRun) {
+    const nowIso = new Date().toISOString();
+    const { data: cleaned, error: cleanErr } = await supa
+      .from("cycle_count_items")
+      .update({
+        status: "skipped",
+        note: "non-BaseBOM -- excluded by policy",
+        updated_at: nowIso,
+      })
+      .in("status", ["pending", "recount"])
+      .in("pn", ineligibleOpenPns)
+      .select("id, pn");
+    if (cleanErr) {
+      log("backlog cleanup failed (non-fatal)", cleanErr.message);
+    } else {
+      cleanedOpen = (cleaned || []).length;
+      log(`backlog cleanup: skipped ${cleanedOpen} open row(s) for ${new Set(ineligibleOpenPns).size} ineligible pn(s)`);
+    }
+  } else if (ineligibleOpenPns.length > 0 && dryRun) {
+    log(`backlog cleanup (dry): would skip ${ineligibleOpenPns.length} open row(s) for ${new Set(ineligibleOpenPns).size} ineligible pn(s)`);
   }
 
   const plans = [];   // rows to insert
-  const summary = { hot: 0, runway: 0, rotation: 0, framesForced: 0, skippedExisting: 0 };
+  const summary = {
+    hot: 0,
+    runway: 0,
+    rotation: 0,
+    framesForced: 0,
+    skippedExisting: 0,
+    excludedNonBaseBom,
+    excludedPhasingOut,
+    backlogCleaned: cleanedOpen,
+  };
 
   // ---- HOT -------------------------------------------------------
   for (const [pn, p] of partsByPn.entries()) {
