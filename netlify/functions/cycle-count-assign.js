@@ -63,13 +63,53 @@ const TRANSITION_RUNUP_EXTRA_DAYS = 30;
 const POST_CUTIN_VERIFY_DAYS = 14;
 
 // v-cc-loc-2 VENDOR-MANAGED (fix 2). Suppliers on this list are
-// consignment / VMI -- the vendor counts them, we don't. Match is
-// case-insensitive against the parts.data.supplier field (the same
-// field the part drawer's SUPPLIER input edits). Add or remove
-// entries here to change policy; a redeploy takes effect on the
-// next cron fire AND the policy sweep clears any open items whose
-// pn is now covered.
-const VMI_SUPPLIERS = ["fastenal"];
+// consignment / VMI -- the vendor counts them, we don't.
+//
+// v-cc-loc-3.1 BUGFIX -- 16U00003 (real supplier "FASTENAL
+// COMPANY") kept being assigned after 8a7fced because the match
+// was `VMI_SUPPLIERS.includes(supplierNorm)` -- exact equality,
+// not the contains-match the header claimed. Fixed here to
+// case-insensitive SUBSTRING match. Also reads the same field(s)
+// the drawer round-trips: js/10's part-drawer SAVE writes to
+// `part.supplier` (line 995ish, via id="pd-supplier"), and js/10's
+// row / drawer reads all read `part.supplier`, so that is
+// canonical. The legacy-alias check on `vendor` / `vendorName` /
+// `Supplier` (case-variant) is a belt-and-suspenders catch for
+// older rows a prior sync may have written with a different key.
+//
+// VMI_SUPPLIER_TOKENS: each entry is lowercased and matched as a
+// substring against the lowercased trimmed supplier field. Add
+// aliases (e.g. "fastenal", "fastenal, inc") to cover distinct
+// legal names for the same vendor.
+const VMI_SUPPLIER_TOKENS = ["fastenal"];
+// Legacy alias kept for the older shipped constant name so an
+// operator grepping the code base still finds one thing.
+const VMI_SUPPLIERS = VMI_SUPPLIER_TOKENS;
+
+// Reads every supplier-ish field on a part.data blob and returns
+// true when any of them contains any VMI token as a substring
+// (case-insensitive). js/10's drawer canonical is `supplier`; the
+// aliases guard against older rows written under a different key
+// before the drawer/sync stabilized on that name.
+function _isVmiPart(d) {
+  if (!d || typeof d !== "object") return false;
+  const candidates = [
+    d.supplier,
+    d.vendor,
+    d.vendorName,
+    d.supplierName,
+    d.Supplier,
+    d.SupplierName,
+  ];
+  for (const raw of candidates) {
+    const norm = String(raw || "").toLowerCase().trim();
+    if (!norm) continue;
+    for (const token of VMI_SUPPLIER_TOKENS) {
+      if (token && norm.includes(token)) return true;
+    }
+  }
+  return false;
+}
 
 function _todayIsoUtc() {
   const d = new Date();
@@ -223,6 +263,24 @@ exports.handler = async (event) => {
     return dt.getTime() > todayDateForChain.getTime();
   }
 
+  // v-cc-loc-3.1 -- one-shot diagnostic for the pn the operator
+  // called out as still slipping through the VMI filter. Prints
+  // the raw parts.data key list + every supplier-ish value so the
+  // next run's log shows exactly what shape the row is stored in
+  // (proves whether the drawer save path uses `supplier`, an
+  // alias, or something else entirely). Cheap: one log line when
+  // the row exists, nothing when it doesn't.
+  const DIAG_PN = "16U00003";
+  const diagRow = partsRows.find(r => r && String(r.pn) === DIAG_PN);
+  if (diagRow) {
+    const d = diagRow.data || {};
+    log(`[VMI-DIAG] ${DIAG_PN} parts.data keys: ${Object.keys(d).sort().join(", ")}`);
+    log(`[VMI-DIAG] ${DIAG_PN} supplier-ish values: supplier=${JSON.stringify(d.supplier)} vendor=${JSON.stringify(d.vendor)} vendorName=${JSON.stringify(d.vendorName)} supplierName=${JSON.stringify(d.supplierName)} Supplier=${JSON.stringify(d.Supplier)} SupplierName=${JSON.stringify(d.SupplierName)}`);
+    log(`[VMI-DIAG] ${DIAG_PN} _isVmiPart => ${_isVmiPart(d)}`);
+  } else {
+    log(`[VMI-DIAG] ${DIAG_PN} not present in parts feed`);
+  }
+
   const partsByPn = new Map();
   let excludedNonBaseBom = 0;
   let excludedPhasingOut = 0;   // count only; retained in partsByPn -- see note
@@ -234,8 +292,7 @@ exports.handler = async (event) => {
     const d = p.data || {};
     const itemType = String(d.itemType || "").toLowerCase().trim();
     if (itemType !== "base_bom") { excludedNonBaseBom++; continue; }
-    const supplierNorm = String(d.supplier || "").toLowerCase().trim();
-    if (supplierNorm && VMI_SUPPLIERS.includes(supplierNorm)) { excludedVmi++; continue; }
+    if (_isVmiPart(d)) { excludedVmi++; continue; }
     // Fix 3a: pre-launch successors -- the successor of a
     // transitioning chain whose cut-in is in the future -- must
     // NEVER be flagged HOT for zero on-hand. Zero on-hand is the
@@ -324,8 +381,7 @@ exports.handler = async (event) => {
     if (!d) return "non-BaseBOM -- excluded by policy";
     const itemType = String(d.itemType || "").toLowerCase().trim();
     if (itemType !== "base_bom") return "non-BaseBOM -- excluded by policy";
-    const supplierNorm = String(d.supplier || "").toLowerCase().trim();
-    if (supplierNorm && VMI_SUPPLIERS.includes(supplierNorm)) return "vendor-managed -- excluded by policy";
+    if (_isVmiPart(d)) return "vendor-managed -- excluded by policy";
     if (d.phasingOut) return "phasing-out -- excluded by policy";
     const chain = classifyChainMember(pn, allPartsData, allEntries, todayDateForChain);
     if (chain.role === "successor" && chain.preLaunchSuccessor) return "pre-launch successor -- excluded by policy";
