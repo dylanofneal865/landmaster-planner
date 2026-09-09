@@ -39,7 +39,7 @@
 // po_receipts, or frame_schedule.
 
 const { createClient } = require("@supabase/supabase-js");
-const { classifyChainMember } = require("../../lib/supersession-server.js");
+const { classifyChainRole } = require("../../lib/supersession-server.js");
 
 // Frames get forced onto a 30-day rotation cycle -- keeps the six
 // finished-goods SKUs on a predictable audit rhythm. Kept in sync
@@ -319,24 +319,55 @@ exports.handler = async (event) => {
   let excludedNonBaseBom = 0;
   let excludedPhasingOut = 0;   // count only; retained in partsByPn -- see note
   let excludedVmi = 0;
-  let excludedPreLaunchSuccessor = 0;
+  let excludedQueuedChain = 0;         // v-cc-loc-6: queued chain members (any hops)
+  let excludedRetiredChain = 0;        // v-cc-loc-6: fully-burned-down predecessors
   let excludedPreLaunchStandalone = 0;
+  // v-cc-loc-6 -- as we filter, remember every chain we swept a
+  // queued/retired member from so the plan loop can force-assign
+  // the chain's ACTIVE member (the one that actually needs to be
+  // counted) alongside the sweep. Keyed by anchorPn so each chain
+  // only lands once.
+  const chainsNeedingActive = new Map();
   for (const p of partsRows) {
     if (!p || !p.pn) continue;
     const d = p.data || {};
     const itemType = String(d.itemType || "").toLowerCase().trim();
     if (itemType !== "base_bom") { excludedNonBaseBom++; continue; }
     if (_isVmiPart(d)) { excludedVmi++; continue; }
-    // Fix 3a: pre-launch successors -- the successor of a
-    // transitioning chain whose cut-in is in the future -- must
-    // NEVER be flagged HOT for zero on-hand. Zero on-hand is the
-    // expected state until cut-in. Skip the whole part; the chain
-    // will re-add the successor with a "cut-in" reason after
-    // transitionStartDate arrives (fix 3d).
-    const chain = classifyChainMember(String(p.pn), allPartsData, allEntries, todayDateForChain);
-    if (chain.role === "successor" && chain.preLaunchSuccessor) {
-      excludedPreLaunchSuccessor++;
-      continue;
+    // v-cc-loc-6 -- MULTI-HOP CHAIN CLASSIFICATION.
+    //   QUEUED   -- any hops out with a future transitionStartDate
+    //               OR any lineage member AFTER the ACTIVE index
+    //               (implicit queue). Never HOT for zero/negative.
+    //   RETIRED  -- lineage members ordered BEFORE the ACTIVE member.
+    //               With zero stock, nothing to count -> excluded.
+    //               With residual stock (unusual: a burned-down
+    //               predecessor that unexpectedly has units), we
+    //               KEEP it in partsByPn so the HOT loop can still
+    //               catch real anomalies.
+    //   ACTIVE   -- the member currently being consumed; fed into
+    //               partsByPn and evaluated by the HOT chain rules
+    //               below (transition run-up, handoff-risk, cut-in).
+    //   Chain not transitioning / not in a chain -> standalone,
+    //   evaluated by the plain (non-chain) rules.
+    const chain = classifyChainRole(String(p.pn), allPartsData, allEntries, todayDateForChain);
+    if (chain.transitioning) {
+      if (chain.role === "queued") {
+        excludedQueuedChain++;
+        chainsNeedingActive.set(chain.anchorPn, chain);
+        continue;
+      }
+      if (chain.role === "retired") {
+        const stock = _physicalFor(String(p.pn), d.onHand);
+        if (stock <= 0) {
+          excludedRetiredChain++;
+          chainsNeedingActive.set(chain.anchorPn, chain);
+          continue;
+        }
+        // Residual-stock retired -- fall through to partsByPn so
+        // real negatives / anomalies still land in HOT.
+      }
+      // role === "active" -> fall through to the partsByPn insert
+      // below; chain-hot reasons decided in the HOT loop.
     }
     // v-cc-loc-3 -- STANDALONE pre-launch parts (own
     // transitionStartDate in the future, no chain / not a chain
@@ -379,7 +410,7 @@ exports.handler = async (event) => {
       chain,   // pre-computed so the HOT loop reads it O(1)
     });
   }
-  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedPreLaunchSuccessor} pre-launch-successor, ${excludedPreLaunchStandalone} pre-launch-standalone (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them)`);
+  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedQueuedChain} queued-chain, ${excludedRetiredChain} retired-chain, ${excludedPreLaunchStandalone} pre-launch-standalone (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them; ${chainsNeedingActive.size} chain(s) will force-assign their active member)`);
   log(`[PHYSICAL] on-hand source per eligible pn: ${physicalSourceStats.fromLocations} from location-sum, ${physicalSourceStats.fromSentinel} from __warehouse__ sentinel, ${physicalSourceStats.fromFallback} from parts.data.onHand fallback (no location row yet)`);
 
   // Pre-compute onPO per pn from the loaded pos rows -- used by the
@@ -426,9 +457,23 @@ exports.handler = async (event) => {
     const itemType = String(d.itemType || "").toLowerCase().trim();
     if (itemType !== "base_bom") return "non-BaseBOM -- excluded by policy";
     if (_isVmiPart(d)) return "vendor-managed -- excluded by policy";
+    // v-cc-loc-6 -- multi-hop chain awareness. QUEUED/RETIRED
+    // members get a specific note pointing at the ACTIVE member.
+    // Two adjacent notes let the supervisor see WHY a pn stopped
+    // being on the list and WHERE to look instead.
+    const chain = classifyChainRole(pn, allPartsData, allEntries, todayDateForChain);
+    if (chain.transitioning) {
+      if (chain.role === "queued") {
+        return "chain -- counting active member " + chain.activePn + " instead";
+      }
+      if (chain.role === "retired") {
+        const stock = _physicalFor(pn, d.onHand);
+        if (stock <= 0) return "chain -- counting active member " + chain.activePn + " instead";
+        // Residual stock retired -- fall through (keep normal
+        // handling; note not needed since not swept).
+      }
+    }
     if (d.phasingOut) return "phasing-out -- excluded by policy";
-    const chain = classifyChainMember(pn, allPartsData, allEntries, todayDateForChain);
-    if (chain.role === "successor" && chain.preLaunchSuccessor) return "pre-launch successor -- excluded by policy";
     if (_isStandalonePreLaunch(d)) return "pre-launch -- excluded until cut-in window";
     return "non-BaseBOM -- excluded by policy";
   }
@@ -486,9 +531,11 @@ exports.handler = async (event) => {
     skippedExisting: 0,
     excludedNonBaseBom,
     excludedVmi,
-    excludedPreLaunchSuccessor,
+    excludedQueuedChain,
+    excludedRetiredChain,
     excludedPreLaunchStandalone,
     excludedPhasingOut,
+    chainsWithForcedActive: chainsNeedingActive.size,
     backlogCleaned: cleanedOpen,
     cleanedByPolicy,
     // per-reason HOT tally, filled below.
@@ -534,52 +581,77 @@ exports.handler = async (event) => {
   //
   // A chain's assessment is idempotent per run -- chainHandoffAssessed
   // stores the outcome keyed by anchorPn.
+  // v-cc-loc-6 -- chain rules refactored around the ACTIVE / QUEUED /
+  // RETIRED role trio from classifyChainRole:
+  //   * Transition run-up: force the ACTIVE pn (regardless of hop
+  //     count) when today is within lead_time_of_next_queued + 30
+  //     days of the next queued member's cut-in.
+  //   * Post-cut-in: force whichever chain member just cut in
+  //     (its own role flips to active on the day, with a past
+  //     transitionStartDate) with "cut-in -- verify initial stock".
+  //   * Handoff-risk: for the CURRENTLY-ACTIVE member and the NEXT
+  //     queued member. Assessed once per chain (by anchor); the
+  //     next queued's onPO is what we watch, not the terminal's.
   const chainHandoffAssessed = new Map();
   const forcedHotByPn = new Map();   // pn -> reason (from chain rules)
+  const chainMeta = new Map();       // anchorPn -> chain descriptor (for the
+                                     // active-member force-assign below)
   for (const [pn, p] of partsByPn.entries()) {
     const c = p.chain;
     if (!c || !c.transitioning) continue;
-    // 3b: transition run-up predecessor
-    if (c.role === "predecessor" && c.daysUntilStart !== null && c.daysUntilStart >= 0) {
-      const sucData = c.successor || {};
-      const leadDaysSuc = (Number(sucData.ltWeeks) || 0) * 7;
-      const window = leadDaysSuc + TRANSITION_RUNUP_EXTRA_DAYS;
+    // Track every transitioning chain we see so the force-assign
+    // pass below can walk them all.
+    chainMeta.set(c.anchorPn, c);
+    // TRANSITION RUN-UP -- fires on the ACTIVE member only. The
+    // active pn stays the current one (regardless of hop count);
+    // "next cut-in" is the next queued member's own date.
+    if (c.role === "active" && c.daysUntilStart !== null && c.daysUntilStart >= 0) {
+      const nextPnData = allPartsData.get(c.nextQueuedPn) || {};
+      const leadDaysNext = (Number(nextPnData.ltWeeks) || 0) * 7;
+      const window = leadDaysNext + TRANSITION_RUNUP_EXTRA_DAYS;
       if (c.daysUntilStart <= window) {
-        const cutInIso = c.startDate ? (c.startDate.getFullYear() + "-" + String(c.startDate.getMonth() + 1).padStart(2, "0") + "-" + String(c.startDate.getDate()).padStart(2, "0")) : "unknown";
+        const cutInIso = c.nextCutinDate
+          ? (c.nextCutinDate.getFullYear() + "-" + String(c.nextCutinDate.getMonth() + 1).padStart(2, "0") + "-" + String(c.nextCutinDate.getDate()).padStart(2, "0"))
+          : "unknown";
         forcedHotByPn.set(pn, `transition -- chain runs on ${pn} until ${cutInIso}; verify remaining stock`);
       }
     }
-    // 3d: post-cut-in successor
-    if (c.role === "successor" && c.postCutInSuccessor && c.daysUntilStart !== null && c.daysUntilStart >= -POST_CUTIN_VERIFY_DAYS) {
+    // POST-CUT-IN -- fires when the ACTIVE pn's OWN
+    // transitionStartDate is within POST_CUTIN_VERIFY_DAYS
+    // in the past (freshly cut in).
+    if (c.role === "active" && c.postCutInSuccessor) {
       forcedHotByPn.set(pn, "cut-in -- verify initial stock");
     }
-    // 3c: handoff watch -- assess once per chain (by anchor).
+    // HANDOFF WATCH -- assess once per chain (by anchor). Applies
+    // to ACTIVE + NEXT queued specifically.
     if (!chainHandoffAssessed.has(c.anchorPn)) {
-      const sucPn = c.successorPn;
-      const sucData = c.successor || {};
-      const leadDaysSuc = (Number(sucData.ltWeeks) || 0) * 7;
-      const sucOnPo = Number(onPoByPn.get(sucPn) || 0);
-      // Combined chain on-hand from raw parts data (lineage members
-      // aren't all in partsByPn -- predecessors may be Options /
-      // Service tagged), so read from allPartsData.
-      let chainOnHand = 0;
-      for (const memberPn of c.lineage) {
-        const mp = allPartsData.get(memberPn);
-        chainOnHand += Math.max(0, Number(mp && mp.onHand) || 0);
-      }
-      const anchor = allPartsData.get(c.anchorPn) || {};
-      const anchorDaily = Number(anchor.daily) || 0;
-      const chainRunoutDays = anchorDaily > 0 ? (chainOnHand / anchorDaily) : Infinity;
-      // At risk when the chain will run dry before the successor's
-      // next PO arrives. We don't have expected dates loaded, so we
-      // conservatively treat "no on-order stock" (sucOnPo === 0) as
-      // "will not arrive in time" and let the chain runway be the
-      // trigger.
-      const atRisk = (sucOnPo <= 0) && Number.isFinite(chainRunoutDays) && chainRunoutDays <= (leadDaysSuc + TRANSITION_RUNUP_EXTRA_DAYS);
-      chainHandoffAssessed.set(c.anchorPn, { atRisk, chainOnHand, chainRunoutDays, leadDaysSuc, sucOnPo, sucPn, predPn: c.predecessorPn });
-      if (atRisk) {
-        forcedHotByPn.set(c.predecessorPn, "transition at risk -- count both ends");
-        forcedHotByPn.set(c.successorPn,   "transition at risk -- count both ends");
+      const nextPn = c.nextQueuedPn;
+      if (nextPn) {
+        const nextData = allPartsData.get(nextPn) || {};
+        const leadDaysNext = (Number(nextData.ltWeeks) || 0) * 7;
+        const nextOnPo = Number(onPoByPn.get(nextPn) || 0);
+        // Combined chain on-hand from raw parts data.
+        let chainOnHand = 0;
+        for (const memberPn of c.lineage) {
+          const mp = allPartsData.get(memberPn);
+          chainOnHand += Math.max(0, Number(mp && mp.onHand) || 0);
+        }
+        const anchor = allPartsData.get(c.anchorPn) || {};
+        const anchorDaily = Number(anchor.daily) || 0;
+        const chainRunoutDays = anchorDaily > 0 ? (chainOnHand / anchorDaily) : Infinity;
+        const atRisk = (nextOnPo <= 0) && Number.isFinite(chainRunoutDays) && chainRunoutDays <= (leadDaysNext + TRANSITION_RUNUP_EXTRA_DAYS);
+        chainHandoffAssessed.set(c.anchorPn, { atRisk, chainOnHand, chainRunoutDays, leadDaysNext, nextOnPo, nextPn, activePn: c.activePn });
+        if (atRisk) {
+          // ACTIVE + NEXT queued -- but the NEXT queued isn't in
+          // partsByPn (it was filtered out). The HOT loop iterates
+          // partsByPn, so setting forcedHotByPn on the queued pn
+          // won't fire from that loop -- handle it as a
+          // "chainsNeedingActive" force-assign below with the
+          // atRisk-both-ends note.
+          forcedHotByPn.set(c.activePn, "transition at risk -- count both ends");
+        }
+      } else {
+        chainHandoffAssessed.set(c.anchorPn, { atRisk: false });
       }
     }
   }
@@ -617,8 +689,8 @@ exports.handler = async (event) => {
     if (reason.startsWith("negative")) reasonLabel = "negative-onHand";
     else if (reason === "zero on-hand") reasonLabel = "zero-onHand";
     else if (reason.startsWith("transition at risk")) reasonLabel = "chain-handoff-risk";
-    else if (reason.startsWith("transition --")) reasonLabel = "chain-runup-predecessor";
-    else if (reason.startsWith("cut-in --")) reasonLabel = "chain-postcutin-successor";
+    else if (reason.startsWith("transition --")) reasonLabel = "chain-runup-active";
+    else if (reason.startsWith("cut-in --")) reasonLabel = "chain-postcutin-active";
     bumpReason(reasonLabel);
     plans.push({
       assigned_date: today,
@@ -626,6 +698,43 @@ exports.handler = async (event) => {
       reason,
       pn,
       system_qty_at_assign: p.onHand,
+      status: "pending",
+    });
+    summary.hot++;
+  }
+
+  // v-cc-loc-6 -- FORCE-ASSIGN THE ACTIVE MEMBER of every chain we
+  // swept a queued/retired member from, so the swap from "count JP"
+  // to "count 19920" is visible in the same run rather than silent.
+  // Skip when:
+  //   * activePn is already in plans (would double-add)
+  //   * activePn is already on hotTodayPns (existing item covers it)
+  //   * activePn isn't in partsByPn (excluded upstream -- shouldn't
+  //     happen for a valid active member but be defensive)
+  for (const [anchorPn, c] of chainsNeedingActive.entries()) {
+    const activePn = c.activePn;
+    if (!activePn) continue;
+    if (hotTodayPns.has(activePn)) continue;
+    if (plans.some(pl => pl.pn === activePn)) continue;
+    const activeRow = partsByPn.get(activePn);
+    if (!activeRow) {
+      // Active member isn't Base BOM or was filtered for another
+      // policy reason. Log and move on -- we can't force it in.
+      log(`[chain] active member ${activePn} for anchor ${anchorPn} not in partsByPn (was it filtered upstream?); skipping force-assign`);
+      continue;
+    }
+    // Reason: prefer the chain-forced reason from the HOT loop if
+    // one was set (handoff-risk / run-up / cut-in), else generic
+    // "chain -- active member; verify remaining stock".
+    let reason = forcedHotByPn.get(activePn);
+    if (!reason) reason = "chain -- active member " + activePn + "; verify remaining stock";
+    bumpReason("chain-active-force-assigned");
+    plans.push({
+      assigned_date: today,
+      tier: "hot",
+      reason,
+      pn: activePn,
+      system_qty_at_assign: activeRow.onHand,
       status: "pending",
     });
     summary.hot++;
