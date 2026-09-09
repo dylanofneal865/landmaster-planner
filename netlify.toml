@@ -6,6 +6,16 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+# Cycle Count -- mobile counter page. Serves count.html at the
+# short /count URL so a warehouse counter's bookmark is one word.
+# ?c=<token> pass-through works because the redirect is status
+# 200 (rewrite, not 301) -- Netlify keeps the query string on
+# rewrite so /count?c=c1-marisol lands on count.html?c=c1-marisol.
+[[redirects]]
+  from = "/count"
+  to = "/count.html"
+  status = 200
+
 # Schedule the Acumatica sync to run every 2 minutes
 [functions."acumatica-sync"]
   schedule = "*/2 * * * *"

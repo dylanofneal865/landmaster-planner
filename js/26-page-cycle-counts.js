@@ -983,6 +983,8 @@ function renderCycleCounts() {
         <div class="dr-section" style="margin-top:16px">Completed / skipped / reconciled (most recent 60)</div>
         ${_ccRenderTable(doneItems, { emptyMsg: "No completed rows yet." })}
       ` : ""}
+
+      ${_ccMobileLinksBlock()}
     </div>
   `;
   main.innerHTML = html;
@@ -1087,6 +1089,63 @@ function flagForCountButton(pn, opts) {
   return `<button class="${cls}" title="${esc(title)}" onclick="${stop}(function(){const n=prompt('Optional note (why is this flagged?)',''); if(n===null)return; flagPartForCount('${esc(pn)}', n||'');})()">${esc(label)}</button>`;
 }
 if (typeof window !== "undefined") window.flagForCountButton = flagForCountButton;
+
+/* ============================================================
+   MOBILE LINKS HELPER
+   Renders a small "counter links" block on the supervisor tab
+   listing each per-counter mobile URL with copy buttons. The
+   COUNTERS constant lives in js/count-mobile.js (single source
+   of truth); this list is duplicated here so js/26 has zero
+   runtime dependency on the mobile bundle (mobile page must
+   stay isolated).
+   ============================================================ */
+const CC_COUNTER_LINKS = [
+  { token: "c1-marisol", name: "Marisol" },
+  { token: "c2-james",   name: "James" },
+  { token: "c3-alex",    name: "Alex" },
+  { token: "c4-taylor",  name: "Taylor" },
+];
+function _ccMobileLinksBlock() {
+  const origin = (typeof location !== "undefined" && location.origin) ? location.origin : "";
+  const rows = CC_COUNTER_LINKS.map(c => {
+    const url = `${origin}/count?c=${encodeURIComponent(c.token)}`;
+    return `
+      <tr>
+        <td><strong>${esc(c.name)}</strong></td>
+        <td class="mono tiny dim" style="word-break:break-all">${esc(url)}</td>
+        <td class="right" style="white-space:nowrap">
+          <button class="btn xs" onclick="_ccCopyLink('${esc(url)}', this)">Copy</button>
+          <a class="btn xs ghost" href="${esc(url)}" target="_blank" rel="noopener">Open</a>
+        </td>
+      </tr>`;
+  }).join("");
+  return `
+    <div class="dr-section" style="margin-top:24px">Mobile counter links (attribution, not auth)</div>
+    <p class="muted tiny">One URL per counter. Bookmark the right one on the tablet / phone each person carries; the token pre-fills and locks their name. See <span class="mono">js/count-mobile.js</span> COUNTERS to change names.</p>
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr><th>Counter</th><th>URL</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  `;
+}
+function _ccCopyLink(url, btn) {
+  const done = (ok) => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = ok ? "Copied!" : "Copy failed";
+    setTimeout(() => { btn.textContent = orig; }, 1400);
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(() => done(true)).catch(() => done(false));
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = url; document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy"); ta.remove(); done(ok);
+    }
+  } catch (_) { done(false); }
+}
+if (typeof window !== "undefined") window._ccCopyLink = _ccCopyLink;
 
 /* ============================================================
    ROUTE REGISTRATION
