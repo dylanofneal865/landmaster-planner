@@ -1020,22 +1020,48 @@ async function _ccVerifyLog(logId, rowBtn) {
 }
 if (typeof window !== "undefined") window._ccVerifyLog = _ccVerifyLog;
 
-async function _ccRequestRecount(itemId, rowBtn) {
+async function _ccRequestRecount(itemId, rowBtn, opts) {
+  opts = opts || {};
   const requester = _ccName();
+  // v-cc-loc-8 -- optional supervisor note. When called from the
+  // live-feed "Send back out" action we prompt for one; from
+  // Needs Attention's "Request recount" we go through the same
+  // path so the two entry points behave identically.
+  let note = "";
+  if (opts.promptForNote) {
+    const raw = (typeof prompt === "function")
+      ? prompt("Optional note for the counter (shows on their phone card, e.g. 'recheck RMSTOR-LM bin'):", "")
+      : "";
+    if (raw === null) return;   // supervisor cancelled the prompt
+    note = String(raw || "").trim();
+  } else if (typeof opts.note === "string") {
+    note = opts.note.trim();
+  }
+  const restoreLabel = (rowBtn && rowBtn.textContent) || "Request recount";
   if (rowBtn) { rowBtn.disabled = true; rowBtn.textContent = "..."; }
-  const res = await postCycleCountBatch([{ op: "requestRecount", itemId, requested_by: requester }]);
+  const payload = { op: "requestRecount", itemId, requested_by: requester };
+  if (note) payload.note = note;
+  const res = await postCycleCountBatch([payload]);
   if (!res || !res.ok) {
     if (typeof showToast === "function") showToast("Recount request failed: " + ((res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown"), "warn");
-    if (rowBtn) { rowBtn.disabled = false; rowBtn.textContent = "Request recount"; }
+    if (rowBtn) { rowBtn.disabled = false; rowBtn.textContent = restoreLabel; }
     return;
   }
   const r = res.results && res.results[0];
   if (r && r.skipped) { if (typeof showToast === "function") showToast("A recount is already pending for this item.", ""); }
-  else if (typeof showToast === "function") showToast("Recount created -- next counter (other than the original) will pick it up.", "ok");
+  else if (typeof showToast === "function") showToast("Sent back out -- next counter (other than the original) will pick it up.", "ok");
   if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
   if (typeof refresh === "function") refresh();
 }
 if (typeof window !== "undefined") window._ccRequestRecount = _ccRequestRecount;
+// Convenience wrapper for the live-feed "Send back out" button --
+// always prompts for the optional note. Kept separate from
+// _ccRequestRecount so Needs Attention can opt into a note without
+// forcing every existing caller through the prompt.
+function _ccSendBackOut(itemId, rowBtn) {
+  return _ccRequestRecount(itemId, rowBtn, { promptForNote: true });
+}
+if (typeof window !== "undefined") window._ccSendBackOut = _ccSendBackOut;
 
 /* ---- live feed data -------------------------------------- */
 function _ccRecentLogRows(limit) {
@@ -1063,6 +1089,32 @@ function _ccItemHasPendingRecount(parentItemId) {
     if (it && it.recount_of === parentItemId && (it.status === "pending" || it.status === "recount")) return true;
   }
   return false;
+}
+// v-cc-loc-8 -- lifecycle state for a parent item across ANY of
+// its recount children. Return values drive the live-feed
+// "Send back out" button label + disabled state:
+//   "none"     -- no recount child exists; button reads "Send
+//                 back out" and is active.
+//   "pending"  -- at least one recount child exists in status
+//                 pending or recount; button reads "recount
+//                 pending" and is disabled.
+//   "counted"  -- every recount child has completed (counted /
+//                 reconciled / skipped) and none are still open;
+//                 button reads "recounted &#10003;" and is disabled.
+// A parent that has NEVER been recounted returns "none"; once
+// even one child lands, we transition to counted (or pending
+// while the child is still open). Latest child wins the state.
+function _ccItemRecountStatus(parentItemId) {
+  if (!(DB && DB.cycleCounts && DB.cycleCounts.items instanceof Map)) return "none";
+  const children = [];
+  for (const it of DB.cycleCounts.items.values()) {
+    if (it && it.recount_of === parentItemId) children.push(it);
+  }
+  if (children.length === 0) return "none";
+  for (const c of children) {
+    if (c.status === "pending" || c.status === "recount") return "pending";
+  }
+  return "counted";
 }
 
 /* ---- render fragments ------------------------------------ */
@@ -1136,6 +1188,24 @@ function _ccRenderLiveFeed() {
     const desc = _ccPartDesc(r.pn);
     const hasBins = Array.isArray(r.locations) && r.locations.length > 0;
     const expanded = CC_STATE._feedExpanded.has(r.id);
+    // v-cc-loc-8 -- Send-back-out button state.
+    //   * Never allowed on rows that aren't a real count -- skipped
+    //     rows have nothing to re-check, and rows with no item_id
+    //     (defensive) can't be routed.
+    //   * "none" -> "Send back out"        (primary, enabled)
+    //   * "pending" -> "recount pending"    (disabled)
+    //   * "counted" -> "recounted &#10003;" (disabled, muted)
+    let sendBtn = "";
+    if (r.item_id && r.outcome !== "skipped") {
+      const rs = _ccItemRecountStatus(r.item_id);
+      if (rs === "none") {
+        sendBtn = `<button class="btn xs" title="Spawn a recount for a different counter -- prompts for an optional note that shows on their phone card" onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this)">Send back out</button>`;
+      } else if (rs === "pending") {
+        sendBtn = `<button class="btn xs" disabled title="A recount is already open for this item">recount pending</button>`;
+      } else {
+        sendBtn = `<button class="btn xs ghost" disabled title="This item has already been recounted">recounted &#10003;</button>`;
+      }
+    }
     const rowHtml = `
       <tr class="${isNew ? "cc-new-flash" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
         <td class="dim tiny mono">${esc((at || "").slice(11, 16))}</td>
@@ -1148,9 +1218,10 @@ function _ccRenderLiveFeed() {
         <td class="right num">${r.counted_qty == null ? "-" : Math.round(r.counted_qty)}</td>
         <td class="right num ${vCls}">${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span></td>
         <td><span class="pill tiny ${statusCls}">${statusLabel.toUpperCase()}</span>${r.reviewed_by ? `<div class="dim tiny">by ${esc(r.reviewed_by)}</div>` : ""}</td>
+        <td class="right" style="white-space:nowrap">${sendBtn}</td>
       </tr>`;
     const breakdown = (hasBins && expanded)
-      ? `<tr class="cc-breakdown-row"><td colspan="7" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(r)}</td></tr>`
+      ? `<tr class="cc-breakdown-row"><td colspan="8" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(r)}</td></tr>`
       : "";
     return rowHtml + breakdown;
   }).join("");
@@ -1160,7 +1231,7 @@ function _ccRenderLiveFeed() {
         <thead><tr>
           <th>Time</th><th>Counter</th><th>Part / description</th>
           <th class="right">SYS ON-HAND</th><th class="right">Counted</th><th class="right">Variance</th>
-          <th>Status</th>
+          <th>Status</th><th></th>
         </tr></thead>
         <tbody>${body}</tbody>
       </table>
@@ -1217,7 +1288,7 @@ function _ccRenderNeedsAttention() {
         <td class="right num bold">${dollarTxt}</td>
         <td class="right" style="white-space:nowrap">
           <button class="btn xs primary" onclick="_ccVerifyLog('${esc(row.id)}', this)" title="Attest that this variance is real and adjustment should be sent to Acumatica. Writes reviewed_by/at on the log row; NEVER writes on-hand.">Verified &mdash; send to Acumatica</button>
-          <button class="btn xs" onclick="_ccRequestRecount('${esc(row.item_id)}', this)" ${pendingRecount ? "disabled title='Recount already pending'" : "title='Spawn a recount for a different counter'"}>${pendingRecount ? "Recount pending" : "Request recount"}</button>
+          <button class="btn xs" onclick="_ccSendBackOut('${esc(row.item_id)}', this)" ${pendingRecount ? "disabled title='Recount already pending'" : "title='Spawn a recount for a different counter -- prompts for an optional note'"}>${pendingRecount ? "Recount pending" : "Request recount"}</button>
         </td>
       </tr>`;
     const breakdown = (hasBins && expanded)

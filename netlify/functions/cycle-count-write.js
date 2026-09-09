@@ -445,8 +445,14 @@ async function _applyOp(supa, w, i, log) {
         // a pending/recount child already exists for this parent
         // we return { skipped: true } with the existing child id
         // instead of stacking duplicates.
+        //
+        // v-cc-loc-8 -- optional `note`: a one-liner from the
+        // supervisor ("recheck RMSTOR-LM bin") that lands on the
+        // mobile count card as the reason line so the counter
+        // knows exactly what to double-check.
         const parentId = String(w.itemId || "").trim();
         const requester = String(w.requested_by || "").trim();
+        const noteRaw = String(w.note || "").trim();
         if (!parentId) return { index: i, ok: false, error: "requestRecount: itemId required" };
         const { data: parent, error: pErr } = await supa
           .from("cycle_count_items")
@@ -466,9 +472,14 @@ async function _applyOp(supa, w, i, log) {
           return { index: i, ok: true, kind: "requestRecount", skipped: true, reason: "recount already pending", existingChildId: existing.id };
         }
         const today = nowIso.slice(0, 10);
-        const reasonText = requester
+        // v-cc-loc-8 -- reason format:
+        //   "supervisor requested recount [(via NAME)][: NOTE]"
+        // Mobile app's humanReason splits on the ": " to surface
+        // the note as an explicit ask to the counter.
+        const reasonBase = requester
           ? "supervisor requested recount (via " + requester + ")"
           : "supervisor requested recount";
+        const reasonText = noteRaw ? reasonBase + ": " + noteRaw : reasonBase;
         const { data: child, error: cErr } = await supa
           .from("cycle_count_items")
           .insert({
@@ -479,7 +490,10 @@ async function _applyOp(supa, w, i, log) {
             system_qty_at_assign: parent.system_qty_at_assign,
             status: "pending",
             recount_of: parentId,
-            note: parent.note || null,
+            // v-cc-loc-8 -- the supervisor note becomes the item
+            // note too (in addition to the reason) so it shows in
+            // any note-based UI.
+            note: noteRaw || parent.note || null,
           })
           .select("id")
           .single();

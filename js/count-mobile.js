@@ -99,9 +99,25 @@
     setTimeout(() => el.remove(), ms || 2200);
   };
   const humanReason = (item) => {
-    const r = String(item.reason || "").toLowerCase();
+    const raw = String(item.reason || "");
+    const r = raw.toLowerCase();
+    // v-cc-loc-8 -- supervisor-requested recount reason format:
+    //   "supervisor requested recount [(via NAME)][: NOTE]"
+    // Extract the NOTE (everything after the first ": ") so the
+    // counter sees the exact ask.
+    if (r.startsWith("supervisor requested recount")) {
+      const colon = raw.indexOf(": ");
+      const note = colon >= 0 ? raw.slice(colon + 2).trim() : "";
+      const base = item.recount_of
+        ? "Supervisor sent this back out. Recount -- don't peek at the prior count."
+        : "Supervisor asked for a recount.";
+      return note ? base + " Note: " + note : base;
+    }
     if (item.recount_of) return "Recount -- don't peek at the prior count. Fresh eyes only.";
     if (r.startsWith("operator flag")) return "Someone on the line flagged this. Check what they found.";
+    if (r.startsWith("chain handoff at risk")) return "Chain handoff at risk -- count this AND its partner. Both ends matter.";
+    if (r.startsWith("final part of its chain")) return "Final part of its chain -- no successor coming. This count is the only safety net.";
+    if (r.startsWith("chain active member")) return "Active chain member -- verify what's on the shelf.";
     if (r.startsWith("transition at risk")) return "Chain handoff at risk -- count this AND its partner. Both ends matter.";
     if (r.startsWith("transition --")) return "Chain is about to switch parts -- verify what's left on this one.";
     if (r.startsWith("cut-in --")) return "New part just launched -- verify initial stock.";
