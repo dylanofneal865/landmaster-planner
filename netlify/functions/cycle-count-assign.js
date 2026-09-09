@@ -53,14 +53,32 @@ const RUNWAY_CAP_PER_WEEK = 45;
 const WEEKLY_TOTAL_TARGET = 60;
 const ROTATION_STALE_DAYS = 180;
 const FRAME_ROTATION_DAYS = 30;
-// Chain transition run-up window (fix 3b): predecessor is assigned
-// as HOT when we're within `lead_time_of_successor + this many
-// days` of the successor's transitionStartDate.
-const TRANSITION_RUNUP_EXTRA_DAYS = 30;
-// Cut-in follow-up window (fix 3d): successor gets a "cut-in --
-// verify initial stock" reason when today - transitionStartDate is
-// within this many days.
-const POST_CUTIN_VERIFY_DAYS = 14;
+// v-cc-loc-7 -- chain-active reason set:
+//
+//   TERMINAL ACTIVE (case 1) -- the chain's active member is
+//     lineage[last] (no queued successor exists). No cut-in
+//     coming, no PO on the horizon can be for "the next part".
+//     HOT-level attention, but recency-gated so we don't re-assign
+//     the same terminal daily:
+//       TERMINAL_ACTIVE_RECENCY_DAYS -- skip if counted within.
+//
+//   HANDOFF AT RISK (case 2) -- a queued successor exists AND the
+//     chain's reorder-by has PASSED or passes within
+//     CHAIN_RISK_LOOKAHEAD_DAYS with NO covering PO on the next
+//     queued member. Mirrors the drawer's ORDER-BY PASSED signal:
+//       chainRunoutDays <= leadDaysNext + SAFETY_DAYS
+//                          + CHAIN_RISK_LOOKAHEAD_DAYS
+//       AND nextOnPo <= 0
+//     HOT-level attention, no recency (urgent).
+//
+//   ACTIVE COVERED (case 3) -- a queued successor exists AND
+//     handoff is not at risk (covered PO OR reorder window still
+//     open). Normal cadence -- assign at the RUNWAY recency rhythm
+//     (RUNWAY_RECENCY_DAYS below) with a plain "chain active
+//     member -- verify stock" reason.
+const CHAIN_RISK_LOOKAHEAD_DAYS = 7;
+const SAFETY_DAYS_DEFAULT = 7;
+const TERMINAL_ACTIVE_RECENCY_DAYS = 14;
 
 // v-cc-loc-2 VENDOR-MANAGED (fix 2). Suppliers on this list are
 // consignment / VMI -- the vendor counts them, we don't.
@@ -581,79 +599,69 @@ exports.handler = async (event) => {
   //
   // A chain's assessment is idempotent per run -- chainHandoffAssessed
   // stores the outcome keyed by anchorPn.
-  // v-cc-loc-6 -- chain rules refactored around the ACTIVE / QUEUED /
-  // RETIRED role trio from classifyChainRole:
-  //   * Transition run-up: force the ACTIVE pn (regardless of hop
-  //     count) when today is within lead_time_of_next_queued + 30
-  //     days of the next queued member's cut-in.
-  //   * Post-cut-in: force whichever chain member just cut in
-  //     (its own role flips to active on the day, with a past
-  //     transitionStartDate) with "cut-in -- verify initial stock".
-  //   * Handoff-risk: for the CURRENTLY-ACTIVE member and the NEXT
-  //     queued member. Assessed once per chain (by anchor); the
-  //     next queued's onPO is what we watch, not the terminal's.
-  const chainHandoffAssessed = new Map();
-  const forcedHotByPn = new Map();   // pn -> reason (from chain rules)
-  const chainMeta = new Map();       // anchorPn -> chain descriptor (for the
-                                     // active-member force-assign below)
+  // v-cc-loc-7 -- three ACTIVE-only cases, priority-ordered:
+  //
+  //   1. TERMINAL ACTIVE -- lineage[last]; no queued successor.
+  //      Reason: "final part of its chain -- no successor coming;
+  //      this count is the only safety net". Recency-gated so
+  //      re-runs don't hammer it daily.
+  //   2. HANDOFF AT RISK -- queued successor exists AND chain
+  //      reorder-by has passed or passes within
+  //      CHAIN_RISK_LOOKAHEAD_DAYS days AND next-queued has no
+  //      covering PO. Reason: "chain handoff at risk -- count
+  //      this AND its partner". No recency; this is urgent.
+  //   3. ACTIVE COVERED -- queued successor exists, not at risk.
+  //      Reason: "chain active member -- verify stock".
+  //      Recency-gated at the RUNWAY cadence.
+  //
+  // The three cases are mutually exclusive per priority: terminal
+  // wins over risk (a terminal can't be at risk -- no next member
+  // to worry about); risk wins over covered.
+  //
+  // Handoff assessment is per-chain (by anchor); the ACTIVE HOT
+  // decision reads chainMeta[anchor] rather than recomputing.
+  const chainMeta = new Map();       // anchorPn -> chain descriptor
+  const forcedHotByPn = new Map();    // pn -> reason
   for (const [pn, p] of partsByPn.entries()) {
     const c = p.chain;
     if (!c || !c.transitioning) continue;
-    // Track every transitioning chain we see so the force-assign
-    // pass below can walk them all.
+    if (c.role !== "active") continue;   // queued/retired handled upstream
     chainMeta.set(c.anchorPn, c);
-    // TRANSITION RUN-UP -- fires on the ACTIVE member only. The
-    // active pn stays the current one (regardless of hop count);
-    // "next cut-in" is the next queued member's own date.
-    if (c.role === "active" && c.daysUntilStart !== null && c.daysUntilStart >= 0) {
-      const nextPnData = allPartsData.get(c.nextQueuedPn) || {};
-      const leadDaysNext = (Number(nextPnData.ltWeeks) || 0) * 7;
-      const window = leadDaysNext + TRANSITION_RUNUP_EXTRA_DAYS;
-      if (c.daysUntilStart <= window) {
-        const cutInIso = c.nextCutinDate
-          ? (c.nextCutinDate.getFullYear() + "-" + String(c.nextCutinDate.getMonth() + 1).padStart(2, "0") + "-" + String(c.nextCutinDate.getDate()).padStart(2, "0"))
-          : "unknown";
-        forcedHotByPn.set(pn, `transition -- chain runs on ${pn} until ${cutInIso}; verify remaining stock`);
-      }
+
+    const lastAt = lastCountedByPn.get(pn);
+    const daysSinceCount = lastAt ? _daysBetweenIso(lastAt, today) : Infinity;
+
+    // Case 1: TERMINAL ACTIVE -- no next queued member exists.
+    if (!c.nextQueuedPn) {
+      if (daysSinceCount < TERMINAL_ACTIVE_RECENCY_DAYS) continue;   // don't re-assign daily
+      forcedHotByPn.set(pn, "final part of its chain -- no successor coming; this count is the only safety net");
+      continue;
     }
-    // POST-CUT-IN -- fires when the ACTIVE pn's OWN
-    // transitionStartDate is within POST_CUTIN_VERIFY_DAYS
-    // in the past (freshly cut in).
-    if (c.role === "active" && c.postCutInSuccessor) {
-      forcedHotByPn.set(pn, "cut-in -- verify initial stock");
+
+    // Compute chain runway + next-queued PO once.
+    const nextData = allPartsData.get(c.nextQueuedPn) || {};
+    const leadDaysNext = (Number(nextData.ltWeeks) || 0) * 7;
+    const nextOnPo = Number(onPoByPn.get(c.nextQueuedPn) || 0);
+    let chainOnHand = 0;
+    for (const memberPn of c.lineage) {
+      const mp = allPartsData.get(memberPn);
+      chainOnHand += Math.max(0, Number(mp && mp.onHand) || 0);
     }
-    // HANDOFF WATCH -- assess once per chain (by anchor). Applies
-    // to ACTIVE + NEXT queued specifically.
-    if (!chainHandoffAssessed.has(c.anchorPn)) {
-      const nextPn = c.nextQueuedPn;
-      if (nextPn) {
-        const nextData = allPartsData.get(nextPn) || {};
-        const leadDaysNext = (Number(nextData.ltWeeks) || 0) * 7;
-        const nextOnPo = Number(onPoByPn.get(nextPn) || 0);
-        // Combined chain on-hand from raw parts data.
-        let chainOnHand = 0;
-        for (const memberPn of c.lineage) {
-          const mp = allPartsData.get(memberPn);
-          chainOnHand += Math.max(0, Number(mp && mp.onHand) || 0);
-        }
-        const anchor = allPartsData.get(c.anchorPn) || {};
-        const anchorDaily = Number(anchor.daily) || 0;
-        const chainRunoutDays = anchorDaily > 0 ? (chainOnHand / anchorDaily) : Infinity;
-        const atRisk = (nextOnPo <= 0) && Number.isFinite(chainRunoutDays) && chainRunoutDays <= (leadDaysNext + TRANSITION_RUNUP_EXTRA_DAYS);
-        chainHandoffAssessed.set(c.anchorPn, { atRisk, chainOnHand, chainRunoutDays, leadDaysNext, nextOnPo, nextPn, activePn: c.activePn });
-        if (atRisk) {
-          // ACTIVE + NEXT queued -- but the NEXT queued isn't in
-          // partsByPn (it was filtered out). The HOT loop iterates
-          // partsByPn, so setting forcedHotByPn on the queued pn
-          // won't fire from that loop -- handle it as a
-          // "chainsNeedingActive" force-assign below with the
-          // atRisk-both-ends note.
-          forcedHotByPn.set(c.activePn, "transition at risk -- count both ends");
-        }
-      } else {
-        chainHandoffAssessed.set(c.anchorPn, { atRisk: false });
-      }
+    const anchor = allPartsData.get(c.anchorPn) || {};
+    const anchorDaily = Number(anchor.daily) || 0;
+    const chainRunoutDays = anchorDaily > 0 ? (chainOnHand / anchorDaily) : Infinity;
+    const riskThreshold = leadDaysNext + SAFETY_DAYS_DEFAULT + CHAIN_RISK_LOOKAHEAD_DAYS;
+    const atRisk = (nextOnPo <= 0) && Number.isFinite(chainRunoutDays) && chainRunoutDays <= riskThreshold;
+
+    // Case 2: HANDOFF AT RISK.
+    if (atRisk) {
+      forcedHotByPn.set(pn, "chain handoff at risk -- count this AND its partner");
+      continue;
     }
+
+    // Case 3: ACTIVE COVERED -- normal cadence, recency-gated.
+    if (daysSinceCount < RUNWAY_RECENCY_DAYS) continue;
+    forcedHotByPn.set(pn, "chain active member -- verify stock");
   }
 
   for (const [pn, p] of partsByPn.entries()) {
@@ -684,13 +692,13 @@ exports.handler = async (event) => {
       }
     }
     if (!hot) continue;
-    // Categorize the reason for reporting.
+    // Categorize the reason for reporting. v-cc-loc-7 labels.
     let reasonLabel = "critical-cover";
     if (reason.startsWith("negative")) reasonLabel = "negative-onHand";
     else if (reason === "zero on-hand") reasonLabel = "zero-onHand";
-    else if (reason.startsWith("transition at risk")) reasonLabel = "chain-handoff-risk";
-    else if (reason.startsWith("transition --")) reasonLabel = "chain-runup-active";
-    else if (reason.startsWith("cut-in --")) reasonLabel = "chain-postcutin-active";
+    else if (reason.startsWith("chain handoff at risk")) reasonLabel = "chain-handoff-risk";
+    else if (reason.startsWith("final part of its chain")) reasonLabel = "chain-terminal-active";
+    else if (reason.startsWith("chain active member")) reasonLabel = "chain-active-covered";
     bumpReason(reasonLabel);
     plans.push({
       assigned_date: today,
@@ -727,7 +735,7 @@ exports.handler = async (event) => {
     // one was set (handoff-risk / run-up / cut-in), else generic
     // "chain -- active member; verify remaining stock".
     let reason = forcedHotByPn.get(activePn);
-    if (!reason) reason = "chain -- active member " + activePn + "; verify remaining stock";
+    if (!reason) reason = "chain active member -- verify stock";
     bumpReason("chain-active-force-assigned");
     plans.push({
       assigned_date: today,
