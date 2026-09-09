@@ -25,13 +25,18 @@
        js/01-config.js about the token being an app-build
        credential applies here too.
 
-   Per-counter attribution (NOT auth):
-     * URL ?c=<token> resolves against COUNTERS below; a match
-       pre-fills and LOCKS counted_by for the session.
-     * Without a token, we prompt for a name once and keep it in
-       localStorage. Anyone can type any name; this is stamping,
-       not identity verification. Recount blind rule is enforced
-       server-side against the value we send.
+   Attribution (NOT auth):
+     * Everyone uses the same /count URL. On first load the page
+       prompts for a name; the answer is kept in localStorage and
+       stamped on every counted_by field. Tap the name chip at
+       the top of any screen to change it.
+     * The name is REQUIRED before the first submit -- postWrite
+       rejects a blank counted_by and the server-side blind-
+       recount rule (recount must be a different counter than the
+       original) depends on the value being real.
+     * Anyone can type any name; this is stamping, not identity
+       verification. Real identity belongs to whatever IdP wraps
+       the Netlify site, not this page.
    ===================================================== */
 
 (function () {
@@ -41,16 +46,6 @@
   // CONFIG
   // ---------------------------------------------------------------
   const CFG = window.CC_CONFIG || {};
-  // Placeholder names -- operator edits this block to point each
-  // physical device / bookmark at a person. Tokens can be any URL-
-  // safe string; keep them opaque so a supplier / random URL guess
-  // doesn't casually attribute counts to a real name.
-  const COUNTERS = {
-    "c1-marisol": "Marisol",
-    "c2-james":   "James",
-    "c3-alex":    "Alex",
-    "c4-taylor":  "Taylor",
-  };
   // localStorage keys.
   const LS_NAME  = "cc.mobile.name";
   const LS_QUEUE = "cc.mobile.retryQueue.v1";
@@ -70,7 +65,6 @@
   // ---------------------------------------------------------------
   const S = {
     name: null,
-    nameLocked: false,
     supa: null,
     items: [],                  // cycle_count_items rows (pending/recount only)
     locsByItem: new Map(),       // item_id -> Array<location snapshot rows>
@@ -134,31 +128,20 @@
   };
 
   // ---------------------------------------------------------------
-  // NAME / TOKEN
+  // NAME
+  // Single flow: read from localStorage, else prompt. The chip in
+  // the top bar taps back into the same modal so a shared tablet
+  // can be handed off between counters without a reload.
   // ---------------------------------------------------------------
   function resolveName() {
-    // 1. URL ?c=<token> wins and locks.
-    const params = new URLSearchParams(location.search);
-    const tok = params.get("c");
-    if (tok && Object.prototype.hasOwnProperty.call(COUNTERS, tok)) {
-      S.name = COUNTERS[tok];
-      S.nameLocked = true;
-      $("name-chip").textContent = S.name;
-      $("name-chip").classList.add("locked");
-      $("name-chip").title = "URL locks this device to " + S.name + ". Change by opening a different /count?c=... link.";
-      return true;
-    }
-    // 2. localStorage
     try {
       const v = localStorage.getItem(LS_NAME);
       if (v && v.trim()) { S.name = v.trim(); $("name-chip").textContent = S.name; return true; }
     } catch (_) {}
-    // 3. Prompt.
     openNameModal();
     return false;
   }
   function openNameModal() {
-    if (S.nameLocked) return;
     $("name-input").value = S.name || "";
     $("name-save").disabled = !S.name;
     $("name-modal").classList.add("on");
