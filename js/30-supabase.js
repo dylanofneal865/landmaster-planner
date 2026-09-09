@@ -1146,6 +1146,168 @@ async function _fsPostFrameScheduleWrite(body) {
   return { ok: true, ...json };
 }
 
+/* ============================================================
+   CYCLE COUNTS (v-cc-1)
+
+   Client mirror of the cycle_count_items + cycle_count_log tables,
+   plus the POST helper for cycle-count-write. Isolation contract
+   mirrors the Frame Schedule one exactly:
+
+     * READ-ONLY against parts / pos / usage / frame_schedule / etc.
+     * NEVER writes parts.data.onHand -- Acumatica is the SoR; the
+       sync brings adjusted truth back on its normal cadence.
+     * All mutations go through /.netlify/functions/cycle-count-write
+       with x-fs-edit-token (FS_EDIT_TOKEN_CLIENT, same value the
+       frame-schedule flow uses) + x-app-build (APP_BUILD).
+     * Realtime is not wired (poll-only, mirror of build_plan_targets
+       + frame_schedule initial pattern). js/26 refetches on demand
+       after every write via _refetchCycleCounts().
+   ============================================================ */
+
+async function _fetchAllCycleCountItems() {
+  if (!_supa) return null;
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("cycle_count_items")
+      .select("id, assigned_date, tier, reason, pn, system_qty_at_assign, counted_qty, counted_by, counted_at, variance, status, recount_of, note, created_at, updated_at")
+      .order("assigned_date", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] cycle_count_items fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+async function _fetchAllCycleCountLog() {
+  if (!_supa) return null;
+  // Log is unbounded over time -- fetch only the last 12 months.
+  // The drift detector + summary only look at recent history; older
+  // rows stay on the server for audit.
+  const oneYearAgo = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("cycle_count_log")
+      .select("id, item_id, pn, assigned_date, counted_at, counted_by, tier, reason, system_qty_at_assign, counted_qty, variance, variance_pct, outcome, note, recount_of")
+      .gte("counted_at", oneYearAgo)
+      .order("counted_at", { ascending: false })
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] cycle_count_log fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+function _populateCycleCountsFromRows(items, logs) {
+  if (!DB.cycleCounts || !(DB.cycleCounts.items instanceof Map)) {
+    DB.cycleCounts = { items: new Map(), log: [], loaded: false };
+  }
+  DB.cycleCounts.items.clear();
+  if (Array.isArray(items)) {
+    for (const r of items) {
+      if (!r || !r.id) continue;
+      DB.cycleCounts.items.set(r.id, {
+        id: r.id,
+        assigned_date: r.assigned_date,
+        tier: r.tier,
+        reason: r.reason,
+        pn: r.pn,
+        system_qty_at_assign: Number(r.system_qty_at_assign) || 0,
+        counted_qty: (r.counted_qty == null) ? null : Number(r.counted_qty),
+        counted_by: r.counted_by || null,
+        counted_at: r.counted_at || null,
+        variance: (r.variance == null) ? null : Number(r.variance),
+        status: r.status,
+        recount_of: r.recount_of || null,
+        note: r.note || null,
+        created_at: r.created_at || null,
+        updated_at: r.updated_at || null,
+      });
+    }
+  }
+  DB.cycleCounts.log = Array.isArray(logs) ? logs.slice() : [];
+  // logs come from Supabase sorted newest-first; keep it that way.
+  DB.cycleCounts.loaded = true;
+}
+
+// Refetch both tables in one shot. Callable from js/26 after a
+// write; also useful for a manual "reload" button later.
+async function _refetchCycleCounts() {
+  const [items, log] = await Promise.all([
+    _fetchAllCycleCountItems(),
+    _fetchAllCycleCountLog(),
+  ]);
+  if (items !== null || log !== null) {
+    _populateCycleCountsFromRows(items || [], log || []);
+  }
+  return DB.cycleCounts;
+}
+if (typeof window !== "undefined") window._refetchCycleCounts = _refetchCycleCounts;
+
+// POST helper -- mirrors _fsPostFrameScheduleWrite. Same env
+// (FS_EDIT_TOKEN shared across the frame-schedule and cycle-count
+// writers; APP_BUILD from js/01-config.js). Returns
+//   { ok: true, results: [{index, ok, ...}] }  on 200
+//   { ok: false, error }                        on network / 4xx / 5xx
+async function postCycleCountBatch(writes) {
+  if (!Array.isArray(writes) || writes.length === 0) return { ok: true, results: [] };
+  const token = (typeof FS_EDIT_TOKEN_CLIENT === "string" && FS_EDIT_TOKEN_CLIENT) ? FS_EDIT_TOKEN_CLIENT : "";
+  if (!token) {
+    console.warn("[cycle-count cloud] FS_EDIT_TOKEN_CLIENT missing from js/01-config.js -- server will 401");
+  }
+  let resp;
+  try {
+    resp = await fetch("/.netlify/functions/cycle-count-write", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fs-edit-token": token,
+        "x-app-build": String(typeof APP_BUILD === "number" ? APP_BUILD : 0),
+      },
+      body: JSON.stringify({ writes }),
+    });
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (_) {}
+  if (resp.status === 401) {
+    console.error("[cycle-count cloud] 401 -- FS_EDIT_TOKEN_CLIENT (js/01-config.js) does not match Netlify site env FS_EDIT_TOKEN. Rotate both together.");
+    if (typeof showToast === "function") showToast("Cycle count write blocked: app token mismatch (deploy issue).", "crit");
+    return { ok: false, error: new Error("edit token rejected by server (config mismatch)"), status: 401 };
+  }
+  if (resp.status === 409) {
+    if (typeof window !== "undefined" && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+      try { window._fsCheckWriteBlockedAndBanner(); } catch (_) {}
+    }
+    return { ok: false, error: new Error("app build stale"), status: 409, minWriteBuild: json && json.minWriteBuild };
+  }
+  if (!resp.ok) {
+    const detail = (json && (json.error || json.detail)) || text.slice(0, 200);
+    return { ok: false, error: new Error(`cycle-count-write ${resp.status}: ${detail}`), status: resp.status };
+  }
+  return { ok: true, ...json };
+}
+if (typeof window !== "undefined") window.postCycleCountBatch = postCycleCountBatch;
+
 // v7.11 Batch API: submit an array of { iso, payload }. Returns
 // { ok, results: [{iso, ok, skipped?, reason?, error?}, ...] }.
 // Callers with bulk work (Replan horizon, persister passes) use
@@ -1739,6 +1901,21 @@ async function cloudInit() {
     console.warn("[cloud] frame_schedule fetch failed; DB.frameSchedule may be empty this session");
     if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
       DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+    }
+  }
+
+  // ---- Cycle Counts (v-cc-1) ----
+  // Sidecar tables cycle_count_items + cycle_count_log. Poll-only
+  // (mirror of build_plan_targets + frame_schedule initial pattern).
+  // js/26 refetches after every write via _refetchCycleCounts.
+  const [ccItems, ccLog] = await Promise.all([_fetchAllCycleCountItems(), _fetchAllCycleCountLog()]);
+  if (ccItems !== null || ccLog !== null) {
+    _populateCycleCountsFromRows(ccItems || [], ccLog || []);
+    console.log(`[cloud] loaded cycle counts: ${DB.cycleCounts.items.size} item(s), ${DB.cycleCounts.log.length} log row(s)`);
+  } else {
+    console.warn("[cloud] cycle_count fetch failed; DB.cycleCounts may be empty this session");
+    if (!DB.cycleCounts || !(DB.cycleCounts.items instanceof Map)) {
+      DB.cycleCounts = { items: new Map(), log: [], loaded: false };
     }
   }
 

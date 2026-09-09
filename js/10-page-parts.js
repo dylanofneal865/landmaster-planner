@@ -794,7 +794,9 @@ function renderPartDetail(part) {
         <button class="btn primary" onclick="closeDrawer(); openOnHandQuickModal('${esc(part.pn)}')">⚡ Update on-hand</button>
         ${!partIsKit && !part.phasingOut && (status.status === "critical" || status.status === "warning" || sq > 0) ? `<button class="btn primary" onclick="quickAddToDraft('${esc(part.pn)}'); closeDrawer()">+ Order ${fmtNum(sq)}</button>` : ""}
         <button class="btn" onclick="closeDrawer(); navigate('order-queue')">View order queue</button>
+        ${typeof flagForCountButton === "function" ? flagForCountButton(part.pn) : ""}
       </div>
+      ${typeof renderPartCycleCountHistory === "function" ? (renderPartCycleCountHistory(part.pn) || "") : ""}
       ${chainBoost ? `<p class="muted tiny" style="margin-top:8px;line-height:1.5">Suggested qty sized against the chain's combined on-hand (${fmtNum(chainBoost.combinedOnHand)} total${(chainBoost.combinedOnHand - (Number(part.onHand) || 0)) > 0 ? ` — incl. ${fmtNum(chainBoost.combinedOnHand - (Number(part.onHand) || 0))} on-hand from predecessors being burned down` : ''}) at ${fmtNum(chainBoost.dailyRate, 2)}/day from anchor ${esc(chainBoost.anchorPn)}.</p>` : ''}
 
       <div class="dr-section">Edit part</div>
@@ -1476,7 +1478,7 @@ registerRoute("parts", () => {
                 </td></tr>
                 ${parts.slice(0, 500).map(p => `
                   <tr class="clickable" data-parts-row data-pt-pn="${esc(partsHeaderValue(p, "pn"))}" data-pt-desc="${esc(partsHeaderValue(p, "desc"))}" data-pt-supplier="${esc(partsHeaderValue(p, "supplier"))}" data-pt-cls="${esc(partsHeaderValue(p, "cls"))}" data-pt-status="${esc(partsHeaderValue(p, "status"))}" onclick="openPartDetail('${esc(p.pn)}')">
-                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${p._forceAdmitAsPreLaunchOrder ? ' <span class="pill crit" style="font-size:9px;padding:1px 6px;margin-left:4px;letter-spacing:0.04em" title="Pre-launch part — order-by deadline has passed and no covering PO or blanket">ORDER NOW</span>' : ''}</td>
+                    <td class="pn">${esc(p.pn)}${hasNoOrderCost(p) ? ' <span class="pill warn">NO COST</span>' : ''}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${p._forceAdmitAsPreLaunchOrder ? ' <span class="pill crit" style="font-size:9px;padding:1px 6px;margin-left:4px;letter-spacing:0.04em" title="Pre-launch part — order-by deadline has passed and no covering PO or blanket">ORDER NOW</span>' : ''} <button class="btn xs ghost" style="margin-left:6px;padding:1px 6px;font-size:10px" title="Flag this pn for today's HOT cycle-count list" onclick="event.stopPropagation();(function(){const n=prompt('Optional note (why is this flagged?)',''); if(n===null)return; flagPartForCount('${esc(p.pn)}', n||'');})()">⚑</button></td>
                     <td>${esc(p.desc)}</td>
                     <td class="dim">${esc(p.supplier)}</td>
                     <td class="dim">${p.isKit ? '<span class="pill" style="background:var(--accent-soft,#eef);color:var(--accent,#36c)">KIT</span>' : esc(partItemTypeLabel(p))}</td>

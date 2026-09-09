@@ -67,6 +67,17 @@
 [functions."frame-schedule-compute"]
   schedule = "*/15 * * * *"
 
+# Cycle Count assignment -- weekday mornings at 10:30 UTC (~5:30
+# AM Central). HOT tier every weekday (negative on-hand, critical
+# cover); RUNWAY + ROTATION on Mondays only. Idempotent; a manual
+# retrigger during the same day is safe (per-pn de-dupe against
+# today's / this-week's existing items). ?dry=1 previews; ?force=1
+# runs on weekends. Deleting this stanza stops assignment without
+# affecting the write function or the page. See the function
+# header for tunables (HOT_COVER_DAYS, RUNWAY_COVER_DAYS, etc.).
+[functions."cycle-count-assign"]
+  schedule = "30 10 * * *"
+
 # INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
 # filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
 # to datetimeoffset and then to a full sweep if the tenant rejects
