@@ -183,17 +183,51 @@ exports.handler = async (event) => {
 
   // ---- Load inputs ----------------------------------------------
   // v-cc-loc-2 -- pos loaded too, for handoff-watch (fix 3c).
-  let partsRows, todaysItems, weeksItems, posRows, lastCountedByPn;
+  // v-cc-loc-4 -- part_locations loaded so we can build PHYSICAL
+  // on-hand per pn (sum non-sentinel locations, else __warehouse__
+  // sentinel, else fall back to parts.data.onHand).
+  let partsRows, todaysItems, weeksItems, posRows, locRows, lastCountedByPn;
   try {
-    [partsRows, todaysItems, weeksItems, posRows] = await Promise.all([
+    [partsRows, todaysItems, weeksItems, posRows, locRows] = await Promise.all([
       _fetchAll(supa, "parts", "pn, data"),
       _fetchAll(supa, "cycle_count_items", "pn, tier, assigned_date, status"),  // filtered below
       _fetchAll(supa, "cycle_count_log", "pn, counted_at, outcome"),  // for last-counted-by-pn
       _fetchAll(supa, "pos", "id, data"),                              // for onPO per pn
+      _fetchAll(supa, "part_locations", "pn, location, qty"),          // for physical on-hand
     ]);
   } catch (err) {
     log("input fetch failed", err.message);
     return { statusCode: 500, body: JSON.stringify({ error: "input fetch failed", detail: err.message }) };
+  }
+
+  // v-cc-loc-4 -- physical on-hand per pn. Priority:
+  //   1. Sum of non-sentinel part_locations rows (per-location pns)
+  //   2. __warehouse__ sentinel row's qty (aggregate-only pns)
+  //   3. parts.data.onHand FALLBACK (only for pns Acumatica hasn't
+  //      synced a location row for yet -- rare; keeps HOT alive
+  //      for a new pn between its parts-row creation and the next
+  //      location sync).
+  // The fallback uses available (parts.data.onHand); the log flags
+  // how many pns hit that path so we can watch for drift.
+  const WAREHOUSE_SENTINEL = "__warehouse__";
+  const physicalByPn = new Map();
+  const sentinelByPn = new Map();
+  const locSumByPn = new Map();
+  for (const l of (locRows || [])) {
+    if (!l || !l.pn) continue;
+    const qty = Number(l.qty) || 0;
+    if (String(l.location) === WAREHOUSE_SENTINEL) {
+      sentinelByPn.set(l.pn, qty);
+    } else {
+      locSumByPn.set(l.pn, (locSumByPn.get(l.pn) || 0) + qty);
+    }
+  }
+  const physicalSourceStats = { fromLocations: 0, fromSentinel: 0, fromFallback: 0 };
+  function _physicalFor(pn, availFallback) {
+    if (locSumByPn.has(pn)) { physicalSourceStats.fromLocations++; return locSumByPn.get(pn); }
+    if (sentinelByPn.has(pn)) { physicalSourceStats.fromSentinel++; return sentinelByPn.get(pn); }
+    physicalSourceStats.fromFallback++;
+    return Number(availFallback) || 0;
   }
   // Reduce items to today + this-week sets.
   const hotTodayPns = new Set(
@@ -324,9 +358,18 @@ exports.handler = async (event) => {
     // accurate. Keep phasingOut parts in the map with a flag; the
     // per-tier loops decide what to do with them.
     if (d.phasingOut) excludedPhasingOut++;
+    // v-cc-loc-4 -- onHand is PHYSICAL (shelf) qty from
+    // part_locations. Zero-on-hand HOT should only fire when the
+    // shelf is actually empty; a part with 0 available but 5
+    // allocated is still 5 on the shelf and should not be tagged
+    // zero-onHand. RUNWAY / ROTATION cover math still uses the
+    // physical figure -- runway is about "when does the bin get
+    // empty", same physical shelf.
+    const physical = _physicalFor(String(p.pn), d.onHand);
     partsByPn.set(String(p.pn), {
       pn: String(p.pn),
-      onHand: Number(d.onHand) || 0,
+      onHand: physical,                       // PHYSICAL, was parts.data.onHand
+      available: Number(d.onHand) || 0,        // kept for diagnostics only
       daily: Number(d.daily) || 0,
       partClass: d.partClass || "",
       itemType,
@@ -337,6 +380,7 @@ exports.handler = async (event) => {
     });
   }
   log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedPreLaunchSuccessor} pre-launch-successor, ${excludedPreLaunchStandalone} pre-launch-standalone (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them)`);
+  log(`[PHYSICAL] on-hand source per eligible pn: ${physicalSourceStats.fromLocations} from location-sum, ${physicalSourceStats.fromSentinel} from __warehouse__ sentinel, ${physicalSourceStats.fromFallback} from parts.data.onHand fallback (no location row yet)`);
 
   // Pre-compute onPO per pn from the loaded pos rows -- used by the
   // handoff-watch (fix 3c). PO shape (mirrors the client's DB.pos):
@@ -723,6 +767,10 @@ exports.handler = async (event) => {
       const locsByPn = new Map();
       for (const r of (locRows || [])) {
         if (!r || !r.pn) continue;
+        // v-cc-loc-4 -- exclude the __warehouse__ sentinel from
+        // the counter-visible bin list; it's a per-pn aggregate,
+        // not a countable bin.
+        if (String(r.location) === WAREHOUSE_SENTINEL) continue;
         let arr = locsByPn.get(r.pn);
         if (!arr) { arr = []; locsByPn.set(r.pn, arr); }
         arr.push(r);

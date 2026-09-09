@@ -237,6 +237,21 @@ exports.handler = async (event) => {
   // QtyAvailableinWarehouse still yields byte-identical output
   // because that field is the per-pn aggregate that repeats
   // identically on every location row for a given pn.
+  //
+  // v-cc-loc-4 -- PHYSICAL WAREHOUSE ON-HAND.
+  // Cycle counters measure PHYSICAL shelf qty (which includes
+  // allocated / reserved stock). The planning path stores
+  // available (QtyAvailableinWarehouse) as parts.data.onHand and
+  // that stays byte-identical. Alongside it we capture per-pn
+  // QtyOnHandinWarehouse (same first-per-pn dedupe -- the field
+  // is a per-pn aggregate that repeats identically on every
+  // location row) and emit it as a sentinel row in part_locations
+  // with location "__warehouse__". Cycle counts read the sentinel
+  // for parts WITHOUT location rows; per-location parts sum their
+  // QtyOnHandinLocation instead. The desktop drawer's "Current
+  // locations" block filters the sentinel out so a bin list still
+  // reads as a bin list.
+  const physicalByPn = new Map();
   const locByPn = new Map();
   for (const raw of entries) {
     const { get, isNull } = makeFieldGetters(raw);
@@ -252,6 +267,22 @@ exports.handler = async (event) => {
 
     if (!dedupe.has(pn)) {
       dedupe.set(pn, qtyAvail);
+    }
+
+    // v-cc-loc-4 -- also capture QtyOnHandinWarehouse (physical).
+    // Same dedupe rule as available: per-pn aggregate repeats on
+    // every location row for a given pn, so first-row-per-pn is
+    // sufficient. Only stored when non-null / finite; a missing
+    // column (unlikely -- the LOC-DIAG confirmed the feed carries
+    // it) leaves physicalByPn without an entry and the sentinel
+    // emit skips that pn (assign falls back to summing the
+    // per-location rows, which is correct anyway).
+    if (!physicalByPn.has(pn)) {
+      const qtyPhysStr = isNull("QtyOnHandinWarehouse") ? null : get("QtyOnHandinWarehouse");
+      if (qtyPhysStr !== null) {
+        const qtyPhys = parseFloat(qtyPhysStr);
+        if (isFinite(qtyPhys)) physicalByPn.set(pn, qtyPhys);
+      }
     }
 
     // Per-location collection. Prefer Location; fall back to
@@ -483,6 +514,46 @@ exports.handler = async (event) => {
   if (disagreePns > agreePns && disagreePns > 20) {
     log(`[LOC] WARN: disagreement widespread (${disagreePns} vs ${agreePns}). Available-vs-OnHand normally explains a gap; if this ratio persists after Reserved qty is checked, suspect LotSerialNbr rows still double-counting despite the wh+loc collapse.`);
   }
+
+  // v-cc-loc-4 -- PHYSICAL sentinel emit + physical-vs-available
+  // assertion. For every pn we have a physical figure for AND
+  // that we know about (parts row exists, not tombstoned), emit
+  // one sentinel row per pn:
+  //   { pn, location: "__warehouse__", qty: physical_onhand }
+  // The delete-then-insert cycle above already added the pn to
+  // touchedPnsForLocs (via the location loop OR nothing -- if
+  // an aggregate-only pn has no location rows, we still need to
+  // schedule its delete so the sentinel refreshes). Handle both.
+  const WAREHOUSE_SENTINEL = "__warehouse__";
+  let sentinelRows = 0;
+  let physicalDisagreePns = 0;
+  let physicalWidestGap = 0;
+  let physicalWidestGapPn = null;
+  const touchedForSentinel = new Set(touchedPnsForLocs);
+  for (const [pn, physQty] of physicalByPn.entries()) {
+    if (tombstoned.has(pn)) continue;
+    if (!existingMap.has(pn)) continue;
+    partLocationRows.push({
+      pn,
+      location: WAREHOUSE_SENTINEL,
+      location_desc: null,
+      qty: physQty,
+      synced_at: nowIsoLoc,
+    });
+    sentinelRows++;
+    if (!touchedForSentinel.has(pn)) {
+      touchedForSentinel.add(pn);
+      touchedPnsForLocs.push(pn);
+    }
+    const avail = Number(dedupe.get(pn)) || 0;
+    const gap = Math.abs(physQty - avail);
+    if (gap > 0.5) {
+      physicalDisagreePns++;
+      if (gap > physicalWidestGap) { physicalWidestGap = gap; physicalWidestGapPn = pn; }
+    }
+  }
+  log(`[LOC] emitted ${sentinelRows} __warehouse__ sentinel row(s) (per-pn physical OnHand)`);
+  log(`[LOC] physical-vs-available: ${physicalDisagreePns} pn(s) differ, max gap ${physicalWidestGap.toFixed(1)}${physicalWidestGapPn ? " on " + physicalWidestGapPn : ""} -- the reason cycle counts (physical) diverge from planning (available); zero-gap pns have no allocated / reserved stock.`);
 
   // Delete existing rows for touched pns, then batch-insert fresh.
   // Chunked to stay under the ~16 KB PostgREST URL ceiling.

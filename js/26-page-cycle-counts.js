@@ -85,14 +85,30 @@ function _ccSetName(v) {
   return s;
 }
 
-// Live parts.data.onHand for a given pn (read from the client's
-// DB.parts mirror -- populated by the same sync path everything
-// else on the app reads from).
+// v-cc-loc-4 -- PHYSICAL live on-hand for a pn (shelf qty, not
+// planning-available). Preference:
+//   1. Sum of DB.partLocations entries (per-location parts)
+//   2. DB.partOnHandPhysical (aggregate __warehouse__ sentinel)
+//   3. null when neither is populated (part_locations sync hasn't
+//      landed yet for this pn -- caller renders as "-")
+// The planner's parts.data.onHand is AVAILABLE (Reserved/Allocated
+// removed) and would understate what the counter sees on the
+// shelf; never fall back to it here.
 function _ccLiveOnHand(pn) {
-  if (typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) return null;
-  const p = DB.parts.find(x => x && x.pn === pn);
-  if (!p) return null;
-  return Number(p.onHand) || 0;
+  if (typeof DB === "undefined" || !DB) return null;
+  if (DB.partLocations instanceof Map) {
+    const bins = DB.partLocations.get(pn);
+    if (Array.isArray(bins) && bins.length > 0) {
+      let s = 0;
+      for (const b of bins) s += Number(b.qty) || 0;
+      return s;
+    }
+  }
+  if (DB.partOnHandPhysical instanceof Map) {
+    const v = DB.partOnHandPhysical.get(pn);
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return null;
 }
 
 // Beyond tolerance? Matches cycle-count-write.js exactly.
@@ -849,8 +865,8 @@ function _ccRenderTable(items, opts) {
             <th>Part #</th>
             <th>Description</th>
             <th>Tier / reason</th>
-            <th class="right">Sys qty (at assign)</th>
-            <th class="right">Live qty (now)</th>
+            <th class="right" title="Physical shelf qty at the time the item was assigned (QtyOnHandinWarehouse / sum of QtyOnHandinLocation). NOT parts.data.onHand -- that's planning-available.">SYS ON-HAND (at assign)</th>
+            <th class="right" title="Physical shelf qty now, per the latest Acumatica sync. NOT parts.data.onHand.">SYS ON-HAND (now)</th>
             <th class="right">Counted qty</th>
             <th class="right">Variance</th>
             <th>Status</th>
@@ -1020,9 +1036,16 @@ function _ccRenderPartLocationsBlock(pn) {
       <td class="right num">${Math.round(Number(l.qty) || 0)}</td>
     </tr>
   `).join("");
+  // v-cc-loc-4 -- these numbers are PHYSICAL (QtyOnHandinLocation)
+  // and can differ from parts.data.onHand (available), which is
+  // what the planner uses. Note it in the caption so the buyer
+  // isn't surprised by a mismatch.
+  const availText = (typeof DB !== "undefined" && DB && Array.isArray(DB.parts))
+    ? (() => { const p = DB.parts.find(x => x && x.pn === pn); return p ? Math.round(Number(p.onHand) || 0) : null; })()
+    : null;
   return `
     <div class="dr-section">Current locations (${locs.length})</div>
-    <div class="dim tiny" style="margin-bottom:6px">On-hand by bin per the last Acumatica sync${syncedAt ? ` (${esc(syncedAt.slice(0, 16).replace("T", " "))})` : ""}. Aggregate on-hand = ${Math.round(total)}.</div>
+    <div class="dim tiny" style="margin-bottom:6px">SHELF on-hand by bin (QtyOnHandinLocation) per the last Acumatica sync${syncedAt ? ` (${esc(syncedAt.slice(0, 16).replace("T", " "))})` : ""}. Shelf total = ${Math.round(total)}${availText != null && availText !== Math.round(total) ? ` &middot; planning-available = ${availText} (gap = reserved / allocated)` : ""}.</div>
     <div class="tbl-wrap"><table class="tbl">
       <thead><tr><th>Location</th><th>Description</th><th class="right">Qty</th></tr></thead>
       <tbody>${body}</tbody>

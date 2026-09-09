@@ -1190,13 +1190,26 @@ async function _fetchAllPartLocations() {
   }
   return all;
 }
+// v-cc-loc-4 -- the __warehouse__ sentinel (per-pn physical
+// on-hand from QtyOnHandinWarehouse) is split OUT of
+// DB.partLocations (which stays as user-visible bins) into
+// DB.partOnHandPhysical (Map<pn, qty>). Cycle-count "live"
+// displays read from DB.partOnHandPhysical; the drawer's
+// "Current locations" table iterates DB.partLocations and
+// naturally hides the sentinel.
+const WAREHOUSE_SENTINEL_LOC = "__warehouse__";
 function _populatePartLocationsFromRows(rows) {
-  const m = new Map();
+  const bins = new Map();
+  const physical = new Map();
   if (Array.isArray(rows)) {
     for (const r of rows) {
       if (!r || !r.pn) continue;
-      let arr = m.get(r.pn);
-      if (!arr) { arr = []; m.set(r.pn, arr); }
+      if (String(r.location) === WAREHOUSE_SENTINEL_LOC) {
+        physical.set(r.pn, Number(r.qty) || 0);
+        continue;
+      }
+      let arr = bins.get(r.pn);
+      if (!arr) { arr = []; bins.set(r.pn, arr); }
       arr.push({
         location: r.location,
         location_desc: r.location_desc || null,
@@ -1205,11 +1218,12 @@ function _populatePartLocationsFromRows(rows) {
       });
     }
     // Deterministic per-pn order: location asc.
-    for (const arr of m.values()) {
+    for (const arr of bins.values()) {
       arr.sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0));
     }
   }
-  DB.partLocations = m;
+  DB.partLocations = bins;
+  DB.partOnHandPhysical = physical;
 }
 async function _refetchPartLocations() {
   const rows = await _fetchAllPartLocations();
