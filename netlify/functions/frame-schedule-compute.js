@@ -41,6 +41,14 @@
 const { createClient } = require("@supabase/supabase-js");
 const crypto = require("crypto");
 const FrameScheduler = require("../../lib/frame-scheduler.js");
+// v-cc-loc-2 -- moved the chain helpers to lib/supersession-server.js
+// so cycle-count-assign can share the same lineage / classification
+// logic without a duplicate impl drifting.
+const {
+  supersessionChainServer,
+  supersessionLineageServer,
+  chainDisplayDailyServer,
+} = require("../../lib/supersession-server.js");
 
 const FRAME_PNS = FrameScheduler.FRAME_PNS;
 
@@ -212,74 +220,10 @@ function ingestFrameSchedule(rows) {
                          Monday string keys everywhere).
    ============================================================ */
 
-// Faithful port of js/03 supersessionChain (forward walk following
-// part.supersededBy). Same cycle guard. `byPn` is Map<pn -> partData>.
-function supersessionChainServer(pn, byPn) {
-  const out = [];
-  const visited = new Set();
-  let cur = pn ? String(pn).trim() : "";
-  while (cur && !visited.has(cur)) {
-    out.push(cur);
-    visited.add(cur);
-    const p = byPn.get(cur);
-    const next = (p && p.supersededBy) ? String(p.supersededBy).trim() : "";
-    if (!next || next === cur) break;
-    cur = next;
-  }
-  return out;
-}
-
-// Faithful port of js/03 supersessionLineage (BACKWARD via
-// predecessors whose supersededBy points at me, THEN FORWARD via
-// supersessionChain). Returns anchor-first ordered pn list.
-function supersessionLineageServer(pn, byPn, allEntries) {
-  const start = pn ? String(pn).trim() : "";
-  if (!start) return [];
-  const back = [];
-  const seen = new Set([start]);
-  let cur = start;
-  while (true) {
-    // O(N) scan mirrors js/03 (same Array.find shape).
-    let pred = null;
-    for (const [predPn, predData] of allEntries) {
-      if (predData && predData.supersededBy && String(predData.supersededBy).trim() === cur) {
-        pred = { pn: predPn };
-        break;
-      }
-    }
-    if (!pred) break;
-    if (seen.has(pred.pn)) break;   // cycle guard
-    back.unshift(pred.pn);
-    seen.add(pred.pn);
-    cur = pred.pn;
-  }
-  const forward = supersessionChainServer(start, byPn);
-  return [...back, ...forward];
-}
-
-// Faithful port of js/03 chainDisplayDaily. Returns anchor.daily
-// when the part is in an actively-transitioning chain (lineage
-// >= 2 AND any member has phasingOut). Otherwise returns own daily.
-// Also returns metadata for the compute-time inputs snapshot.
-function chainDisplayDailyServer(pn, byPn, allEntries) {
-  const own = byPn.get(pn) || {};
-  const ownDaily = Number(own.daily) || 0;
-  const lineage = supersessionLineageServer(pn, byPn, allEntries);
-  if (lineage.length < 2) {
-    return { daily: ownDaily, ownDaily, chainMembers: lineage, chainTransitioning: false, chainAnchorPn: null };
-  }
-  const transitioning = lineage.some(memberPn => {
-    const m = byPn.get(memberPn);
-    return !!(m && m.phasingOut);
-  });
-  const anchorPn = lineage[0];
-  if (!transitioning) {
-    return { daily: ownDaily, ownDaily, chainMembers: lineage, chainTransitioning: false, chainAnchorPn: anchorPn };
-  }
-  const anchor = byPn.get(anchorPn);
-  const daily = anchor ? (Number(anchor.daily) || 0) : ownDaily;
-  return { daily, ownDaily, chainMembers: lineage, chainTransitioning: true, chainAnchorPn: anchorPn };
-}
+// (supersessionChainServer / supersessionLineageServer /
+// chainDisplayDailyServer are imported at the top from
+// lib/supersession-server.js -- one canonical impl shared with
+// cycle-count-assign.)
 
 // Build the 6-row FRAME_PNS row set from parts + return the
 // per-frame inputs snapshot that will be stored in the shadow

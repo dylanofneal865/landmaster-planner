@@ -212,21 +212,52 @@ function _ccMondayIso(dateOrIso) {
    SUMMARY STRIP
    ============================================================ */
 
+// v-cc-loc-2 fix 1 -- AUTO-SWEPT SKIP DETECTOR.
+//
+// The cycle-count-assign backlog sweep marks non-BaseBOM /
+// vendor-managed / pre-launch-successor / phasing-out items as
+// status="skipped" with a note ending "excluded by policy". These
+// rows are policy filtering, NOT audit work -- they must be
+// excluded from the completion + IRA metric denominators so a
+// 101-row auto-sweep doesn't inflate week completion to 76.5%
+// with zero counts actually done.
+//
+// Operator skips (a counter typed a reason -- "damaged label",
+// "bin locked", etc.) DO count in the denominator as unworked --
+// the shift did the work of assessing them and the buyer needs to
+// see them as open. Those never carry the "excluded by policy"
+// suffix.
+function _isAutoSweptSkip(item) {
+  if (!item || item.status !== "skipped") return false;
+  const note = String(item.note || "").toLowerCase();
+  return /excluded by policy/.test(note);
+}
+
 function _ccSummary() {
   const items = _ccAllItems();
   const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
   const today = _ccTodayIso();
   const weekMonday = _ccMondayIso(today);
 
-  const weekItems = items.filter(i => i && i.assigned_date >= weekMonday);
+  const weekItemsAll = items.filter(i => i && i.assigned_date >= weekMonday);
+  // Auto-swept skips filtered from BOTH sides of the ratio.
+  const weekItems = weekItemsAll.filter(i => !_isAutoSweptSkip(i));
+  const autoSweptThisWeek = weekItemsAll.length - weekItems.length;
   const pending = weekItems.filter(i => i.status === "pending" || i.status === "recount");
-  const completed = weekItems.filter(i => i.status !== "pending" && i.status !== "recount");
-  const completionPct = weekItems.length > 0 ? (completed.length / weekItems.length) : 0;
+  const counted = weekItems.filter(i => i.status === "counted" || i.status === "reconciled");
+  const operatorSkipped = weekItems.filter(i => i.status === "skipped");
+  // Completion pct = counted / (counted + operator-skipped + open).
+  // Auto-swept never enters this ratio.
+  const completionPct = weekItems.length > 0 ? (counted.length / weekItems.length) : 0;
 
-  // IRA = counted rows this week within tolerance / all counted rows this week.
+  // IRA = counted rows this week within tolerance / all counted
+  // rows this week. Auto-swept items never had counted_qty, so
+  // they naturally contribute nothing here; explicit filter is
+  // belt-and-suspenders.
   let inTolerance = 0;
   let outTolerance = 0;
   for (const i of weekItems) {
+    if (_isAutoSweptSkip(i)) continue;
     if (i.status !== "counted" && i.status !== "reconciled") continue;
     if (typeof i.counted_qty !== "number") continue;
     const beyond = _ccBeyondTolerance(i.system_qty_at_assign, i.counted_qty);
@@ -257,7 +288,7 @@ function _ccSummary() {
     trend.push({ mondayIso: mIso, ira: tot > 0 ? (inTol / tot) : null, n: tot });
   }
 
-  // IRA by class, this week.
+  // IRA by class, this week. weekItems is already auto-swept-free.
   const byClass = { A: { in: 0, out: 0 }, B: { in: 0, out: 0 }, C: { in: 0, out: 0 }, "": { in: 0, out: 0 } };
   for (const i of weekItems) {
     if (i.status !== "counted" && i.status !== "reconciled") continue;
@@ -298,8 +329,15 @@ function _ccSummary() {
 
   return {
     weekCompletion: completionPct,
+    weekOpen: pending.length,                 // pending + recount
+    weekCounted: counted.length,              // counted + reconciled
+    weekOperatorSkipped: operatorSkipped.length,
+    weekActive: weekItems.length,             // denominator (excludes auto-swept)
+    weekAutoSwept: autoSweptThisWeek,         // reported separately
+    // Legacy field names kept for callers that still read them --
+    // updated to the auto-swept-excluded numbers.
     weekPending: pending.length,
-    weekCompleted: completed.length,
+    weekCompleted: counted.length,
     weekTotal: weekItems.length,
     ira: iraPct,
     trend,
@@ -854,7 +892,8 @@ function _ccRenderSummaryStrip(s) {
       <div class="card" style="padding:12px;min-width:180px">
         <div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Week completion</div>
         <div class="head-lg mono">${complText}</div>
-        <div class="dim tiny">${s.weekCompleted}/${s.weekTotal} done, ${s.weekPending} open</div>
+        <div class="dim tiny">${s.weekCounted}/${s.weekActive} counted, ${s.weekOpen} open${s.weekOperatorSkipped > 0 ? ` (+${s.weekOperatorSkipped} operator-skipped)` : ""}</div>
+        ${s.weekAutoSwept > 0 ? `<div class="dim tiny" title="Rows the assignment cron auto-skipped as ineligible (non-BaseBOM / vendor-managed / pre-launch successor / phasing-out). Not counted in the ratio.">${s.weekAutoSwept} auto-swept (policy)</div>` : ""}
       </div>
       <div class="card" style="padding:12px;min-width:180px">
         <div class="muted tiny" style="letter-spacing:.08em;text-transform:uppercase">Inventory record accuracy (week)</div>

@@ -39,6 +39,7 @@
 // po_receipts, or frame_schedule.
 
 const { createClient } = require("@supabase/supabase-js");
+const { classifyChainMember } = require("../../lib/supersession-server.js");
 
 // Frames get forced onto a 30-day rotation cycle -- keeps the six
 // finished-goods SKUs on a predictable audit rhythm. Kept in sync
@@ -52,6 +53,23 @@ const RUNWAY_CAP_PER_WEEK = 45;
 const WEEKLY_TOTAL_TARGET = 60;
 const ROTATION_STALE_DAYS = 180;
 const FRAME_ROTATION_DAYS = 30;
+// Chain transition run-up window (fix 3b): predecessor is assigned
+// as HOT when we're within `lead_time_of_successor + this many
+// days` of the successor's transitionStartDate.
+const TRANSITION_RUNUP_EXTRA_DAYS = 30;
+// Cut-in follow-up window (fix 3d): successor gets a "cut-in --
+// verify initial stock" reason when today - transitionStartDate is
+// within this many days.
+const POST_CUTIN_VERIFY_DAYS = 14;
+
+// v-cc-loc-2 VENDOR-MANAGED (fix 2). Suppliers on this list are
+// consignment / VMI -- the vendor counts them, we don't. Match is
+// case-insensitive against the parts.data.supplier field (the same
+// field the part drawer's SUPPLIER input edits). Add or remove
+// entries here to change policy; a redeploy takes effect on the
+// next cron fire AND the policy sweep clears any open items whose
+// pn is now covered.
+const VMI_SUPPLIERS = ["fastenal"];
 
 function _todayIsoUtc() {
   const d = new Date();
@@ -124,12 +142,14 @@ exports.handler = async (event) => {
   }
 
   // ---- Load inputs ----------------------------------------------
-  let partsRows, todaysItems, weeksItems, lastCountedByPn;
+  // v-cc-loc-2 -- pos loaded too, for handoff-watch (fix 3c).
+  let partsRows, todaysItems, weeksItems, posRows, lastCountedByPn;
   try {
-    [partsRows, todaysItems, weeksItems] = await Promise.all([
+    [partsRows, todaysItems, weeksItems, posRows] = await Promise.all([
       _fetchAll(supa, "parts", "pn, data"),
       _fetchAll(supa, "cycle_count_items", "pn, tier, assigned_date, status"),  // filtered below
       _fetchAll(supa, "cycle_count_log", "pn, counted_at, outcome"),  // for last-counted-by-pn
+      _fetchAll(supa, "pos", "id, data"),                              // for onPO per pn
     ]);
   } catch (err) {
     log("input fetch failed", err.message);
@@ -169,68 +189,161 @@ exports.handler = async (event) => {
   // any parts with no itemType set (untagged catalog rows are not
   // production-eligible until an operator classifies them).
   //
-  // Also drop phasingOut parts -- they're being burned down and
-  // aren't on the audit rhythm. (Kits are already excluded by the
-  // base_bom gate; the earlier standalone `d.isKit` filter was
-  // never firing because parts.data doesn't carry `isKit` -- it's
-  // a computed field injected by partsWithStatus in the browser.)
+  // v-cc-loc-2 also excludes:
+  //   * VMI suppliers (fix 2, VMI_SUPPLIERS)
+  //   * phasingOut parts (burning down; not on the audit rhythm)
+  //
+  // We still want the FULL raw-data map (allPartsData) so the chain
+  // classifier can walk supersededBy links across the whole catalog
+  // -- a predecessor of a base_bom successor might itself be tagged
+  // Options / Service, and the lineage walk needs to see it.
+  const allPartsData = new Map();
+  for (const p of partsRows) {
+    if (!p || !p.pn) continue;
+    allPartsData.set(String(p.pn), p.data || {});
+  }
+  const allEntries = [...allPartsData.entries()];
+  const todayDateForChain = new Date(today + "T00:00:00");
+  todayDateForChain.setHours(0, 0, 0, 0);
+
   const partsByPn = new Map();
   let excludedNonBaseBom = 0;
-  let excludedPhasingOut = 0;
+  let excludedPhasingOut = 0;   // count only; retained in partsByPn -- see note
+  let excludedVmi = 0;
+  let excludedPreLaunchSuccessor = 0;
   for (const p of partsRows) {
     if (!p || !p.pn) continue;
     const d = p.data || {};
     const itemType = String(d.itemType || "").toLowerCase().trim();
     if (itemType !== "base_bom") { excludedNonBaseBom++; continue; }
-    if (d.phasingOut) { excludedPhasingOut++; continue; }
+    const supplierNorm = String(d.supplier || "").toLowerCase().trim();
+    if (supplierNorm && VMI_SUPPLIERS.includes(supplierNorm)) { excludedVmi++; continue; }
+    // Fix 3a: pre-launch successors -- the successor of a
+    // transitioning chain whose cut-in is in the future -- must
+    // NEVER be flagged HOT for zero on-hand. Zero on-hand is the
+    // expected state until cut-in. Skip the whole part; the chain
+    // will re-add the successor with a "cut-in" reason after
+    // transitionStartDate arrives (fix 3d).
+    const chain = classifyChainMember(String(p.pn), allPartsData, allEntries, todayDateForChain);
+    if (chain.role === "successor" && chain.preLaunchSuccessor) {
+      excludedPreLaunchSuccessor++;
+      continue;
+    }
+    // Fix 3b: phasingOut is normally dropped from RUNWAY / ROTATION
+    // (they're being burned down and aren't on the audit rhythm),
+    // but a phasing-out chain PREDECESSOR in the transition run-up
+    // window MUST still reach the HOT loop so the run-up rule can
+    // force it -- the chain's runway depends on that count being
+    // accurate. Keep phasingOut parts in the map with a flag; the
+    // per-tier loops decide what to do with them.
+    if (d.phasingOut) excludedPhasingOut++;
     partsByPn.set(String(p.pn), {
       pn: String(p.pn),
       onHand: Number(d.onHand) || 0,
       daily: Number(d.daily) || 0,
       partClass: d.partClass || "",
       itemType,
+      supplier: d.supplier || "",
+      ltWeeks: Number(d.ltWeeks) || 0,
+      phasingOut: !!d.phasingOut,
+      chain,   // pre-computed so the HOT loop reads it O(1)
     });
   }
-  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedPhasingOut} phasing-out`);
+  log(`catalog scope: ${partsByPn.size} base_bom parts eligible; skipped ${excludedNonBaseBom} non-BaseBOM, ${excludedVmi} vendor-managed, ${excludedPreLaunchSuccessor} pre-launch-successor (${excludedPhasingOut} of the eligible carry phasingOut -- HOT chain rules apply, RUNWAY/ROTATION skip them)`);
+
+  // Pre-compute onPO per pn from the loaded pos rows -- used by the
+  // handoff-watch (fix 3c). PO shape (mirrors the client's DB.pos):
+  // po.data.lines is an array of {pn, qty, qtyReceived, ...}.
+  const onPoByPn = new Map();
+  for (const po of (posRows || [])) {
+    const d = (po && po.data) || {};
+    if (d.status && String(d.status).toLowerCase() === "closed") continue;
+    const lines = Array.isArray(d.lines) ? d.lines : [];
+    for (const ln of lines) {
+      if (!ln || !ln.pn) continue;
+      // Skip blanket lines -- they're commitments, not scheduled
+      // deliveries. Approximation matches openPOQty in js/03: any
+      // line with type === "blanket" excluded.
+      if (String(ln.type || "").toLowerCase() === "blanket") continue;
+      const remaining = Math.max(0, (Number(ln.qty) || 0) - (Number(ln.qtyReceived) || 0));
+      if (remaining <= 0) continue;
+      const key = String(ln.pn);
+      onPoByPn.set(key, (onPoByPn.get(key) || 0) + remaining);
+    }
+  }
 
   // BACKLOG CLEANUP -- any currently-pending item whose pn is no
-  // longer eligible (item type flipped off base_bom, or was on the
-  // list before this policy took effect) gets marked "skipped" with
-  // reason "non-BaseBOM -- excluded by policy" so the tab
-  // self-cleans. Runs BEFORE the plan below so today's assignment
-  // sees a clean slate. Also skips items whose pn no longer exists
-  // in the catalog at all -- same policy shape ("no longer
-  // eligible"), so the reason line is the same.
+  // longer eligible gets marked "skipped" with a policy note. The
+  // note prefix ("non-BaseBOM", "vendor-managed", "pre-launch
+  // successor", "phasing-out") is later matched by js/26's
+  // _isAutoSweptSkip so these auto-skips DON'T inflate the
+  // completion metric (fix 1). Operator skips have a typed reason
+  // that never starts with "excluded by policy" -- they stay in
+  // the denominator as unworked.
+  //
+  // Ineligibility is decided by rebuilding the exclusion set from
+  // the current parts.data feed: not-in-partsByPn AND we know why
+  // (non-BaseBOM / VMI / pre-launch successor / phasing-out).
+  // Anything ineligible for an unknown reason falls back to
+  // "non-BaseBOM -- excluded by policy" so the sweep is complete.
   //
   // NOTE: we intentionally do NOT append a cycle_count_log row for
-  // these -- log rows are supposed to represent completed audit
-  // work, and a policy sweep isn't audit work. The updated_at bump
-  // + status flip is enough to surface the change in the UI.
+  // these -- log rows are completed audit work.
+  function _sweepNoteFor(pn) {
+    const d = allPartsData.get(pn);
+    if (!d) return "non-BaseBOM -- excluded by policy";
+    const itemType = String(d.itemType || "").toLowerCase().trim();
+    if (itemType !== "base_bom") return "non-BaseBOM -- excluded by policy";
+    const supplierNorm = String(d.supplier || "").toLowerCase().trim();
+    if (supplierNorm && VMI_SUPPLIERS.includes(supplierNorm)) return "vendor-managed -- excluded by policy";
+    if (d.phasingOut) return "phasing-out -- excluded by policy";
+    const chain = classifyChainMember(pn, allPartsData, allEntries, todayDateForChain);
+    if (chain.role === "successor" && chain.preLaunchSuccessor) return "pre-launch successor -- excluded by policy";
+    return "non-BaseBOM -- excluded by policy";
+  }
+
   const openItems = todaysItems.filter(r => r && (r.status === "pending" || r.status === "recount"));
-  const ineligibleOpenPns = openItems
-    .filter(r => !partsByPn.has(String(r.pn)))
-    .map(r => String(r.pn));
+  const ineligibleOpen = openItems.filter(r => !partsByPn.has(String(r.pn)));
+  // Bucket ineligibles by the exact policy note so each row gets
+  // the right reason (and we can log a per-policy tally). Fewer
+  // round trips: one UPDATE per bucket.
+  const buckets = new Map();
+  for (const r of ineligibleOpen) {
+    const pn = String(r.pn);
+    const note = _sweepNoteFor(pn);
+    let b = buckets.get(note);
+    if (!b) { b = new Set(); buckets.set(note, b); }
+    b.add(pn);
+  }
   let cleanedOpen = 0;
-  if (ineligibleOpenPns.length > 0 && !dryRun) {
+  const cleanedByPolicy = {};
+  if (buckets.size > 0 && !dryRun) {
     const nowIso = new Date().toISOString();
-    const { data: cleaned, error: cleanErr } = await supa
-      .from("cycle_count_items")
-      .update({
-        status: "skipped",
-        note: "non-BaseBOM -- excluded by policy",
-        updated_at: nowIso,
-      })
-      .in("status", ["pending", "recount"])
-      .in("pn", ineligibleOpenPns)
-      .select("id, pn");
-    if (cleanErr) {
-      log("backlog cleanup failed (non-fatal)", cleanErr.message);
-    } else {
-      cleanedOpen = (cleaned || []).length;
-      log(`backlog cleanup: skipped ${cleanedOpen} open row(s) for ${new Set(ineligibleOpenPns).size} ineligible pn(s)`);
+    for (const [note, pnSet] of buckets.entries()) {
+      const { data: cleaned, error: cleanErr } = await supa
+        .from("cycle_count_items")
+        .update({
+          status: "skipped",
+          note,
+          updated_at: nowIso,
+        })
+        .in("status", ["pending", "recount"])
+        .in("pn", [...pnSet])
+        .select("id, pn");
+      if (cleanErr) {
+        log("backlog cleanup failed (non-fatal)", { note, message: cleanErr.message });
+        continue;
+      }
+      const n = (cleaned || []).length;
+      cleanedOpen += n;
+      cleanedByPolicy[note] = n;
     }
-  } else if (ineligibleOpenPns.length > 0 && dryRun) {
-    log(`backlog cleanup (dry): would skip ${ineligibleOpenPns.length} open row(s) for ${new Set(ineligibleOpenPns).size} ineligible pn(s)`);
+    log(`backlog cleanup: skipped ${cleanedOpen} open row(s) across ${buckets.size} policy bucket(s): ${JSON.stringify(cleanedByPolicy)}`);
+  } else if (buckets.size > 0 && dryRun) {
+    for (const [note, pnSet] of buckets.entries()) {
+      cleanedByPolicy[note] = pnSet.size;
+    }
+    log(`backlog cleanup (dry): would skip ${ineligibleOpen.length} open row(s): ${JSON.stringify(cleanedByPolicy)}`);
   }
 
   const plans = [];   // rows to insert
@@ -241,18 +354,125 @@ exports.handler = async (event) => {
     framesForced: 0,
     skippedExisting: 0,
     excludedNonBaseBom,
+    excludedVmi,
+    excludedPreLaunchSuccessor,
     excludedPhasingOut,
     backlogCleaned: cleanedOpen,
+    cleanedByPolicy,
+    // per-reason HOT tally, filled below.
+    hotReasons: {},
+  };
+  const bumpReason = (label) => {
+    summary.hotReasons[label] = (summary.hotReasons[label] || 0) + 1;
   };
 
   // ---- HOT -------------------------------------------------------
+  //
+  // v-cc-loc-2 CHAIN-AWARE HOT (fixes 3a-3d):
+  //
+  //   3a  Pre-launch successors are already dropped from partsByPn
+  //       above, so they can't reach this loop -- their zero on-hand
+  //       is expected and MUST NOT flag HOT.
+  //
+  //   3b  In the transition run-up window (today within lead_time +
+  //       30 days of the successor's cut-in), the PREDECESSOR is
+  //       forced HOT regardless of stock level -- the chain's
+  //       runway depends on the old part being accurately counted.
+  //       Reason: "transition -- chain runs on <old pn> until
+  //       <cut-in>; verify remaining stock". Overrides / wins over
+  //       the plain onHand/cover reason if the predecessor already
+  //       qualified.
+  //
+  //   3c  HANDOFF WATCH -- when the chain's combined runway (sum
+  //       of on-hand across lineage / anchor's daily) will run out
+  //       BEFORE the successor's on-order stock arrives (proxied
+  //       here as `chainRunoutDays <= leadDaysOfSuccessor` AND
+  //       successor.onPO === 0), BOTH the predecessor AND the
+  //       successor are forced HOT with reason "transition at risk
+  //       -- count both ends", regardless of the recency cap.
+  //       Loading pos costs one extra table read per run (added
+  //       above); the classifier caches per-chain evaluation via
+  //       chainHandoffAssessed so a lineage is only priced once.
+  //
+  //   3d  After cut-in (today >= transitionStartDate) but within
+  //       POST_CUTIN_VERIFY_DAYS, the successor is forced HOT with
+  //       reason "cut-in -- verify initial stock". The predecessor
+  //       reverts to normal rules (whatever HOT criteria stock
+  //       levels imply, plus rotation on Mondays).
+  //
+  // A chain's assessment is idempotent per run -- chainHandoffAssessed
+  // stores the outcome keyed by anchorPn.
+  const chainHandoffAssessed = new Map();
+  const forcedHotByPn = new Map();   // pn -> reason (from chain rules)
+  for (const [pn, p] of partsByPn.entries()) {
+    const c = p.chain;
+    if (!c || !c.transitioning) continue;
+    // 3b: transition run-up predecessor
+    if (c.role === "predecessor" && c.daysUntilStart !== null && c.daysUntilStart >= 0) {
+      const sucData = c.successor || {};
+      const leadDaysSuc = (Number(sucData.ltWeeks) || 0) * 7;
+      const window = leadDaysSuc + TRANSITION_RUNUP_EXTRA_DAYS;
+      if (c.daysUntilStart <= window) {
+        const cutInIso = c.startDate ? (c.startDate.getFullYear() + "-" + String(c.startDate.getMonth() + 1).padStart(2, "0") + "-" + String(c.startDate.getDate()).padStart(2, "0")) : "unknown";
+        forcedHotByPn.set(pn, `transition -- chain runs on ${pn} until ${cutInIso}; verify remaining stock`);
+      }
+    }
+    // 3d: post-cut-in successor
+    if (c.role === "successor" && c.postCutInSuccessor && c.daysUntilStart !== null && c.daysUntilStart >= -POST_CUTIN_VERIFY_DAYS) {
+      forcedHotByPn.set(pn, "cut-in -- verify initial stock");
+    }
+    // 3c: handoff watch -- assess once per chain (by anchor).
+    if (!chainHandoffAssessed.has(c.anchorPn)) {
+      const sucPn = c.successorPn;
+      const sucData = c.successor || {};
+      const leadDaysSuc = (Number(sucData.ltWeeks) || 0) * 7;
+      const sucOnPo = Number(onPoByPn.get(sucPn) || 0);
+      // Combined chain on-hand from raw parts data (lineage members
+      // aren't all in partsByPn -- predecessors may be Options /
+      // Service tagged), so read from allPartsData.
+      let chainOnHand = 0;
+      for (const memberPn of c.lineage) {
+        const mp = allPartsData.get(memberPn);
+        chainOnHand += Math.max(0, Number(mp && mp.onHand) || 0);
+      }
+      const anchor = allPartsData.get(c.anchorPn) || {};
+      const anchorDaily = Number(anchor.daily) || 0;
+      const chainRunoutDays = anchorDaily > 0 ? (chainOnHand / anchorDaily) : Infinity;
+      // At risk when the chain will run dry before the successor's
+      // next PO arrives. We don't have expected dates loaded, so we
+      // conservatively treat "no on-order stock" (sucOnPo === 0) as
+      // "will not arrive in time" and let the chain runway be the
+      // trigger.
+      const atRisk = (sucOnPo <= 0) && Number.isFinite(chainRunoutDays) && chainRunoutDays <= (leadDaysSuc + TRANSITION_RUNUP_EXTRA_DAYS);
+      chainHandoffAssessed.set(c.anchorPn, { atRisk, chainOnHand, chainRunoutDays, leadDaysSuc, sucOnPo, sucPn, predPn: c.predecessorPn });
+      if (atRisk) {
+        forcedHotByPn.set(c.predecessorPn, "transition at risk -- count both ends");
+        forcedHotByPn.set(c.successorPn,   "transition at risk -- count both ends");
+      }
+    }
+  }
+
   for (const [pn, p] of partsByPn.entries()) {
     if (hotTodayPns.has(pn)) { summary.skippedExisting++; continue; }
     let hot = false;
     let reason = "";
-    if (p.onHand < 0) { hot = true; reason = `negative on-hand (${p.onHand})`; }
-    else if (p.onHand <= 0) { hot = true; reason = "zero on-hand"; }
-    else if (p.daily > 0) {
+    // Chain-forced reasons win over plain stock-level reasons.
+    if (forcedHotByPn.has(pn)) {
+      hot = true;
+      reason = forcedHotByPn.get(pn);
+    } else if (p.phasingOut) {
+      // A phasing-out part without a chain-forced reason is being
+      // deliberately burned down -- don't count it just because it
+      // trips a stock-level threshold. The chain rules above
+      // handle the "still active predecessor" case.
+      continue;
+    } else if (p.onHand < 0) {
+      hot = true;
+      reason = `negative on-hand (${p.onHand})`;
+    } else if (p.onHand <= 0) {
+      hot = true;
+      reason = "zero on-hand";
+    } else if (p.daily > 0) {
       const cover = p.onHand / p.daily;
       if (cover <= HOT_COVER_DAYS) {
         hot = true;
@@ -260,6 +480,14 @@ exports.handler = async (event) => {
       }
     }
     if (!hot) continue;
+    // Categorize the reason for reporting.
+    let reasonLabel = "critical-cover";
+    if (reason.startsWith("negative")) reasonLabel = "negative-onHand";
+    else if (reason === "zero on-hand") reasonLabel = "zero-onHand";
+    else if (reason.startsWith("transition at risk")) reasonLabel = "chain-handoff-risk";
+    else if (reason.startsWith("transition --")) reasonLabel = "chain-runup-predecessor";
+    else if (reason.startsWith("cut-in --")) reasonLabel = "chain-postcutin-successor";
+    bumpReason(reasonLabel);
     plans.push({
       assigned_date: today,
       tier: "hot",
@@ -278,6 +506,7 @@ exports.handler = async (event) => {
     for (const [pn, p] of partsByPn.entries()) {
       if (runwayThisWeekPns.has(pn)) continue;
       if (hotTodayPns.has(pn)) continue;   // HOT wins the same-day battle
+      if (p.phasingOut) continue;          // burn-down parts skip RUNWAY
       if (p.daily <= 0) continue;
       const cover = p.onHand / p.daily;
       if (cover >= RUNWAY_COVER_DAYS) continue;
@@ -309,6 +538,7 @@ exports.handler = async (event) => {
       if (rotationThisWeekPns.has(pn)) continue;
       if (hotTodayPns.has(pn)) continue;
       if (runwayThisWeekPns.has(pn) || plans.some(pl => pl.pn === pn)) continue;
+      if (p.phasingOut) continue;          // burn-down parts skip ROTATION
       const lastAt = lastCountedByPn.get(pn);
       const daysSince = lastAt ? _daysBetweenIso(lastAt, today) : Infinity;
       rotationCandidates.push({ pn, daysSince, p, isFrame: FRAME_PNS.includes(pn) });
