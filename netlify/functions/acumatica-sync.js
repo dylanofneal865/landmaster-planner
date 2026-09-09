@@ -153,6 +153,79 @@ exports.handler = async (event) => {
   const entries = xml.split(/<entry[^>]*>/i).slice(1);
   log(`Found ${entries.length} <entry> elements`);
 
+  // v-cc-loc-1 -- DIAGNOSTIC ONLY, no behavioral change.
+  //
+  // Goal: answer "does the LM Planner Inventory GI already return
+  // per-location rows so cycle counts can adopt per-bin counting,
+  // or does the operator have to add Location + a per-location Qty
+  // column in Acumatica first?" Cheap enough to keep on every run.
+  //
+  // Two signals:
+  //   [LOC-DIAG] first-entry columns (N): <sorted column list>
+  //     -- every tag name inside the first <entry>. Look for a
+  //     Location / LocationID / SiteID column and a per-location
+  //     Qty column.
+  //   [LOC-DIAG] PER-LOCATION LIKELY: N pn(s) have > 1 row, ...
+  //     -- indicates the feed already returns per-location rows.
+  //     The existing dedupe.set-only-if-absent loop below would be
+  //     dropping the extras silently. Confirm the column list and
+  //     we can extend the sync + wire up cycle-count-item-locations.
+  //   [LOC-DIAG] AGGREGATE-ONLY: every pn has exactly 1 row.
+  //     -- confirms the current one-row-per-pn assumption. Per-
+  //     location cycle counting cannot ship without adding columns
+  //     to the GI in Acumatica first.
+  //
+  // Does NOT touch dedupe, upsert, tombstone, or PO sync paths.
+  if (entries.length > 0) {
+    const tagNames = new Set();
+    // Tag opener regex -- captures NAME from <NAME>, <NAME attr=..>,
+    // <NAME/>, <d:NAME>, <m:NAME>. Skips container wrappers we
+    // already know about (they aren't data columns).
+    const IGNORE_TAGS = new Set(["properties", "content", "id", "title", "updated", "author", "name", "category", "link"]);
+    const tagRe = /<(?:[a-zA-Z]+:)?([A-Za-z_][A-Za-z0-9_]*)(?:\s[^>]*)?\/?>/g;
+    let mTag;
+    const firstRaw = entries[0];
+    while ((mTag = tagRe.exec(firstRaw)) !== null) {
+      const t = mTag[1];
+      if (IGNORE_TAGS.has(t)) continue;
+      tagNames.add(t);
+    }
+    const sortedTags = [...tagNames].sort();
+    log(`[LOC-DIAG] first-entry columns (${sortedTags.length}): ${sortedTags.join(", ")}`);
+    const anyLocationTag = sortedTags.some(t => /location/i.test(t) || /^siteid$/i.test(t) || /^bin/i.test(t));
+    if (anyLocationTag) {
+      log(`[LOC-DIAG] location-like column(s) detected in first-entry tag set. Confirm with the row-count check below.`);
+    } else {
+      log(`[LOC-DIAG] NO location-like column in the first-entry tag set (nothing matching /location|siteid|bin/i).`);
+    }
+
+    // Count rows-per-pn without disturbing the dedupe below. If
+    // this is > 1 for any pn, the GI is emitting per-location rows
+    // and the current dedupe is silently discarding all but the
+    // first. Cheap: same regex the main loop uses.
+    const rowsPerPn = new Map();
+    for (const raw of entries) {
+      const { get } = makeFieldGetters(raw);
+      const pnDiag = get("InventoryID");
+      if (!pnDiag) continue;
+      rowsPerPn.set(pnDiag, (rowsPerPn.get(pnDiag) || 0) + 1);
+    }
+    let dupePns = 0;
+    let maxRows = 0;
+    let sampleDupPn = null;
+    for (const [pn, n] of rowsPerPn.entries()) {
+      if (n > 1) {
+        dupePns++;
+        if (n > maxRows) { maxRows = n; sampleDupPn = pn; }
+      }
+    }
+    if (dupePns > 0) {
+      log(`[LOC-DIAG] PER-LOCATION LIKELY: ${dupePns} pn(s) have > 1 row in the feed; max rows-per-pn=${maxRows}; sample pn=${sampleDupPn}. If a Location column is in the first-entry tag list above, the sync just needs the extension. If not, add both Location + per-location Qty to the GI in Acumatica.`);
+    } else {
+      log(`[LOC-DIAG] AGGREGATE-ONLY: every pn has exactly 1 row in the feed. Per-location cycle counting cannot ship until the LM Planner Inventory GI is extended with (a) a Location column (LocationID or SiteID) AND (b) a per-location Qty column (e.g. QtyOnHandByLocation, or a raw QtyAvailable that isn't already aggregated by warehouse).`);
+    }
+  }
+
   const dedupe = new Map();
   for (const raw of entries) {
     const { get, isNull } = makeFieldGetters(raw);
