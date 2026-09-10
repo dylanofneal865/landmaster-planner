@@ -184,62 +184,39 @@
   }
 
   async function fetchQueue() {
-    // Pull all pending + recount items assigned within the last
-    // 30 days (a stale HOT item from three weeks ago is still work).
-    const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    // v-cc-mobile-perf: today's queue only + open recounts.
+    // Prior: 30-day sweep + full location snapshot for every
+    // item + parts desc fetch -- ~4 round-trips before first
+    // paint even when the queue is short.
+    // Now: single items fetch (today OR status=recount) + a
+    // small parents/descs fetch keyed on what we actually got.
+    // Location snapshots are fetched on-demand in startCount.
+    const today = new Date().toISOString().slice(0, 10);
     const { data: items, error: e1 } = await S.supa
       .from("cycle_count_items")
       .select("id, pn, tier, reason, system_qty_at_assign, status, recount_of, note, assigned_date, counted_by")
       .in("status", ["pending", "recount"])
-      .gte("assigned_date", cutoff)
+      .or(`assigned_date.eq.${today},status.eq.recount`)
       .order("tier", { ascending: true })
       .order("assigned_date", { ascending: true });
     if (e1) throw new Error("items fetch failed: " + e1.message);
-    // Locations for those items.
-    const ids = (items || []).map(r => r.id);
-    let locs = [];
-    if (ids.length > 0) {
-      // Chunked -- Supabase URL limit.
-      for (let i = 0; i < ids.length; i += 200) {
-        const batch = ids.slice(i, i + 200);
-        const { data: chunk, error: e2 } = await S.supa
-          .from("cycle_count_item_locations")
-          .select("id, item_id, location, location_desc, system_qty_at_assign")
-          .in("item_id", batch);
-        if (e2) throw new Error("locations fetch failed: " + e2.message);
-        locs.push(...(chunk || []));
-      }
+    // Preserve any location snapshots we already cached for
+    // items still in the queue -- so an opened card doesn't
+    // re-fetch its bins on every 30s poll tick.
+    const keepIds = new Set((items || []).map(r => r.id));
+    const carriedLocs = new Map();
+    for (const [id, arr] of S.locsByItem.entries()) {
+      if (keepIds.has(id)) carriedLocs.set(id, arr);
     }
-    // Also grab any parent items referenced by recounts so we can
-    // enforce blind + prevent showing the prior count to the same
-    // counter that made it.
+    // Parents + descs in parallel (both bounded to what we
+    // actually have; both tolerate 0-length arrays).
     const parentIds = [...new Set((items || []).map(r => r.recount_of).filter(Boolean))];
-    const parents = [];
-    if (parentIds.length > 0) {
-      const { data: pchunk } = await S.supa
-        .from("cycle_count_items")
-        .select("id, counted_by, counted_qty")
-        .in("id", parentIds);
-      if (pchunk) parents.push(...pchunk);
-    }
-    // Also pull part descriptions + class for the queue's display
-    // (dedup pns; parts is small enough to scan by pn IN list).
-    const partPns = [...new Set((items || []).map(r => r.pn))];
-    const descByPn = new Map();
-    if (partPns.length > 0) {
-      for (let i = 0; i < partPns.length; i += 200) {
-        const batch = partPns.slice(i, i + 200);
-        const { data: pchunk, error: pe } = await S.supa
-          .from("parts")
-          .select("pn, data")
-          .in("pn", batch);
-        if (!pe && pchunk) {
-          for (const p of pchunk) descByPn.set(p.pn, { desc: (p.data && p.data.desc) || "", cls: (p.data && p.data.partClass) || "" });
-        }
-      }
-    }
+    const partPns   = [...new Set((items || []).map(r => r.pn))];
+    const [parents, descByPn] = await Promise.all([
+      _fetchParentsMinimal(parentIds),
+      _fetchPartMetaMinimal(partPns),
+    ]);
 
-    // Enrich items with desc + class + parent counter info.
     const parentByChildId = new Map();
     for (const it of (items || [])) {
       const d = descByPn.get(it.pn) || {};
@@ -250,21 +227,50 @@
         if (p) parentByChildId.set(it.id, p);
       }
     }
-    // Group locations.
-    const locsByItem = new Map();
-    for (const l of locs) {
-      let arr = locsByItem.get(l.item_id);
-      if (!arr) { arr = []; locsByItem.set(l.item_id, arr); }
-      arr.push(l);
-    }
-    for (const arr of locsByItem.values()) {
-      arr.sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0));
-    }
 
     S.items = items || [];
-    S.locsByItem = locsByItem;
+    S.locsByItem = carriedLocs;   // lazy-populated on startCount
     S.parentByChildId = parentByChildId;
     rebuildVisibleQueue();
+  }
+  async function _fetchParentsMinimal(parentIds) {
+    if (!parentIds || parentIds.length === 0) return [];
+    const out = [];
+    for (let i = 0; i < parentIds.length; i += 200) {
+      const batch = parentIds.slice(i, i + 200);
+      const { data } = await S.supa
+        .from("cycle_count_items")
+        .select("id, counted_by, counted_qty")
+        .in("id", batch);
+      if (data) out.push(...data);
+    }
+    return out;
+  }
+  async function _fetchPartMetaMinimal(partPns) {
+    const m = new Map();
+    if (!partPns || partPns.length === 0) return m;
+    for (let i = 0; i < partPns.length; i += 200) {
+      const batch = partPns.slice(i, i + 200);
+      const { data } = await S.supa
+        .from("parts")
+        .select("pn, data")
+        .in("pn", batch);
+      if (data) {
+        for (const p of data) m.set(p.pn, { desc: (p.data && p.data.desc) || "", cls: (p.data && p.data.partClass) || "" });
+      }
+    }
+    return m;
+  }
+  async function _ensureLocationsFor(itemId) {
+    if (S.locsByItem.has(itemId)) return S.locsByItem.get(itemId);
+    const { data, error } = await S.supa
+      .from("cycle_count_item_locations")
+      .select("id, item_id, location, location_desc, system_qty_at_assign")
+      .eq("item_id", itemId);
+    if (error) { console.warn("[cc-mobile] locations fetch failed:", error.message); return []; }
+    const arr = (data || []).slice().sort((a, b) => (a.location < b.location ? -1 : a.location > b.location ? 1 : 0));
+    S.locsByItem.set(itemId, arr);
+    return arr;
   }
 
   function rebuildVisibleQueue() {
@@ -448,19 +454,23 @@
   // ---------------------------------------------------------------
   // COUNT SCREEN
   // ---------------------------------------------------------------
-  function startCount(itemId) {
+  async function startCount(itemId) {
     const item = S.items.find(i => i.id === itemId);
     if (!item) return;
     S.activeItemId = itemId;
     S.binIdx = 0;
     S.extraBins = [];
-    const locs = (S.locsByItem.get(itemId) || []).map(l => ({
+    // Lazy per-card fetch -- initial queue load skips bins so
+    // Home paints instantly; we fetch this card's bins the
+    // moment the counter taps in.
+    const rows = await _ensureLocationsFor(itemId);
+    if (S.activeItemId !== itemId) return;  // user backed out
+    S.binValues = rows.map(l => ({
       location: l.location,
       location_desc: l.location_desc || "",
       system: Number(l.system_qty_at_assign) || 0,
       entered: "",
     }));
-    S.binValues = locs;
     renderCountScreen();
   }
   function renderCountScreen() {
@@ -670,7 +680,7 @@
   // ---------------------------------------------------------------
   // SUBMIT
   // ---------------------------------------------------------------
-  async function submitSingle(item, counted) {
+  function submitSingle(item, counted) {
     if (item.recount_of) {
       const parent = S.parentByChildId.get(item.id);
       if (parent && parent.counted_by && String(parent.counted_by).trim().toLowerCase() === S.name.trim().toLowerCase()) {
@@ -678,16 +688,10 @@
         return;
       }
     }
-    const op = {
-      op: "submitCount",
-      itemId: item.id,
-      counted_qty: counted,
-      counted_by: S.name,
-    };
-    const res = await postWrite([op]);
-    handleSubmitResult(item, item.system_qty_at_assign, counted, res, op);
+    const op = { op: "submitCount", itemId: item.id, counted_qty: counted, counted_by: S.name };
+    _optimisticSubmit(item, item.system_qty_at_assign, counted, op);
   }
-  async function submitMulti(item) {
+  function submitMulti(item) {
     const all = S.binValues.concat(S.extraBins.map(e => ({ ...e, isExtra: true })));
     const sum = all.reduce((s, b) => s + Math.max(0, Math.round(Number(b.entered) || 0)), 0);
     const locations = all.map(b => {
@@ -702,41 +706,29 @@
         return;
       }
     }
-    const op = {
-      op: "submitCount",
-      itemId: item.id,
-      counted_qty: sum,
-      counted_by: S.name,
-      locations,
-    };
-    const res = await postWrite([op]);
-    handleSubmitResult(item, item.system_qty_at_assign, sum, res, op);
+    const op = { op: "submitCount", itemId: item.id, counted_qty: sum, counted_by: S.name, locations };
+    _optimisticSubmit(item, item.system_qty_at_assign, sum, op);
   }
-  function handleSubmitResult(item, sys, counted, res, op) {
-    if (!res || !res.ok) {
-      // Retry queue -- keep the entered values visible; user can
-      // tap SUBMIT again once online. We ALSO queue the op so if
-      // they close the tab it'll retry on the next load.
-      queueForRetry(op);
-      flash("Save failed -- queued for retry", 3500);
-      return;
-    }
-    const r = (res.results && res.results[0]) || {};
-    if (r.ok === false) {
-      flash("Rejected: " + (r.error || "unknown"), 4500);
-      return;
-    }
+  function _optimisticSubmit(item, sys, counted, op) {
+    // v-cc-mobile-perf: advance the queue the instant the
+    // counter taps SUBMIT. We infer match/off locally (server
+    // uses the same tolerance rule). If the server later
+    // decides RECOUNT (only when off), the recount item will
+    // reappear in the next fetch for a different counter --
+    // no worse than pre-optimistic behavior.
     S.countedThisShift.add(item.id);
-    // Result screen.
+    _showResultScreen(item, sys, counted);
+    // Fire-and-forget: retry queue handles any failure.
+    postWrite([op]).then(res => {
+      if (!res || !res.ok) { queueForRetry(op); flash("Save queued for retry", 2500); return; }
+      const r = (res.results && res.results[0]) || {};
+      if (r.ok === false) { flash("Rejected: " + (r.error || "unknown"), 4500); }
+    }).catch(() => { queueForRetry(op); flash("Save queued for retry", 2500); });
+  }
+  function _showResultScreen(item, sys, counted) {
     const rs = $("result-screen");
     rs.classList.remove("match", "off", "recount");
-    if (r.status === "recount") {
-      rs.classList.add("recount");
-      $("result-icon").textContent = "🔁";
-      $("result-headline").textContent = "Recount needed";
-      $("result-sub").textContent = `Off by ${Math.abs(counted - sys)}. Another counter will verify.`;
-      $("result-hint").textContent = "logged. moving on...";
-    } else if (inTol(sys, counted)) {
+    if (inTol(sys, counted)) {
       rs.classList.add("match");
       $("result-icon").textContent = "✅";
       $("result-headline").textContent = "Matches";
@@ -753,11 +745,10 @@
     setTimeout(() => {
       rs.classList.remove("on");
       rebuildVisibleQueue();
-      // Ensure home shows next.
       renderHome();
-      // Fetch again in the background so recount rows / new
-      // assignments land without a manual refresh.
-      refresh().catch(() => {});
+      // No inline refresh() here -- the 30s poll (and the
+      // visibilitychange refetch on tab wake) keep the queue
+      // fresh. One fetch per screen transition, not per tick.
     }, RESULT_ADVANCE_MS);
   }
 
@@ -806,6 +797,7 @@
   }
 
   async function boot() {
+    try { console.time("cc-mobile-boot"); } catch (_) {}
     // Load per-session "later" set.
     try { const later = JSON.parse(localStorage.getItem(LS_LATER) || "[]"); S.laterIds = new Set(later); } catch (_) {}
     loadRetryQueue();
@@ -835,11 +827,13 @@
 
     if (!nameOk) {
       // Wait for name input; queue will render after save.
+      try { console.timeEnd("cc-mobile-boot"); } catch (_) {}
       return;
     }
     try { await refresh(); }
     catch (err) { showError(err.message); return; }
     startPoll();
+    try { console.timeEnd("cc-mobile-boot"); } catch (_) {}
     // Re-drain retry queue on visibility change (came back from lock).
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {

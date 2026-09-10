@@ -807,16 +807,41 @@ function _ccVarianceCell(item) {
   return `<td class="right num ${cls}">${sign}${v} <span class="dim tiny">(${(pct*100).toFixed(1)}%)</span></td>`;
 }
 
-function _ccPartClass(pn) {
-  if (typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) return "";
-  const p = DB.parts.find(x => x && x.pn === pn);
-  return (p && p.partClass) || "";
+// v-cc-live-perf -- session-lifetime parts cache. Previously every
+// call to _ccPartClass / _ccPartDesc / _ccDollarImpactFor / etc
+// did a linear DB.parts.find scan (O(1600) per call, called N
+// times per render). Now one build per session, invalidated only
+// if the caller explicitly asks (_ccInvalidatePartsCache).
+function _ccPartsCache() {
+  if (CC_STATE._partsCache instanceof Map) return CC_STATE._partsCache;
+  const m = new Map();
+  if (typeof DB !== "undefined" && DB && Array.isArray(DB.parts)) {
+    for (const p of DB.parts) {
+      if (!p || !p.pn) continue;
+      m.set(p.pn, {
+        desc: p.desc || "",
+        cost: Number(p.cost) || 0,
+        cls:  p.partClass || "",
+      });
+    }
+  }
+  CC_STATE._partsCache = m;
+  return m;
 }
+function _ccInvalidatePartsCache() { CC_STATE._partsCache = null; }
+if (typeof window !== "undefined") window._ccInvalidatePartsCache = _ccInvalidatePartsCache;
 
+function _ccPartClass(pn) {
+  const rec = _ccPartsCache().get(pn);
+  return rec ? rec.cls : "";
+}
 function _ccPartDesc(pn) {
-  if (typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) return "";
-  const p = DB.parts.find(x => x && x.pn === pn);
-  return (p && p.desc) || "";
+  const rec = _ccPartsCache().get(pn);
+  return rec ? rec.desc : "";
+}
+function _ccPartCost(pn) {
+  const rec = _ccPartsCache().get(pn);
+  return rec ? rec.cost : 0;
 }
 
 function _ccRenderItemRow(item, opts) {
@@ -1102,9 +1127,7 @@ function _ccLogRowIsAttention(row) {
 function _ccDollarImpactFor(row) {
   const pn = row && row.pn;
   const v = (typeof row.variance === "number") ? row.variance : ((Number(row.counted_qty) || 0) - (Number(row.system_qty_at_assign) || 0));
-  if (typeof DB === "undefined" || !DB || !Array.isArray(DB.parts)) return { units: v, dollars: null, cost: null };
-  const p = DB.parts.find(x => x && x.pn === pn);
-  const cost = p ? (Number(p.cost) || 0) : 0;
+  const cost = _ccPartCost(pn);
   return { units: v, dollars: cost * Math.abs(v), cost };
 }
 function _ccItemHasPendingRecount(parentItemId) {
@@ -1185,99 +1208,86 @@ function _ccBinBreakdownRow(row) {
   `;
 }
 
+// v-cc-live-perf -- factored out of _ccRenderLiveFeed so
+// _ccPatchAfterDelta can prepend one row without re-rendering
+// the entire feed. Returns a bare `<tr>` (+ optional breakdown
+// row) HTML string for one log row.
+function _ccRenderFeedTr(r, lastSeen) {
+  const at = r.counted_at || "";
+  const isNew = at && lastSeen && at > lastSeen;
+  const v = (typeof r.variance === "number") ? r.variance : 0;
+  const sys = Math.abs(Number(r.system_qty_at_assign) || 0);
+  const pct = sys < 1e-9 ? (r.counted_qty === 0 ? 0 : 1) : Math.abs(v) / sys;
+  const beyond = (typeof r.counted_qty === "number") ? _ccBeyondTolerance(r.system_qty_at_assign, r.counted_qty) : false;
+  const vCls = beyond ? "text-warn bold" : (v === 0 ? "dim" : "");
+  const statusLabel = r.reviewed_by ? "verified"
+                    : r.outcome === "recount" ? "recount"
+                    : r.outcome === "reconciled" ? "ok"
+                    : r.outcome === "skipped" ? "skipped"
+                    : "counted";
+  const statusCls = statusLabel === "verified" ? "ok"
+                  : statusLabel === "recount" ? "warn"
+                  : statusLabel === "ok" ? "ok"
+                  : statusLabel === "skipped" ? "muted"
+                  : "";
+  const desc = _ccPartDesc(r.pn);
+  const hasBins = Array.isArray(r.locations) && r.locations.length > 0;
+  const expanded = CC_STATE._feedExpanded.has(r.id);
+  const isSkipRow = r.outcome === "skipped";
+  let sendBtn = "";
+  if (r.item_id) {
+    if (isSkipRow) {
+      const cur = (DB.cycleCounts.items instanceof Map) ? DB.cycleCounts.items.get(r.item_id) : null;
+      const curStatus = cur ? cur.status : null;
+      if (curStatus === "skipped") {
+        sendBtn = `<button class="btn xs" title="Reassign this skipped item as pending -- prompts for an optional note that shows on the counter's phone card. No blind rule; any counter can pick it up." onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this, { fromSkip: true })">Send back out</button>`;
+      } else if (curStatus === "pending" || curStatus === "recount") {
+        sendBtn = `<button class="btn xs" disabled title="Skip already reassigned and waiting for a counter">reassigned</button>`;
+      } else {
+        sendBtn = `<button class="btn xs ghost" disabled title="Item has been handled since the skip">handled</button>`;
+      }
+    } else {
+      const rs = _ccItemRecountStatus(r.item_id);
+      if (rs === "none") {
+        sendBtn = `<button class="btn xs" title="Spawn a recount for a different counter -- prompts for an optional note that shows on their phone card" onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this)">Send back out</button>`;
+      } else if (rs === "pending") {
+        sendBtn = `<button class="btn xs" disabled title="A recount is already open for this item">recount pending</button>`;
+      } else {
+        sendBtn = `<button class="btn xs ghost" disabled title="This item has already been recounted">recounted &#10003;</button>`;
+      }
+    }
+  }
+  const skipReasonInline = isSkipRow
+    ? `<span class="dim tiny">skipped: ${esc(r.note || r.reason || "no reason given")}</span>`
+    : "";
+  const trHtml = `
+    <tr data-log-id="${esc(r.id)}" class="${isNew ? "cc-new-flash" : ""}${isSkipRow ? " cc-skip-row" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
+      <td class="dim tiny mono">${esc((at || "").slice(11, 16))}</td>
+      <td>${esc(r.counted_by || "-")}</td>
+      <td>
+        <span class="mono">${esc(r.pn)}</span>${hasBins ? ` <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"} ${r.locations.length} bin${r.locations.length === 1 ? "" : "s"}</span>` : ""}
+        <div class="dim tiny">${esc(desc)}</div>
+        ${skipReasonInline}
+      </td>
+      <td class="right num">${r.system_qty_at_assign == null ? "-" : Math.round(r.system_qty_at_assign)}</td>
+      <td class="right num">${isSkipRow ? '<span class="dim">-</span>' : (r.counted_qty == null ? "-" : Math.round(r.counted_qty))}</td>
+      <td class="right num ${vCls}">${isSkipRow ? '<span class="dim">-</span>' : `${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span>`}</td>
+      <td><span class="pill tiny ${statusCls}">${(statusLabel === "ok" ? "reconciled" : statusLabel).toUpperCase()}</span>${r.reviewed_by ? `<div class="dim tiny">by ${esc(r.reviewed_by)}</div>` : ""}</td>
+      <td class="right" style="white-space:nowrap">${sendBtn}</td>
+    </tr>`;
+  const breakdown = (hasBins && expanded)
+    ? `<tr data-log-id="${esc(r.id)}-bd" class="cc-breakdown-row"><td colspan="8" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(r)}</td></tr>`
+    : "";
+  return trHtml + breakdown;
+}
+
 function _ccRenderLiveFeed() {
   const rows = _ccRecentLogRows(60);
   if (rows.length === 0) {
     return `<div class="empty" style="padding:16px"><div class="empty-title muted">No counts logged yet. New submissions appear here as they arrive.</div></div>`;
   }
   const lastSeen = CC_STATE._lastSeenLogAt || "";
-  const body = rows.map(r => {
-    const at = r.counted_at || "";
-    const isNew = at && at > lastSeen;
-    const v = (typeof r.variance === "number") ? r.variance : 0;
-    const sys = Math.abs(Number(r.system_qty_at_assign) || 0);
-    const pct = sys < 1e-9 ? (r.counted_qty === 0 ? 0 : 1) : Math.abs(v) / sys;
-    const beyond = (typeof r.counted_qty === "number") ? _ccBeyondTolerance(r.system_qty_at_assign, r.counted_qty) : false;
-    const vCls = beyond ? "text-warn bold" : (v === 0 ? "dim" : "");
-    const statusLabel = r.reviewed_by ? "verified"
-                     : r.outcome === "recount" ? "recount"
-                     : r.outcome === "reconciled" ? "reconciled"
-                     : r.outcome === "skipped" ? "skipped"
-                     : "counted";
-    const statusCls = statusLabel === "verified" ? "ok"
-                   : statusLabel === "recount" ? "warn"
-                   : statusLabel === "reconciled" ? "ok"
-                   : statusLabel === "skipped" ? "muted"
-                   : "";
-    const desc = _ccPartDesc(r.pn);
-    const hasBins = Array.isArray(r.locations) && r.locations.length > 0;
-    const expanded = CC_STATE._feedExpanded.has(r.id);
-    const isSkipRow = r.outcome === "skipped";
-    // v-cc-loc-9 -- send-back-out button state per row type.
-    //   COUNT / RECOUNT rows (outcome=counted|recount|reconciled):
-    //     "none"   -> "Send back out"   (routes requestRecount)
-    //     "pending"-> "recount pending" (child recount open)
-    //     "counted"-> "recounted &#10003;"
-    //   SKIP rows (outcome=skipped):
-    //     item still status=skipped         -> "Send back out"
-    //                                          (routes reassignFromSkip)
-    //     item now pending (reassigned)     -> "reassigned"
-    //     item completed after reassignment -> "handled"
-    let sendBtn = "";
-    if (r.item_id) {
-      if (isSkipRow) {
-        // Read the parent item's CURRENT status; a skip that was
-        // later reassigned via reassignFromSkip is now "pending"
-        // (or a downstream state).
-        const cur = (DB.cycleCounts.items instanceof Map)
-          ? DB.cycleCounts.items.get(r.item_id)
-          : null;
-        const curStatus = cur ? cur.status : null;
-        if (curStatus === "skipped") {
-          sendBtn = `<button class="btn xs" title="Reassign this skipped item as pending -- prompts for an optional note that shows on the counter's phone card. No blind rule; any counter can pick it up." onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this, { fromSkip: true })">Send back out</button>`;
-        } else if (curStatus === "pending" || curStatus === "recount") {
-          sendBtn = `<button class="btn xs" disabled title="Skip already reassigned and waiting for a counter">reassigned</button>`;
-        } else {
-          sendBtn = `<button class="btn xs ghost" disabled title="Item has been handled since the skip">handled</button>`;
-        }
-      } else {
-        const rs = _ccItemRecountStatus(r.item_id);
-        if (rs === "none") {
-          sendBtn = `<button class="btn xs" title="Spawn a recount for a different counter -- prompts for an optional note that shows on their phone card" onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this)">Send back out</button>`;
-        } else if (rs === "pending") {
-          sendBtn = `<button class="btn xs" disabled title="A recount is already open for this item">recount pending</button>`;
-        } else {
-          sendBtn = `<button class="btn xs ghost" disabled title="This item has already been recounted">recounted &#10003;</button>`;
-        }
-      }
-    }
-    // v-cc-loc-9 -- the counted/counted-qty/variance columns don't
-    // apply to a skip. Replace with the skip reason inline (from
-    // log.note or item.reason). The skipper's name comes through
-    // r.counted_by (populated by the write function post-v-cc-loc-9).
-    const skipReasonInline = isSkipRow
-      ? `<span class="dim tiny">skipped: ${esc(r.note || r.reason || "no reason given")}</span>`
-      : "";
-    const rowHtml = `
-      <tr class="${isNew ? "cc-new-flash" : ""}${isSkipRow ? " cc-skip-row" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
-        <td class="dim tiny mono">${esc((at || "").slice(11, 16))}</td>
-        <td>${esc(r.counted_by || "-")}</td>
-        <td>
-          <span class="mono">${esc(r.pn)}</span>${hasBins ? ` <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"} ${r.locations.length} bin${r.locations.length === 1 ? "" : "s"}</span>` : ""}
-          <div class="dim tiny">${esc(desc)}</div>
-          ${skipReasonInline}
-        </td>
-        <td class="right num">${r.system_qty_at_assign == null ? "-" : Math.round(r.system_qty_at_assign)}</td>
-        <td class="right num">${isSkipRow ? '<span class="dim">-</span>' : (r.counted_qty == null ? "-" : Math.round(r.counted_qty))}</td>
-        <td class="right num ${vCls}">${isSkipRow ? '<span class="dim">-</span>' : `${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span>`}</td>
-        <td><span class="pill tiny ${statusCls}">${statusLabel.toUpperCase()}</span>${r.reviewed_by ? `<div class="dim tiny">by ${esc(r.reviewed_by)}</div>` : ""}</td>
-        <td class="right" style="white-space:nowrap">${sendBtn}</td>
-      </tr>`;
-    const breakdown = (hasBins && expanded)
-      ? `<tr class="cc-breakdown-row"><td colspan="8" style="background:var(--surf-2,#f5f5f7);padding:0">${_ccBinBreakdownRow(r)}</td></tr>`
-      : "";
-    return rowHtml + breakdown;
-  }).join("");
+  const body = rows.map(r => _ccRenderFeedTr(r, lastSeen)).join("");
   return `
     <div class="tbl-wrap">
       <table class="tbl cc-feed-table">
@@ -1286,7 +1296,7 @@ function _ccRenderLiveFeed() {
           <th class="right">SYS ON-HAND</th><th class="right">Counted</th><th class="right">Variance</th>
           <th>Status</th><th></th>
         </tr></thead>
-        <tbody>${body}</tbody>
+        <tbody id="cc-feed-tbody">${body}</tbody>
       </table>
     </div>
   `;
@@ -1431,13 +1441,160 @@ function _ccRenderOpenQueueBody() {
   `;
 }
 
-/* ---- realtime hookup + poll fallback --------------------- */
+/* ---- v-cc-live-perf: DELTA FETCH + DOM PATCH -------------
+   Realtime event / poll tick used to call _refetchCycleCounts
+   (three full-table fetches) + refresh() (full-page navigate
+   with scrollTop reset). For a supervisor watching the tab in
+   the background, that was 3 round-trips + ~200ms of DOM
+   thrash per event.
+
+   New path:
+     * _ccFetchLogDelta(sinceIso)      -- only rows newer than
+       the watermark, or a bounded refresh limit on first load.
+     * _ccFetchItemsDelta(sinceIso)    -- only items with
+       updated_at > watermark.
+     * _ccMergeLog / _ccMergeItems     -- in-place merge into
+       DB.cycleCounts.log / items, advancing the watermarks.
+     * _ccApplyDelta                    -- targeted DOM patch:
+       new log rows prepend into #cc-feed-tbody, existing rows
+       replaced in place when they update (verifyLog etc), and
+       the summary + needs-attention + open-queue-summary
+       blocks re-render their inner HTML only.
+     * refresh() ONLY runs on user actions (chime toggle,
+       expand queue, name input, etc), never on realtime.
+   ----------------------------------------------------------- */
+function _ccFetchLogDelta(sinceIso, limit) {
+  if (typeof _supa === "undefined" || !_supa) return Promise.resolve([]);
+  let q = _supa
+    .from("cycle_count_log")
+    .select("id, item_id, pn, assigned_date, counted_at, counted_by, tier, reason, system_qty_at_assign, counted_qty, variance, variance_pct, outcome, note, recount_of, reviewed_by, reviewed_at, locations")
+    .order("counted_at", { ascending: false });
+  if (sinceIso) q = q.gt("counted_at", sinceIso);
+  if (limit) q = q.limit(limit);
+  return q.then(({ data, error }) => {
+    if (error) { console.warn("[cc-delta] log fetch failed:", error.message); return []; }
+    return data || [];
+  });
+}
+function _ccFetchItemsDelta(sinceIso) {
+  if (typeof _supa === "undefined" || !_supa) return Promise.resolve([]);
+  let q = _supa
+    .from("cycle_count_items")
+    .select("id, assigned_date, tier, reason, pn, system_qty_at_assign, counted_qty, counted_by, counted_at, variance, status, recount_of, note, created_at, updated_at");
+  if (sinceIso) q = q.gt("updated_at", sinceIso);
+  return q.then(({ data, error }) => {
+    if (error) { console.warn("[cc-delta] items fetch failed:", error.message); return []; }
+    return data || [];
+  });
+}
+function _ccMergeLogRows(rows) {
+  if (!(DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log))) return { added: [], updated: [] };
+  const existing = DB.cycleCounts.log;
+  const byId = new Map(existing.map(r => [r.id, r]));
+  const added = [];
+  const updated = [];
+  for (const r of rows) {
+    if (!r || !r.id) continue;
+    if (byId.has(r.id)) {
+      Object.assign(byId.get(r.id), r);
+      updated.push(r.id);
+    } else {
+      byId.set(r.id, r);
+      added.push(r);
+    }
+    if (r.counted_at && (!CC_STATE._logWatermark || r.counted_at > CC_STATE._logWatermark)) {
+      CC_STATE._logWatermark = r.counted_at;
+    }
+  }
+  if (added.length > 0) {
+    // Rebuild in newest-first order (cheap: log is capped at
+    // ~1 year in the initial fetch).
+    existing.length = 0;
+    for (const r of byId.values()) existing.push(r);
+    existing.sort((a, b) => String(b.counted_at || "").localeCompare(String(a.counted_at || "")));
+  }
+  return { added, updated };
+}
+function _ccMergeItemRows(rows) {
+  if (!(DB && DB.cycleCounts && DB.cycleCounts.items instanceof Map)) return { touched: [] };
+  const items = DB.cycleCounts.items;
+  const touched = [];
+  for (const r of rows) {
+    if (!r || !r.id) continue;
+    items.set(r.id, {
+      id: r.id, assigned_date: r.assigned_date, tier: r.tier, reason: r.reason, pn: r.pn,
+      system_qty_at_assign: Number(r.system_qty_at_assign) || 0,
+      counted_qty: r.counted_qty == null ? null : Number(r.counted_qty),
+      counted_by: r.counted_by || null, counted_at: r.counted_at || null,
+      variance: r.variance == null ? null : Number(r.variance),
+      status: r.status, recount_of: r.recount_of || null, note: r.note || null,
+      created_at: r.created_at || null, updated_at: r.updated_at || null,
+    });
+    touched.push(r.id);
+    if (r.updated_at && (!CC_STATE._itemsWatermark || r.updated_at > CC_STATE._itemsWatermark)) {
+      CC_STATE._itemsWatermark = r.updated_at;
+    }
+  }
+  return { touched };
+}
+function _ccApplyDelta({ addedLog, updatedLog, touchedItems }) {
+  const feedTbody = document.getElementById("cc-feed-tbody");
+  if (feedTbody) {
+    // Prepend new rows.
+    if (addedLog && addedLog.length > 0) {
+      const lastSeen = CC_STATE._lastSeenLogAt || "";
+      const html = addedLog.map(r => _ccRenderFeedTr(r, lastSeen)).join("");
+      feedTbody.insertAdjacentHTML("afterbegin", html);
+      // Trim to 60 <tr>s (main + breakdown counted separately;
+      // breakdowns come next to their main row so we cap the
+      // count and let the browser reflow).
+      while (feedTbody.querySelectorAll("tr:not(.cc-breakdown-row)").length > 60) {
+        feedTbody.deleteRow(feedTbody.rows.length - 1);
+      }
+    }
+    // Replace updated rows in place (verifyLog stamps
+    // reviewed_by / reviewed_at, changing the status pill).
+    if (updatedLog && updatedLog.length > 0) {
+      const lastSeen = CC_STATE._lastSeenLogAt || "";
+      for (const id of updatedLog) {
+        const oldTr = feedTbody.querySelector(`tr[data-log-id="${id}"]`);
+        if (!oldTr) continue;
+        const row = DB.cycleCounts.log.find(r => r.id === id);
+        if (!row) continue;
+        const holder = document.createElement("tbody");
+        holder.innerHTML = _ccRenderFeedTr(row, lastSeen);
+        const newTr = holder.querySelector(`tr[data-log-id="${id}"]`);
+        if (newTr) oldTr.replaceWith(newTr);
+        // Also refresh optional breakdown row.
+        const oldBd = feedTbody.querySelector(`tr[data-log-id="${id}-bd"]`);
+        if (oldBd) oldBd.remove();
+        const newBd = holder.querySelector(`tr[data-log-id="${id}-bd"]`);
+        if (newBd) newTr.after(newBd);
+      }
+    }
+  }
+  // Items changed OR log added -> refresh Needs Attention + Open
+  // Queue summary + Summary strip inner HTML. Cheap: each is a
+  // single innerHTML swap on a small chunk of DOM.
+  if ((touchedItems && touchedItems.length > 0) || (addedLog && addedLog.length > 0)) {
+    const attn = document.getElementById("cc-attn-block");
+    if (attn) attn.innerHTML = _ccRenderNeedsAttention();
+    const oqSum = document.getElementById("cc-open-queue-summary-text");
+    if (oqSum) oqSum.textContent = _ccOpenQueueSummary();
+    const sum = document.getElementById("cc-summary-strip");
+    if (sum) sum.innerHTML = _ccRenderTightSummary(_ccSummary());
+    // If open queue is expanded, re-render its body too.
+    if (CC_STATE._openQueueExpanded) {
+      const oqBody = document.getElementById("cc-open-queue-body");
+      if (oqBody) oqBody.innerHTML = _ccRenderOpenQueueBody();
+    }
+  }
+}
+
 function _ccOnLiveEvent(source) {
-  // Realtime event OR poll -- refetch + rerender if we're on
-  // this route. If the source is a state ping only, don't refetch.
+  // State pings update just the pulse dot -- no fetch, no
+  // re-render.
   if (source === "state") {
-    // Only update the pulse dot -- avoid a full re-render on every
-    // heartbeat. The dot ID is stable so target it directly.
     const dot = document.querySelector(".cc-pulse-dot");
     if (dot) {
       const state = (typeof ccLiveState === "function") ? ccLiveState() : "connecting";
@@ -1445,25 +1602,34 @@ function _ccOnLiveEvent(source) {
     }
     return;
   }
-  if (typeof _refetchCycleCounts !== "function") return;
-  _refetchCycleCounts().then(() => {
-    if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE !== "cycle-counts") return;
-    // Detect any new attention row we haven't chimed for.
-    const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
-    const lastSeen = CC_STATE._lastSeenLogAt || "";
-    const newest = log[0] && log[0].counted_at;
-    if (newest && newest > lastSeen) {
+  // Only act on the supervisor tab (other routes ignore).
+  if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE !== "cycle-counts") return;
+  // Delta fetch both tables in parallel using the watermarks
+  // populated by the last render / delta pass. Backstop the log
+  // fetch with a 60-row limit so a first-ever call still lands
+  // (no watermark yet -> falls back to the last 60 rows).
+  const logSince = CC_STATE._logWatermark || null;
+  const itemsSince = CC_STATE._itemsWatermark || null;
+  const logP = _ccFetchLogDelta(logSince, logSince ? null : 60);
+  const itemsP = itemsSince ? _ccFetchItemsDelta(itemsSince) : Promise.resolve([]);
+  Promise.all([logP, itemsP]).then(([logRows, itemRows]) => {
+    const { added, updated } = _ccMergeLogRows(logRows);
+    const { touched } = _ccMergeItemRows(itemRows);
+    if (added.length === 0 && updated.length === 0 && touched.length === 0) return;
+    // Chime + advance last-seen only on genuinely new counts (not
+    // status-only updates).
+    if (added.length > 0) {
       _ccPlayChime();
+      const newest = added[0] && added[0].counted_at;
+      if (newest) _ccPersistLastSeen(newest);
     }
-    if (typeof refresh === "function") refresh();
-  }).catch(() => {});
+    _ccApplyDelta({ addedLog: added, updatedLog: updated, touchedItems: touched });
+  }).catch(err => { console.warn("[cc-delta] apply failed:", err && err.message); });
 }
 function _ccEnsureLiveWiring() {
   if (CC_STATE._liveSubscribed) return;
   CC_STATE._liveSubscribed = true;
-  if (typeof ccLiveSubscribe === "function") {
-    ccLiveSubscribe(_ccOnLiveEvent);
-  }
+  if (typeof ccLiveSubscribe === "function") ccLiveSubscribe(_ccOnLiveEvent);
   // 60s poll fallback -- runs regardless of realtime state so a
   // silently-dropped socket still sees new counts within a minute.
   if (CC_STATE._pollTimer) clearInterval(CC_STATE._pollTimer);
@@ -1473,14 +1639,39 @@ function _ccEnsureLiveWiring() {
 function renderCycleCounts() {
   const main = document.getElementById("main");
   if (!main) return;
+  try { console.time("cc-supervisor-render"); } catch (_) {}
   _ccInitLocalState();
   _ccEnsureLiveWiring();
   if (!(DB && DB.cycleCounts) || !DB.cycleCounts.loaded) {
-    main.innerHTML = `<div class="page" data-page="cycle-counts"><div class="empty"><div class="empty-title muted">Loading cycle counts...</div></div></div>`;
+    // Skeleton first paint -- shell + section headers so the
+    // layout doesn't jump when data lands.
+    main.innerHTML = `
+      <div class="page" data-page="cycle-counts">
+        <div class="page-hd"><div><h1>Cycle Counts</h1><p class="muted">Loading counts...</p></div></div>
+        <div id="cc-summary-strip"><div class="empty tiny muted">Summary loading...</div></div>
+        <div class="dr-section" style="margin-top:16px">Needs attention</div>
+        <div id="cc-attn-block"><div class="empty tiny muted">Loading...</div></div>
+        <div class="dr-section" style="margin-top:20px">Counts as they come in</div>
+        <div class="empty tiny muted">Loading live feed...</div>
+      </div>`;
     if (typeof _refetchCycleCounts === "function") {
       _refetchCycleCounts().then(() => { if (CURRENT_ROUTE === "cycle-counts") refresh(); }).catch(() => {});
     }
+    try { console.timeEnd("cc-supervisor-render"); } catch (_) {}
     return;
+  }
+  // Seed watermarks from what we already have so the FIRST
+  // realtime tick fetches only genuinely new rows, not the
+  // whole table.
+  if (!CC_STATE._logWatermark && Array.isArray(DB.cycleCounts.log) && DB.cycleCounts.log[0]) {
+    CC_STATE._logWatermark = DB.cycleCounts.log[0].counted_at || null;
+  }
+  if (!CC_STATE._itemsWatermark && DB.cycleCounts.items instanceof Map) {
+    let maxU = null;
+    for (const it of DB.cycleCounts.items.values()) {
+      if (it && it.updated_at && (!maxU || it.updated_at > maxU)) maxU = it.updated_at;
+    }
+    CC_STATE._itemsWatermark = maxU;
   }
   const s = _ccSummary();
   const name = _ccName();
@@ -1514,22 +1705,22 @@ function renderCycleCounts() {
         </div>
       </div>
 
-      ${_ccRenderTightSummary(s)}
+      <div id="cc-summary-strip">${_ccRenderTightSummary(s)}</div>
 
       ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before verifying counts -- it's stamped on every reviewed log row.</div>` : ""}
 
       <div class="dr-section" style="margin-top:16px">Needs attention</div>
-      ${_ccRenderNeedsAttention()}
+      <div id="cc-attn-block">${_ccRenderNeedsAttention()}</div>
 
       <div class="dr-section" style="margin-top:20px">Counts as they come in</div>
       ${_ccRenderLiveFeed()}
 
       <div class="dr-section" style="margin-top:20px;cursor:pointer" onclick="_ccToggleOpenQueue()">
-        Open queue -- ${_ccOpenQueueSummary()} ${CC_STATE._openQueueExpanded ? "&#9650;" : "&#9660;"}
+        Open queue -- <span id="cc-open-queue-summary-text">${_ccOpenQueueSummary()}</span> ${CC_STATE._openQueueExpanded ? "&#9650;" : "&#9660;"}
       </div>
       ${CC_STATE._openQueueExpanded ? `
         <p class="muted tiny">Supervisor override tools. Prefer /count on a phone for routine counting.</p>
-        ${_ccRenderOpenQueueBody()}
+        <div id="cc-open-queue-body">${_ccRenderOpenQueueBody()}</div>
       ` : ""}
 
       ${_ccMobileAppBlock()}
@@ -1537,11 +1728,14 @@ function renderCycleCounts() {
   `;
   main.innerHTML = html;
   _ccRenderMobileQR();
+  // Reconcile scan runs on route entry only -- not on every
+  // realtime tick. Delta path handles ongoing updates.
   _ccScheduleReconcileScan();
   // Advance last-seen watermark after render so the next redraw's
   // flash class only lands on rows that arrived AFTER this one.
   const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
   if (log[0] && log[0].counted_at) _ccPersistLastSeen(log[0].counted_at);
+  try { console.timeEnd("cc-supervisor-render"); } catch (_) {}
 }
 function _ccOnNameInput(v) { _ccSetName(v); if (typeof refresh === "function") refresh(); }
 function _ccToggleCompleted() { CC_STATE._showCompleted = !CC_STATE._showCompleted; if (typeof refresh === "function") refresh(); }

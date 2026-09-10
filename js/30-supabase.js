@@ -1393,19 +1393,34 @@ async function _refetchCycleCounts() {
    to the supervisor tab's pulse dot without entangling the
    reconnect logic of the main app-wide channel.
 
-   Enable in Supabase (needed once):
+   Server prerequisite (needed once per environment):
      ALTER PUBLICATION supabase_realtime
        ADD TABLE cycle_count_items, cycle_count_log,
                  cycle_count_item_locations;
-   Until that's run, subscribe() will fire CHANNEL_ERROR /
-   TIMED_OUT and cycleCountLiveState() returns "polling" so the
-   pulse dot goes amber. The 60s poll fallback in js/26 keeps
-   the feed fresh regardless.
+   Without that, subscribe() fires CHANNEL_ERROR / TIMED_OUT and
+   the pulse dot goes amber (polling fallback in js/26 keeps the
+   feed fresh regardless).
 
-   Public API:
-     ccLiveSubscribe(onChange)  -- subscribe (idempotent). Calls
-       onChange(sourceTable) whenever a cc-* row changes AND on
-       first subscribe status.
+   v-cc-live-perf -- reliability pass:
+     * Waits for the supabase client to be ready before the first
+       subscribe attempt (previously the initial call could arrive
+       before _supa was populated, leading to a permanent
+       "unavailable" state).
+     * Logs every status transition WITH the error payload -- the
+       operator sees SUBSCRIBED / CHANNEL_ERROR / TIMED_OUT /
+       CLOSED and the accompanying error message so a publication
+       or RLS misconfig surfaces immediately.
+     * On any non-SUBSCRIBED status, tears the channel down and
+       resubscribes with exponential backoff (2s -> 30s cap,
+       forever -- never gives up into polling permanently). Each
+       success resets the backoff to 2s.
+     * On visibilitychange -> visible, forces a re-check + fast
+       reconnect if we're not currently subscribed.
+     * The pulse dot in js/26 reads ccLiveState() each render, so
+       it flips green as soon as SUBSCRIBED fires.
+
+   Public API (unchanged):
+     ccLiveSubscribe(onChange)  -- subscribe (idempotent).
      ccLiveState()              -- "subscribed" | "polling" |
        "connecting" | "unavailable" -- for the pulse dot.
      ccLiveUnsubscribe()        -- teardown; no-op when idle.
@@ -1413,42 +1428,125 @@ async function _refetchCycleCounts() {
 let _ccLiveChannel = null;
 let _ccLiveState = "connecting";
 let _ccLiveOnChange = null;
+let _ccLiveBackoffMs = 2000;
+const _CC_LIVE_BACKOFF_MIN = 2000;
+const _CC_LIVE_BACKOFF_MAX = 30000;
+let _ccLiveRetryTimer = null;
+let _ccLiveVisibilityWired = false;
+let _ccLiveAttempts = 0;
+
 function ccLiveState() { return _ccLiveState; }
-function ccLiveSubscribe(onChange) {
-  if (typeof onChange === "function") _ccLiveOnChange = onChange;
-  if (_ccLiveChannel) {
-    // Already subscribed -- fire an initial state ping so a fresh
-    // caller renders the current dot state.
-    if (_ccLiveOnChange) _ccLiveOnChange("state");
-    return;
-  }
-  if (!_supa || typeof _supa.channel !== "function") {
-    _ccLiveState = "unavailable";
-    if (_ccLiveOnChange) _ccLiveOnChange("state");
-    return;
-  }
-  _ccLiveState = "connecting";
-  const fire = (src) => { if (_ccLiveOnChange) _ccLiveOnChange(src); };
-  const chan = _supa
-    .channel("cc-supervisor")
-    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_items" }, () => fire("items"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_log" }, () => fire("log"))
-    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_item_locations" }, () => fire("item_locs"));
-  chan.subscribe((status) => {
-    if (status === "SUBSCRIBED")       _ccLiveState = "subscribed";
-    else if (status === "CHANNEL_ERROR"
-          || status === "TIMED_OUT"
-          || status === "CLOSED")      _ccLiveState = "polling";
-    fire("state");
-  });
-  _ccLiveChannel = chan;
+
+function _ccLiveFire(src) { if (_ccLiveOnChange) _ccLiveOnChange(src); }
+
+function _ccLiveClearRetry() {
+  if (_ccLiveRetryTimer) { clearTimeout(_ccLiveRetryTimer); _ccLiveRetryTimer = null; }
 }
-async function ccLiveUnsubscribe() {
+
+async function _ccLiveTeardown() {
   if (!_ccLiveChannel) return;
   const c = _ccLiveChannel;
   _ccLiveChannel = null;
+  try { await _supa.removeChannel(c); } catch (e) { console.warn("[cc-live] teardown removeChannel threw:", e && e.message); }
+}
+
+function _ccLiveScheduleRetry(reason) {
+  _ccLiveClearRetry();
+  const delay = _ccLiveBackoffMs;
+  console.warn(`[cc-live] channel down (${reason}); retrying in ${delay}ms (attempt ${_ccLiveAttempts + 1})`);
+  _ccLiveRetryTimer = setTimeout(() => {
+    _ccLiveRetryTimer = null;
+    _ccLiveConnect();
+  }, delay);
+  _ccLiveBackoffMs = Math.min(_ccLiveBackoffMs * 2, _CC_LIVE_BACKOFF_MAX);
+}
+
+async function _ccLiveConnect() {
+  if (_ccLiveChannel) await _ccLiveTeardown();
+  if (!_supa || typeof _supa.channel !== "function") {
+    // Client not ready yet -- retry soon. Doesn't count against
+    // the exponential backoff (we're waiting on our own boot).
+    console.warn("[cc-live] supabase client not ready; deferring subscribe 500ms");
+    setTimeout(() => _ccLiveConnect(), 500);
+    return;
+  }
+  _ccLiveAttempts++;
   _ccLiveState = "connecting";
-  try { await _supa.removeChannel(c); } catch (_) {}
+  _ccLiveFire("state");
+  console.log(`[cc-live] subscribing to cc-supervisor channel (attempt ${_ccLiveAttempts})`);
+  const chan = _supa
+    .channel("cc-supervisor")
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_items" },           () => _ccLiveFire("items"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_log" },             () => _ccLiveFire("log"))
+    .on("postgres_changes", { event: "*", schema: "public", table: "cycle_count_item_locations" }, () => _ccLiveFire("item_locs"));
+  _ccLiveChannel = chan;
+  chan.subscribe((status, err) => {
+    // The status callback fires for every transition. Log every
+    // one, with the error payload -- diagnosis for the operator.
+    if (err) {
+      console.warn(`[cc-live] status=${status} err:`, err && (err.message || err));
+    } else {
+      console.log(`[cc-live] status=${status}`);
+    }
+    if (status === "SUBSCRIBED") {
+      _ccLiveState = "subscribed";
+      _ccLiveBackoffMs = _CC_LIVE_BACKOFF_MIN;
+      _ccLiveClearRetry();
+      _ccLiveFire("state");
+      return;
+    }
+    if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+      // Diagnostic hint for the most likely production cause.
+      if (status === "CHANNEL_ERROR" && !_ccLivePublicationHintShown) {
+        _ccLivePublicationHintShown = true;
+        console.warn(
+          "[cc-live] CHANNEL_ERROR is usually the supabase_realtime publication\n" +
+          "  not including the cc tables. Run once in the Supabase SQL editor:\n" +
+          "    ALTER PUBLICATION supabase_realtime\n" +
+          "      ADD TABLE public.cycle_count_items,\n" +
+          "                public.cycle_count_log,\n" +
+          "                public.cycle_count_item_locations;\n" +
+          "  (Ignore 'relation already member' errors -- means that table is fine.)"
+        );
+      }
+      _ccLiveState = "polling";
+      _ccLiveFire("state");
+      _ccLiveScheduleRetry(status + (err && err.message ? ` (${err.message})` : ""));
+      return;
+    }
+    // Any other status (subscribing, etc.) -- just report.
+    _ccLiveFire("state");
+  });
+}
+let _ccLivePublicationHintShown = false;
+
+function ccLiveSubscribe(onChange) {
+  if (typeof onChange === "function") _ccLiveOnChange = onChange;
+  if (_ccLiveChannel) {
+    // Already have a channel -- fire an initial state ping so a
+    // fresh caller renders the current dot state.
+    _ccLiveFire("state");
+    return;
+  }
+  // Wire the visibility listener once so a phone wake or a tab
+  // that's been backgrounded for hours reconnects fast.
+  if (!_ccLiveVisibilityWired && typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      if (_ccLiveState === "subscribed") return;
+      console.log("[cc-live] tab woke; forcing reconnect");
+      _ccLiveBackoffMs = _CC_LIVE_BACKOFF_MIN;
+      _ccLiveClearRetry();
+      _ccLiveConnect();
+    });
+    _ccLiveVisibilityWired = true;
+  }
+  _ccLiveConnect();
+}
+async function ccLiveUnsubscribe() {
+  _ccLiveClearRetry();
+  await _ccLiveTeardown();
+  _ccLiveState = "connecting";
 }
 if (typeof window !== "undefined") {
   window.ccLiveSubscribe = ccLiveSubscribe;
