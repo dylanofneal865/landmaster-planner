@@ -174,6 +174,31 @@
     font-weight: 600;
   }
   .retry-pill.on { display: inline-block; }
+  /* v-cc-retry-honest: application rejection turned the pill red,
+     tap-to-open the failure modal. Same footprint as the amber
+     state so the topbar doesn't reflow. */
+  .retry-pill.failed {
+    background: var(--crit);
+    color: #fff;
+    border-color: var(--crit);
+    cursor: pointer;
+  }
+  .fail-row {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surf-2);
+    margin-bottom: 10px;
+  }
+  .fail-hd { font-weight: 600; margin-bottom: 4px; }
+  .fail-err {
+    color: var(--crit);
+    font-size: 13px;
+    margin-bottom: 8px;
+    word-break: break-word;
+  }
+  .fail-actions { display: flex; gap: 8px; }
+  .fail-actions button { flex: 1; min-height: 44px; }
 
   /* ============================================================
      SCREEN CONTAINERS. Only one visible at a time.
@@ -479,6 +504,21 @@
       <div class="modal-actions">
         <button id="skip-cancel">Cancel</button>
         <button id="skip-confirm" class="btn-primary" style="font-size:18px;min-height:56px" disabled>Skip</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- FAILURE MODAL (v-cc-retry-honest) -->
+  <div id="fail-modal" class="modal-bd">
+    <div class="modal">
+      <h3>Submits the server rejected</h3>
+      <p class="dim" style="margin-top:0">
+        These were sent but the server said no. Fix or discard each
+        one -- they will not send on their own.
+      </p>
+      <div id="fail-list" style="max-height:60vh;overflow-y:auto"></div>
+      <div class="modal-actions">
+        <button id="fail-close" class="btn-primary" style="font-size:18px;min-height:56px">Close</button>
       </div>
     </div>
   </div>

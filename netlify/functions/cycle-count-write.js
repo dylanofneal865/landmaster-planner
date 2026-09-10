@@ -44,6 +44,19 @@ const { createClient } = require("@supabase/supabase-js");
 const VAR_TOLERANCE_PCT = 0.10;
 const VAR_TOLERANCE_UNITS = 5;
 
+// v-cc-idem: postgres duplicate-key error code. Both node-postgres
+// and PostgREST bubble this up as { code: "23505" } (message
+// contains "duplicate key value" too). We treat certain dup-keys
+// (log.client_key retries, open-pn recount child collisions) as
+// benign so a submitCount attempt never fails just because
+// bookkeeping was already done.
+function _isDupKey(err) {
+  if (!err) return false;
+  if (err.code === "23505") return true;
+  const msg = String(err.message || err).toLowerCase();
+  return msg.indexOf("duplicate key") !== -1;
+}
+
 // Auto-reconcile threshold: when live parts.data.onHand converges
 // within RECONCILE_UNITS of the counted qty, mark the item
 // "reconciled" (Acumatica caught up).
@@ -148,12 +161,44 @@ async function _applyOp(supa, w, i, log) {
         const counter = String(w.counted_by || "").trim();
         const countedRaw = Number(w.counted_qty);
         const locationsIn = Array.isArray(w.locations) ? w.locations : null;
+        // v-cc-idem: client-supplied idempotency key. When present,
+        // a prior successful submit with the same key short-circuits
+        // to that outcome so a retried POST can never double-log a
+        // count (or spawn a duplicate recount child, or double-flip
+        // an item's status). Nullable for backward compatibility --
+        // an older client that doesn't send it keeps the old
+        // at-most-once-per-fingers-crossed behavior.
+        const clientKey = String(w.client_key || w.clientKey || "").trim() || null;
         if (!itemId) return { index: i, ok: false, error: "submitCount: itemId required" };
         if (!counter) return { index: i, ok: false, error: "submitCount: counted_by required" };
         if (!Number.isFinite(countedRaw) || countedRaw < 0) {
           return { index: i, ok: false, error: "submitCount: counted_qty must be a non-negative number" };
         }
         const counted = Math.round(countedRaw);
+        // Idempotency short-circuit BEFORE any writes.
+        if (clientKey) {
+          const { data: prior, error: priorErr } = await supa
+            .from("cycle_count_log")
+            .select("id, item_id")
+            .eq("client_key", clientKey)
+            .maybeSingle();
+          if (priorErr) return { index: i, ok: false, error: "submitCount: idempotency check failed: " + priorErr.message };
+          if (prior && prior.id) {
+            const { data: priorItem } = await supa
+              .from("cycle_count_items")
+              .select("status, variance")
+              .eq("id", prior.item_id)
+              .maybeSingle();
+            return {
+              index: i, ok: true, kind: "submitCount",
+              itemId: prior.item_id,
+              status: (priorItem && priorItem.status) || "counted",
+              variance: (priorItem && Number(priorItem.variance)) || 0,
+              childId: null,
+              idempotent: true,
+            };
+          }
+        }
         const { data: item, error: itemErr } = await supa
           .from("cycle_count_items")
           .select("id, pn, assigned_date, tier, reason, system_qty_at_assign, status, recount_of, note")
@@ -187,7 +232,15 @@ async function _applyOp(supa, w, i, log) {
         let childId = null;
         if (beyond && !item.recount_of) {
           newStatus = "recount";
-          // Spawn blind child.
+          // Spawn blind child. Happens BEFORE the item + log writes
+          // so the "the child was queued" invariant holds when the
+          // parent flips to recount. A duplicate-key error here is
+          // benign -- an open recount child already exists for this
+          // pn / parent (either a prior successful submit whose
+          // response was lost, or the open-pn unique index catching
+          // a race). We adopt the existing child and continue -- a
+          // count must never fail because bookkeeping was already
+          // done.
           const { data: child, error: childErr } = await supa
             .from("cycle_count_items")
             .insert({
@@ -202,8 +255,24 @@ async function _applyOp(supa, w, i, log) {
             })
             .select("id")
             .single();
-          if (childErr) return { index: i, ok: false, error: "submitCount: recount child spawn failed: " + childErr.message };
-          childId = child.id;
+          if (childErr) {
+            if (_isDupKey(childErr)) {
+              log("submitCount: recount child dup-key benign (" + (childErr.message || "23505") + ")");
+              // Best-effort recovery of the existing child's id so
+              // the client can hand it to a supervisor if needed.
+              const { data: existingChild } = await supa
+                .from("cycle_count_items")
+                .select("id")
+                .eq("recount_of", item.id)
+                .in("status", ["pending", "recount"])
+                .maybeSingle();
+              childId = (existingChild && existingChild.id) || null;
+            } else {
+              return { index: i, ok: false, error: "submitCount: recount child spawn failed: " + childErr.message };
+            }
+          } else {
+            childId = child.id;
+          }
         }
         // v-cc-loc-1 phase 1 -- location persistence, must happen
         // BEFORE the item update so a failure here aborts the whole
@@ -316,12 +385,19 @@ async function _applyOp(supa, w, i, log) {
           recount_of: item.recount_of || null,
         };
         if (locationsBreakdown) logRow.locations = locationsBreakdown;
+        if (clientKey) logRow.client_key = clientKey;
         const { error: logErr } = await supa
           .from("cycle_count_log")
           .insert(logRow);
         if (logErr) {
-          // Non-fatal but surface it -- the count update landed.
-          log("submitCount: log insert failed (non-fatal): " + logErr.message);
+          // A dup-key on client_key means a concurrent retry beat us
+          // to the log insert -- benign, the row is there.
+          if (_isDupKey(logErr)) {
+            log("submitCount: log client_key dup-key benign (" + (logErr.message || "23505") + ")");
+          } else {
+            // Non-fatal but surface it -- the count update landed.
+            log("submitCount: log insert failed (non-fatal): " + logErr.message);
+          }
         }
         return { index: i, ok: true, kind: "submitCount", itemId, status: newStatus, variance, childId };
       }

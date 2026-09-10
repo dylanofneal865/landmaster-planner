@@ -59,6 +59,13 @@
   // in cycle-count-write.js).
   const TOL_UNITS = 5;
   const TOL_PCT   = 0.10;
+  // v-cc-retry-honest: after this many APPLICATION-level failures
+  // (server accepted the batch, returned ok:false on this op --
+  // "not found", "recount by different counter", "counted_qty !=
+  // sum(locations)", etc.), stop auto-retrying and demand a human
+  // decision via the red pill / failure modal. Transport failures
+  // (offline, HTTP 500, timeout) keep retrying silently forever.
+  const APP_FAIL_CAP = 2;
 
   // ---------------------------------------------------------------
   // STATE
@@ -314,10 +321,48 @@
 
   // ---------------------------------------------------------------
   // RETRY QUEUE
+  //
+  // Entry shape: { op, attempts, appFailures, lastError }
+  //   - attempts:    transport retries (fetch fell over, HTTP !ok)
+  //   - appFailures: server accepted the batch but returned
+  //                  ok:false on this op (rejected). We cap at
+  //                  APP_FAIL_CAP so the pill can go red instead
+  //                  of silently retrying forever.
+  //   - lastError:   the server-provided text, shown in the
+  //                  failure modal.
+  //
+  // v-cc-idem: every op carries client_key from _optimisticSubmit,
+  // so the server short-circuits a retry to its prior outcome
+  // instead of re-writing (would otherwise double-log, spawn a
+  // second recount child, etc). Entries dedupe on client_key so a
+  // retry-of-a-retry updates metadata rather than stacking.
   // ---------------------------------------------------------------
+  function _newClientKey() {
+    try {
+      if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+    } catch (_) {}
+    return "ck-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 12);
+  }
+  function _wrapEntry(op) {
+    return { op, attempts: 0, appFailures: 0, lastError: null };
+  }
   function loadRetryQueue() {
-    try { S.retryQueue = JSON.parse(localStorage.getItem(LS_QUEUE) || "[]") || []; }
-    catch (_) { S.retryQueue = []; }
+    try {
+      const raw = JSON.parse(localStorage.getItem(LS_QUEUE) || "[]") || [];
+      // Backfill: pre-v-cc-retry-honest entries were bare ops.
+      S.retryQueue = raw.map(x => {
+        if (x && typeof x === "object" && x.op && typeof x.op === "object") {
+          return {
+            op: x.op,
+            attempts: Number(x.attempts) || 0,
+            appFailures: Number(x.appFailures) || 0,
+            lastError: x.lastError || null,
+          };
+        }
+        // Assume x is a bare op.
+        return _wrapEntry(x);
+      });
+    } catch (_) { S.retryQueue = []; }
     renderRetryPill();
   }
   function saveRetryQueue() {
@@ -325,25 +370,66 @@
     catch (_) {}
     renderRetryPill();
   }
+  function _pillLabel() {
+    const failed = S.retryQueue.filter(e => (e.appFailures || 0) >= APP_FAIL_CAP);
+    const saving = S.retryQueue.length - failed.length;
+    return { failed: failed.length, saving };
+  }
   function renderRetryPill() {
     const p = $("retry-pill");
     if (!p) return;
+    p.classList.remove("failed");
+    p.onclick = null;
     if (S.retryQueue.length === 0) { p.classList.remove("on"); return; }
-    p.textContent = S.retryQueue.length + " saving...";
+    const { failed, saving } = _pillLabel();
+    if (failed > 0) {
+      p.textContent = failed + " failed -- tap for details";
+      p.classList.add("failed");
+      p.onclick = openFailureModal;
+      p.classList.add("on");
+      return;
+    }
+    p.textContent = saving + " saving...";
     p.classList.add("on");
   }
   async function drainRetryQueue() {
     if (S.retryQueue.length === 0) return;
-    const batch = S.retryQueue.slice(0, 20);
-    const ok = await postWrite(batch);
-    if (ok && ok.ok) {
-      S.retryQueue = S.retryQueue.slice(batch.length);
+    // Only touch entries that haven't hit the app-failure cap;
+    // capped ones sit there until a human retries via the modal.
+    const draftable = S.retryQueue.filter(e => (e.appFailures || 0) < APP_FAIL_CAP);
+    if (draftable.length === 0) { renderRetryPill(); return; }
+    const batch = draftable.slice(0, 20);
+    const resp = await postWrite(batch.map(e => e.op));
+    if (!resp || resp.transportError) {
+      // Network / HTTP failure -- keep retrying silently.
+      for (const e of batch) e.attempts = (e.attempts || 0) + 1;
+      if (resp && resp.error) for (const e of batch) e.lastError = resp.error;
       saveRetryQueue();
-      if (S.retryQueue.length > 0) setTimeout(drainRetryQueue, 500);
-    } else {
-      // Try again later.
       if (S.retryTimer) clearTimeout(S.retryTimer);
       S.retryTimer = setTimeout(drainRetryQueue, 10000);
+      return;
+    }
+    // Batch reached the server. Inspect per-op outcomes.
+    const results = Array.isArray(resp.results) ? resp.results : [];
+    const succeeded = new Set();   // entries to remove
+    for (let idx = 0; idx < batch.length; idx++) {
+      const r = results[idx];
+      if (r && r.ok === true) {
+        succeeded.add(batch[idx]);
+      } else {
+        batch[idx].appFailures = (batch[idx].appFailures || 0) + 1;
+        batch[idx].lastError = String((r && r.error) || "server returned no result");
+      }
+    }
+    if (succeeded.size > 0) {
+      S.retryQueue = S.retryQueue.filter(e => !succeeded.has(e));
+    }
+    saveRetryQueue();
+    // Continue draining if anything else is still draftable.
+    const stillDraftable = S.retryQueue.some(e => (e.appFailures || 0) < APP_FAIL_CAP);
+    if (stillDraftable) {
+      if (S.retryTimer) clearTimeout(S.retryTimer);
+      S.retryTimer = setTimeout(drainRetryQueue, 500);
     }
   }
 
@@ -360,19 +446,101 @@
       });
       const text = await resp.text();
       let json = null; try { json = JSON.parse(text); } catch (_) {}
-      if (!resp.ok) return { ok: false, status: resp.status, error: (json && json.error) || text.slice(0, 120) };
-      return json || { ok: true };
+      if (!resp.ok) {
+        // 4xx / 5xx -- transport-ish, not an application decision.
+        // Retry silently and don't count against APP_FAIL_CAP.
+        return { ok: false, transportError: true, status: resp.status, error: (json && json.error) || text.slice(0, 200) };
+      }
+      // Batch reached us; per-op ok booleans decide the rest.
+      return json || { ok: true, results: [] };
     } catch (err) {
-      return { ok: false, error: err.message || String(err) };
+      // fetch threw (offline, DNS, TLS, etc.)
+      return { ok: false, transportError: true, error: err.message || String(err) };
     }
   }
 
-  function queueForRetry(op) {
-    S.retryQueue.push(op);
+  function queueForRetry(op, meta) {
+    meta = meta || {};
+    // Dedupe on client_key -- same submit fingerprint from two
+    // paths shouldn't stack.
+    const key = op && op.client_key;
+    const existingIdx = key ? S.retryQueue.findIndex(e => e && e.op && e.op.client_key === key) : -1;
+    if (existingIdx >= 0) {
+      const cur = S.retryQueue[existingIdx];
+      if (meta.appFail) {
+        cur.appFailures = (cur.appFailures || 0) + 1;
+        if (meta.error) cur.lastError = meta.error;
+      } else {
+        cur.attempts = (cur.attempts || 0) + 1;
+        if (meta.error) cur.lastError = meta.error;
+      }
+    } else {
+      const entry = _wrapEntry(op);
+      if (meta.appFail) { entry.appFailures = 1; entry.lastError = meta.error || "unknown"; }
+      else { entry.attempts = 1; entry.lastError = meta.error || null; }
+      S.retryQueue.push(entry);
+    }
     saveRetryQueue();
     if (S.retryTimer) clearTimeout(S.retryTimer);
     S.retryTimer = setTimeout(drainRetryQueue, 1000);
   }
+
+  // ---------------------------------------------------------------
+  // FAILURE MODAL
+  // ---------------------------------------------------------------
+  function openFailureModal() {
+    const modal = $("fail-modal");
+    if (!modal) return;
+    const body = $("fail-list");
+    const failed = S.retryQueue.filter(e => (e.appFailures || 0) >= APP_FAIL_CAP);
+    if (failed.length === 0) { modal.classList.remove("on"); return; }
+    body.innerHTML = failed.map((e, idx) => {
+      const op = e.op || {};
+      const pn = esc(op.pn || (op.itemId ? "item " + op.itemId.slice(0, 8) : "(unknown)"));
+      const kind = op.op === "submitCount" ? ("count " + (op.counted_qty != null ? op.counted_qty : ""))
+                 : op.op === "skip" ? ("skip: " + (op.reason || ""))
+                 : (op.op || "op");
+      return `
+        <div class="fail-row" data-idx="${idx}">
+          <div class="fail-hd"><span class="mono">${pn}</span> <span class="dim">${esc(kind)}</span></div>
+          <div class="fail-err">${esc(e.lastError || "unknown error")}</div>
+          <div class="fail-actions">
+            <button class="btn-ghost" data-act="retry" data-idx="${idx}">Retry</button>
+            <button class="btn-ghost" data-act="discard" data-idx="${idx}">Discard</button>
+          </div>
+        </div>`;
+    }).join("");
+    body.querySelectorAll("button[data-act]").forEach(btn => {
+      btn.onclick = () => {
+        const act = btn.getAttribute("data-act");
+        const idx = Number(btn.getAttribute("data-idx"));
+        const target = failed[idx];
+        if (!target) return;
+        if (act === "retry") {
+          // Reset the app-failure count so drainRetryQueue picks
+          // it up again -- attempts is preserved for diagnostics.
+          target.appFailures = 0;
+          saveRetryQueue();
+          drainRetryQueue();
+          openFailureModal();  // refresh list
+        } else if (act === "discard") {
+          if (!confirm("Discard this failed submit? It will NOT be sent.")) return;
+          S.retryQueue = S.retryQueue.filter(x => x !== target);
+          // Also let the counter re-count this item if they want.
+          if (target.op && target.op.itemId) S.countedThisShift.delete(target.op.itemId);
+          saveRetryQueue();
+          openFailureModal();
+          rebuildVisibleQueue();
+        }
+      };
+    });
+    modal.classList.add("on");
+  }
+  function closeFailureModal() {
+    const modal = $("fail-modal");
+    if (modal) modal.classList.remove("on");
+  }
+  if (typeof window !== "undefined") window._ccCloseFailureModal = closeFailureModal;
 
   // ---------------------------------------------------------------
   // RENDER -- HOME
@@ -710,20 +878,35 @@
     _optimisticSubmit(item, item.system_qty_at_assign, sum, op);
   }
   function _optimisticSubmit(item, sys, counted, op) {
-    // v-cc-mobile-perf: advance the queue the instant the
-    // counter taps SUBMIT. We infer match/off locally (server
-    // uses the same tolerance rule). If the server later
-    // decides RECOUNT (only when off), the recount item will
-    // reappear in the next fetch for a different counter --
-    // no worse than pre-optimistic behavior.
+    // v-cc-idem: stamp a per-attempt-set idempotency key BEFORE
+    // any network call so a retry (from here OR from the drain
+    // path after a transport failure) uses the SAME key and the
+    // server short-circuits to the prior outcome instead of
+    // re-writing.
+    op.client_key = op.client_key || _newClientKey();
+    // v-cc-mobile-perf: advance the queue immediately. Local
+    // match/off inference is enough to render the result screen
+    // (server uses the same tolerance rule); if the server later
+    // decides RECOUNT, the recount item reappears in the next
+    // fetch for a different counter.
     S.countedThisShift.add(item.id);
     _showResultScreen(item, sys, counted);
-    // Fire-and-forget: retry queue handles any failure.
     postWrite([op]).then(res => {
-      if (!res || !res.ok) { queueForRetry(op); flash("Save queued for retry", 2500); return; }
+      if (!res || res.transportError) {
+        // Network / HTTP failure -- silent retry.
+        queueForRetry(op, { error: res && res.error });
+        return;
+      }
       const r = (res.results && res.results[0]) || {};
-      if (r.ok === false) { flash("Rejected: " + (r.error || "unknown"), 4500); }
-    }).catch(() => { queueForRetry(op); flash("Save queued for retry", 2500); });
+      if (r.ok === false) {
+        // Application rejection -- surface it, count against cap.
+        flash("Rejected: " + (r.error || "unknown"), 4500);
+        queueForRetry(op, { appFail: true, error: r.error });
+      }
+      // r.ok === true (including idempotent replay): nothing to do.
+    }).catch(err => {
+      queueForRetry(op, { error: err && err.message });
+    });
   }
   function _showResultScreen(item, sys, counted) {
     const rs = $("result-screen");
@@ -772,10 +955,16 @@
     // shows WHO skipped in the live feed (was blank prior release).
     const op = { op: "skip", itemId: S.activeItemId, reason: fullReason, counted_by: S.name || "" };
     const res = await postWrite([op]);
-    if (!res || !res.ok) { queueForRetry(op); flash("Skip queued for retry"); }
-    else if (res.results && res.results[0] && res.results[0].ok === false) {
-      flash("Rejected: " + res.results[0].error, 4500);
-      return;
+    if (!res || res.transportError) {
+      queueForRetry(op, { error: res && res.error });
+      flash("Skip queued for retry");
+    } else {
+      const r = (res.results && res.results[0]) || {};
+      if (r.ok === false) {
+        flash("Rejected: " + (r.error || "unknown"), 4500);
+        queueForRetry(op, { appFail: true, error: r.error });
+        return;
+      }
     }
     S.countedThisShift.add(S.activeItemId);
     closeSkipModal();
@@ -822,6 +1011,8 @@
     });
     $("skip-cancel").onclick = closeSkipModal;
     $("skip-confirm").onclick = confirmSkip;
+    const failClose = $("fail-close");
+    if (failClose) failClose.onclick = closeFailureModal;
     $("count-back").onclick = () => { S.activeItemId = null; renderHome(); };
     $("count-skip").onclick = () => openSkipModal(S.activeItemId);
 
