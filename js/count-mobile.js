@@ -101,16 +101,24 @@
   const humanReason = (item) => {
     const raw = String(item.reason || "");
     const r = raw.toLowerCase();
-    // v-cc-loc-8 -- supervisor-requested recount reason format:
+    // v-cc-loc-8 / v-cc-loc-9 -- supervisor-driven reasons:
     //   "supervisor requested recount [(via NAME)][: NOTE]"
-    // Extract the NOTE (everything after the first ": ") so the
-    // counter sees the exact ask.
-    if (r.startsWith("supervisor requested recount")) {
+    //     -- fired by _ccRequestRecount (recount child; blind rule)
+    //   "supervisor sent back out [(via NAME)][: NOTE]"
+    //     -- fired by _ccReassignFromSkip (item flipped back to
+    //     pending after a skip; NO blind rule -- any counter, incl
+    //     the one who skipped it, may pick it up).
+    // Both extract the NOTE (everything after the first ": ") so
+    // the counter sees the exact ask.
+    if (r.startsWith("supervisor requested recount") || r.startsWith("supervisor sent back out")) {
       const colon = raw.indexOf(": ");
       const note = colon >= 0 ? raw.slice(colon + 2).trim() : "";
-      const base = item.recount_of
-        ? "Supervisor sent this back out. Recount -- don't peek at the prior count."
-        : "Supervisor asked for a recount.";
+      const isRecount = r.startsWith("supervisor requested recount");
+      const base = isRecount
+        ? (item.recount_of
+            ? "Supervisor sent this back out. Recount -- don't peek at the prior count."
+            : "Supervisor asked for a recount.")
+        : "Supervisor sent this back out after a skip. Try again with fresh eyes.";
       return note ? base + " Note: " + note : base;
     }
     if (item.recount_of) return "Recount -- don't peek at the prior count. Fresh eyes only.";
@@ -769,7 +777,9 @@
     if (!S.skipReason || !S.activeItemId) return;
     const note = ($("skip-note").value || "").trim();
     const fullReason = note ? (S.skipReason + " -- " + note) : S.skipReason;
-    const op = { op: "skip", itemId: S.activeItemId, reason: fullReason };
+    // v-cc-loc-9 -- stamp the skipper's name so the supervisor tab
+    // shows WHO skipped in the live feed (was blank prior release).
+    const op = { op: "skip", itemId: S.activeItemId, reason: fullReason, counted_by: S.name || "" };
     const res = await postWrite([op]);
     if (!res || !res.ok) { queueForRetry(op); flash("Skip queued for retry"); }
     else if (res.results && res.results[0] && res.results[0].ok === false) {

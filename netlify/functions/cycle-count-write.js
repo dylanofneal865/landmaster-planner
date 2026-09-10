@@ -327,8 +327,16 @@ async function _applyOp(supa, w, i, log) {
       }
 
       case "skip": {
+        // v-cc-loc-9 -- stamp the SKIPPER's name on both the item
+        // and the log row so the supervisor tab can attribute the
+        // skip (previously counted_by was null on skip rows,
+        // rendering as "-" in the feed). `counted_by` is optional
+        // in the payload only for backward compatibility with
+        // callers that predate this change; new callers should
+        // send it.
         const itemId = String(w.itemId || "").trim();
         const reason = String(w.reason || "").trim();
+        const skipper = String(w.counted_by || "").trim();
         if (!itemId) return { index: i, ok: false, error: "skip: itemId required" };
         if (!reason) return { index: i, ok: false, error: "skip: reason required" };
         const { data: item, error: itemErr } = await supa
@@ -338,13 +346,15 @@ async function _applyOp(supa, w, i, log) {
           .maybeSingle();
         if (itemErr) return { index: i, ok: false, error: "skip: read failed: " + itemErr.message };
         if (!item) return { index: i, ok: false, error: "skip: item not found" };
+        const updates = {
+          status: "skipped",
+          note: reason,
+          updated_at: nowIso,
+        };
+        if (skipper) { updates.counted_by = skipper; updates.counted_at = nowIso; }
         const { error: upErr } = await supa
           .from("cycle_count_items")
-          .update({
-            status: "skipped",
-            note: reason,
-            updated_at: nowIso,
-          })
+          .update(updates)
           .eq("id", itemId);
         if (upErr) return { index: i, ok: false, error: "skip: update failed: " + upErr.message };
         const { error: logErr } = await supa
@@ -354,7 +364,7 @@ async function _applyOp(supa, w, i, log) {
             pn: item.pn,
             assigned_date: item.assigned_date,
             counted_at: nowIso,
-            counted_by: null,
+            counted_by: skipper || null,
             tier: item.tier,
             reason: item.reason || null,
             system_qty_at_assign: item.system_qty_at_assign,
@@ -367,6 +377,61 @@ async function _applyOp(supa, w, i, log) {
           });
         if (logErr) log("skip: log insert failed (non-fatal): " + logErr.message);
         return { index: i, ok: true, kind: "skip", itemId };
+      }
+
+      case "reassignFromSkip": {
+        // v-cc-loc-9 -- supervisor sends a SKIPPED item back out.
+        // Flips the item back to "pending", clears the counted_by /
+        // counted_at fields left over from the skip, moves
+        // assigned_date to today so it sorts to the front of the
+        // queue, and (optionally) rewrites the reason to carry the
+        // supervisor's note. NO log row is written for the
+        // reassignment itself -- log rows represent completed
+        // audit work; the eventual count that lands will log
+        // normally.
+        //
+        // Rejects when the item is not currently skipped. Idempotent
+        // per state: a second call after the item is already
+        // pending / counted returns { skipped: true } instead of
+        // clobbering the intermediate state.
+        const itemId = String(w.itemId || "").trim();
+        const requester = String(w.requested_by || "").trim();
+        const noteRaw = String(w.note || "").trim();
+        if (!itemId) return { index: i, ok: false, error: "reassignFromSkip: itemId required" };
+        const { data: item, error: itemErr } = await supa
+          .from("cycle_count_items")
+          .select("id, pn, tier, reason, system_qty_at_assign, status, note, recount_of, assigned_date")
+          .eq("id", itemId)
+          .maybeSingle();
+        if (itemErr) return { index: i, ok: false, error: "reassignFromSkip: read failed: " + itemErr.message };
+        if (!item) return { index: i, ok: false, error: "reassignFromSkip: item not found" };
+        if (item.status !== "skipped") {
+          return { index: i, ok: true, kind: "reassignFromSkip", itemId, skipped: true, reason: "current status is " + item.status };
+        }
+        const today = nowIso.slice(0, 10);
+        // Reason: "supervisor sent back out (via NAME)[: NOTE]".
+        // Mirrors the requestRecount format so humanReason in
+        // count-mobile.js can surface it uniformly.
+        const reasonBase = requester
+          ? "supervisor sent back out (via " + requester + ")"
+          : "supervisor sent back out";
+        const reasonText = noteRaw ? reasonBase + ": " + noteRaw : reasonBase;
+        const { error: upErr } = await supa
+          .from("cycle_count_items")
+          .update({
+            status: "pending",
+            reason: reasonText,
+            note: noteRaw || null,
+            counted_by: null,
+            counted_at: null,
+            counted_qty: null,
+            variance: null,
+            assigned_date: today,   // to-queue-front behavior
+            updated_at: nowIso,
+          })
+          .eq("id", itemId);
+        if (upErr) return { index: i, ok: false, error: "reassignFromSkip: update failed: " + upErr.message };
+        return { index: i, ok: true, kind: "reassignFromSkip", itemId };
       }
 
       case "reconcileFromLive": {

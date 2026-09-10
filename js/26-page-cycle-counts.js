@@ -720,7 +720,13 @@ async function _ccSkip(itemId) {
   const reason = (typeof prompt === "function") ? prompt(`Skip reason for ${item.pn}?\n(required -- appears in the log)`, "") : "";
   const clean = (typeof reason === "string") ? reason.trim() : "";
   if (!clean) { if (typeof showToast === "function") showToast("Skip needs a reason", "warn"); return; }
-  const res = await postCycleCountBatch([{ op: "skip", itemId, reason: clean }]);
+  // v-cc-loc-9 -- stamp the skipper's name so the supervisor tab
+  // shows who skipped in the live feed (was blank previously when
+  // a supervisor skipped from the desktop expanded queue).
+  const counter = _ccName();
+  const payload = { op: "skip", itemId, reason: clean };
+  if (counter) payload.counted_by = counter;
+  const res = await postCycleCountBatch([payload]);
   if (!res || !res.ok) {
     const err = (res && res.results && res.results[0] && res.results[0].error) || "unknown";
     if (typeof showToast === "function") showToast("Skip failed: " + err, "warn");
@@ -1023,43 +1029,61 @@ if (typeof window !== "undefined") window._ccVerifyLog = _ccVerifyLog;
 async function _ccRequestRecount(itemId, rowBtn, opts) {
   opts = opts || {};
   const requester = _ccName();
-  // v-cc-loc-8 -- optional supervisor note. When called from the
-  // live-feed "Send back out" action we prompt for one; from
-  // Needs Attention's "Request recount" we go through the same
-  // path so the two entry points behave identically.
+  // Two send-back-out shapes routed here:
+  //   COUNT rows (counted / recount log outcomes) -> requestRecount
+  //     op: spawns a recount CHILD (tier=flagged, recount_of=parent);
+  //     blind rule fires server-side (different counter required).
+  //   SKIP rows (skipped log outcomes) -> reassignFromSkip op:
+  //     flips the SAME item back to pending, clears the counted_*
+  //     fields left over from the skip, moves assigned_date to
+  //     today. NO blind rule -- any counter can pick it up (a
+  //     skip was never a count).
+  const skipMode = !!opts.fromSkip;
   let note = "";
   if (opts.promptForNote) {
     const raw = (typeof prompt === "function")
-      ? prompt("Optional note for the counter (shows on their phone card, e.g. 'recheck RMSTOR-LM bin'):", "")
+      ? prompt(skipMode
+          ? "Optional note for the counter (shows on their phone card; e.g. 'bin should be unlocked now'):"
+          : "Optional note for the counter (shows on their phone card; e.g. 'recheck RMSTOR-LM bin'):",
+          "")
       : "";
     if (raw === null) return;   // supervisor cancelled the prompt
     note = String(raw || "").trim();
   } else if (typeof opts.note === "string") {
     note = opts.note.trim();
   }
-  const restoreLabel = (rowBtn && rowBtn.textContent) || "Request recount";
+  const restoreLabel = (rowBtn && rowBtn.textContent) || "Send back out";
   if (rowBtn) { rowBtn.disabled = true; rowBtn.textContent = "..."; }
-  const payload = { op: "requestRecount", itemId, requested_by: requester };
+  const payload = skipMode
+    ? { op: "reassignFromSkip", itemId, requested_by: requester }
+    : { op: "requestRecount",    itemId, requested_by: requester };
   if (note) payload.note = note;
   const res = await postCycleCountBatch([payload]);
   if (!res || !res.ok) {
-    if (typeof showToast === "function") showToast("Recount request failed: " + ((res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown"), "warn");
+    if (typeof showToast === "function") showToast("Send back failed: " + ((res && res.results && res.results[0] && res.results[0].error) || (res && res.error && res.error.message) || "unknown"), "warn");
     if (rowBtn) { rowBtn.disabled = false; rowBtn.textContent = restoreLabel; }
     return;
   }
   const r = res.results && res.results[0];
-  if (r && r.skipped) { if (typeof showToast === "function") showToast("A recount is already pending for this item.", ""); }
-  else if (typeof showToast === "function") showToast("Sent back out -- next counter (other than the original) will pick it up.", "ok");
+  if (r && r.skipped) {
+    if (typeof showToast === "function") showToast(skipMode ? "Item is no longer skipped -- nothing to reassign." : "A recount is already pending for this item.", "");
+  } else if (typeof showToast === "function") {
+    showToast(skipMode
+      ? "Sent back out -- any counter can pick it up now."
+      : "Sent back out -- next counter (other than the original) will pick it up.",
+      "ok");
+  }
   if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
   if (typeof refresh === "function") refresh();
 }
 if (typeof window !== "undefined") window._ccRequestRecount = _ccRequestRecount;
 // Convenience wrapper for the live-feed "Send back out" button --
-// always prompts for the optional note. Kept separate from
-// _ccRequestRecount so Needs Attention can opt into a note without
-// forcing every existing caller through the prompt.
-function _ccSendBackOut(itemId, rowBtn) {
-  return _ccRequestRecount(itemId, rowBtn, { promptForNote: true });
+// always prompts for the optional note. Pass { fromSkip: true } for
+// skip rows so the write function's reassignFromSkip op runs
+// instead of requestRecount.
+function _ccSendBackOut(itemId, rowBtn, opts) {
+  const merged = Object.assign({ promptForNote: true }, opts || {});
+  return _ccRequestRecount(itemId, rowBtn, merged);
 }
 if (typeof window !== "undefined") window._ccSendBackOut = _ccSendBackOut;
 
@@ -1188,35 +1212,64 @@ function _ccRenderLiveFeed() {
     const desc = _ccPartDesc(r.pn);
     const hasBins = Array.isArray(r.locations) && r.locations.length > 0;
     const expanded = CC_STATE._feedExpanded.has(r.id);
-    // v-cc-loc-8 -- Send-back-out button state.
-    //   * Never allowed on rows that aren't a real count -- skipped
-    //     rows have nothing to re-check, and rows with no item_id
-    //     (defensive) can't be routed.
-    //   * "none" -> "Send back out"        (primary, enabled)
-    //   * "pending" -> "recount pending"    (disabled)
-    //   * "counted" -> "recounted &#10003;" (disabled, muted)
+    const isSkipRow = r.outcome === "skipped";
+    // v-cc-loc-9 -- send-back-out button state per row type.
+    //   COUNT / RECOUNT rows (outcome=counted|recount|reconciled):
+    //     "none"   -> "Send back out"   (routes requestRecount)
+    //     "pending"-> "recount pending" (child recount open)
+    //     "counted"-> "recounted &#10003;"
+    //   SKIP rows (outcome=skipped):
+    //     item still status=skipped         -> "Send back out"
+    //                                          (routes reassignFromSkip)
+    //     item now pending (reassigned)     -> "reassigned"
+    //     item completed after reassignment -> "handled"
     let sendBtn = "";
-    if (r.item_id && r.outcome !== "skipped") {
-      const rs = _ccItemRecountStatus(r.item_id);
-      if (rs === "none") {
-        sendBtn = `<button class="btn xs" title="Spawn a recount for a different counter -- prompts for an optional note that shows on their phone card" onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this)">Send back out</button>`;
-      } else if (rs === "pending") {
-        sendBtn = `<button class="btn xs" disabled title="A recount is already open for this item">recount pending</button>`;
+    if (r.item_id) {
+      if (isSkipRow) {
+        // Read the parent item's CURRENT status; a skip that was
+        // later reassigned via reassignFromSkip is now "pending"
+        // (or a downstream state).
+        const cur = (DB.cycleCounts.items instanceof Map)
+          ? DB.cycleCounts.items.get(r.item_id)
+          : null;
+        const curStatus = cur ? cur.status : null;
+        if (curStatus === "skipped") {
+          sendBtn = `<button class="btn xs" title="Reassign this skipped item as pending -- prompts for an optional note that shows on the counter's phone card. No blind rule; any counter can pick it up." onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this, { fromSkip: true })">Send back out</button>`;
+        } else if (curStatus === "pending" || curStatus === "recount") {
+          sendBtn = `<button class="btn xs" disabled title="Skip already reassigned and waiting for a counter">reassigned</button>`;
+        } else {
+          sendBtn = `<button class="btn xs ghost" disabled title="Item has been handled since the skip">handled</button>`;
+        }
       } else {
-        sendBtn = `<button class="btn xs ghost" disabled title="This item has already been recounted">recounted &#10003;</button>`;
+        const rs = _ccItemRecountStatus(r.item_id);
+        if (rs === "none") {
+          sendBtn = `<button class="btn xs" title="Spawn a recount for a different counter -- prompts for an optional note that shows on their phone card" onclick="event.stopPropagation();_ccSendBackOut('${esc(r.item_id)}', this)">Send back out</button>`;
+        } else if (rs === "pending") {
+          sendBtn = `<button class="btn xs" disabled title="A recount is already open for this item">recount pending</button>`;
+        } else {
+          sendBtn = `<button class="btn xs ghost" disabled title="This item has already been recounted">recounted &#10003;</button>`;
+        }
       }
     }
+    // v-cc-loc-9 -- the counted/counted-qty/variance columns don't
+    // apply to a skip. Replace with the skip reason inline (from
+    // log.note or item.reason). The skipper's name comes through
+    // r.counted_by (populated by the write function post-v-cc-loc-9).
+    const skipReasonInline = isSkipRow
+      ? `<span class="dim tiny">skipped: ${esc(r.note || r.reason || "no reason given")}</span>`
+      : "";
     const rowHtml = `
-      <tr class="${isNew ? "cc-new-flash" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
+      <tr class="${isNew ? "cc-new-flash" : ""}${isSkipRow ? " cc-skip-row" : ""}" ${hasBins ? `onclick="_ccToggleFeedExpand('${esc(r.id)}')"` : ""} style="${hasBins ? "cursor:pointer" : ""}">
         <td class="dim tiny mono">${esc((at || "").slice(11, 16))}</td>
         <td>${esc(r.counted_by || "-")}</td>
         <td>
           <span class="mono">${esc(r.pn)}</span>${hasBins ? ` <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"} ${r.locations.length} bin${r.locations.length === 1 ? "" : "s"}</span>` : ""}
           <div class="dim tiny">${esc(desc)}</div>
+          ${skipReasonInline}
         </td>
         <td class="right num">${r.system_qty_at_assign == null ? "-" : Math.round(r.system_qty_at_assign)}</td>
-        <td class="right num">${r.counted_qty == null ? "-" : Math.round(r.counted_qty)}</td>
-        <td class="right num ${vCls}">${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span></td>
+        <td class="right num">${isSkipRow ? '<span class="dim">-</span>' : (r.counted_qty == null ? "-" : Math.round(r.counted_qty))}</td>
+        <td class="right num ${vCls}">${isSkipRow ? '<span class="dim">-</span>' : `${v > 0 ? "+" : ""}${v} <span class="dim tiny">(${(pct * 100).toFixed(1)}%)</span>`}</td>
         <td><span class="pill tiny ${statusCls}">${statusLabel.toUpperCase()}</span>${r.reviewed_by ? `<div class="dim tiny">by ${esc(r.reviewed_by)}</div>` : ""}</td>
         <td class="right" style="white-space:nowrap">${sendBtn}</td>
       </tr>`;
