@@ -1686,6 +1686,39 @@ function renderCycleCounts() {
       .cc-new-flash td { animation: cc-flash-in 3.5s ease-out forwards; }
       .cc-feed-table tr td { vertical-align: top; }
       .cc-feed-table tr.cc-breakdown-row td { padding: 0 !important; }
+      /* Open Queue collapsible header -- obvious affordance so a
+         supervisor scanning the page knows the row is interactive.
+         Chevron rotates on toggle; hover/active add background so
+         the pointer feedback is more than just the cursor. */
+      .cc-oq-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        user-select: none;
+        padding: 6px 8px;
+        margin-left: -8px;
+        margin-right: -8px;
+        border-radius: 6px;
+        transition: background-color 120ms ease;
+      }
+      .cc-oq-header:hover   { background: color-mix(in srgb, var(--ink,#0f172a) 6%, transparent); }
+      .cc-oq-header:active  { background: color-mix(in srgb, var(--ink,#0f172a) 12%, transparent); }
+      .cc-oq-header:focus-visible {
+        outline: 2px solid var(--accent,#2563eb);
+        outline-offset: 2px;
+      }
+      .cc-oq-chev {
+        display: inline-block;
+        width: 14px;
+        text-align: center;
+        transition: transform 160ms ease;
+        font-size: 12px;
+        line-height: 1;
+        color: var(--ink-2, inherit);
+      }
+      .cc-oq-header.expanded .cc-oq-chev { transform: rotate(90deg); }
+      .cc-oq-hint { color: var(--dim,#64748b); font-size: 12px; font-weight: normal; margin-left: auto; }
     </style>
     <div class="page" data-page="cycle-counts">
       <div class="page-hd">
@@ -1715,8 +1748,14 @@ function renderCycleCounts() {
       <div class="dr-section" style="margin-top:20px">Counts as they come in</div>
       ${_ccRenderLiveFeed()}
 
-      <div class="dr-section" style="margin-top:20px;cursor:pointer" onclick="_ccToggleOpenQueue()">
-        Open queue -- <span id="cc-open-queue-summary-text">${_ccOpenQueueSummary()}</span> ${CC_STATE._openQueueExpanded ? "&#9650;" : "&#9660;"}
+      <div class="dr-section cc-oq-header${CC_STATE._openQueueExpanded ? " expanded" : ""}"
+           style="margin-top:20px"
+           role="button" tabindex="0" aria-expanded="${CC_STATE._openQueueExpanded ? "true" : "false"}" aria-controls="cc-open-queue-body"
+           onclick="_ccToggleOpenQueue()"
+           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_ccToggleOpenQueue();}">
+        <span class="cc-oq-chev" aria-hidden="true">&#9656;</span>
+        <span>Open queue: <span id="cc-open-queue-summary-text">${_ccOpenQueueSummary()}</span></span>
+        <span class="cc-oq-hint">(tap to ${CC_STATE._openQueueExpanded ? "collapse" : "expand"})</span>
       </div>
       ${CC_STATE._openQueueExpanded ? `
         <p class="muted tiny">Supervisor override tools. Prefer /count on a phone for routine counting.</p>
