@@ -146,12 +146,21 @@ async function _applyOp(supa, w, i, log) {
 
       case "recordAdhocCount": {
         // v-ir-1: desktop replacement for the phone flow. Supervisor
-        // records a count against a pn that doesn't have an open
-        // cycle_count_items row -- we create one (tier "manual",
-        // reason "supervisor recorded count [source]") and then
-        // delegate the actual count logic to submitCount so the
-        // tolerance / recount-child / locations rules stay in one
-        // place.
+        // records a count for a pn from the IR workbench.
+        //
+        // v-ir-adopt: ADOPT BEFORE SPAWN. If an open item (status
+        // pending or recount) already exists for the pn, submit the
+        // count against THAT item instead of spawning a new one. This
+        // is the normal case for a supervisor recording a count on a
+        // pn that's already in today's queue -- the prior spawn-
+        // unconditionally path collided with the partial unique index
+        // cycle_count_items_open_pn_uniq (pending + recount_of null)
+        // and surfaced as a bare "500" to the user.
+        //
+        // Ordering: prefer the OLDEST open pending row (assigned_date
+        // asc, id asc as a stable tie-break) so a supervisor's count
+        // completes the earliest-queued audit rather than a fresher
+        // recount child.
         const pn = String(w.pn || "").trim();
         const counter = String(w.counted_by || "").trim();
         const countedRaw = Number(w.counted_qty);
@@ -166,38 +175,71 @@ async function _applyOp(supa, w, i, log) {
         const reason = source
           ? "supervisor recorded count (" + source + ")"
           : "supervisor recorded count";
-        const { data: inserted, error: insErr } = await supa
+
+        // Look for an already-open item for this pn.
+        const { data: openRows, error: openErr } = await supa
           .from("cycle_count_items")
-          .insert({
-            assigned_date: today,
-            tier: "manual",
-            reason,
-            pn,
-            system_qty_at_assign: sysQty,
-            status: "pending",
-            note: null,
-          })
-          .select("id")
-          .single();
-        if (insErr) return { index: i, ok: false, error: "recordAdhocCount: item spawn failed: " + insErr.message };
-        // Delegate to submitCount with the new item id, preserving
-        // client_key so a retry short-circuits (via the log row's
-        // unique index) BEFORE we'd double-spawn an adhoc item on
-        // retry. NOTE: retries of recordAdhocCount that reach here
-        // WILL create a second cycle_count_items row -- the log's
-        // client_key idempotency protects against a double-log but
-        // the item row is not client_key-scoped. We accept that cost:
-        // an extra "pending" adhoc item that will be re-flipped to
-        // "counted" by the delegated submitCount with no data loss.
+          .select("id, tier, status, recount_of, assigned_date, counted_by")
+          .eq("pn", pn)
+          .in("status", ["pending", "recount"])
+          .order("assigned_date", { ascending: true })
+          .order("id", { ascending: true })
+          .limit(50);
+        if (openErr) return { index: i, ok: false, error: "recordAdhocCount: open-item lookup failed: " + openErr.message };
+
+        let adoptId = null;
+        let adopted = false;
+        if (Array.isArray(openRows) && openRows.length > 0) {
+          // Prefer a parent-pending row (recount_of null); fall back
+          // to a recount child if the counter is different (blind
+          // rule enforced by submitCount below).
+          const parent = openRows.find(r => !r.recount_of);
+          if (parent) {
+            adoptId = parent.id;
+          } else {
+            const eligibleRecount = openRows.find(r => r.recount_of && String(r.counted_by || "").trim().toLowerCase() !== counter.toLowerCase());
+            if (eligibleRecount) adoptId = eligibleRecount.id;
+          }
+          if (adoptId) adopted = true;
+        }
+
+        let itemId = adoptId;
+        if (!itemId) {
+          // No adoptable open row -- spawn ad-hoc.
+          const { data: inserted, error: insErr } = await supa
+            .from("cycle_count_items")
+            .insert({
+              assigned_date: today,
+              tier: "manual",
+              reason,
+              pn,
+              system_qty_at_assign: sysQty,
+              status: "pending",
+              note: null,
+            })
+            .select("id")
+            .single();
+          if (insErr) return { index: i, ok: false, error: "recordAdhocCount: item spawn failed: " + insErr.message };
+          itemId = inserted.id;
+        }
+
+        // Delegate to submitCount. client_key idempotency protects
+        // the log row on retry; if we adopted, no ad-hoc row was
+        // created, so no cleanup needed either way.
         const sub = {
           op: "submitCount",
-          itemId: inserted.id,
+          itemId,
           counted_qty: countedRaw,
           counted_by: counter,
           client_key: w.client_key || w.clientKey || null,
           locations: Array.isArray(w.locations) ? w.locations : undefined,
         };
-        return await _applyOp(supa, sub, i, log);
+        const subRes = await _applyOp(supa, sub, i, log);
+        if (subRes && subRes.ok) {
+          subRes.kind = "recordAdhocCount";
+          subRes.adopted = adopted;
+        }
+        return subRes;
       }
 
       case "submitCount": {

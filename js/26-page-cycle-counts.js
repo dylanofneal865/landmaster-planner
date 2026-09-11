@@ -407,7 +407,14 @@ async function flagPartForCount(pn, note) {
     systemQtyNow: live == null ? 0 : live,
   }]);
   if (!res || !res.ok) {
-    if (typeof showToast === "function") showToast("Flag failed" + ((res && res.error && res.error.message) ? ": " + res.error.message : ""), "warn");
+    // v-ir-honest: surface per-op error text (200 with results[0].ok
+    // === false) OR transport/batch error, never a bare status.
+    const opResult = res && Array.isArray(res.results) ? res.results[0] : null;
+    const opError = opResult && opResult.ok === false ? String(opResult.error || "") : "";
+    const batchError = res && res.error && (res.error.message || res.error) ? String(res.error.message || res.error) : "";
+    const detail = opError || batchError || "unknown";
+    if (typeof _irReportWriteError === "function") _irReportWriteError("Flag", detail);
+    else if (typeof showToast === "function") showToast("Flag failed: " + detail, "warn");
     return;
   }
   const r = res.results && res.results[0];
@@ -2513,9 +2520,18 @@ async function _irSubmitRecord(pn, multi) {
       body: JSON.stringify(body),
     });
     const json = await resp.json();
-    if (!resp.ok || !json.ok) { alert("Record count failed: " + (json && json.error || resp.status)); }
-    else if (json.results && json.results[0] && json.results[0].ok === false) {
-      alert("Record count rejected: " + (json.results[0].error || "unknown"));
+    // v-ir-honest: never surface a bare HTTP status. The server
+    // returns 200 even when a per-op result fails (batch reached
+    // the server; only THIS op was rejected). Always prefer the
+    // per-op error text; fall back to batch-level error; only
+    // show the status when nothing else is available.
+    const opResult = json && Array.isArray(json.results) ? json.results[0] : null;
+    const opError = opResult && opResult.ok === false ? String(opResult.error || "") : "";
+    const batchError = json && json.error ? String(json.error) : "";
+    if (opError) {
+      _irReportWriteError("Record count", opError);
+    } else if (!resp.ok || (json && json.ok === false)) {
+      _irReportWriteError("Record count", batchError || ("server " + resp.status));
     } else {
       IR_STATE.recordFor = null;
       // Refresh log so the accumulator picks up the new anchor.
@@ -2523,12 +2539,25 @@ async function _irSubmitRecord(pn, multi) {
       _irInvalidate();
     }
   } catch (err) {
-    alert("Record count failed: " + (err && err.message));
+    _irReportWriteError("Record count", (err && err.message) || String(err) || "network error");
   }
   IR_STATE.recordSaving = false;
   if (typeof refresh === "function") refresh();
 }
 function _irOpenPart(pn) { if (typeof openPartDetail === "function") openPartDetail(pn); }
+
+// v-ir-honest: unified failure surface for write ops from this page.
+// Prefers a toast (showToast from js/05) but falls back to alert()
+// when the toast helper isn't available. Always includes the
+// server's error text; never a bare HTTP status alone.
+function _irReportWriteError(label, detail) {
+  const msg = String(label || "Write") + " failed: " + String(detail || "unknown");
+  if (typeof showToast === "function") {
+    try { showToast(msg, "warn"); return; } catch (_) {}
+  }
+  alert(msg);
+}
+if (typeof window !== "undefined") window._irReportWriteError = _irReportWriteError;
 
 // -------- VERIFY LIST ------------------------------------------------
 function _irVerifyList() {
