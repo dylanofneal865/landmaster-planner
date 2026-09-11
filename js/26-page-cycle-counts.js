@@ -1672,6 +1672,14 @@ const IR_STATE = {
   receipts90d: null,          // Array<{pn, receiptDate, qty, poNum, vendor, receiptNbr}>
   receipts90dLoading: false,
   receiptsMathExpanded: new Set(),
+  // v-ir-verdicts: threshold defaults for "does our on-hand look right".
+  // Editable inline in the headline; persisted via IR_THRESHOLDS_LS.
+  thresholdPct: 0.15,      // 15% of on-hand
+  thresholdUnits: 10,      // OR 10 units, whichever is bigger
+  thresholdUsd: 250,       // AND at least $250 impact
+  snoozed: null,           // pn -> { at, units, usd }; lazy loaded
+  mathShown: null,         // Set<pn>; lazy created
+  showFullLedger: false,   // full analyst table demoted
 };
 
 function _irInvalidate() { IR_STATE.aggByPn = null; }
@@ -2001,7 +2009,7 @@ function _irRenderRunway() {
     <div class="ir-collapse-hd" onclick="_irToggleRunway()" role="button" tabindex="0"
          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_irToggleRunway();}">
       <span class="ir-chev">${chev}</span>
-      <span>Runs out &le;<strong>${threshold}d</strong> (shelf only, POs excluded): <strong>${all.length}</strong></span>
+      <span>Running out soon &mdash; worth a fresh count (&le;<strong>${threshold}d</strong> shelf-only, ${all.length} ${all.length === 1 ? "part" : "parts"})</span>
       <span class="dim tiny" style="margin-left:auto">tap to ${expanded ? "collapse" : "expand"}</span>
     </div>
     ${expanded ? `
@@ -2609,6 +2617,404 @@ if (typeof window !== "undefined") {
 // retry via setTimeout so the browser can process macrotasks
 // (including cloudInit finishing). Retry is capped so a broken
 // SDK load doesn't leave the tab retrying forever.
+/* ================================================================
+   VERDICT ENGINE -- v-ir-verdicts
+   Plain-English "does our on-hand look right" story cards.
+   Unifies the two engines (receipts-math + nightly ledger) into
+   one verdict per pn; picks whichever gives the tighter claim
+   (smaller |delta|) and names it in the basis line.
+
+   Kinds:
+     * "over"        -- likely MORE on the shelf than the system shows
+                        (system undercounts). Amber chip.
+     * "short"       -- likely LESS on the shelf than the system shows
+                        (system overcounts). Red chip.
+     * "cant_add_up" -- receipts-math triggers (b): starting stock
+                        would have to exceed a year of use. Purple chip.
+
+   Sign convention: delta_units is the ABSOLUTE magnitude of the
+   discrepancy; kind carries the direction.
+   ================================================================ */
+
+const IR_SNOOZE_LS = "landmaster.ir.snoozed.v1";
+const IR_THRESHOLDS_LS = "landmaster.ir.thresholds.v1";
+
+function _irLoadPrefs() {
+  if (IR_STATE._prefsLoaded) return;
+  IR_STATE._prefsLoaded = true;
+  try {
+    const s = JSON.parse(localStorage.getItem(IR_SNOOZE_LS) || "{}");
+    IR_STATE.snoozed = (s && typeof s === "object") ? s : {};
+  } catch (_) { IR_STATE.snoozed = {}; }
+  try {
+    const t = JSON.parse(localStorage.getItem(IR_THRESHOLDS_LS) || "{}");
+    if (t && typeof t === "object") {
+      if (Number.isFinite(Number(t.pct))) IR_STATE.thresholdPct = Number(t.pct);
+      if (Number.isFinite(Number(t.units))) IR_STATE.thresholdUnits = Number(t.units);
+      if (Number.isFinite(Number(t.usd))) IR_STATE.thresholdUsd = Number(t.usd);
+    }
+  } catch (_) {}
+}
+function _irSavePrefs() {
+  try { localStorage.setItem(IR_SNOOZE_LS, JSON.stringify(IR_STATE.snoozed || {})); } catch (_) {}
+  try { localStorage.setItem(IR_THRESHOLDS_LS, JSON.stringify({
+    pct: IR_STATE.thresholdPct, units: IR_STATE.thresholdUnits, usd: IR_STATE.thresholdUsd,
+  })); } catch (_) {}
+}
+function _irSnooze(pn, units, usd) {
+  if (!IR_STATE.snoozed) IR_STATE.snoozed = {};
+  IR_STATE.snoozed[pn] = { at: new Date().toISOString(), units: Math.abs(Number(units) || 0), usd: Math.abs(Number(usd) || 0) };
+  _irSavePrefs();
+  if (typeof refresh === "function") refresh();
+}
+function _irUnsnooze(pn) {
+  if (IR_STATE.snoozed) delete IR_STATE.snoozed[pn];
+  _irSavePrefs();
+  if (typeof refresh === "function") refresh();
+}
+function _irSetThreshold(kind, v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return;
+  if (kind === "pct")   IR_STATE.thresholdPct = n / 100;   // input is a %; store fraction
+  if (kind === "units") IR_STATE.thresholdUnits = n;
+  if (kind === "usd")   IR_STATE.thresholdUsd = n;
+  _irSavePrefs();
+  if (typeof refresh === "function") refresh();
+}
+function _irToggleMath(pn) {
+  if (!(IR_STATE.mathShown instanceof Set)) IR_STATE.mathShown = new Set();
+  if (IR_STATE.mathShown.has(pn)) IR_STATE.mathShown.delete(pn);
+  else IR_STATE.mathShown.add(pn);
+  if (typeof refresh === "function") refresh();
+}
+function _irToggleFullLedger() {
+  IR_STATE.showFullLedger = !IR_STATE.showFullLedger;
+  if (typeof refresh === "function") refresh();
+}
+
+// Date helpers -- "Jul 10", "Sep 11".
+function _irNiceDate(iso) {
+  if (!iso) return "?";
+  const s = String(iso).slice(0, 10);
+  const parts = s.split("-").map(Number);
+  if (parts.length !== 3 || !parts.every(n => Number.isFinite(n))) return s;
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  if (isNaN(d.getTime())) return s;
+  const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return MONTHS[d.getMonth()] + " " + d.getDate();
+}
+function _irWindowStartIso(days) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return new Date(d.getTime() - days * 24 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+function _irBuildVerdicts() {
+  _irLoadPrefs();
+  const partsCache = _ccPartsCache();
+  const byPn = new Map();
+
+  // ---- Receipts-math source ----
+  const receiptsRows = _irReceiptsMathRows();
+  for (const r of receiptsRows) {
+    let kind, deltaUnits;
+    if (r.kind === "excess") { kind = "cant_add_up"; deltaUnits = 0; }
+    else {
+      // "unaccounted" -- receipts exceed what usage + on-hand explain.
+      // reality is likely GREATER than what the system shows -> OVER.
+      kind = "over";
+      deltaUnits = r.units;   // already the magnitude
+    }
+    byPn.set(r.pn, {
+      pn: r.pn, desc: r.desc, cls: r.cls, cost: r.cost, onHand: r.onHand,
+      daily: r.daily,
+      kind, deltaUnits, deltaUsd: r.absUsd,
+      basis: "receipts-math",
+      basisSince: _irWindowStartIso(r.window),
+      window: r.window,
+      receipts: r.receipts,
+      receiptsQty: r.receiptsQty,
+      usageEst: r.usageEst,
+      impliedPrior: r.impliedPrior,
+    });
+  }
+
+  // ---- Nightly ledger source ----
+  const agg = _irAggregate();
+  for (const a of agg.values()) {
+    if (a.ledgerDays < 7) continue;   // require meaningful coverage
+    if (Math.abs(a.residualSum) < 1) continue;
+    // residualSum > 0 -> extra stock appearing over time -> OVER.
+    // residualSum < 0 -> stock disappearing -> SHORT.
+    const kind = a.residualSum > 0 ? "over" : "short";
+    const deltaUnits = Math.abs(a.residualSum);
+    const deltaUsd = a.residualUsdAbs;
+    const existing = byPn.get(a.pn);
+    // Ledger overrides receipts-math when the claim is TIGHTER
+    // (smaller magnitude). If existing is cant_add_up, keep it --
+    // that's a categorical signal.
+    if (existing && existing.kind === "cant_add_up") continue;
+    if (existing && deltaUnits >= existing.deltaUnits) continue;
+    const p = partsCache.get(a.pn) || {};
+    byPn.set(a.pn, {
+      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "",
+      cost: Number(p.cost) || 0, onHand: a.onHand, daily: a.dailyUse,
+      kind, deltaUnits, deltaUsd,
+      basis: "ledger",
+      basisSince: a.firstAccumDate || a.lastSnapDate,
+      ledgerDays: a.ledgerDays,
+      leakPerDay: a.leakPerDay,
+      residualSum: a.residualSum,
+    });
+  }
+
+  // ---- Verified-recently annotation ----
+  for (const v of byPn.values()) {
+    const a = agg.get(v.pn);
+    if (a && a.lastCountAgeDays != null && a.lastCountAgeDays <= 45) {
+      v.verifiedDate = a.lastCountedAt;
+      v.verifiedCounter = a.lastCounter;
+      v.verifiedAgeDays = a.lastCountAgeDays;
+    }
+  }
+
+  // ---- Threshold + snooze filter ----
+  const pctT = IR_STATE.thresholdPct || 0.15;
+  const uT   = IR_STATE.thresholdUnits || 10;
+  const usdT = IR_STATE.thresholdUsd || 250;
+  const now = Date.now();
+  const SNOOZE_MS = 30 * 24 * 3600 * 1000;
+  const kept = [];
+  const suppressedByCount = [];
+  for (const v of byPn.values()) {
+    const unitFloor = Math.max(uT, v.onHand * pctT);
+    const passes = (v.kind === "cant_add_up")
+      ? v.deltaUsd >= usdT
+      : (v.deltaUnits >= unitFloor && v.deltaUsd >= usdT);
+    if (!passes) continue;
+
+    // Recent-count guard: for RECEIPTS-basis flags, the receipts
+    // window pre-dates the count; a fresh-counted part shouldn't
+    // reappear on the strength of receipts that landed before the
+    // counter walked over. Ledger basis already anchors post-count.
+    if (v.verifiedAgeDays != null && v.basis === "receipts-math") {
+      suppressedByCount.push(v);
+      continue;
+    }
+
+    // Snooze: 30-day dismissal, gated on gap growing by another
+    // threshold-worth (units OR dollars).
+    const s = IR_STATE.snoozed && IR_STATE.snoozed[v.pn];
+    if (s) {
+      const age = now - new Date(s.at).getTime();
+      if (age < SNOOZE_MS) {
+        const growUnits = v.deltaUnits - (Number(s.units) || 0);
+        const growUsd   = v.deltaUsd   - (Number(s.usd)   || 0);
+        if (growUnits < unitFloor && growUsd < usdT) { v._snoozed = true; continue; }
+      }
+    }
+    kept.push(v);
+  }
+  kept.sort((a, b) => b.deltaUsd - a.deltaUsd);
+  return { verdicts: kept, suppressedByCount };
+}
+
+// Simple text-first receipts summary line.
+function _irFormatReceiptsLine(receipts) {
+  if (!Array.isArray(receipts) || receipts.length === 0) return "No dated receipts in this window.";
+  const sorted = receipts.slice().sort((a, b) => a.receiptDate.localeCompare(b.receiptDate));
+  const shown = sorted.slice(0, 4);
+  const parts = shown.map(r => {
+    const qty = Math.round(r.qty);
+    const when = _irNiceDate(r.receiptDate);
+    const tag = r.poNum ? " (" + esc(r.poNum) + ")" : (r.receiptNbr ? " (" + esc(r.receiptNbr) + ")" : "");
+    return qty + " on " + when + tag;
+  });
+  let text = "Received " + parts.join(", ");
+  if (sorted.length > shown.length) text += ", and " + (sorted.length - shown.length) + " more";
+  return text + ".";
+}
+function _irUsageLine(v) {
+  const daily = Number(v.daily) || 0;
+  const dailyText = daily.toFixed(1);
+  if (v.basis === "receipts-math") {
+    const since = _irNiceDate(v.basisSince);
+    const used = Math.round(v.usageEst);
+    return `We use about ${dailyText}/day &mdash; roughly ${used} used since ${since}.`;
+  }
+  const since = _irNiceDate(v.basisSince);
+  const used = Math.round(daily * (v.ledgerDays || 0));
+  return `We use about ${dailyText}/day (chain-aware) &mdash; roughly ${used} used since ${since}.`;
+}
+function _irVerdictLine(v) {
+  const N = Math.round(v.deltaUnits);
+  const usdText = "$" + Math.round(v.deltaUsd).toLocaleString();
+  if (v.kind === "cant_add_up") {
+    return `Starting stock would have to be ${Math.round(v.impliedPrior)} for this to add up &mdash; that's over a year of use. Something in receipts, daily use, or on-hand is wrong (${usdText}).`;
+  }
+  if (v.basis === "receipts-math") {
+    return `So on-hand doesn't match the receipts story &mdash; about ${N} units (${usdText}) that came in aren't in the on-hand tally.`;
+  }
+  // ledger
+  if (v.kind === "over") {
+    return `Nightly tracking shows ${N} units (${usdText}) of stock appearing over ${v.ledgerDays} days &mdash; more on the shelf than the system says.`;
+  }
+  return `Nightly tracking shows ${N} units (${usdText}) of unexplained loss over ${v.ledgerDays} days &mdash; less on the shelf than the system says.`;
+}
+function _irBasisLine(v) {
+  if (v.basis === "receipts-math") return `based on receipts since ${_irNiceDate(v.basisSince)}`;
+  return `based on nightly tracking since ${_irNiceDate(v.basisSince)}`;
+}
+function _irRenderMathExpander(v) {
+  const rows = (v.receipts || []).slice().sort((a, b) => b.receiptDate.localeCompare(a.receiptDate)).map(x => `
+    <tr>
+      <td class="mono">${esc(x.poNum)}</td>
+      <td class="dim tiny">${esc(x.receiptNbr)}</td>
+      <td>${esc(x.receiptDate)}</td>
+      <td class="right num">${Math.round(x.qty)}</td>
+      <td class="dim">${esc(x.vendor)}</td>
+    </tr>`).join("");
+  const rec = v.basis === "receipts-math"
+    ? `<div class="dim tiny" style="margin-top:6px">
+         implied_prior = on_hand_now(${Math.round(v.onHand)}) - receipts(${Math.round(v.receiptsQty)}) + usage_est(${Math.round(v.usageEst)}) = <strong>${Math.round(v.impliedPrior)}</strong>.
+         Threshold hit: |implied_prior| > max(5, 10% receipts).
+       </div>
+       ${rows ? `<table class="tbl" style="margin-top:6px"><thead><tr>
+         <th>PO</th><th>Receipt</th><th>Date</th><th class="right">Qty</th><th>Vendor</th>
+       </tr></thead><tbody>${rows}</tbody></table>` : ""}`
+    : `<div class="dim tiny" style="margin-top:6px">
+         residualSum(${(v.residualSum || 0).toFixed(1)}) over ${v.ledgerDays} accumulated days,
+         avg ${(v.leakPerDay || 0).toFixed(2)} units/day &middot; $${Math.round(v.deltaUsd).toLocaleString()} impact.
+       </div>`;
+  return `<div class="ir-card-math">${rec}</div>`;
+}
+
+function _irRenderStoryCard(v) {
+  const chip = v.kind === "over"
+    ? `<span class="ir-chip ir-chip-amber">LOOKS WRONG &mdash; likely over by ~${Math.round(v.deltaUnits)}</span>`
+    : v.kind === "short"
+    ? `<span class="ir-chip ir-chip-red">LOOKS WRONG &mdash; likely short by ~${Math.round(v.deltaUnits)}</span>`
+    : `<span class="ir-chip ir-chip-purple">CAN'T ADD UP &mdash; count to reset</span>`;
+  const verified = v.verifiedAgeDays != null
+    ? `<div class="dim tiny" style="margin-top:4px">verified ${_irNiceDate(v.verifiedDate)}${v.verifiedCounter ? " &middot; " + esc(v.verifiedCounter) : ""}</div>`
+    : "";
+  const line1 = v.basis === "receipts-math"
+    ? _irFormatReceiptsLine(v.receipts)
+    : `Nightly tracking has been recording daily gaps since ${_irNiceDate(v.basisSince)} (${v.ledgerDays} days of data).`;
+  const line2 = _irUsageLine(v);
+  const line3 = _irVerdictLine(v);
+  const basisTag = `<span class="dim tiny">${_irBasisLine(v)}</span>`;
+  const mathShown = IR_STATE.mathShown instanceof Set && IR_STATE.mathShown.has(v.pn);
+  const recordShown = IR_STATE.recordFor === v.pn;
+  const shim = _irVerdictToAggShim(v);
+  return `
+    <article class="ir-card ir-card-${v.kind}" data-pn="${esc(v.pn)}">
+      <header class="ir-card-hd">
+        <div class="ir-card-id">
+          <div class="mono ir-card-pn">${esc(v.pn)}</div>
+          <div class="dim">${esc(v.desc)}${v.cls ? " &middot; " + esc(v.cls) : ""}</div>
+        </div>
+        <div class="ir-card-oh">
+          <div class="dim tiny">on-hand now</div>
+          <div class="ir-card-oh-num">${Math.round(v.onHand)}</div>
+        </div>
+        <div class="ir-card-chip">${chip}${verified}</div>
+      </header>
+      <div class="ir-card-body">
+        <p>${line1}</p>
+        <p>${line2}</p>
+        <p class="ir-card-verdict"><strong>${line3}</strong> ${basisTag}</p>
+      </div>
+      <footer class="ir-card-ft">
+        <button class="btn primary" onclick="_irBeginRecord('${esc(v.pn)}')">Go count it</button>
+        <button class="btn ghost" onclick="_irToggleMath('${esc(v.pn)}')">${mathShown ? "Hide" : "Show"} the math</button>
+        <button class="btn ghost" onclick="_irSnooze('${esc(v.pn)}', ${v.deltaUnits}, ${v.deltaUsd})">Looks fine &mdash; snooze 30d</button>
+      </footer>
+      ${recordShown ? `<div class="ir-card-inline">${_irRenderRecordForm(shim)}</div>` : ""}
+      ${mathShown ? _irRenderMathExpander(v) : ""}
+    </article>
+  `;
+}
+
+// _irRenderRecordForm expects an "agg"-shaped object (agg.pn,
+// agg.desc, agg.onHand). Wrap a verdict so it slots in cleanly.
+function _irVerdictToAggShim(v) {
+  return { pn: v.pn, desc: v.desc, cls: v.cls, onHand: v.onHand, dailyUse: v.daily };
+}
+
+function _irRenderVerdictsSection() {
+  _irLoadPrefs();
+  const receiptsReady = IR_STATE.receipts90d != null && !IR_STATE.receipts90dLoading;
+  const snapsReady = IR_STATE.snaps != null;
+  if (!receiptsReady || !snapsReady) {
+    return `<div class="ir-headline">
+      <h2>Does our on-hand look right?</h2>
+      <div class="empty tiny muted">Reading receipts + ledger...</div>
+    </div>`;
+  }
+  const { verdicts, suppressedByCount } = _irBuildVerdicts();
+  // Universe: every Base BOM pn we could possibly reason about.
+  const universe = new Set();
+  if (DB && Array.isArray(DB.parts)) {
+    for (const p of DB.parts) {
+      if (!p || !p.pn) continue;
+      if (String(p.itemType || "").toLowerCase().trim() !== "base_bom") continue;
+      universe.add(p.pn);
+    }
+  }
+  const flaggedCount = verdicts.length;
+  const okCount = Math.max(0, universe.size - flaggedCount - suppressedByCount.length);
+  const okLine = universe.size > 0
+    ? `<div class="ir-ok-line"><span class="ir-ok-check">&#10003;</span> <strong>${okCount} of ${universe.size} parts</strong>: on-hand is consistent with receipts and usage.</div>`
+    : "";
+  const suppressedLine = suppressedByCount.length > 0
+    ? `<div class="dim tiny" style="margin-top:4px">${suppressedByCount.length} parts have a receipts-math flag from before a recent count &mdash; already verified within 45 days, not shown.</div>`
+    : "";
+  const pctPct = Math.round((IR_STATE.thresholdPct || 0.15) * 100);
+  const thresholdsRow = `
+    <details class="ir-thresholds">
+      <summary class="dim tiny">Thresholds &middot; showing parts off by more than max(${pctPct}%, ${IR_STATE.thresholdUnits} units) AND more than $${IR_STATE.thresholdUsd}</summary>
+      <div class="row gap-md" style="margin-top:6px;align-items:center;flex-wrap:wrap">
+        <label class="row gap-sm" style="align-items:center">
+          <span class="muted tiny">% of on-hand</span>
+          <input class="input" type="number" min="0" step="1" style="width:80px" value="${pctPct}" onchange="_irSetThreshold('pct', this.value)">
+        </label>
+        <label class="row gap-sm" style="align-items:center">
+          <span class="muted tiny">units</span>
+          <input class="input" type="number" min="0" step="1" style="width:80px" value="${IR_STATE.thresholdUnits}" onchange="_irSetThreshold('units', this.value)">
+        </label>
+        <label class="row gap-sm" style="align-items:center">
+          <span class="muted tiny">$ impact</span>
+          <input class="input" type="number" min="0" step="10" style="width:100px" value="${IR_STATE.thresholdUsd}" onchange="_irSetThreshold('usd', this.value)">
+        </label>
+      </div>
+    </details>`;
+  if (flaggedCount === 0) {
+    return `<div class="ir-headline">
+      <h2>Does our on-hand look right?</h2>
+      ${okLine}
+      ${suppressedLine}
+      <div class="dim tiny" style="margin-top:6px">Nothing crosses the threshold. Change the thresholds below if you want to see smaller gaps.</div>
+      ${thresholdsRow}
+    </div>`;
+  }
+  const cards = verdicts.map(_irRenderStoryCard).join("");
+  return `<div class="ir-headline">
+    <h2>Does our on-hand look right?</h2>
+    ${okLine}
+    <div class="dim tiny" style="margin-top:4px"><strong>${flaggedCount}</strong> ${flaggedCount === 1 ? "part is" : "parts are"} off by enough to warrant a count &mdash; sorted by $ impact.</div>
+    ${suppressedLine}
+    ${thresholdsRow}
+  </div>
+  <div class="ir-cards">${cards}</div>`;
+}
+
+if (typeof window !== "undefined") {
+  Object.assign(window, {
+    _irSnooze, _irUnsnooze, _irSetThreshold, _irToggleMath, _irToggleFullLedger,
+  });
+}
+
 function _irRouteEnter() {
   // v-ir-recmath: snapshot load AND receipts-90d load are independent
   // async paths; both trigger refresh when they land. The freezefix
@@ -2663,14 +3069,18 @@ function renderCycleCounts() {
        <div class="empty tiny muted" style="margin-top:12px">Fetching parts_onhand_snapshots for the last ${IR_STATE.windowDays} days...</div>`
     : (IR_STATE.view === "verify"
         ? _irRenderVerifyList()
-        : `${_irRenderReceiptsMath()}
-           ${_irRenderTopStrip()}
-           <div style="margin-top:16px">${_irRenderRunway()}</div>
-           <div class="dr-section" style="margin-top:20px">Reconciliation ledger (${IR_STATE.windowDays}d)</div>
-           ${_irRenderMainTable()}
-           <div class="row gap-sm" style="margin-top:8px">
+        : `${_irRenderVerdictsSection()}
+           <div style="margin-top:24px">${_irRenderRunway()}</div>
+           <div class="row gap-sm" style="margin-top:24px;flex-wrap:wrap">
+             <button class="btn" onclick="_irToggleFullLedger()">${IR_STATE.showFullLedger ? "Hide" : "Show"} full ledger &middot; all parts &middot; residual columns &middot; sparklines</button>
              <button class="btn" onclick="_irSetView('verify')">Open Verify List</button>
-           </div>`);
+           </div>
+           ${IR_STATE.showFullLedger ? `
+             <div class="dr-section" style="margin-top:16px">Full reconciliation ledger (${IR_STATE.windowDays}d)</div>
+             ${_irRenderTopStrip()}
+             ${_irRenderReceiptsMath()}
+             ${_irRenderMainTable()}
+           ` : ""}`);
   const feedBlock = (DB && DB.cycleCounts && DB.cycleCounts.loaded)
     ? `<div class="dr-section" style="margin-top:24px">Counts as they come in</div>
        ${_ccRenderLiveFeed()}
@@ -2719,6 +3129,62 @@ function renderCycleCounts() {
       .ir-record-form { padding: 10px 4px; }
       .ir-bin-grid { display: flex; flex-wrap: wrap; gap: 10px; }
       .ir-bin { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+      /* v-ir-verdicts: story-card layout for the plain-English headline */
+      .ir-headline h2 { margin: 4px 0 8px; font-size: 22px; }
+      .ir-ok-line {
+        padding: 10px 12px;
+        border: 1px solid color-mix(in srgb, var(--ok, #16a34a) 40%, transparent);
+        background: color-mix(in srgb, var(--ok, #16a34a) 8%, transparent);
+        border-radius: 8px;
+        margin: 6px 0;
+      }
+      .ir-ok-check { color: var(--ok, #16a34a); font-weight: 700; margin-right: 4px; }
+      .ir-thresholds { margin-top: 8px; }
+      .ir-thresholds summary { cursor: pointer; user-select: none; }
+      .ir-cards { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
+      .ir-card {
+        border: 1px solid var(--line, #cbd5e1);
+        border-left-width: 4px;
+        border-radius: 8px;
+        padding: 14px 16px;
+        background: var(--surf, transparent);
+      }
+      .ir-card-over  { border-left-color: #d97706; }   /* amber */
+      .ir-card-short { border-left-color: #dc2626; }   /* red   */
+      .ir-card-cant_add_up { border-left-color: #7c3aed; } /* purple */
+      .ir-card-hd { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+      .ir-card-id { flex: 1 1 240px; min-width: 200px; }
+      .ir-card-pn { font-size: 16px; font-weight: 700; }
+      .ir-card-oh { text-align: right; min-width: 90px; }
+      .ir-card-oh-num { font-size: 28px; font-weight: 700; line-height: 1.1; }
+      .ir-card-chip { min-width: 220px; }
+      .ir-chip {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: #fff;
+      }
+      .ir-chip-amber  { background: #d97706; }
+      .ir-chip-red    { background: #dc2626; }
+      .ir-chip-purple { background: #7c3aed; }
+      .ir-card-body { margin: 10px 0 4px; }
+      .ir-card-body p { margin: 4px 0; line-height: 1.4; }
+      .ir-card-verdict { padding: 6px 0; }
+      .ir-card-ft { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+      .ir-card-math {
+        margin-top: 8px;
+        padding: 10px;
+        background: color-mix(in srgb, var(--ink, #0f172a) 4%, transparent);
+        border-radius: 6px;
+      }
+      .ir-card-inline { margin-top: 10px; }
+      @media (max-width: 640px) {
+        .ir-card-hd { flex-direction: column; align-items: stretch; }
+        .ir-card-oh { text-align: left; }
+      }
       /* Print styles for the Verify List */
       @media print {
         body * { visibility: hidden; }
