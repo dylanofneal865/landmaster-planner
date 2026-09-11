@@ -1653,7 +1653,11 @@ const IR_STATE = {
   classFilter: "",
   sortKey: "residualUsdAbs",  // residualUsdAbs | pn | onHand | daysLeft | lastCountedAt
   sortDir: "desc",
-  runwayExpanded: true,
+  // v-ir-tame: runway is a secondary panel now -- collapsed by default,
+  // 15/30/60d threshold, cap display at 25.
+  runwayExpanded: false,
+  runwayThreshold: 15,        // 15 | 30 | 60
+  runwayShowAll: false,
   expanded: new Set(),        // pns whose PO detail row is open
   poCache: new Map(),         // pn -> Array<{poNum, receiptDate, qty, vendor}>
   snaps: null,
@@ -1663,6 +1667,11 @@ const IR_STATE = {
   lastSnapshotAt: null,
   recordFor: null,            // pn currently in inline "record count" form
   recordSaving: false,
+  // v-ir-recmath: "Seems off -- receipts math" state. Independent
+  // from snaps so this headline renders even on day 1 of the ledger.
+  receipts90d: null,          // Array<{pn, receiptDate, qty, poNum, vendor, receiptNbr}>
+  receipts90dLoading: false,
+  receiptsMathExpanded: new Set(),
 };
 
 function _irInvalidate() { IR_STATE.aggByPn = null; }
@@ -1946,13 +1955,31 @@ function _irRunwayRows() {
   out.sort((x, y) => x.daysLeft - y.daysLeft);
   return out;
 }
+// v-ir-tame: runway is a secondary panel now. Threshold-scoped
+// list, needs-count pill gated on BOTH 45d-uncounted AND days-left
+// under the threshold, cap display at worst 25 with "show all N".
 function _irRenderRunway() {
-  const rows = _irRunwayRows();
+  const threshold = Number(IR_STATE.runwayThreshold) || 15;
+  const agg = _irAggregate();
+  const all = [];
+  for (const a of agg.values()) {
+    if (a.daysLeft === Infinity) continue;
+    if (a.daysLeft > threshold) continue;
+    all.push(a);
+  }
+  all.sort((x, y) => x.daysLeft - y.daysLeft);
+  const CAP = 25;
+  const overflowed = all.length > CAP;
+  const rows = IR_STATE.runwayShowAll ? all : all.slice(0, CAP);
   const body = rows.map(a => {
     const daysColor = a.daysLeft <= 15 ? "text-crit" : a.daysLeft <= 30 ? "text-warn" : "";
     const onPo = _irOnPoByPn(a.pn);
     const lastAge = a.lastCountAgeDays;
-    const needsCount = (lastAge == null) || (lastAge > 45);
+    // v-ir-tame: pill needs BOTH conditions -- prior version pilled
+    // everything unverified in 45d, which stacked amber across every
+    // healthy part on a young ledger. Now the pill only fires when
+    // the runway threshold ALSO triggers.
+    const needsCount = (lastAge == null || lastAge > 45) && a.daysLeft <= threshold;
     return `
       <tr class="ir-row" data-pn="${esc(a.pn)}" onclick="_irOpenPart('${esc(a.pn)}')">
         <td class="mono">${esc(a.pn)}</td>
@@ -1966,32 +1993,283 @@ function _irRenderRunway() {
         <td><button class="btn xs" onclick="event.stopPropagation();_irBeginRecord('${esc(a.pn)}')">Record count</button></td>
       </tr>`;
   }).join("");
-  const pilledCount = rows.filter(r => (r.lastCountAgeDays == null || r.lastCountAgeDays > 45)).length;
+  const pilledCount = all.filter(r => (r.lastCountAgeDays == null || r.lastCountAgeDays > 45)).length;
   const expanded = IR_STATE.runwayExpanded;
   const chev = expanded ? "&#9662;" : "&#9656;";
+  const thresholdOpts = [15, 30, 60].map(d => `<option value="${d}"${threshold === d ? " selected" : ""}>${d}d</option>`).join("");
   return `
     <div class="ir-collapse-hd" onclick="_irToggleRunway()" role="button" tabindex="0"
          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_irToggleRunway();}">
       <span class="ir-chev">${chev}</span>
-      <span>Runs out &le;60 days (shelf only, POs excluded): <strong>${rows.length}</strong></span>
+      <span>Runs out &le;<strong>${threshold}d</strong> (shelf only, POs excluded): <strong>${all.length}</strong></span>
       <span class="dim tiny" style="margin-left:auto">tap to ${expanded ? "collapse" : "expand"}</span>
     </div>
     ${expanded ? `
-      <div class="dim tiny" style="margin:6px 0 8px">
-        Days-left = shelf on-hand &divide; daily use. On-PO shown as info only.
-        ${pilledCount > 0 ? `<button class="btn xs" style="margin-left:8px" onclick="_irAddRunwayPilledToVerify()">Add all pilled to Verify list</button>` : ""}
+      <div class="row gap-sm" style="margin:8px 0;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+        <label class="row gap-sm" style="align-items:center">
+          <span class="muted tiny">Threshold</span>
+          <select class="input" style="width:80px" onchange="_irSetRunwayThreshold(this.value)">${thresholdOpts}</select>
+        </label>
+        <span class="dim tiny">Days-left = shelf on-hand &divide; daily use. On-PO info only. "Needs count" fires only when unverified &gt; 45d AND days-left &le; threshold.</span>
+        ${pilledCount > 0 ? `<button class="btn xs" onclick="_irAddRunwayPilledToVerify()">Add all pilled to Verify list</button>` : ""}
       </div>
       <div class="tbl-wrap"><table class="tbl ir-runway-table">
         <thead><tr>
           <th>PN</th><th>Description</th><th class="right">On hand</th><th class="right">Daily use</th>
           <th class="right">Days left</th><th class="right">On PO</th><th>Last count</th><th></th><th></th>
         </tr></thead>
-        <tbody>${body || `<tr><td colspan="9" class="empty tiny muted">Nothing runs out in the next 60 workdays.</td></tr>`}</tbody>
+        <tbody>${body || `<tr><td colspan="9" class="empty tiny muted">Nothing runs out in the next ${threshold} workdays.</td></tr>`}</tbody>
       </table></div>
+      ${overflowed ? `
+        <div class="dim tiny" style="margin-top:6px">
+          Showing worst ${rows.length} of ${all.length}.
+          <button class="btn xs ghost" onclick="_irToggleRunwayShowAll()">${IR_STATE.runwayShowAll ? "Show worst 25 only" : "Show all " + all.length}</button>
+        </div>` : ""}
     ` : ""}
   `;
 }
 function _irToggleRunway() { IR_STATE.runwayExpanded = !IR_STATE.runwayExpanded; if (typeof refresh === "function") refresh(); }
+function _irSetRunwayThreshold(v) {
+  IR_STATE.runwayThreshold = Number(v) || 15;
+  IR_STATE.runwayShowAll = false;
+  if (typeof refresh === "function") refresh();
+}
+function _irToggleRunwayShowAll() { IR_STATE.runwayShowAll = !IR_STATE.runwayShowAll; if (typeof refresh === "function") refresh(); }
+
+// -------- SEEMS OFF -- receipts math ---------------------------------
+// v-ir-recmath: bounds check using only po_receipts + on-hand + a
+// workday-aware usage estimate. Independent of the nightly ledger
+// so this renders correctly on day 1 (which is why it's the
+// headline until residual accumulation matures).
+//
+// implied_prior(window) = on_hand_now - receipts_in_window + usage_est_in_window
+//   flag (a) if implied_prior < -max(5, 10% * receipts): received
+//              more than usage + on-hand can explain
+//   flag (b) if implied_prior > daily_use * 365: implies over a
+//              year of stock at window start
+async function _irLoadReceipts90d() {
+  if (IR_STATE.receipts90dLoading) return;
+  if (IR_STATE.receipts90d != null) return;
+  if (typeof _supa === "undefined" || !_supa) {
+    IR_STATE.receipts90d = [];
+    return;
+  }
+  IR_STATE.receipts90dLoading = true;
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const startIso = new Date(start.getTime() - 90 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+  try {
+    const all = [];
+    const PAGE = 1000;
+    let from = 0;
+    const MAX_PAGES = 50;   // 50k rows guard
+    let pageCount = 0;
+    while (true) {
+      const { data, error } = await _supa
+        .from("po_receipts")
+        .select("id, data")
+        .gte("data->>receiptDate", startIso)
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      for (const r of data) {
+        const d = r && r.data;
+        if (!d || !d.pn || !d.receiptDate) continue;
+        if (d.status && String(d.status).trim() !== "Released") continue;
+        all.push({
+          pn: String(d.pn),
+          receiptDate: String(d.receiptDate).slice(0, 10),
+          qty: Number(d.qty) || 0,
+          poNum: d.poNum || "",
+          vendor: d.vendor || "",
+          receiptNbr: d.receiptNbr || "",
+        });
+      }
+      if (data.length < PAGE) break;
+      from += PAGE;
+      if (++pageCount >= MAX_PAGES) { console.error("[ir] receipts90d fetch hit MAX_PAGES=" + MAX_PAGES + "; truncating"); break; }
+    }
+    IR_STATE.receipts90d = all;
+  } catch (err) {
+    console.warn("[ir] receipts90d fetch failed:", err && err.message);
+    IR_STATE.receipts90d = [];
+  }
+  IR_STATE.receipts90dLoading = false;
+}
+function _irPhysicalOnHand(pn, part) {
+  if (DB && DB.partLocations instanceof Map) {
+    const locs = DB.partLocations.get(pn) || [];
+    let sumNonSentinel = 0;
+    let sentinel = null;
+    let sawNonSentinel = false;
+    for (const l of locs) {
+      const q = Number(l.qty) || 0;
+      if (String(l.location) === "__warehouse__") sentinel = q;
+      else { sumNonSentinel += q; sawNonSentinel = true; }
+    }
+    if (sawNonSentinel) return sumNonSentinel;
+    if (sentinel !== null) return sentinel;
+  }
+  return Number(part && part.onHand) || 0;
+}
+function _irDailyUse(part) {
+  if (!part) return 0;
+  if (typeof chainDisplayDaily === "function") {
+    try {
+      const c = chainDisplayDaily(part);
+      if (c && Number.isFinite(Number(c.daily))) return Number(c.daily);
+    } catch (_) {}
+  }
+  return Number(part.daily) || 0;
+}
+function _irReceiptsMathRows() {
+  if (!Array.isArray(IR_STATE.receipts90d)) return [];
+  if (!(DB && Array.isArray(DB.parts))) return [];
+  const WINDOWS = [30, 60, 90];
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const todayIso = now.toISOString().slice(0, 10);
+  const windowStartIso = WINDOWS.map(d => new Date(now.getTime() - d * 24 * 3600 * 1000).toISOString().slice(0, 10));
+  const workdays = WINDOWS.map((_, i) => _irWorkdaysBetweenIso(windowStartIso[i], todayIso));
+  // Group receipts by pn.
+  const byPn = new Map();
+  for (const r of IR_STATE.receipts90d) {
+    let arr = byPn.get(r.pn);
+    if (!arr) { arr = []; byPn.set(r.pn, arr); }
+    arr.push(r);
+  }
+  const out = [];
+  for (const p of DB.parts) {
+    if (!p || !p.pn) continue;
+    if (String(p.itemType || "").toLowerCase().trim() !== "base_bom") continue;
+    const receipts = byPn.get(p.pn) || [];
+    if (receipts.length === 0) continue;
+    const onHand = _irPhysicalOnHand(p.pn, p);
+    const daily = _irDailyUse(p);
+    const cost = Number(p.cost) || 0;
+    let trigger = null;
+    for (let i = 0; i < WINDOWS.length; i++) {
+      const receiptsInWindow = receipts.filter(r => r.receiptDate >= windowStartIso[i] && r.receiptDate <= todayIso);
+      const rQty = receiptsInWindow.reduce((s, r) => s + r.qty, 0);
+      if (rQty <= 0) continue;
+      const usageEst = daily * workdays[i];
+      const impliedPrior = onHand - rQty + usageEst;
+      const lowThreshold = -Math.max(5, rQty * 0.10);
+      const highThreshold = daily * 365;
+      let flag = null;
+      if (impliedPrior < lowThreshold) {
+        const units = -impliedPrior;
+        flag = { kind: "unaccounted", units, usd: units * cost };
+      } else if (daily > 0 && impliedPrior > highThreshold) {
+        const units = impliedPrior - highThreshold;
+        flag = { kind: "excess", units, usd: units * cost };
+      }
+      if (flag) {
+        trigger = {
+          window: WINDOWS[i],
+          receipts: receiptsInWindow,
+          receiptsQty: rQty,
+          usageEst,
+          impliedPrior,
+          flag,
+        };
+        break;   // first triggering window wins (shortest -> most immediate signal)
+      }
+    }
+    if (!trigger) continue;
+    out.push({
+      pn: p.pn, desc: p.desc || "", cls: p.partClass || "",
+      cost, onHand, daily,
+      window: trigger.window,
+      receipts: trigger.receipts,
+      receiptsQty: trigger.receiptsQty,
+      usageEst: trigger.usageEst,
+      impliedPrior: trigger.impliedPrior,
+      kind: trigger.flag.kind,
+      units: trigger.flag.units,
+      usd: trigger.flag.usd,
+      absUsd: Math.abs(trigger.flag.usd),
+    });
+  }
+  out.sort((a, b) => b.absUsd - a.absUsd);
+  return out;
+}
+function _irRenderReceiptsMath() {
+  const hdr = `<div class="dr-section" style="margin-top:12px">
+      Seems off &mdash; receipts math
+      <span class="dim tiny" style="margin-left:8px" title="One-sided bounds math: implied_prior = on_hand_now - receipts_in_window + usage_est_in_window (chain-aware daily x workdays). Flags cases where the paper trail can't explain what arrived. The nightly ledger supersedes this signal as residual coverage grows.">(bounds math &middot; headline until the ledger matures)</span>
+    </div>`;
+  if (IR_STATE.receipts90dLoading || IR_STATE.receipts90d == null) {
+    return hdr + `<div class="empty tiny muted">Scanning last 90d of po_receipts...</div>`;
+  }
+  const rows = _irReceiptsMathRows();
+  if (rows.length === 0) {
+    return hdr + `<div class="empty tiny muted">No parts flagged in the 30/60/90d windows. Received quantities are explainable by usage + current on-hand within the honest bounds.</div>`;
+  }
+  const body = rows.map(r => {
+    const expanded = IR_STATE.receiptsMathExpanded.has(r.pn);
+    const usdColor = r.absUsd >= 5000 ? "text-crit" : r.absUsd >= 500 ? "text-warn" : "";
+    const kindPill = r.kind === "unaccounted"
+      ? `<span class="pill warn" title="Received more than usage + on-hand can explain">unaccounted</span>`
+      : `<span class="pill" title="Implies over a year of stock at window start -- receipts, usage rate, or on-hand likely wrong">year+ implied</span>`;
+    const signal = r.kind === "unaccounted"
+      ? `received more than usage + on-hand can explain &mdash; ~${Math.round(r.units)} units ($${Math.round(r.absUsd).toLocaleString()}) unaccounted`
+      : `implies over a year of stock at window start &mdash; receipts, usage rate, or on-hand likely wrong`;
+    const detail = expanded ? `
+      <tr class="ir-detail-row"><td colspan="9" onclick="event.stopPropagation()">
+        <table class="tbl" style="margin:8px 0"><thead><tr>
+          <th>PO</th><th>Receipt</th><th>Date</th><th class="right">Qty</th><th>Vendor</th>
+        </tr></thead><tbody>${
+          r.receipts.slice().sort((a, b) => b.receiptDate.localeCompare(a.receiptDate)).map(x => `
+            <tr>
+              <td class="mono">${esc(x.poNum)}</td>
+              <td class="dim tiny">${esc(x.receiptNbr)}</td>
+              <td>${esc(x.receiptDate)}</td>
+              <td class="right num">${Math.round(x.qty)}</td>
+              <td class="dim">${esc(x.vendor)}</td>
+            </tr>`).join("")}
+        </tbody></table>
+      </td></tr>` : "";
+    return `
+      <tr class="ir-row" data-pn="${esc(r.pn)}" onclick="_irToggleReceiptsMath('${esc(r.pn)}')">
+        <td>
+          <div class="mono">${esc(r.pn)} ${kindPill}</div>
+          <div class="dim tiny">${esc(r.desc)}${r.cls ? " &middot; " + esc(r.cls) : ""}</div>
+        </td>
+        <td class="right num">${r.window}d</td>
+        <td class="right num">${Math.round(r.onHand)}</td>
+        <td class="right num">${Math.round(r.receiptsQty)} <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"}</span></td>
+        <td class="right num dim">${Math.round(r.usageEst)}</td>
+        <td class="right num">${r.impliedPrior >= 0 ? "+" : ""}${Math.round(r.impliedPrior)}</td>
+        <td class="right num ${usdColor}">${r.units >= 0 ? "" : "-"}${Math.round(Math.abs(r.units))} <span class="dim tiny">$${Math.round(r.absUsd).toLocaleString()}</span></td>
+        <td class="dim tiny">${signal}</td>
+        <td onclick="event.stopPropagation()"><button class="btn xs" onclick="_irBeginRecord('${esc(r.pn)}')">Record count</button></td>
+      </tr>
+      ${detail}`;
+  }).join("");
+  return hdr + `
+    <div class="tbl-wrap"><table class="tbl">
+      <thead><tr>
+        <th>PN / Desc</th><th class="right">Window</th><th class="right">On hand</th>
+        <th class="right">Receipts</th><th class="right">Est. usage</th>
+        <th class="right">Implied prior</th><th class="right">Unaccounted (units &middot; $)</th>
+        <th>Signal</th><th></th>
+      </tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>
+  `;
+}
+function _irToggleReceiptsMath(pn) {
+  if (IR_STATE.receiptsMathExpanded.has(pn)) IR_STATE.receiptsMathExpanded.delete(pn);
+  else IR_STATE.receiptsMathExpanded.add(pn);
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") {
+  Object.assign(window, {
+    _irSetRunwayThreshold, _irToggleRunwayShowAll,
+    _irToggleReceiptsMath,
+  });
+}
 
 // -------- MAIN TABLE -------------------------------------------------
 function _irSparkline(history) {
@@ -2332,8 +2610,14 @@ if (typeof window !== "undefined") {
 // (including cloudInit finishing). Retry is capped so a broken
 // SDK load doesn't leave the tab retrying forever.
 function _irRouteEnter() {
-  if (IR_STATE.snapsLoading) return;
-  if (IR_STATE.snapsLoadedFor === IR_STATE.windowDays) return;
+  // v-ir-recmath: snapshot load AND receipts-90d load are independent
+  // async paths; both trigger refresh when they land. The freezefix
+  // guards (snapsLoadedFor set on all exit paths; receipts90d != null
+  // check) prevent either from re-firing after it settles.
+  const snapsDone = IR_STATE.snapsLoadedFor === IR_STATE.windowDays;
+  const receiptsDone = IR_STATE.receipts90d != null;
+  if (snapsDone && receiptsDone) return;
+  if (IR_STATE.snapsLoading && IR_STATE.receipts90dLoading) return;
   if (typeof _supa === "undefined" || !_supa) {
     IR_STATE._supaWaitAttempts = (IR_STATE._supaWaitAttempts || 0) + 1;
     if (IR_STATE._supaWaitAttempts > 40) {
@@ -2341,6 +2625,7 @@ function _irRouteEnter() {
       console.error("[ir] gave up waiting for Supabase client after 10s -- workbench will show empty state");
       IR_STATE.snaps = [];
       IR_STATE.snapsLoadedFor = IR_STATE.windowDays;
+      IR_STATE.receipts90d = [];
       if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
       return;
     }
@@ -2350,11 +2635,16 @@ function _irRouteEnter() {
     return;
   }
   IR_STATE._supaWaitAttempts = 0;
-  _irLoadSnapshots(IR_STATE.windowDays).then(() => {
-    if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts") {
-      if (typeof refresh === "function") refresh();
-    }
-  });
+  if (!snapsDone && !IR_STATE.snapsLoading) {
+    _irLoadSnapshots(IR_STATE.windowDays).then(() => {
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
+    });
+  }
+  if (!receiptsDone && !IR_STATE.receipts90dLoading) {
+    _irLoadReceipts90d().then(() => {
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
+    });
+  }
 }
 
 // -------- MAIN RENDER ------------------------------------------------
@@ -2373,7 +2663,8 @@ function renderCycleCounts() {
        <div class="empty tiny muted" style="margin-top:12px">Fetching parts_onhand_snapshots for the last ${IR_STATE.windowDays} days...</div>`
     : (IR_STATE.view === "verify"
         ? _irRenderVerifyList()
-        : `${_irRenderTopStrip()}
+        : `${_irRenderReceiptsMath()}
+           ${_irRenderTopStrip()}
            <div style="margin-top:16px">${_irRenderRunway()}</div>
            <div class="dr-section" style="margin-top:20px">Reconciliation ledger (${IR_STATE.windowDays}d)</div>
            ${_irRenderMainTable()}
