@@ -3104,9 +3104,38 @@ function _irLatestResolutionByPn() {
 }
 // Decide whether to suppress a row given its current gap magnitude
 // and the latest resolution for this pn. Returns true = suppress.
+// v-ir-verify: per-source suppression rules.
+//   verify-order  Done/Not needed -> hidden until the pn's order-by
+//                 ADVANCES past the order-by it was resolved against
+//                 (a PO landing moves it forward). The resolved
+//                 order-by ISO is embedded in the reason text; 90d
+//                 hard cap so a stuck part can't hide forever.
+//   running-thin  Done/Not needed -> 14 days.
+//   receipts-math / ledger (side section) -> existing rules:
+//                 done 45d unless gap regrows; not_needed 60d
+//                 unless gap doubles.
+const IR_VERIFY_DONE_CAP_DAYS = 90;
+const IR_THIN_HIDE_DAYS = 14;
+function _irOrderByIsoFromResolution(r) {
+  const m = String((r && r.reason) || "").match(/\((\d{4}-\d{2}-\d{2})\)/);
+  return m ? m[1] : null;
+}
 function _irIsSuppressed(item, latestRes) {
   if (!latestRes) return false;
   const days = (Date.now() - new Date(latestRes.resolved_at).getTime()) / (24 * 3600 * 1000);
+  if (item.source === "verify-order") {
+    if (days > IR_VERIFY_DONE_CAP_DAYS) return false;
+    const resolvedIso = _irOrderByIsoFromResolution(latestRes);
+    // Only a verify-order resolution can suppress a verify-order row;
+    // a stale side-section resolution shouldn't hide an order decision.
+    if (latestRes.source !== "verify-order" || !resolvedIso) return false;
+    return !(item.orderByIso && item.orderByIso > resolvedIso);
+  }
+  if (item.source === "running-thin") {
+    if (latestRes.source !== "running-thin" && latestRes.source !== "verify-order") return false;
+    return days <= IR_THIN_HIDE_DAYS;
+  }
+  // Side section -- existing rules.
   const hideWindow = IR_LIST_RESOLUTION_HIDE_DAYS[latestRes.resolution] || 0;
   if (days > hideWindow) return false;
   const prevUsd = Math.abs(Number(latestRes.gap_usd) || 0);
@@ -3114,16 +3143,11 @@ function _irIsSuppressed(item, latestRes) {
   const curUsd = Math.abs(Number(item.gapUsd) || 0);
   const curUnits = Math.abs(Number(item.gapUnits) || 0);
   if (latestRes.resolution === "not_needed") {
-    // Reappear if the gap has DOUBLED (either dimension).
     if (prevUsd > 0 && curUsd >= 2 * prevUsd) return false;
     if (prevUnits > 0 && curUnits >= 2 * prevUnits) return false;
     if (prevUsd === 0 && prevUnits === 0 && curUsd >= IR_LIST_MIN_USD) return false;
     return true;
   }
-  // "done" -- reappear on NEW evidence after resolved_at that adds
-  // meaningful new gap. Runway-only rows are treated as no-new-gap
-  // during the hide window (a fresh count "cleared" them).
-  if (item.source === "runway" || item.source === "never-verified") return true;
   const grewUsd = curUsd - prevUsd;
   const grewUnits = curUnits - prevUnits;
   if (grewUsd >= IR_LIST_REGROW_USD || grewUnits >= IR_LIST_REGROW_UNITS) return false;
@@ -3154,155 +3178,264 @@ function _irBinsFor(pn) {
   return named.slice(0, 3).join(", ") + " +" + (named.length - 3);
 }
 
-// Build the unified count list from the four engines. Dedupe by
-// pn: $-signal (receipts-math OR ledger) wins > runway > never-
-// verified. Each item carries: sortTier, sortKey, source, reason
-// (short "why" line), gapUnits, gapUsd, dateAdded (evidence start).
+/* ================================================================
+   VERIFY BEFORE WE ORDER -- v-ir-verify
+   One principle: verify a part's count right before its ordering
+   decision, so every PO is sized from a confirmed number.
+
+   PRIMARY  "Verify this week"  -- order-by (naturalOrderByForPart,
+            the drawer's banner math: chain / pre-launch / runout -
+            LT - safety) within the next 10 workdays (or already
+            passed), AND no completed count since the previous
+            order-by. Sorted by order-by asc.
+   SAFETY   "Running thin"      -- shelf-only cover <= 15 workdays
+            (physical on-hand / daily, POs excluded) AND no count in
+            14 days. Sorted by days-left asc. Rendered ABOVE primary.
+   SIDE     "Also looks off"    -- receipts-math / ledger gaps, but
+            ONLY where pessimistic cover ((on-hand - gap) / daily)
+            <= 90 workdays. Everything else rolls into one
+            "N low-risk discrepancies ($X)" line. Capped 10;
+            siblings clustered by flag signature + desc family.
+
+   Nothing here writes to parts; the reorder math is unchanged.
+   ================================================================ */
+const IR_VERIFY_WINDOW_WORKDAYS = 10;
+const IR_THIN_COVER_WORKDAYS = 15;
+const IR_THIN_STALE_DAYS = 14;
+const IR_SIDE_PESSIMISTIC_COVER_WORKDAYS = 90;
+const IR_SIDE_CAP = 10;
+const IR_VMI_TOKENS = ["fastenal"];
+
+function _irIsVmiPart(p) {
+  const cands = [p.supplier, p.vendor, p.vendorName, p.supplierName];
+  for (const raw of cands) {
+    const n = String(raw || "").toLowerCase().trim();
+    if (!n) continue;
+    for (const t of IR_VMI_TOKENS) if (t && n.indexOf(t) !== -1) return true;
+  }
+  return false;
+}
+// Universe = Base BOM parts under the same exclusions the nightly
+// snapshot applies (VMI, phasing-out, pre-launch, queued/retired
+// chain members). Chain-role exclusion is encoded by snapshot
+// membership (the server ran classifyChainRole); when snapshots
+// exist we require membership, otherwise fall back to the cheap
+// browser-side filters only.
+function _irListUniverse() {
+  const out = [];
+  if (!(DB && Array.isArray(DB.parts))) return out;
+  const agg = _irAggregate();
+  const useAggGate = agg.size > 0;
+  for (const p of DB.parts) {
+    if (!p || !p.pn) continue;
+    if (String(p.itemType || "").toLowerCase().trim() !== "base_bom") continue;
+    if (p.phasingOut === true) continue;
+    if (_irIsVmiPart(p)) continue;
+    if (typeof isPreLaunch === "function" && isPreLaunch(p)) continue;
+    if (useAggGate && !agg.has(p.pn)) continue;
+    out.push(p);
+  }
+  return out;
+}
+// Latest completed count per pn straight from the log (independent
+// of snapshot coverage so a pn with no snapshot still gets credit).
+function _irLastCountByPn() {
+  const m = new Map();
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  for (const r of log) {
+    if (!r || !r.pn) continue;
+    if (r.outcome !== "counted" && r.outcome !== "reconciled") continue;
+    const prev = m.get(r.pn);
+    if (!prev || String(r.counted_at) > String(prev.counted_at)) m.set(r.pn, r);
+  }
+  return m;
+}
+function _irIsoOf(d) {
+  if (!(d instanceof Date) || isNaN(d.getTime())) return null;
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+// Workdays from TODAY to a date (negative when past, in calendar days
+// for the past side since calendarDaysToWorkdays only counts forward).
+function _irWorkdaysUntil(d) {
+  const today = (typeof TODAY !== "undefined" && TODAY instanceof Date) ? TODAY : (function () { const t = new Date(); t.setHours(0, 0, 0, 0); return t; })();
+  const cal = Math.round((d.getTime() - today.getTime()) / (24 * 3600 * 1000));
+  if (cal <= 0) return cal;
+  return (typeof calendarDaysToWorkdays === "function") ? calendarDaysToWorkdays(cal, today) : cal;
+}
+// "flip seat weldment lh" / "flip seat weldment rh" -> "flip seat weldment"
+function _irDescFamily(desc) {
+  const words = String(desc || "").toLowerCase().replace(/[^a-z ]+/g, " ").split(/\s+/).filter(Boolean);
+  const stop = new Set(["lh", "rh", "left", "right", "assy", "assembly", "a", "b", "c"]);
+  const core = words.filter(w => !stop.has(w));
+  return core.slice(0, 3).join(" ") || words.slice(0, 3).join(" ") || "(no description)";
+}
+
 function _irBuildCountList() {
   const partsCache = _ccPartsCache();
-  const items = new Map();
+  const lastCount = _irLastCountByPn();
+  const universe = _irListUniverse();
+  const universeByPn = new Map(universe.map(p => [p.pn, p]));
+  const todayIso = _irIsoOf(new Date()) || new Date().toISOString().slice(0, 10);
+  const safetyDays = (typeof DB !== "undefined" && DB && DB.settings && Number(DB.settings.safetyDays)) || 0;
 
-  // Tier A -- $ signal via receipts-math.
-  for (const r of _irReceiptsMathRows()) {
-    const unitFloor = Math.max(IR_LIST_MIN_UNITS_ABS, r.onHand * IR_LIST_MIN_UNITS_PCT);
-    if (r.kind === "cant_add_up") {
-      if (r.absUsd < IR_LIST_MIN_USD) continue;
-    } else if (r.units < unitFloor || r.absUsd < IR_LIST_MIN_USD) continue;
-    let why;
-    if (r.kind === "cant_add_up") {
-      why = "receipts can't add up — count to reset ($" + Math.round(r.absUsd).toLocaleString() + ")";
-    } else {
-      // "unaccounted" = reality likely OVER what the system says.
-      why = "receipts say ~" + Math.round(r.units) + " more than shelf shows — $" + Math.round(r.absUsd).toLocaleString();
-    }
-    // Earliest receipt date in window = evidence start.
-    let earliest = null;
-    for (const rc of r.receipts) {
-      if (!earliest || rc.receiptDate < earliest) earliest = rc.receiptDate;
-    }
-    items.set(r.pn, {
-      pn: r.pn, desc: r.desc, cls: r.cls,
-      bins: _irBinsFor(r.pn),
-      onHand: r.onHand,
-      why, source: "receipts-math",
-      gapUnits: r.kind === "cant_add_up" ? 0 : r.units,
-      gapUsd: r.absUsd,
-      dateAdded: earliest || _irWindowStartIso(r.window),
-      sortTier: 0,
-      sortKey: -r.absUsd,   // desc by |$|
+  // ---- PRIMARY: verify this week (order-by within 10 workdays) ----
+  const verify = [];
+  for (const p of universe) {
+    const obDate = (typeof naturalOrderByForPart === "function") ? naturalOrderByForPart(p) : null;
+    if (!obDate) continue;
+    const wd = _irWorkdaysUntil(obDate);
+    if (wd > IR_VERIFY_WINDOW_WORKDAYS) continue;
+    // "No completed count since the previous order-by." We don't keep
+    // order-by history; approximate previous order-by as this order-by
+    // minus one replenishment interval (lead + safety, min 14d).
+    const lt = (typeof leadTimeDays === "function") ? leadTimeDays(p) : 0;
+    const interval = Math.max(14, lt + safetyDays);
+    const prevOrderBy = new Date(obDate.getTime() - interval * 24 * 3600 * 1000);
+    const lc = lastCount.get(p.pn);
+    if (lc && new Date(lc.counted_at).getTime() >= prevOrderBy.getTime()) continue;
+    const obIso = _irIsoOf(obDate);
+    const nice = _irNiceDate(obIso);
+    const why = wd < 0
+      ? "order decision OVERDUE (was " + nice + ") (" + obIso + ") — verify before we PO"
+      : "order decision due " + nice + " (" + obIso + ") — verify before we PO";
+    verify.push({
+      pn: p.pn, desc: p.desc || "", cls: p.partClass || "",
+      bins: _irBinsFor(p.pn),
+      onHand: _irPhysicalOnHand(p.pn, p),
+      why, source: "verify-order",
+      orderByIso: obIso, orderByWorkdays: wd,
+      gapUnits: 0, gapUsd: 0,
+      dateAdded: todayIso,
+      sortKey: obDate.getTime(),
     });
   }
+  verify.sort((a, b) => a.sortKey - b.sortKey);
 
-  // Nightly ledger -- overrides receipts if it gives a tighter (smaller |units|)
-  // claim, otherwise fills in where receipts-math didn't fire.
+  // ---- SAFETY: running thin (shelf cover <= 15 workdays, no count 14d) ----
+  const thin = [];
+  const verifyPns = new Set(verify.map(v => v.pn));
+  for (const p of universe) {
+    const daily = _irDailyUse(p);
+    if (daily <= 0) continue;
+    const oh = _irPhysicalOnHand(p.pn, p);
+    const cover = oh / daily;
+    if (cover > IR_THIN_COVER_WORKDAYS) continue;
+    const lc = lastCount.get(p.pn);
+    const ageDays = lc ? Math.floor((Date.now() - new Date(lc.counted_at).getTime()) / (24 * 3600 * 1000)) : null;
+    if (ageDays != null && ageDays <= IR_THIN_STALE_DAYS) continue;
+    const daysLeft = Math.max(0, Math.floor(cover));
+    const item = {
+      pn: p.pn, desc: p.desc || "", cls: p.partClass || "",
+      bins: _irBinsFor(p.pn),
+      onHand: oh,
+      why: daysLeft + (daysLeft === 1 ? " day" : " days") + " of stock left — confirm it's really there",
+      source: "running-thin",
+      daysLeft,
+      gapUnits: 0, gapUsd: 0,
+      dateAdded: todayIso,
+      sortKey: cover,
+    };
+    // A pn in both lists: keep it in the primary row (that's the
+    // decision that matters) and note the thin cover on it.
+    if (verifyPns.has(p.pn)) {
+      const v = verify.find(x => x.pn === p.pn);
+      if (v) v.why = v.why + " · only " + daysLeft + "d of stock on the shelf";
+      continue;
+    }
+    thin.push(item);
+  }
+  thin.sort((a, b) => a.sortKey - b.sortKey);
+
+  // ---- SIDE: also looks off (receipts-math + ledger, pessimistic cover <= 90) ----
+  const sideByPn = new Map();
+  for (const r of _irReceiptsMathRows()) {
+    if (!universeByPn.has(r.pn)) continue;
+    const unitFloor = Math.max(IR_LIST_MIN_UNITS_ABS, r.onHand * IR_LIST_MIN_UNITS_PCT);
+    if (r.kind === "cant_add_up") { if (r.absUsd < IR_LIST_MIN_USD) continue; }
+    else if (r.units < unitFloor || r.absUsd < IR_LIST_MIN_USD) continue;
+    const why = r.kind === "cant_add_up"
+      ? "receipts can't add up — count to reset ($" + Math.round(r.absUsd).toLocaleString() + ")"
+      : "receipts say ~" + Math.round(r.units) + " more than shelf shows — $" + Math.round(r.absUsd).toLocaleString();
+    let earliest = null;
+    for (const rc of r.receipts) if (!earliest || rc.receiptDate < earliest) earliest = rc.receiptDate;
+    sideByPn.set(r.pn, {
+      pn: r.pn, desc: r.desc, cls: r.cls, bins: _irBinsFor(r.pn), onHand: r.onHand,
+      daily: r.daily, why, source: "receipts-math", sig: "receipts-" + r.kind,
+      gapUnits: r.kind === "cant_add_up" ? 0 : r.units, gapUsd: r.absUsd,
+      dateAdded: earliest || _irWindowStartIso(r.window),
+    });
+  }
   const agg = _irAggregate();
   for (const a of agg.values()) {
+    if (!universeByPn.has(a.pn)) continue;
     if (a.ledgerDays < 7) continue;
     const absUnits = Math.abs(a.residualSum);
     const absUsd = a.residualUsdAbs;
     const unitFloor = Math.max(IR_LIST_MIN_UNITS_ABS, a.onHand * IR_LIST_MIN_UNITS_PCT);
     if (absUnits < unitFloor || absUsd < IR_LIST_MIN_USD) continue;
-    const existing = items.get(a.pn);
+    const existing = sideByPn.get(a.pn);
     if (existing && existing.source === "receipts-math") {
-      // Prefer ledger only if tighter (smaller |units|). Keep can't-add-up
-      // categorical -- but receipts-math cant_add_up has units=0 so tighter
-      // check would replace it; guard on that.
-      if (existing.gapUnits === 0 && existing.source === "receipts-math") continue;
-      if (absUnits >= existing.gapUnits) continue;
+      if (existing.gapUnits === 0) continue;          // keep cant_add_up categorical
+      if (absUnits >= existing.gapUnits) continue;    // ledger only if tighter
     }
     const p = partsCache.get(a.pn) || {};
-    const kindText = a.residualSum > 0
-      ? "nightly tracking: ~" + Math.round(absUnits) + " units of stock appearing over " + a.ledgerDays + "d — $" + Math.round(absUsd).toLocaleString()
-      : "nightly tracking: ~" + Math.round(absUnits) + " units missing over " + a.ledgerDays + "d — $" + Math.round(absUsd).toLocaleString();
-    items.set(a.pn, {
-      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "",
-      bins: _irBinsFor(a.pn),
-      onHand: a.onHand,
-      why: kindText, source: "ledger",
+    const dir = a.residualSum > 0 ? "appearing" : "missing";
+    sideByPn.set(a.pn, {
+      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "", bins: _irBinsFor(a.pn), onHand: a.onHand,
+      daily: a.dailyUse,
+      why: "nightly tracking: ~" + Math.round(absUnits) + " units " + dir + " over " + a.ledgerDays + "d — $" + Math.round(absUsd).toLocaleString(),
+      source: "ledger", sig: "ledger-" + dir,
       gapUnits: absUnits, gapUsd: absUsd,
       dateAdded: a.firstAccumDate || a.lastSnapDate,
-      sortTier: 0,
-      sortKey: -absUsd,
     });
   }
-
-  // Tier B -- runway (daysLeft <= 60). Only kept if not counted in
-  // 45d (or never counted); merges with $-signal for the same pn by
-  // enriching the why line.
-  const todayIso = new Date().toISOString().slice(0, 10);
-  const runwayItems = _irRunwayItems(IR_LIST_RUNWAY_MAX_DAYS);
-  for (const a of runwayItems) {
-    const staleOrNever = (a.lastCountAgeDays == null) || (a.lastCountAgeDays > IR_LIST_UNVERIFIED_STALE_DAYS);
-    if (!staleOrNever) continue;
-    const existing = items.get(a.pn);
-    if (existing) {
-      // Enrich existing $-signal row's why line rather than replacing.
-      const suffix = " · also runs out in " + a.daysLeft + "d" + (a.lastCountAgeDays == null ? ", never verified" : ", not counted in " + a.lastCountAgeDays + "d");
-      existing.why = existing.why + suffix;
-      continue;
-    }
-    const partsCache2 = _ccPartsCache();
-    const p = partsCache2.get(a.pn) || {};
-    const why = a.lastCountAgeDays == null
-      ? "runs out in " + a.daysLeft + "d, never verified"
-      : "runs out in " + a.daysLeft + "d, not counted in " + a.lastCountAgeDays + "d";
-    items.set(a.pn, {
-      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "",
-      bins: _irBinsFor(a.pn),
-      onHand: a.onHand,
-      why, source: "runway",
-      gapUnits: 0, gapUsd: 0,
-      dateAdded: todayIso,
-      sortTier: 1,
-      sortKey: a.daysLeft,   // asc
-    });
+  // Split by pessimistic cover; exclude pns already on the two lists
+  // above (they're getting counted anyway).
+  const sideRisky = [];
+  let lowRiskCount = 0, lowRiskUsd = 0;
+  const thinPns = new Set(thin.map(t => t.pn));
+  for (const s of sideByPn.values()) {
+    if (verifyPns.has(s.pn) || thinPns.has(s.pn)) continue;
+    const daily = Number(s.daily) || 0;
+    const pess = daily > 0 ? (Math.max(0, s.onHand - s.gapUnits) / daily) : Infinity;
+    s.pessimisticCover = pess;
+    if (pess <= IR_SIDE_PESSIMISTIC_COVER_WORKDAYS) sideRisky.push(s);
+    else { lowRiskCount++; lowRiskUsd += Number(s.gapUsd) || 0; }
   }
 
-  // Tier C -- never-verified Base BOM parts, capped at top N by
-  // (daily * cost) so the tail doesn't overwhelm the list.
-  if (DB && Array.isArray(DB.parts)) {
-    const neverPool = [];
-    for (const p of DB.parts) {
-      if (!p || !p.pn) continue;
-      if (String(p.itemType || "").toLowerCase().trim() !== "base_bom") continue;
-      if (items.has(p.pn)) continue;
-      const aggRow = agg.get(p.pn);
-      if (aggRow && aggRow.lastCountedAt) continue;
-      const daily = Number(p.daily) || 0;
-      if (daily <= 0) continue;
-      const cost = Number(p.cost) || 0;
-      neverPool.push({ p, weight: daily * (cost || 1) });
-    }
-    neverPool.sort((a, b) => b.weight - a.weight);
-    for (const x of neverPool.slice(0, IR_LIST_NEVER_VERIFIED_CAP)) {
-      const p = x.p;
-      items.set(p.pn, {
-        pn: p.pn, desc: p.desc || "", cls: p.partClass || "",
-        bins: _irBinsFor(p.pn),
-        onHand: _irPhysicalOnHand(p.pn, p),
-        why: "never verified", source: "never-verified",
-        gapUnits: 0, gapUsd: 0,
-        dateAdded: todayIso,
-        sortTier: 2,
-        sortKey: -x.weight,
-      });
-    }
-  }
-
-  // Apply resolution suppression.
+  // ---- Resolution suppression (per-source rules) ----
   const latestByPn = _irLatestResolutionByPn();
-  const kept = [];
   let suppressedCount = 0;
-  for (const it of items.values()) {
+  const keep = (arr) => arr.filter(it => {
     const r = latestByPn.get(it.pn);
-    if (_irIsSuppressed(it, r)) { suppressedCount++; continue; }
-    kept.push(it);
-  }
-  kept.sort((a, b) => {
-    if (a.sortTier !== b.sortTier) return a.sortTier - b.sortTier;
-    return a.sortKey - b.sortKey;
+    if (_irIsSuppressed(it, r)) { suppressedCount++; return false; }
+    return true;
   });
-  return { items: kept, suppressedCount };
+  const verifyKept = keep(verify);
+  const thinKept = keep(thin);
+  const sideKept = keep(sideRisky).sort((a, b) => b.gapUsd - a.gapUsd);
+
+  // ---- Cluster side siblings by (signature, desc family) ----
+  const clusters = new Map();
+  for (const s of sideKept) {
+    const key = s.sig + "|" + _irDescFamily(s.desc);
+    let c = clusters.get(key);
+    if (!c) { c = { key, sig: s.sig, family: _irDescFamily(s.desc), members: [], gapUsd: 0 }; clusters.set(key, c); }
+    c.members.push(s);
+    c.gapUsd += Number(s.gapUsd) || 0;
+  }
+  const clusterList = [...clusters.values()].sort((a, b) => b.gapUsd - a.gapUsd);
+  const sideShown = clusterList.slice(0, IR_SIDE_CAP);
+  const sideOverflow = clusterList.slice(IR_SIDE_CAP).reduce((s, c) => s + c.members.length, 0);
+
+  const all = [...verifyKept, ...thinKept, ...sideKept];
+  return {
+    verify: verifyKept,
+    thin: thinKept,
+    side: { clusters: sideShown, overflowCount: sideOverflow, lowRiskCount, lowRiskUsd },
+    items: all,
+    suppressedCount,
+  };
 }
 
 async function _irResolveListItem(pn, resolution) {
@@ -3372,58 +3505,118 @@ if (typeof window !== "undefined") {
   });
 }
 
-function _irRenderCountList() {
-  const receiptsReady = IR_STATE.receipts90d != null && !IR_STATE.receipts90dLoading;
-  const snapsReady = IR_STATE.snaps != null;
-  const resolutionsReady = IR_STATE.resolutions != null && !IR_STATE.resolutionsLoading;
-  if (!receiptsReady || !snapsReady || !resolutionsReady) {
-    return `<div class="empty tiny muted">Loading count list...</div>`;
-  }
-  const { items, suppressedCount } = _irBuildCountList();
-  const totalUsd = items.reduce((s, x) => s + (Number(x.gapUsd) || 0), 0);
-  const stripUsd = totalUsd > 0 ? "$" + Math.round(totalUsd).toLocaleString() : "$0";
-  const snapAgo = IR_STATE.lastSnapshotAt || "no snapshot yet";
-  const strip = `
-    <div class="ir-list-strip">
-      <span><strong>${items.length}</strong> on the list</span>
-      <span>&middot;</span>
-      <span><strong>${stripUsd}</strong> total $ flagged</span>
-      <span>&middot;</span>
-      <span>last snapshot <strong>${esc(String(snapAgo))}</strong></span>
-      ${suppressedCount > 0 ? `<span class="dim tiny" style="margin-left:8px">${suppressedCount} suppressed by recent resolution</span>` : ""}
-    </div>`;
-  const rows = items.map(it => `
-    <tr data-pn="${esc(it.pn)}">
+function _irListRowHtml(it) {
+  // The order-by ISO is kept in `why` in parentheses so the resolution
+  // reason carries it (suppression parses it back); hide it visually.
+  const whyShown = String(it.why || "").replace(/\s*\(\d{4}-\d{2}-\d{2}\)/, "");
+  return `
+    <tr data-pn="${esc(it.pn)}" class="ir-src-${esc(it.source)}">
       <td class="ir-list-chk"><input type="checkbox" aria-label="print check"></td>
       <td class="mono">${esc(it.pn)}</td>
       <td>${esc(it.desc)}${it.cls ? ` <span class="dim tiny">${esc(it.cls)}</span>` : ""}</td>
       <td class="dim tiny">${esc(it.bins || "(no bin on file)")}</td>
       <td class="right num">${Math.round(it.onHand)}</td>
-      <td>${esc(it.why)}</td>
-      <td class="dim tiny">${esc(it.dateAdded ? it.dateAdded.slice(0, 10) : "")}</td>
+      <td>${esc(whyShown)}</td>
       <td class="ir-list-actions">
         <button class="btn xs primary" onclick="_irResolveListItem('${esc(it.pn)}','done')">Done</button>
         <button class="btn xs ghost"   onclick="_irResolveListItem('${esc(it.pn)}','not_needed')">Not needed</button>
       </td>
-    </tr>`).join("");
+    </tr>`;
+}
+function _irToggleSideCluster(key) {
+  if (!(IR_STATE.sideOpen instanceof Set)) IR_STATE.sideOpen = new Set();
+  if (IR_STATE.sideOpen.has(key)) IR_STATE.sideOpen.delete(key); else IR_STATE.sideOpen.add(key);
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") window._irToggleSideCluster = _irToggleSideCluster;
+
+function _irRenderCountList() {
+  const receiptsReady = IR_STATE.receipts90d != null && !IR_STATE.receipts90dLoading;
+  const snapsReady = IR_STATE.snaps != null;
+  const resolutionsReady = IR_STATE.resolutions != null && !IR_STATE.resolutionsLoading;
+  if (!receiptsReady || !snapsReady || !resolutionsReady) {
+    return `<div class="empty tiny muted">Loading verify list...</div>`;
+  }
+  const { verify, thin, side, suppressedCount } = _irBuildCountList();
+  const soonest = verify.slice(0, 3).map(v => `<span class="mono">${esc(v.pn)}</span> ${esc(_irNiceDate(v.orderByIso))}`).join(", ");
+  const strip = `
+    <div class="ir-list-strip">
+      <span><strong>${verify.length}</strong> to verify this week</span>
+      <span>&middot;</span>
+      <span><strong>${thin.length}</strong> running thin</span>
+      <span>&middot;</span>
+      <span>next order decisions: ${soonest || "<span class='dim'>none in the next 10 workdays</span>"}</span>
+      ${suppressedCount > 0 ? `<span class="dim tiny" style="margin-left:8px">${suppressedCount} suppressed by recent resolution</span>` : ""}
+    </div>`;
   const toolbar = `
     <div class="ir-list-toolbar">
       <button class="btn" onclick="window.print()">Print</button>
-      <span class="dim tiny">Sort: $ impact desc &middot; runway by days-left &middot; never-verified last</span>
+      <span class="dim tiny">Running thin by days-left &middot; Verify this week by order-by date</span>
     </div>`;
-  const table = items.length > 0
+  const groupHd = (label, sub) => `<tr class="ir-group-hd"><td colspan="7"><strong>${label}</strong> <span class="dim tiny">${sub}</span></td></tr>`;
+  const thinRows = thin.length
+    ? groupHd("Running thin", "shelf-only cover &le; 15 workdays, not counted in 14 days &mdash; confirm it's really there") + thin.map(_irListRowHtml).join("")
+    : "";
+  const verifyRows = verify.length
+    ? groupHd("Verify this week", "order decision within 10 workdays &mdash; count before we size the PO") + verify.map(_irListRowHtml).join("")
+    : "";
+  const table = (thin.length + verify.length) > 0
     ? `<div class="tbl-wrap"><table class="tbl ir-list-table"><thead><tr>
          <th class="ir-list-chk"></th>
          <th>PN</th><th>Description</th><th>Bins</th>
-         <th class="right">On hand</th><th>Why it's here</th>
-         <th>Added</th><th></th>
-       </tr></thead><tbody>${rows}</tbody></table></div>`
-    : `<div class="ir-ok-line" style="margin-top:12px"><span class="ir-ok-check">&#10003;</span> Nothing on the list &mdash; on-hand looks consistent with receipts and usage across the reconciled parts.</div>`;
+         <th class="right">On hand</th><th>Why it's here</th><th></th>
+       </tr></thead><tbody>${thinRows}${verifyRows}</tbody></table></div>`
+    : `<div class="ir-ok-line" style="margin-top:12px"><span class="ir-ok-check">&#10003;</span> Nothing to verify this week &mdash; no order decisions due in the next 10 workdays and nothing running thin.</div>`;
+
+  // Side section -- collapsed, capped, clustered.
+  const openSet = IR_STATE.sideOpen instanceof Set ? IR_STATE.sideOpen : new Set();
+  const clusterRows = side.clusters.map(c => {
+    if (c.members.length === 1) return _irListRowHtml(c.members[0]);
+    const open = openSet.has(c.key);
+    const m0 = c.members[0];
+    const kindText = c.sig.startsWith("receipts-cant") ? "receipts can't add up"
+                   : c.sig.startsWith("receipts") ? "receipts say more than shelf shows"
+                   : c.sig.endsWith("appearing") ? "nightly tracking: stock appearing"
+                   : "nightly tracking: stock missing";
+    const hd = `
+      <tr class="ir-cluster-hd" onclick="_irToggleSideCluster('${esc(c.key)}')">
+        <td class="ir-list-chk"></td>
+        <td class="mono">${c.members.length} parts</td>
+        <td>${esc(c.family)} <span class="dim tiny">(${c.members.map(m => esc(m.pn)).join(", ")})</span></td>
+        <td class="dim tiny"></td>
+        <td class="right num dim">${Math.round(c.members.reduce((s, m) => s + m.onHand, 0))}</td>
+        <td>${esc(kindText)} &mdash; $${Math.round(c.gapUsd).toLocaleString()} total <span class="dim tiny">${open ? "&#9662;" : "&#9656;"} ${open ? "collapse" : "expand"}</span></td>
+        <td></td>
+      </tr>`;
+    return hd + (open ? c.members.map(_irListRowHtml).join("") : "");
+  }).join("");
+  const lowRiskLine = side.lowRiskCount > 0
+    ? `<div class="dim tiny" style="margin-top:6px">${side.lowRiskCount} low-risk ${side.lowRiskCount === 1 ? "discrepancy" : "discrepancies"} ($${Math.round(side.lowRiskUsd).toLocaleString()}) &mdash; overbuying risk, not runout risk.</div>`
+    : "";
+  const overflowLine = side.overflowCount > 0
+    ? `<div class="dim tiny" style="margin-top:4px">+${side.overflowCount} more beyond the top ${IR_SIDE_CAP} clusters.</div>`
+    : "";
+  const sideCount = side.clusters.reduce((s, c) => s + c.members.length, 0);
+  const sideBlock = `
+    <details class="ir-side" style="margin-top:20px">
+      <summary class="dim tiny" style="cursor:pointer"><strong>Also looks off</strong> &mdash; ${sideCount} ${sideCount === 1 ? "part" : "parts"} with a receipts / nightly-tracking gap AND pessimistic cover &le; 90 workdays${side.lowRiskCount > 0 ? ` &middot; ${side.lowRiskCount} low-risk not shown` : ""}</summary>
+      <div style="margin-top:8px">
+        ${sideCount > 0
+          ? `<div class="tbl-wrap"><table class="tbl ir-list-table"><thead><tr>
+               <th class="ir-list-chk"></th><th>PN</th><th>Description</th><th>Bins</th>
+               <th class="right">On hand</th><th>Why it's here</th><th></th>
+             </tr></thead><tbody>${clusterRows}</tbody></table></div>`
+          : `<div class="dim tiny">No runout-relevant discrepancies right now.</div>`}
+        ${overflowLine}
+        ${lowRiskLine}
+      </div>
+    </details>`;
   return `<div id="ir-count-list-print">
     ${strip}
     ${toolbar}
     ${table}
-  </div>`;
+  </div>
+  ${sideBlock}`;
 }
 
 function _irRenderResolvedExpander() {
@@ -3569,6 +3762,17 @@ function renderCycleCounts() {
       .ir-list-chk { width: 22px; }
       .ir-list-chk input { transform: scale(1.1); }
       .ir-resolved summary { cursor: pointer; user-select: none; }
+      /* v-ir-verify: group + cluster rows */
+      .ir-group-hd td {
+        background: color-mix(in srgb, var(--ink, #0f172a) 6%, transparent);
+        border-top: 2px solid var(--line, #cbd5e1);
+        padding-top: 8px; padding-bottom: 8px;
+      }
+      .ir-src-running-thin td:nth-child(6) { color: var(--crit, #b91c1c); font-weight: 600; }
+      .ir-cluster-hd { cursor: pointer; }
+      .ir-cluster-hd:hover td { background: color-mix(in srgb, var(--ink, #0f172a) 3%, transparent); }
+      .ir-side summary { cursor: pointer; user-select: none; }
+      @media print { .ir-group-hd td { border-top: 2px solid #333; } .ir-side { display: none; } }
       .ir-chip-green { background: #16a34a; }
       .ir-chip-gray  { background: #6b7280; }
       /* v-ir-verdicts: story-card layout for the plain-English headline */
@@ -3652,8 +3856,8 @@ function renderCycleCounts() {
     <div class="page" data-page="cycle-counts">
       <div class="page-hd">
         <div>
-          <h1>Inventory Reconciliation</h1>
-          <p class="muted">One working count list: every part flagged by receipts math, nightly residuals, runway, or never-verified. Hand this to the team. Mark <strong>Done</strong> after Acumatica adjustment; <strong>Not needed</strong> if the flag is a false alarm.</p>
+          <h1>Verify Before We Order</h1>
+          <p class="muted">Count a part right before its ordering decision so every PO is sized from a confirmed number. Hand this to the team. Mark <strong>Done</strong> once counted and adjusted in Acumatica; <strong>Not needed</strong> if it's a false alarm.</p>
         </div>
         <div class="row gap-sm">
           <!-- v-ir-list: chime removed; the count-list surface no longer subscribes to the live feed -->
