@@ -1636,30 +1636,781 @@ function _ccEnsureLiveWiring() {
   CC_STATE._pollTimer = setInterval(() => _ccOnLiveEvent("poll"), 60000);
 }
 
+/* ================================================================
+   INVENTORY RECONCILIATION -- v-ir-1
+   The Cycle Counts tab is now a self-auditing ledger. Every night,
+   parts-onhand-snapshot.js writes one parts_onhand_snapshots row
+   per Base BOM part comparing how on-hand actually moved against
+   how it should have moved (receipts_qty - usage_est). The gap
+   ("residual") is what we can't account for -- record-keeping
+   error that tells us WHICH parts to count and WHY.
+   ================================================================ */
+
+const IR_STATE = {
+  windowDays: 30,             // 7 | 30 | 60 | 90
+  view: "main",               // "main" | "verify"
+  search: "",
+  classFilter: "",
+  sortKey: "residualUsdAbs",  // residualUsdAbs | pn | onHand | daysLeft | lastCountedAt
+  sortDir: "desc",
+  runwayExpanded: true,
+  expanded: new Set(),        // pns whose PO detail row is open
+  poCache: new Map(),         // pn -> Array<{poNum, receiptDate, qty, vendor}>
+  snaps: null,
+  snapsLoadedFor: null,       // window in days
+  snapsLoading: false,
+  aggByPn: null,              // Map<pn, aggregation>
+  lastSnapshotAt: null,
+  recordFor: null,            // pn currently in inline "record count" form
+  recordSaving: false,
+};
+
+function _irInvalidate() { IR_STATE.aggByPn = null; }
+
+function _irWorkdaysBetweenIso(prevIso, curIso) {
+  if (!prevIso || !curIso || prevIso >= curIso) return 0;
+  const [py, pm, pd] = prevIso.split("-").map(Number);
+  const [cy, cm, cd] = curIso.split("-").map(Number);
+  const start = new Date(py, pm - 1, pd); start.setHours(0, 0, 0, 0);
+  const end = new Date(cy, cm - 1, cd); end.setHours(0, 0, 0, 0);
+  let n = 0;
+  const cur = new Date(start.getTime() + 24 * 3600 * 1000);
+  while (cur.getTime() <= end.getTime()) {
+    const dow = cur.getDay();
+    if (dow !== 0 && dow !== 6) n++;
+    cur.setDate(cur.getDate() + 1);
+  }
+  return n;
+}
+
+async function _irLoadSnapshots(days) {
+  if (IR_STATE.snapsLoading) return;
+  if (typeof _supa === "undefined" || !_supa) { IR_STATE.snaps = []; return; }
+  IR_STATE.snapsLoading = true;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today.getTime() - days * 24 * 3600 * 1000)
+    .toISOString().slice(0, 10);
+  try {
+    // Chunked fetch -- 2k+ parts x 90 days can push past a single page.
+    const all = [];
+    const PAGE = 1000;
+    let from = 0;
+    while (true) {
+      const { data, error } = await _supa
+        .from("parts_onhand_snapshots")
+        .select("snapshot_date, pn, on_hand, daily_use, receipts_qty, receipts_count, usage_est, workdays_since_prev, prev_snapshot_date, prev_on_hand, residual, adjustment_applied, last_counted_at")
+        .gte("snapshot_date", start)
+        .order("snapshot_date", { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      all.push(...data);
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+    IR_STATE.snaps = all;
+    IR_STATE.snapsLoadedFor = days;
+    IR_STATE.lastSnapshotAt = all.length ? all[all.length - 1].snapshot_date : null;
+    _irInvalidate();
+  } catch (err) {
+    console.warn("[ir] snapshot fetch failed:", err && err.message);
+    IR_STATE.snaps = [];
+    IR_STATE.snapsLoadedFor = days;
+  }
+  IR_STATE.snapsLoading = false;
+}
+
+function _irAggregate() {
+  if (IR_STATE.aggByPn) return IR_STATE.aggByPn;
+  const agg = new Map();
+  const snaps = IR_STATE.snaps || [];
+  // Anchor per pn -- latest counted / reconciled log row is the
+  // reset date. Snapshots BEFORE that date stay stored but don't
+  // accumulate into the headline residual.
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  const anchorByPn = new Map();
+  for (const r of log) {
+    if (r.outcome !== "counted" && r.outcome !== "reconciled") continue;
+    const prev = anchorByPn.get(r.pn);
+    if (!prev || String(r.counted_at) > String(prev.counted_at)) anchorByPn.set(r.pn, r);
+  }
+  for (const s of snaps) {
+    const anchor = anchorByPn.get(s.pn);
+    const anchorDate = anchor ? String(anchor.counted_at).slice(0, 10) : null;
+    let a = agg.get(s.pn);
+    if (!a) {
+      a = {
+        pn: s.pn,
+        residualSum: 0,
+        residualHistory: [],       // {date, r, adjusted}
+        firstAccumDate: null,
+        lastSnapDate: s.snapshot_date,
+        onHand: s.on_hand,
+        dailyUse: s.daily_use,
+        receiptsSum: 0,
+        lastCountedAt: anchor ? anchor.counted_at : null,
+        lastCounter: anchor ? anchor.counted_by : null,
+        adjustmentsExcluded: 0,
+        driftRun: 0,
+        driftLastSign: 0,
+      };
+      agg.set(s.pn, a);
+    }
+    // Update always-current fields (latest snapshot wins).
+    a.onHand = s.on_hand;
+    a.dailyUse = s.daily_use;
+    a.lastSnapDate = s.snapshot_date;
+    // Accumulate only from AFTER the anchor date (count resets ledger).
+    if (anchorDate && s.snapshot_date <= anchorDate) continue;
+    if (s.residual == null) continue;
+    if (s.adjustment_applied) {
+      a.adjustmentsExcluded++;
+      a.residualHistory.push({ date: s.snapshot_date, r: Number(s.residual) || 0, adjusted: true });
+      continue;
+    }
+    a.receiptsSum += Number(s.receipts_qty) || 0;
+    const r = Number(s.residual) || 0;
+    a.residualSum += r;
+    a.residualHistory.push({ date: s.snapshot_date, r, adjusted: false });
+    if (!a.firstAccumDate) a.firstAccumDate = s.snapshot_date;
+    // drift: same-sign streak
+    const sign = r > 0.5 ? 1 : r < -0.5 ? -1 : 0;
+    if (sign !== 0 && sign === a.driftLastSign) a.driftRun++;
+    else if (sign !== 0) a.driftRun = 1;
+    a.driftLastSign = sign;
+  }
+  // Derived fields.
+  const partsCache = _ccPartsCache();
+  for (const a of agg.values()) {
+    const p = partsCache.get(a.pn) || {};
+    const cost = Number(p.cost) || 0;
+    a.desc = p.desc || "";
+    a.cls = p.cls || "";
+    a.residualUsd = a.residualSum * cost;
+    a.residualUsdAbs = Math.abs(a.residualUsd);
+    a.absResidual = Math.abs(a.residualSum);
+    a.residualPct = a.onHand > 0 ? (a.absResidual / a.onHand) : (a.residualSum === 0 ? 0 : 1);
+    a.beyondThreshold = a.absResidual > Math.max(5, a.onHand * 0.10);
+    a.driftFlag = a.driftRun >= 5 || a.beyondThreshold;
+    // Ledger age (days of accumulation, not calendar days).
+    a.ledgerDays = a.residualHistory.filter(h => !h.adjusted).length;
+    a.leakPerDay = a.ledgerDays > 0 ? (a.residualSum / a.ledgerDays) : 0;
+    a.leakPerWeekUsd = a.leakPerDay * 5 * cost;    // workweek
+    a.daysLeft = a.dailyUse > 0 ? Math.floor(a.onHand / a.dailyUse) : Infinity;
+    a.lastCountAgeDays = a.lastCountedAt
+      ? Math.floor((Date.now() - new Date(a.lastCountedAt).getTime()) / (24 * 3600 * 1000))
+      : null;
+  }
+  IR_STATE.aggByPn = agg;
+  return agg;
+}
+
+function _irOnPoByPn(pn) {
+  // Sum of open PO quantities from DB.pos for this pn.
+  if (!(DB && Array.isArray(DB.pos))) return 0;
+  let total = 0;
+  for (const po of DB.pos) {
+    if (!po || !Array.isArray(po.lines)) continue;
+    for (const l of po.lines) {
+      if (!l || l.pn !== pn) continue;
+      const remaining = Math.max(0, (Number(l.qty) || 0) - (Number(l.receivedQty) || 0));
+      total += remaining;
+    }
+  }
+  return total;
+}
+
+async function _irLoadPoDetailsFor(pn) {
+  if (IR_STATE.poCache.has(pn)) return IR_STATE.poCache.get(pn);
+  if (typeof _supa === "undefined" || !_supa) { IR_STATE.poCache.set(pn, []); return []; }
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const startIso = new Date(start.getTime() - IR_STATE.windowDays * 24 * 3600 * 1000)
+    .toISOString().slice(0, 10);
+  try {
+    const { data, error } = await _supa
+      .from("po_receipts")
+      .select("id, data")
+      .eq("data->>pn", pn)
+      .gte("data->>receiptDate", startIso)
+      .order("data->>receiptDate", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    const rows = (data || [])
+      .map(r => r && r.data)
+      .filter(d => d && (!d.status || String(d.status).trim() === "Released"))
+      .map(d => ({
+        poNum: d.poNum || "",
+        receiptDate: String(d.receiptDate || "").slice(0, 10),
+        qty: Number(d.qty) || 0,
+        vendor: d.vendor || "",
+        receiptNbr: d.receiptNbr || "",
+      }));
+    IR_STATE.poCache.set(pn, rows);
+    return rows;
+  } catch (err) {
+    console.warn("[ir] PO detail fetch failed for", pn, err && err.message);
+    IR_STATE.poCache.set(pn, []);
+    return [];
+  }
+}
+
+// -------- TOP STRIP --------------------------------------------------
+function _irRenderTopStrip() {
+  const agg = _irAggregate();
+  const rows = [...agg.values()];
+  const totalUsd = rows.reduce((s, r) => s + r.residualUsdAbs, 0);
+  const beyondCount = rows.filter(r => r.beyondThreshold).length;
+  let worst = null;
+  for (const r of rows) if (!worst || Math.abs(r.leakPerWeekUsd) > Math.abs(worst.leakPerWeekUsd)) worst = r;
+  const ledgerCoverage = rows.length > 0
+    ? Math.round(rows.reduce((s, r) => s + r.ledgerDays, 0) / rows.length)
+    : 0;
+  const snapAgo = IR_STATE.lastSnapshotAt || "no snapshot yet";
+  const usdFmt = (n) => "$" + Math.round(Math.abs(n)).toLocaleString();
+  return `
+    <div class="ir-strip">
+      <div class="ir-stat">
+        <div class="ir-stat-label">Total |residual| $ (${IR_STATE.windowDays}d)</div>
+        <div class="ir-stat-value">${usdFmt(totalUsd)}</div>
+        <div class="ir-stat-sub">across ${rows.length} parts</div>
+      </div>
+      <div class="ir-stat">
+        <div class="ir-stat-label">Beyond max(10%, 5u)</div>
+        <div class="ir-stat-value ${beyondCount > 0 ? "text-warn" : ""}">${beyondCount}</div>
+        <div class="ir-stat-sub">parts flagged</div>
+      </div>
+      <div class="ir-stat">
+        <div class="ir-stat-label">Worst leaker</div>
+        <div class="ir-stat-value mono" style="font-size:16px">${worst ? esc(worst.pn) : "&mdash;"}</div>
+        <div class="ir-stat-sub">${worst ? (usdFmt(worst.leakPerWeekUsd) + "/wk") : ""}</div>
+      </div>
+      <div class="ir-stat">
+        <div class="ir-stat-label">Ledger coverage</div>
+        <div class="ir-stat-value">${ledgerCoverage}d</div>
+        <div class="ir-stat-sub" title="Average accumulated ledger days per part. Residuals are most reliable at 7d+.">avg &middot; reliable at 7d+</div>
+      </div>
+      <div class="ir-stat">
+        <div class="ir-stat-label">Last snapshot</div>
+        <div class="ir-stat-value" style="font-size:16px">${esc(snapAgo)}</div>
+        <div class="ir-stat-sub">nightly at 05:50 UTC</div>
+      </div>
+    </div>
+  `;
+}
+
+// -------- RUNWAY -----------------------------------------------------
+function _irRunwayRows() {
+  const agg = _irAggregate();
+  const out = [];
+  for (const a of agg.values()) {
+    if (a.daysLeft === Infinity) continue;
+    if (a.daysLeft > 60) continue;
+    out.push(a);
+  }
+  out.sort((x, y) => x.daysLeft - y.daysLeft);
+  return out;
+}
+function _irRenderRunway() {
+  const rows = _irRunwayRows();
+  const body = rows.map(a => {
+    const daysColor = a.daysLeft <= 15 ? "text-crit" : a.daysLeft <= 30 ? "text-warn" : "";
+    const onPo = _irOnPoByPn(a.pn);
+    const lastAge = a.lastCountAgeDays;
+    const needsCount = (lastAge == null) || (lastAge > 45);
+    return `
+      <tr class="ir-row" data-pn="${esc(a.pn)}" onclick="_irOpenPart('${esc(a.pn)}')">
+        <td class="mono">${esc(a.pn)}</td>
+        <td class="dim">${esc(a.desc)}</td>
+        <td class="right num">${Math.round(a.onHand)}</td>
+        <td class="right num">${(a.dailyUse || 0).toFixed(2)}</td>
+        <td class="right num bold ${daysColor}">${a.daysLeft}</td>
+        <td class="right num dim">${Math.round(onPo)}</td>
+        <td class="dim tiny">${lastAge == null ? "never" : (lastAge + "d ago")}</td>
+        <td>${needsCount ? '<span class="pill warn">needs count</span>' : ""}</td>
+        <td><button class="btn xs" onclick="event.stopPropagation();_irBeginRecord('${esc(a.pn)}')">Record count</button></td>
+      </tr>`;
+  }).join("");
+  const pilledCount = rows.filter(r => (r.lastCountAgeDays == null || r.lastCountAgeDays > 45)).length;
+  const expanded = IR_STATE.runwayExpanded;
+  const chev = expanded ? "&#9662;" : "&#9656;";
+  return `
+    <div class="ir-collapse-hd" onclick="_irToggleRunway()" role="button" tabindex="0"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_irToggleRunway();}">
+      <span class="ir-chev">${chev}</span>
+      <span>Runs out &le;60 days (shelf only, POs excluded): <strong>${rows.length}</strong></span>
+      <span class="dim tiny" style="margin-left:auto">tap to ${expanded ? "collapse" : "expand"}</span>
+    </div>
+    ${expanded ? `
+      <div class="dim tiny" style="margin:6px 0 8px">
+        Days-left = shelf on-hand &divide; daily use. On-PO shown as info only.
+        ${pilledCount > 0 ? `<button class="btn xs" style="margin-left:8px" onclick="_irAddRunwayPilledToVerify()">Add all pilled to Verify list</button>` : ""}
+      </div>
+      <div class="tbl-wrap"><table class="tbl ir-runway-table">
+        <thead><tr>
+          <th>PN</th><th>Description</th><th class="right">On hand</th><th class="right">Daily use</th>
+          <th class="right">Days left</th><th class="right">On PO</th><th>Last count</th><th></th><th></th>
+        </tr></thead>
+        <tbody>${body || `<tr><td colspan="9" class="empty tiny muted">Nothing runs out in the next 60 workdays.</td></tr>`}</tbody>
+      </table></div>
+    ` : ""}
+  `;
+}
+function _irToggleRunway() { IR_STATE.runwayExpanded = !IR_STATE.runwayExpanded; if (typeof refresh === "function") refresh(); }
+
+// -------- MAIN TABLE -------------------------------------------------
+function _irSparkline(history) {
+  if (!history || history.length === 0) return "";
+  const values = history.filter(h => !h.adjusted).map(h => h.r);
+  if (values.length === 0) return "";
+  const w = 60, h = 18;
+  const max = Math.max(1, ...values.map(v => Math.abs(v)));
+  const step = values.length > 1 ? w / (values.length - 1) : 0;
+  const pts = values.map((v, i) => {
+    const x = i * step;
+    const y = h / 2 - (v / max) * (h / 2 - 1);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" style="vertical-align:middle">
+    <line x1="0" y1="${h / 2}" x2="${w}" y2="${h / 2}" stroke="currentColor" stroke-width="0.5" opacity="0.25"/>
+    <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.8"/>
+  </svg>`;
+}
+function _irMainTableRows() {
+  const agg = _irAggregate();
+  const q = String(IR_STATE.search || "").toLowerCase().trim();
+  const cls = IR_STATE.classFilter;
+  let rows = [...agg.values()].filter(r => {
+    if (cls && r.cls !== cls) return false;
+    if (q) {
+      const hay = (r.pn + " " + (r.desc || "")).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  });
+  const dir = IR_STATE.sortDir === "asc" ? 1 : -1;
+  const key = IR_STATE.sortKey;
+  rows.sort((a, b) => {
+    const av = a[key], bv = b[key];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (typeof av === "string") return dir * av.localeCompare(bv);
+    return dir * (av - bv);
+  });
+  return rows;
+}
+function _irRenderMainTable() {
+  const rows = _irMainTableRows();
+  const partsCache = _ccPartsCache();
+  const classes = new Set();
+  for (const p of partsCache.values()) if (p.cls) classes.add(p.cls);
+  const classOpts = [...classes].sort().map(c => `<option value="${esc(c)}"${IR_STATE.classFilter === c ? " selected" : ""}>${esc(c)}</option>`).join("");
+  const body = rows.map(a => {
+    const expanded = IR_STATE.expanded.has(a.pn);
+    const usd = a.residualUsd;
+    const usdColor = Math.abs(usd) >= 500 ? "text-crit" : Math.abs(usd) >= 100 ? "text-warn" : "dim";
+    const confidence = a.ledgerDays < IR_STATE.windowDays
+      ? `<span class="pill" style="font-size:9px" title="This part's ledger is younger than the window; residual reads are still stabilizing.">ledger ${a.ledgerDays}d</span>`
+      : "";
+    const driftBadge = a.driftFlag
+      ? `<span class="pill warn" style="font-size:9px" title="Systematic drift -- ${a.driftRun} consecutive same-direction residuals or accumulation beyond max(10%, 5u). Check BOM/backflush.">drift</span>`
+      : "";
+    const lastCount = a.lastCountedAt
+      ? `<span class="dim tiny">${esc(a.lastCountedAt.slice(0, 10))}${a.lastCounter ? " &middot; " + esc(a.lastCounter) : ""}</span>`
+      : `<span class="dim tiny">never</span>`;
+    const mainRow = `
+      <tr class="ir-row" data-pn="${esc(a.pn)}" onclick="_irToggleReceipts('${esc(a.pn)}')">
+        <td>
+          <div class="mono">${esc(a.pn)} ${confidence} ${driftBadge}</div>
+          <div class="dim tiny">${esc(a.desc)}${a.cls ? " &middot; " + esc(a.cls) : ""}</div>
+        </td>
+        <td class="right num">${Math.round(a.onHand)}</td>
+        <td class="right num">${(a.dailyUse || 0).toFixed(2)}</td>
+        <td class="right num">${Math.round(a.receiptsSum)} <span class="dim tiny">${expanded ? "&#9662;" : "&#9656;"}</span></td>
+        <td class="right num">${a.residualSum > 0 ? "+" : ""}${a.residualSum.toFixed(1)} <span class="dim tiny">${(a.residualPct * 100).toFixed(1)}%</span></td>
+        <td class="right num ${usdColor}">${usd >= 0 ? "+" : "-"}$${Math.round(Math.abs(usd)).toLocaleString()}</td>
+        <td>${_irSparkline(a.residualHistory)}</td>
+        <td>${lastCount}</td>
+        <td onclick="event.stopPropagation()">
+          <button class="btn xs" onclick="_irBeginRecord('${esc(a.pn)}')">Record count</button>
+          <button class="btn xs ghost" onclick="_irOpenPart('${esc(a.pn)}')">Open</button>
+        </td>
+      </tr>`;
+    const recordRow = IR_STATE.recordFor === a.pn
+      ? `<tr class="ir-record-row"><td colspan="9" onclick="event.stopPropagation()">${_irRenderRecordForm(a)}</td></tr>`
+      : "";
+    const detailRow = expanded
+      ? `<tr class="ir-detail-row"><td colspan="9" onclick="event.stopPropagation()"><div id="ir-po-${esc(a.pn)}" class="ir-po-detail">Loading receipts...</div></td></tr>`
+      : "";
+    return mainRow + recordRow + detailRow;
+  }).join("");
+  const winOpts = [7, 30, 60, 90].map(d => `<option value="${d}"${IR_STATE.windowDays === d ? " selected" : ""}>${d}d</option>`).join("");
+  return `
+    <div class="ir-toolbar">
+      <label class="row gap-sm" style="align-items:center">
+        <span class="muted tiny">Window</span>
+        <select class="input" style="width:80px" onchange="_irSetWindow(this.value)">${winOpts}</select>
+      </label>
+      <input class="input" placeholder="Search pn or description..." value="${esc(IR_STATE.search)}" oninput="_irSetSearch(this.value)" style="max-width:280px">
+      <label class="row gap-sm" style="align-items:center">
+        <span class="muted tiny">Class</span>
+        <select class="input" style="width:140px" onchange="_irSetClassFilter(this.value)"><option value="">(all)</option>${classOpts}</select>
+      </label>
+      <span class="grow"></span>
+      <span class="dim tiny">${rows.length} parts &middot; sorted by ${esc(IR_STATE.sortKey)} ${IR_STATE.sortDir}</span>
+    </div>
+    <div class="tbl-wrap"><table class="tbl ir-main-table">
+      <thead><tr>
+        <th onclick="_irSort('pn')">PN / Desc</th>
+        <th class="right" onclick="_irSort('onHand')">On hand</th>
+        <th class="right" onclick="_irSort('dailyUse')">Daily use</th>
+        <th class="right" onclick="_irSort('receiptsSum')">Receipts (${IR_STATE.windowDays}d)</th>
+        <th class="right" onclick="_irSort('residualSum')">Residual</th>
+        <th class="right" onclick="_irSort('residualUsdAbs')">Residual $</th>
+        <th>Trend</th>
+        <th onclick="_irSort('lastCountedAt')">Last count</th>
+        <th></th>
+      </tr></thead>
+      <tbody>${body || `<tr><td colspan="9" class="empty tiny muted">No snapshots yet -- the nightly job hasn't run, or nothing matches your filter.</td></tr>`}</tbody>
+    </table></div>
+  `;
+}
+
+function _irToggleReceipts(pn) {
+  if (IR_STATE.expanded.has(pn)) { IR_STATE.expanded.delete(pn); if (typeof refresh === "function") refresh(); return; }
+  IR_STATE.expanded.add(pn);
+  if (typeof refresh === "function") refresh();
+  // Lazy-fetch after DOM update.
+  setTimeout(() => {
+    _irLoadPoDetailsFor(pn).then(rows => {
+      const el = document.getElementById("ir-po-" + pn);
+      if (!el) return;
+      if (rows.length === 0) { el.innerHTML = `<div class="empty tiny muted">No released receipts in this window.</div>`; return; }
+      const tbody = rows.map(r => `
+        <tr>
+          <td class="mono">${esc(r.poNum)}</td>
+          <td class="dim tiny">${esc(r.receiptNbr)}</td>
+          <td>${esc(r.receiptDate)}</td>
+          <td class="right num">${Math.round(r.qty)}</td>
+          <td class="dim">${esc(r.vendor)}</td>
+        </tr>`).join("");
+      el.innerHTML = `
+        <table class="tbl" style="margin:8px 0"><thead><tr>
+          <th>PO</th><th>Receipt</th><th>Date</th><th class="right">Qty</th><th>Vendor</th>
+        </tr></thead><tbody>${tbody}</tbody></table>`;
+    });
+  }, 30);
+}
+
+// -------- RECORD COUNT (inline) --------------------------------------
+function _irRenderRecordForm(agg) {
+  const name = _ccName();
+  const locs = (DB && DB.partLocations instanceof Map) ? (DB.partLocations.get(agg.pn) || []) : [];
+  // Filter out sentinel; if any bin rows remain, use per-bin inputs.
+  const binRows = locs.filter(l => String(l.location) !== "__warehouse__");
+  const multi = binRows.length > 0;
+  const nameWarn = !name ? `<div class="banner warn tiny" style="margin-bottom:6px">Enter your name in the header first -- it's stamped on the count.</div>` : "";
+  const inputs = multi
+    ? `<div class="ir-bin-grid">${binRows.map((l, i) => `
+        <label class="ir-bin">
+          <span class="mono">${esc(l.location)}</span>
+          <span class="dim tiny">sys ${Math.round(Number(l.qty) || 0)}</span>
+          <input class="input" type="number" min="0" step="1" data-bin="${esc(l.location)}" id="ir-bin-${i}" placeholder="0" style="width:80px" oninput="_irBinSumUpdate('${esc(agg.pn)}')">
+        </label>`).join("")}
+      </div>
+      <div class="dim tiny" style="margin-top:6px">Sum so far: <span id="ir-bin-sum-${esc(agg.pn)}">0</span></div>`
+    : `<label class="row gap-sm" style="align-items:center">
+        <span class="muted tiny">Counted qty</span>
+        <input class="input" type="number" min="0" step="1" id="ir-adhoc-qty" placeholder="0" style="width:120px">
+        <span class="dim tiny">system says <strong>${Math.round(agg.onHand)}</strong></span>
+      </label>`;
+  const disabled = !name || IR_STATE.recordSaving;
+  return `
+    <div class="ir-record-form">
+      <div class="row gap-md" style="align-items:baseline"><strong>Record count for <span class="mono">${esc(agg.pn)}</span></strong>
+        <span class="dim tiny">${esc(agg.desc)}</span></div>
+      ${nameWarn}
+      ${inputs}
+      <div class="row gap-sm" style="margin-top:8px">
+        <button class="btn primary" ${disabled ? "disabled" : ""} onclick="_irSubmitRecord('${esc(agg.pn)}', ${multi ? "true" : "false"})">${IR_STATE.recordSaving ? "Saving..." : "Submit count"}</button>
+        <button class="btn ghost" onclick="_irCancelRecord()">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+function _irBeginRecord(pn) { IR_STATE.recordFor = pn; IR_STATE.recordSaving = false; if (typeof refresh === "function") refresh(); }
+function _irCancelRecord() { IR_STATE.recordFor = null; IR_STATE.recordSaving = false; if (typeof refresh === "function") refresh(); }
+function _irBinSumUpdate(pn) {
+  const inputs = document.querySelectorAll("[id^='ir-bin-']");
+  let sum = 0;
+  inputs.forEach(i => sum += Math.max(0, Math.round(Number(i.value) || 0)));
+  const s = document.getElementById("ir-bin-sum-" + pn);
+  if (s) s.textContent = String(sum);
+}
+async function _irSubmitRecord(pn, multi) {
+  const name = _ccName();
+  if (!name) return;
+  const agg = _irAggregate().get(pn);
+  if (!agg) return;
+  let counted, locations;
+  if (multi) {
+    const inputs = document.querySelectorAll("[id^='ir-bin-']");
+    counted = 0;
+    locations = [];
+    inputs.forEach(i => {
+      const q = Math.max(0, Math.round(Number(i.value) || 0));
+      counted += q;
+      locations.push({ location: i.getAttribute("data-bin"), counted_qty: q });
+    });
+  } else {
+    const el = document.getElementById("ir-adhoc-qty");
+    counted = Math.max(0, Math.round(Number(el && el.value) || 0));
+  }
+  IR_STATE.recordSaving = true;
+  if (typeof refresh === "function") refresh();
+  try {
+    const body = {
+      writes: [{
+        op: "recordAdhocCount",
+        pn,
+        counted_qty: counted,
+        counted_by: name,
+        systemQtyNow: Math.round(agg.onHand),
+        client_key: (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : "ir-" + Date.now(),
+        source: "IR workbench",
+        locations,
+      }],
+    };
+    const resp = await fetch("/.netlify/functions/cycle-count-write", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fs-edit-token": (typeof FS_EDIT_TOKEN_CLIENT !== "undefined") ? FS_EDIT_TOKEN_CLIENT : "",
+        "x-app-build": String((typeof APP_BUILD !== "undefined") ? APP_BUILD : 0),
+      },
+      body: JSON.stringify(body),
+    });
+    const json = await resp.json();
+    if (!resp.ok || !json.ok) { alert("Record count failed: " + (json && json.error || resp.status)); }
+    else if (json.results && json.results[0] && json.results[0].ok === false) {
+      alert("Record count rejected: " + (json.results[0].error || "unknown"));
+    } else {
+      IR_STATE.recordFor = null;
+      // Refresh log so the accumulator picks up the new anchor.
+      if (typeof _refetchCycleCounts === "function") await _refetchCycleCounts();
+      _irInvalidate();
+    }
+  } catch (err) {
+    alert("Record count failed: " + (err && err.message));
+  }
+  IR_STATE.recordSaving = false;
+  if (typeof refresh === "function") refresh();
+}
+function _irOpenPart(pn) { if (typeof openPartDetail === "function") openPartDetail(pn); }
+
+// -------- VERIFY LIST ------------------------------------------------
+function _irVerifyList() {
+  const agg = _irAggregate();
+  const top20 = [...agg.values()]
+    .filter(a => a.ledgerDays >= 7)
+    .sort((a, b) => b.residualUsdAbs - a.residualUsdAbs)
+    .slice(0, 20);
+  const runway = _irRunwayRows().filter(r => r.lastCountAgeDays == null || r.lastCountAgeDays > 45);
+  const stale = [...agg.values()].filter(a => a.lastCountAgeDays == null || a.lastCountAgeDays > 90);
+  const seen = new Set();
+  const combined = [];
+  for (const list of [top20, runway, stale]) {
+    for (const a of list) {
+      if (seen.has(a.pn)) continue;
+      seen.add(a.pn);
+      combined.push(a);
+    }
+  }
+  return combined;
+}
+function _irRenderVerifyList() {
+  const list = _irVerifyList();
+  // Blind checklist -- deliberately no system qty and no residual.
+  const body = list.map(a => {
+    const locs = (DB && DB.partLocations instanceof Map)
+      ? (DB.partLocations.get(a.pn) || []).filter(l => String(l.location) !== "__warehouse__")
+      : [];
+    const binText = locs.length ? locs.map(l => esc(l.location)).join(", ") : "(no bin on file)";
+    return `
+      <tr>
+        <td class="mono">${esc(a.pn)}</td>
+        <td>${esc(a.desc)}</td>
+        <td class="dim tiny">${binText}</td>
+        <td class="ir-blank"></td>
+      </tr>`;
+  }).join("");
+  return `
+    <div class="row gap-sm" style="margin:8px 0" id="ir-verify-toolbar">
+      <button class="btn primary" onclick="window.print()">Print</button>
+      <button class="btn ghost" onclick="_irSetView('main')">Back to workbench</button>
+      <span class="dim tiny">${list.length} parts &middot; blind checklist (no system qty on purpose)</span>
+    </div>
+    <div id="ir-verify-print">
+      <h2 style="margin-bottom:4px">Cycle Count Verify List</h2>
+      <div class="dim tiny">Generated ${new Date().toLocaleString()}</div>
+      <table class="tbl ir-print-table" style="margin-top:12px">
+        <thead><tr><th style="width:20%">PN</th><th style="width:45%">Description</th><th style="width:20%">Bin(s)</th><th style="width:15%">Counted</th></tr></thead>
+        <tbody>${body || `<tr><td colspan="4" class="empty tiny muted">Nothing to verify.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+}
+function _irAddRunwayPilledToVerify() { _irSetView("verify"); }
+
+// -------- CONTROLS ---------------------------------------------------
+function _irSetWindow(v) { IR_STATE.windowDays = Number(v) || 30; IR_STATE.snapsLoadedFor = null; IR_STATE.poCache = new Map(); _irInvalidate(); _irRouteEnter(); }
+function _irSetSearch(v) { IR_STATE.search = String(v || ""); if (typeof refresh === "function") refresh(); }
+function _irSetClassFilter(v) { IR_STATE.classFilter = String(v || ""); if (typeof refresh === "function") refresh(); }
+function _irSetView(v) { IR_STATE.view = v; if (typeof refresh === "function") refresh(); }
+function _irSort(key) {
+  if (IR_STATE.sortKey === key) IR_STATE.sortDir = IR_STATE.sortDir === "asc" ? "desc" : "asc";
+  else { IR_STATE.sortKey = key; IR_STATE.sortDir = (key === "pn" || key === "lastCountedAt") ? "asc" : "desc"; }
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") {
+  Object.assign(window, {
+    _irSetWindow, _irSetSearch, _irSetClassFilter, _irSetView, _irSort,
+    _irToggleRunway, _irBeginRecord, _irCancelRecord, _irBinSumUpdate,
+    _irSubmitRecord, _irOpenPart, _irToggleReceipts, _irAddRunwayPilledToVerify,
+  });
+}
+
+// Route entry -- kicks off the snapshot fetch and re-renders when done.
+function _irRouteEnter() {
+  if (IR_STATE.snapsLoadedFor !== IR_STATE.windowDays) {
+    _irLoadSnapshots(IR_STATE.windowDays).then(() => {
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts") {
+        if (typeof refresh === "function") refresh();
+      }
+    });
+  }
+}
+
+// -------- MAIN RENDER ------------------------------------------------
 function renderCycleCounts() {
   const main = document.getElementById("main");
   if (!main) return;
-  try { console.time("cc-supervisor-render"); } catch (_) {}
+  try { console.time("ir-render"); } catch (_) {}
   _ccInitLocalState();
   _ccEnsureLiveWiring();
-  if (!(DB && DB.cycleCounts) || !DB.cycleCounts.loaded) {
-    // Skeleton first paint -- shell + section headers so the
-    // layout doesn't jump when data lands.
-    main.innerHTML = `
-      <div class="page" data-page="cycle-counts">
-        <div class="page-hd"><div><h1>Cycle Counts</h1><p class="muted">Loading counts...</p></div></div>
-        <div id="cc-summary-strip"><div class="empty tiny muted">Summary loading...</div></div>
-        <div class="dr-section" style="margin-top:16px">Needs attention</div>
-        <div id="cc-attn-block"><div class="empty tiny muted">Loading...</div></div>
-        <div class="dr-section" style="margin-top:20px">Counts as they come in</div>
-        <div class="empty tiny muted">Loading live feed...</div>
-      </div>`;
-    if (typeof _refetchCycleCounts === "function") {
-      _refetchCycleCounts().then(() => { if (CURRENT_ROUTE === "cycle-counts") refresh(); }).catch(() => {});
-    }
-    try { console.timeEnd("cc-supervisor-render"); } catch (_) {}
-    return;
-  }
+  _irRouteEnter();
+  const name = _ccName();
+  const liveState = (typeof ccLiveState === "function") ? ccLiveState() : "connecting";
+  const skeletonSnaps = !IR_STATE.snaps || IR_STATE.snapsLoading;
+  const workbench = skeletonSnaps
+    ? `<div class="ir-strip"><div class="ir-stat"><div class="ir-stat-label">Loading ledger...</div></div></div>
+       <div class="empty tiny muted" style="margin-top:12px">Fetching parts_onhand_snapshots for the last ${IR_STATE.windowDays} days...</div>`
+    : (IR_STATE.view === "verify"
+        ? _irRenderVerifyList()
+        : `${_irRenderTopStrip()}
+           <div style="margin-top:16px">${_irRenderRunway()}</div>
+           <div class="dr-section" style="margin-top:20px">Reconciliation ledger (${IR_STATE.windowDays}d)</div>
+           ${_irRenderMainTable()}
+           <div class="row gap-sm" style="margin-top:8px">
+             <button class="btn" onclick="_irSetView('verify')">Open Verify List</button>
+           </div>`);
+  const feedBlock = (DB && DB.cycleCounts && DB.cycleCounts.loaded)
+    ? `<div class="dr-section" style="margin-top:24px">Counts as they come in</div>
+       ${_ccRenderLiveFeed()}
+       <div class="dr-section" style="margin-top:20px">Accuracy</div>
+       <div id="cc-summary-strip">${_ccRenderTightSummary(_ccSummary())}</div>`
+    : `<div class="dim tiny" style="margin-top:24px">Live feed loading...</div>`;
+  const html = `
+    <style>
+      @keyframes cc-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
+      @keyframes cc-flash-in {
+        0%   { background: color-mix(in srgb, var(--ok,#3a7) 25%, transparent); }
+        100% { background: transparent; }
+      }
+      .cc-new-flash td { animation: cc-flash-in 3.5s ease-out forwards; }
+      .cc-feed-table tr td { vertical-align: top; }
+      .cc-feed-table tr.cc-breakdown-row td { padding: 0 !important; }
+      /* IR workbench styles */
+      .ir-strip { display: flex; gap: 12px; flex-wrap: wrap; }
+      .ir-stat {
+        flex: 1 1 180px;
+        min-width: 180px;
+        padding: 10px 12px;
+        border: 1px solid var(--line, #cbd5e1);
+        border-radius: 6px;
+        background: var(--bg-2, transparent);
+      }
+      .ir-stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim,#64748b); }
+      .ir-stat-value { font-size: 22px; font-weight: 700; margin: 2px 0; }
+      .ir-stat-sub { font-size: 11px; color: var(--dim,#64748b); }
+      .ir-collapse-hd {
+        display: flex; align-items: center; gap: 8px;
+        padding: 8px 10px; border: 1px solid var(--line,#cbd5e1);
+        border-radius: 6px; cursor: pointer; user-select: none;
+        transition: background-color 120ms ease;
+      }
+      .ir-collapse-hd:hover { background: color-mix(in srgb, var(--ink,#0f172a) 5%, transparent); }
+      .ir-chev { display: inline-block; width: 14px; text-align: center; }
+      .ir-toolbar { display: flex; gap: 12px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+      .ir-toolbar .grow { flex: 1; }
+      .ir-main-table th { cursor: pointer; user-select: none; }
+      .ir-main-table th:hover { background: color-mix(in srgb, var(--ink,#0f172a) 5%, transparent); }
+      .ir-row { cursor: pointer; }
+      .ir-row:hover td { background: color-mix(in srgb, var(--ink,#0f172a) 3%, transparent); }
+      .ir-detail-row td, .ir-record-row td { background: color-mix(in srgb, var(--ink,#0f172a) 4%, transparent); }
+      .ir-po-detail table { width: 100%; }
+      .ir-record-form { padding: 10px 4px; }
+      .ir-bin-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+      .ir-bin { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+      /* Print styles for the Verify List */
+      @media print {
+        body * { visibility: hidden; }
+        #ir-verify-print, #ir-verify-print * { visibility: visible; }
+        #ir-verify-print { position: absolute; left: 0; top: 0; width: 100%; padding: 12px; }
+        #ir-verify-toolbar { display: none; }
+        .ir-print-table td, .ir-print-table th {
+          border: 1px solid #999; padding: 4px 6px; font-size: 11px;
+        }
+        .ir-blank { border-bottom: 1px solid #333; min-width: 80px; }
+        thead { display: table-header-group; }
+        tr, td, th { page-break-inside: avoid; }
+      }
+    </style>
+    <div class="page" data-page="cycle-counts">
+      <div class="page-hd">
+        <div>
+          <h1>Inventory Reconciliation ${_ccPulseDot(liveState)}</h1>
+          <p class="muted">Nightly ledger comparing how on-hand moved vs how it should have moved. Residual is the record-keeping gap we can't account for -- that's what to count and why.</p>
+        </div>
+        <div class="row gap-sm">
+          <label class="row gap-sm" style="align-items:center;cursor:pointer">
+            <span class="muted tiny">Chime on new count</span>
+            <input type="checkbox" class="chk" ${CC_STATE._chimeOn ? "checked" : ""} onchange="_ccToggleChime()">
+          </label>
+          <label class="row gap-sm" style="align-items:center">
+            <span class="muted tiny">Your name</span>
+            <input class="input" id="cc-name-input" value="${esc(name)}" placeholder="e.g. Marisol" style="width:180px" onchange="_ccOnNameInput(this.value)">
+          </label>
+        </div>
+      </div>
+      ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before recording counts -- it's stamped on every count row.</div>` : ""}
+      ${workbench}
+      ${feedBlock}
+    </div>
+  `;
+  main.innerHTML = html;
+  const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
+  if (log[0] && log[0].counted_at) _ccPersistLastSeen(log[0].counted_at);
+  try { console.timeEnd("ir-render"); } catch (_) {}
+}
+// v-ir-1: legacy renderer stub -- older callers that expected the
+// pre-reconciliation supervisor tab now enter through renderCycleCounts
+// above. Retained here so the "if not loaded, skeleton" branch below
+// stays unreachable rather than deleted; keeps the diff shallow.
+function _ccRenderCycleCountsLegacy_UNUSED() {
+  if (false) {
   // Seed watermarks from what we already have so the FIRST
   // realtime tick fetches only genuinely new rows, not the
   // whole table.
@@ -1775,7 +2526,8 @@ function renderCycleCounts() {
   const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
   if (log[0] && log[0].counted_at) _ccPersistLastSeen(log[0].counted_at);
   try { console.timeEnd("cc-supervisor-render"); } catch (_) {}
-}
+  }   // close if(false)
+}     // close _ccRenderCycleCountsLegacy_UNUSED
 function _ccOnNameInput(v) { _ccSetName(v); if (typeof refresh === "function") refresh(); }
 function _ccToggleCompleted() { CC_STATE._showCompleted = !CC_STATE._showCompleted; if (typeof refresh === "function") refresh(); }
 if (typeof window !== "undefined") {
@@ -1827,11 +2579,71 @@ function _ccRenderPartLocationsBlock(pn) {
 // `locations` jsonb column, expand that row inline so the buyer
 // sees the per-bin call. Returns "" only when BOTH the locations
 // block AND the history are empty (js/10 hides the section then).
+function _irMiniLedgerBlock(pn) {
+  // Placeholder that fills in after a lazy per-pn fetch. Keeps the
+  // drawer synchronous. Renders anchor -> receipts -> usage ->
+  // expected-vs-actual + a compact daily residual list.
+  const id = "ir-pd-ledger-" + pn;
+  setTimeout(async () => {
+    const el = document.getElementById(id);
+    if (!el || typeof _supa === "undefined" || !_supa) return;
+    try {
+      const start = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const { data, error } = await _supa
+        .from("parts_onhand_snapshots")
+        .select("snapshot_date, on_hand, daily_use, receipts_qty, usage_est, prev_snapshot_date, prev_on_hand, residual, adjustment_applied, workdays_since_prev")
+        .eq("pn", pn)
+        .gte("snapshot_date", start)
+        .order("snapshot_date", { ascending: true })
+        .limit(60);
+      if (error) throw error;
+      const rows = data || [];
+      if (rows.length === 0) { el.innerHTML = `<div class="dim tiny">No snapshot rows yet -- the nightly reconciliation ledger hasn't landed for this part.</div>`; return; }
+      const latest = rows[rows.length - 1];
+      const anchor = rows[0];
+      const sumRes = rows.filter(r => r.residual != null && !r.adjustment_applied).reduce((s, r) => s + Number(r.residual), 0);
+      const sumRecv = rows.reduce((s, r) => s + (Number(r.receipts_qty) || 0), 0);
+      const sumUsage = rows.reduce((s, r) => s + (Number(r.usage_est) || 0), 0);
+      const dailyList = rows.slice(-14).map(r => `
+        <tr>
+          <td class="dim tiny">${esc(r.snapshot_date)}</td>
+          <td class="right num">${Math.round(r.on_hand)}</td>
+          <td class="right num dim">${(r.receipts_qty || 0).toFixed(0)}</td>
+          <td class="right num dim" title="Estimate: chain-aware daily use x workdays since previous snapshot">${(r.usage_est || 0).toFixed(1)}</td>
+          <td class="right num ${r.residual == null ? "dim" : (r.adjustment_applied ? "dim" : Math.abs(r.residual) > 5 ? "text-warn" : "")}">
+            ${r.residual == null ? "-" : (r.residual > 0 ? "+" : "") + Number(r.residual).toFixed(1)}
+            ${r.adjustment_applied ? '<span class="pill" style="font-size:9px">adj</span>' : ""}
+          </td>
+        </tr>`).join("");
+      el.innerHTML = `
+        <div class="dim tiny" style="margin:6px 0 8px">
+          Anchor ${esc(anchor.snapshot_date)}: on-hand <strong>${Math.round(anchor.on_hand)}</strong> &middot;
+          received <strong>${Math.round(sumRecv)}</strong> &middot;
+          usage estimate <strong>${sumUsage.toFixed(1)}</strong>
+          <span title="Estimate; based on chain-aware daily use x workdays.">*</span> &middot;
+          expected today <strong>${Math.round(anchor.on_hand + sumRecv - sumUsage)}</strong> vs actual <strong>${Math.round(latest.on_hand)}</strong>
+          &rarr; residual <strong class="${Math.abs(sumRes) > 5 ? "text-warn" : ""}">${sumRes > 0 ? "+" : ""}${sumRes.toFixed(1)}</strong>
+        </div>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr>
+          <th>Date</th><th class="right">On hand</th><th class="right">Received</th><th class="right">Usage (est)</th><th class="right">Residual</th>
+        </tr></thead><tbody>${dailyList}</tbody></table></div>
+      `;
+    } catch (err) {
+      el.innerHTML = `<div class="dim tiny">Ledger fetch failed: ${esc(err && err.message || "unknown")}</div>`;
+    }
+  }, 40);
+  return `
+    <div class="dr-section">Reconciliation ledger (last 30d)</div>
+    <div id="${esc(id)}" class="dim tiny">Loading ledger...</div>
+  `;
+}
+
 function renderPartCycleCountHistory(pn) {
   const locBlock = _ccRenderPartLocationsBlock(pn);
-  if (!(DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log))) return locBlock;
+  const ledgerBlock = _irMiniLedgerBlock(pn);
+  if (!(DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log))) return locBlock + ledgerBlock;
   const rows = DB.cycleCounts.log.filter(r => r && r.pn === pn).slice(0, 5);
-  if (rows.length === 0) return locBlock;
+  if (rows.length === 0) return locBlock + ledgerBlock;
   const drift = _ccDriftFor(pn);
   const driftLine = drift
     ? `<div class="banner warn tiny" style="margin-bottom:8px">Systematic drift detected -- ${drift.consecutive} consecutive ${drift.direction} counts, avg ${drift.avgPerCount.toFixed(1)}/count. Check BOM / backflush.</div>`
@@ -1864,7 +2676,7 @@ function renderPartCycleCountHistory(pn) {
       <tbody>${body}</tbody>
     </table></div>
   `;
-  return locBlock + historyBlock;
+  return locBlock + ledgerBlock + historyBlock;
 }
 if (typeof window !== "undefined") window.renderPartCycleCountHistory = renderPartCycleCountHistory;
 

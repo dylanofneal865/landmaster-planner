@@ -19,9 +19,20 @@
 //   { writes: [ { op, ...opFields } ] }   -- max 100 writes/batch
 //
 // Ops (see per-op inline docs in _applyOp below):
-//   { op: "flag",         pn, note?, systemQtyNow }
-//   { op: "submitCount",  itemId, counted_qty, counted_by }
-//   { op: "skip",         itemId, reason }
+//   { op: "flag",              pn, note?, systemQtyNow }
+//   { op: "submitCount",       itemId, counted_qty, counted_by,
+//                              client_key?, locations? }
+//   { op: "recordAdhocCount",  pn, counted_qty, counted_by,
+//                              systemQtyNow, client_key?, locations?,
+//                              source? -- creates a "manual" tier
+//                              cycle_count_items row for the pn then
+//                              submits the count against it in one
+//                              round-trip. Used by the Inventory
+//                              Reconciliation workbench's "Record
+//                              count" action so a supervisor can
+//                              record a count without pre-seeding
+//                              an assignment.
+//   { op: "skip",              itemId, reason }
 //   { op: "reconcileFromLive", itemId, currentOnHand }
 //
 // Response:
@@ -131,6 +142,62 @@ async function _applyOp(supa, w, i, log) {
           .single();
         if (insErr) return { index: i, ok: false, error: "flag: insert failed: " + insErr.message };
         return { index: i, ok: true, kind: "flag", itemId: inserted.id };
+      }
+
+      case "recordAdhocCount": {
+        // v-ir-1: desktop replacement for the phone flow. Supervisor
+        // records a count against a pn that doesn't have an open
+        // cycle_count_items row -- we create one (tier "manual",
+        // reason "supervisor recorded count [source]") and then
+        // delegate the actual count logic to submitCount so the
+        // tolerance / recount-child / locations rules stay in one
+        // place.
+        const pn = String(w.pn || "").trim();
+        const counter = String(w.counted_by || "").trim();
+        const countedRaw = Number(w.counted_qty);
+        if (!pn) return { index: i, ok: false, error: "recordAdhocCount: pn required" };
+        if (!counter) return { index: i, ok: false, error: "recordAdhocCount: counted_by required" };
+        if (!Number.isFinite(countedRaw) || countedRaw < 0) {
+          return { index: i, ok: false, error: "recordAdhocCount: counted_qty must be a non-negative number" };
+        }
+        const sysQty = Number.isFinite(Number(w.systemQtyNow)) ? Number(w.systemQtyNow) : 0;
+        const today = _todayIsoUtc();
+        const source = String(w.source || "").trim();
+        const reason = source
+          ? "supervisor recorded count (" + source + ")"
+          : "supervisor recorded count";
+        const { data: inserted, error: insErr } = await supa
+          .from("cycle_count_items")
+          .insert({
+            assigned_date: today,
+            tier: "manual",
+            reason,
+            pn,
+            system_qty_at_assign: sysQty,
+            status: "pending",
+            note: null,
+          })
+          .select("id")
+          .single();
+        if (insErr) return { index: i, ok: false, error: "recordAdhocCount: item spawn failed: " + insErr.message };
+        // Delegate to submitCount with the new item id, preserving
+        // client_key so a retry short-circuits (via the log row's
+        // unique index) BEFORE we'd double-spawn an adhoc item on
+        // retry. NOTE: retries of recordAdhocCount that reach here
+        // WILL create a second cycle_count_items row -- the log's
+        // client_key idempotency protects against a double-log but
+        // the item row is not client_key-scoped. We accept that cost:
+        // an extra "pending" adhoc item that will be re-flipped to
+        // "counted" by the delegated submitCount with no data loss.
+        const sub = {
+          op: "submitCount",
+          itemId: inserted.id,
+          counted_qty: countedRaw,
+          counted_by: counter,
+          client_key: w.client_key || w.clientKey || null,
+          locations: Array.isArray(w.locations) ? w.locations : undefined,
+        };
+        return await _applyOp(supa, sub, i, log);
       }
 
       case "submitCount": {

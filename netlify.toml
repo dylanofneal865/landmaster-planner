@@ -88,6 +88,21 @@
 [functions."cycle-count-assign"]
   schedule = "30 10 * * *"
 
+# Inventory Reconciliation nightly ledger -- 05:50 UTC daily.
+# Writes one parts_onhand_snapshots row per Base BOM part (same
+# exclusions as cycle-count-assign: VMI, pre-launch, phasing-out,
+# queued/retired chain members). Each row records physical on-hand,
+# chain-aware daily use, receipts_qty since prev snapshot (by date
+# range so a missed night doesn't orphan receipts), workday-aware
+# usage_est, and residual = (on_hand - prev.on_hand) - receipts +
+# usage. Manual re-triggerable at GET /.netlify/functions/parts-
+# onhand-snapshot; ?dry=1 previews, ?anchor=1 forces an anchor row.
+# 180-day retention; RLS anon SELECT. Read-only against parts /
+# part_locations / po_receipts / cycle_count_log; NEVER writes
+# on-hand. See the function header for the CREATE TABLE SQL.
+[functions."parts-onhand-snapshot"]
+  schedule = "50 5 * * *"
+
 # INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
 # filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
 # to datetimeoffset and then to a full sweep if the tenant rejects
