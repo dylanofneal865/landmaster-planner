@@ -1685,7 +1685,18 @@ function _irWorkdaysBetweenIso(prevIso, curIso) {
 
 async function _irLoadSnapshots(days) {
   if (IR_STATE.snapsLoading) return;
-  if (typeof _supa === "undefined" || !_supa) { IR_STATE.snaps = []; return; }
+  // v-ir-freezefix: DO NOT early-return here on missing _supa
+  // without setting snapsLoadedFor -- _irRouteEnter's .then(refresh)
+  // would then re-render, re-call _irRouteEnter, and spin
+  // synchronously in the microtask queue (that's what pegged CPU
+  // on the first deploy). The route entry function now gates on
+  // _supa being present before calling us; this is a
+  // belt-and-suspenders that STILL sets snapsLoadedFor.
+  if (typeof _supa === "undefined" || !_supa) {
+    IR_STATE.snaps = [];
+    IR_STATE.snapsLoadedFor = days;
+    return;
+  }
   IR_STATE.snapsLoading = true;
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -1696,6 +1707,8 @@ async function _irLoadSnapshots(days) {
     const all = [];
     const PAGE = 1000;
     let from = 0;
+    const MAX_PAGES = 200;   // guard: at most ~200k rows
+    let pageCount = 0;
     while (true) {
       const { data, error } = await _supa
         .from("parts_onhand_snapshots")
@@ -1708,6 +1721,7 @@ async function _irLoadSnapshots(days) {
       all.push(...data);
       if (data.length < PAGE) break;
       from += PAGE;
+      if (++pageCount >= MAX_PAGES) { console.error("[ir] snapshot fetch hit MAX_PAGES=" + MAX_PAGES + "; truncating"); break; }
     }
     IR_STATE.snaps = all;
     IR_STATE.snapsLoadedFor = days;
@@ -1721,21 +1735,39 @@ async function _irLoadSnapshots(days) {
   IR_STATE.snapsLoading = false;
 }
 
+// v-ir-freezefix: hard cap on total iterations across the two
+// inner loops. 2k parts * 90d + overhead = ~200k comfortably; a
+// cap at 2M means we bail well before hurting the event loop even
+// on pathological input. Bail with console.error so a future
+// regression is loud but non-fatal.
+const IR_AGG_MAX_ITERATIONS = 2_000_000;
 function _irAggregate() {
   if (IR_STATE.aggByPn) return IR_STATE.aggByPn;
+  const t0 = (typeof performance !== "undefined") ? performance.now() : Date.now();
   const agg = new Map();
   const snaps = IR_STATE.snaps || [];
+  let iterations = 0;
   // Anchor per pn -- latest counted / reconciled log row is the
   // reset date. Snapshots BEFORE that date stay stored but don't
   // accumulate into the headline residual.
   const log = (DB && DB.cycleCounts && Array.isArray(DB.cycleCounts.log)) ? DB.cycleCounts.log : [];
   const anchorByPn = new Map();
   for (const r of log) {
+    if (++iterations > IR_AGG_MAX_ITERATIONS) {
+      console.error("[ir] aggregation hit iteration cap in anchor pass -- bailing (snaps=" + snaps.length + " log=" + log.length + ")");
+      IR_STATE.aggByPn = agg;
+      return agg;
+    }
     if (r.outcome !== "counted" && r.outcome !== "reconciled") continue;
     const prev = anchorByPn.get(r.pn);
     if (!prev || String(r.counted_at) > String(prev.counted_at)) anchorByPn.set(r.pn, r);
   }
   for (const s of snaps) {
+    if (++iterations > IR_AGG_MAX_ITERATIONS) {
+      console.error("[ir] aggregation hit iteration cap in snap pass -- bailing (snaps=" + snaps.length + " partsSeen=" + agg.size + ")");
+      IR_STATE.aggByPn = agg;
+      return agg;
+    }
     const anchor = anchorByPn.get(s.pn);
     const anchorDate = anchor ? String(anchor.counted_at).slice(0, 10) : null;
     let a = agg.get(s.pn);
@@ -1803,6 +1835,8 @@ function _irAggregate() {
       : null;
   }
   IR_STATE.aggByPn = agg;
+  const t1 = (typeof performance !== "undefined") ? performance.now() : Date.now();
+  if (t1 - t0 > 500) console.warn("[ir] aggregation took " + Math.round(t1 - t0) + "ms (snaps=" + snaps.length + " parts=" + agg.size + ")");
   return agg;
 }
 
@@ -2283,14 +2317,44 @@ if (typeof window !== "undefined") {
 }
 
 // Route entry -- kicks off the snapshot fetch and re-renders when done.
+//
+// v-ir-freezefix: the initial render can fire BEFORE cloudInit
+// hydrates _supa (cloudInit runs 200ms after DOMContentLoaded via
+// setTimeout; navigate() fires ON DOMContentLoaded). If we called
+// _irLoadSnapshots immediately with no client, it would resolve
+// its promise in the same microtask flush, .then(refresh) would
+// re-render, _irRouteEnter would re-call load, promise resolves
+// again -- a synchronous microtask loop that pegs CPU 100% (which
+// is exactly what d949eed shipped).
+//
+// Fix: gate on _supa being ready. If it's not, schedule a delayed
+// retry via setTimeout so the browser can process macrotasks
+// (including cloudInit finishing). Retry is capped so a broken
+// SDK load doesn't leave the tab retrying forever.
 function _irRouteEnter() {
-  if (IR_STATE.snapsLoadedFor !== IR_STATE.windowDays) {
-    _irLoadSnapshots(IR_STATE.windowDays).then(() => {
-      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts") {
-        if (typeof refresh === "function") refresh();
-      }
-    });
+  if (IR_STATE.snapsLoading) return;
+  if (IR_STATE.snapsLoadedFor === IR_STATE.windowDays) return;
+  if (typeof _supa === "undefined" || !_supa) {
+    IR_STATE._supaWaitAttempts = (IR_STATE._supaWaitAttempts || 0) + 1;
+    if (IR_STATE._supaWaitAttempts > 40) {
+      // 40 * 250ms = 10s. Give up so the skeleton stops spinning.
+      console.error("[ir] gave up waiting for Supabase client after 10s -- workbench will show empty state");
+      IR_STATE.snaps = [];
+      IR_STATE.snapsLoadedFor = IR_STATE.windowDays;
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
+      return;
+    }
+    setTimeout(() => {
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts") _irRouteEnter();
+    }, 250);
+    return;
   }
+  IR_STATE._supaWaitAttempts = 0;
+  _irLoadSnapshots(IR_STATE.windowDays).then(() => {
+    if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts") {
+      if (typeof refresh === "function") refresh();
+    }
+  });
 }
 
 // -------- MAIN RENDER ------------------------------------------------
