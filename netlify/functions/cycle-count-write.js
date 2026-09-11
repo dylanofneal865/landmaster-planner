@@ -34,6 +34,13 @@
 //                              an assignment.
 //   { op: "skip",              itemId, reason }
 //   { op: "reconcileFromLive", itemId, currentOnHand }
+//   { op: "resolveListItem",   pn, resolved_by, resolution ('done' |
+//                              'not_needed'), gap_units?, gap_usd?,
+//                              reason?, source? -- writes an audit
+//                              row to count_list_resolutions. Used
+//                              by the Inventory Reconciliation count
+//                              list's [Done] / [Not needed] actions;
+//                              NEVER touches on-hand or cycle_count_*.
 //
 // Response:
 //   200 { ok: true, results: [{ index, ok, ... }] }
@@ -142,6 +149,45 @@ async function _applyOp(supa, w, i, log) {
           .single();
         if (insErr) return { index: i, ok: false, error: "flag: insert failed: " + insErr.message };
         return { index: i, ok: true, kind: "flag", itemId: inserted.id };
+      }
+
+      case "resolveListItem": {
+        // v-ir-list: [Done] / [Not needed] on the Inventory
+        // Reconciliation count list. Writes an audit row to
+        // count_list_resolutions; NEVER touches parts, on-hand,
+        // cycle_count_items, or cycle_count_log. A "done"
+        // resolution asserts the count landed in Acumatica; a
+        // "not_needed" is a supervisor dismissal. The client
+        // re-shows the pn per the re-entry rules (done: new
+        // evidence after resolved_at within 45d; not_needed:
+        // gap doubled within 60d).
+        const pn = String(w.pn || "").trim();
+        const resolvedBy = String(w.resolved_by || "").trim();
+        const resolution = String(w.resolution || "").trim();
+        if (!pn) return { index: i, ok: false, error: "resolveListItem: pn required" };
+        if (!resolvedBy) return { index: i, ok: false, error: "resolveListItem: resolved_by required" };
+        if (resolution !== "done" && resolution !== "not_needed") {
+          return { index: i, ok: false, error: "resolveListItem: resolution must be 'done' or 'not_needed'" };
+        }
+        const gapUnits = Number.isFinite(Number(w.gap_units)) ? Number(w.gap_units) : null;
+        const gapUsd = Number.isFinite(Number(w.gap_usd)) ? Number(w.gap_usd) : null;
+        const reason = typeof w.reason === "string" ? w.reason.trim().slice(0, 500) : null;
+        const source = typeof w.source === "string" ? w.source.trim().slice(0, 50) : null;
+        const { data, error } = await supa
+          .from("count_list_resolutions")
+          .insert({
+            pn,
+            resolved_by: resolvedBy,
+            resolution,
+            gap_units: gapUnits,
+            gap_usd: gapUsd,
+            reason: reason || null,
+            source: source || null,
+          })
+          .select("id, resolved_at")
+          .single();
+        if (error) return { index: i, ok: false, error: "resolveListItem: insert failed: " + error.message };
+        return { index: i, ok: true, kind: "resolveListItem", id: data && data.id, pn, resolution, resolvedAt: data && data.resolved_at };
       }
 
       case "recordAdhocCount": {

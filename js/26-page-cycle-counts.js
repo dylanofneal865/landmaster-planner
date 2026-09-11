@@ -3044,23 +3044,430 @@ if (typeof window !== "undefined") {
   });
 }
 
+/* ================================================================
+   COUNT LIST -- v-ir-list
+   The IR page is now one working table. All four engines
+   (receipts-math, nightly residuals, runway, never-verified) feed
+   it; their reasoning compresses to one plain-English "why" line
+   per row. Resolutions ([Done] / [Not needed]) write to
+   count_list_resolutions and drive re-entry rules:
+     * done       -- hide 45d unless a new signal after resolved_at
+                     grows the gap by another threshold-worth
+     * not_needed -- hide 60d unless the gap doubles
+   ================================================================ */
+
+const IR_LIST_RESOLUTION_HIDE_DAYS = { done: 45, not_needed: 60 };
+const IR_LIST_MIN_USD = 250;                  // $ threshold for receipts/ledger inclusion
+const IR_LIST_MIN_UNITS_ABS = 10;             // units floor
+const IR_LIST_MIN_UNITS_PCT = 0.15;           // OR 15% of on-hand
+const IR_LIST_RUNWAY_MAX_DAYS = 60;           // include in list if daysLeft <= this
+const IR_LIST_UNVERIFIED_STALE_DAYS = 45;     // "not counted in 45"
+const IR_LIST_NEVER_VERIFIED_CAP = 25;        // TOP N never-verified only
+const IR_LIST_REGROW_UNITS = 5;               // minimum unit-gap growth
+const IR_LIST_REGROW_USD = 100;               // OR minimum $ growth (done)
+
+async function _irLoadResolutions() {
+  if (IR_STATE.resolutionsLoading) return;
+  if (IR_STATE.resolutions != null) return;
+  if (typeof _supa === "undefined" || !_supa) {
+    IR_STATE.resolutions = [];
+    return;
+  }
+  IR_STATE.resolutionsLoading = true;
+  try {
+    // 60-day window covers the longest suppression rule + audit tail.
+    const cutoff = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString();
+    const { data, error } = await _supa
+      .from("count_list_resolutions")
+      .select("id, pn, resolved_at, resolved_by, resolution, gap_units, gap_usd, reason, source")
+      .gte("resolved_at", cutoff)
+      .order("resolved_at", { ascending: false })
+      .limit(2000);
+    if (error) throw error;
+    IR_STATE.resolutions = data || [];
+  } catch (err) {
+    console.warn("[ir] resolutions fetch failed:", err && err.message);
+    IR_STATE.resolutions = [];
+  }
+  IR_STATE.resolutionsLoading = false;
+}
+// Latest resolution per pn (newest wins). Older rows stay in
+// IR_STATE.resolutions for the Resolved(30d) expander.
+function _irLatestResolutionByPn() {
+  const map = new Map();
+  for (const r of (IR_STATE.resolutions || [])) {
+    if (!r || !r.pn) continue;
+    const prev = map.get(r.pn);
+    if (!prev || String(r.resolved_at) > String(prev.resolved_at)) map.set(r.pn, r);
+  }
+  return map;
+}
+// Decide whether to suppress a row given its current gap magnitude
+// and the latest resolution for this pn. Returns true = suppress.
+function _irIsSuppressed(item, latestRes) {
+  if (!latestRes) return false;
+  const days = (Date.now() - new Date(latestRes.resolved_at).getTime()) / (24 * 3600 * 1000);
+  const hideWindow = IR_LIST_RESOLUTION_HIDE_DAYS[latestRes.resolution] || 0;
+  if (days > hideWindow) return false;
+  const prevUsd = Math.abs(Number(latestRes.gap_usd) || 0);
+  const prevUnits = Math.abs(Number(latestRes.gap_units) || 0);
+  const curUsd = Math.abs(Number(item.gapUsd) || 0);
+  const curUnits = Math.abs(Number(item.gapUnits) || 0);
+  if (latestRes.resolution === "not_needed") {
+    // Reappear if the gap has DOUBLED (either dimension).
+    if (prevUsd > 0 && curUsd >= 2 * prevUsd) return false;
+    if (prevUnits > 0 && curUnits >= 2 * prevUnits) return false;
+    if (prevUsd === 0 && prevUnits === 0 && curUsd >= IR_LIST_MIN_USD) return false;
+    return true;
+  }
+  // "done" -- reappear on NEW evidence after resolved_at that adds
+  // meaningful new gap. Runway-only rows are treated as no-new-gap
+  // during the hide window (a fresh count "cleared" them).
+  if (item.source === "runway" || item.source === "never-verified") return true;
+  const grewUsd = curUsd - prevUsd;
+  const grewUnits = curUnits - prevUnits;
+  if (grewUsd >= IR_LIST_REGROW_USD || grewUnits >= IR_LIST_REGROW_UNITS) return false;
+  return true;
+}
+
+// Runway row builder -- extracted from _irRenderRunway so the count
+// list can consume the same shape without touching the older render.
+function _irRunwayItems(maxDays) {
+  const agg = _irAggregate();
+  const out = [];
+  for (const a of agg.values()) {
+    if (a.daysLeft === Infinity) continue;
+    if (a.daysLeft > maxDays) continue;
+    out.push(a);
+  }
+  return out;
+}
+
+function _irBinsFor(pn) {
+  if (!(DB && DB.partLocations instanceof Map)) return "";
+  const locs = DB.partLocations.get(pn) || [];
+  const named = locs
+    .filter(l => l && String(l.location) !== "__warehouse__" && l.location)
+    .map(l => String(l.location));
+  if (named.length === 0) return "";
+  if (named.length <= 3) return named.join(", ");
+  return named.slice(0, 3).join(", ") + " +" + (named.length - 3);
+}
+
+// Build the unified count list from the four engines. Dedupe by
+// pn: $-signal (receipts-math OR ledger) wins > runway > never-
+// verified. Each item carries: sortTier, sortKey, source, reason
+// (short "why" line), gapUnits, gapUsd, dateAdded (evidence start).
+function _irBuildCountList() {
+  const partsCache = _ccPartsCache();
+  const items = new Map();
+
+  // Tier A -- $ signal via receipts-math.
+  for (const r of _irReceiptsMathRows()) {
+    const unitFloor = Math.max(IR_LIST_MIN_UNITS_ABS, r.onHand * IR_LIST_MIN_UNITS_PCT);
+    if (r.kind === "cant_add_up") {
+      if (r.absUsd < IR_LIST_MIN_USD) continue;
+    } else if (r.units < unitFloor || r.absUsd < IR_LIST_MIN_USD) continue;
+    let why;
+    if (r.kind === "cant_add_up") {
+      why = "receipts can't add up — count to reset ($" + Math.round(r.absUsd).toLocaleString() + ")";
+    } else {
+      // "unaccounted" = reality likely OVER what the system says.
+      why = "receipts say ~" + Math.round(r.units) + " more than shelf shows — $" + Math.round(r.absUsd).toLocaleString();
+    }
+    // Earliest receipt date in window = evidence start.
+    let earliest = null;
+    for (const rc of r.receipts) {
+      if (!earliest || rc.receiptDate < earliest) earliest = rc.receiptDate;
+    }
+    items.set(r.pn, {
+      pn: r.pn, desc: r.desc, cls: r.cls,
+      bins: _irBinsFor(r.pn),
+      onHand: r.onHand,
+      why, source: "receipts-math",
+      gapUnits: r.kind === "cant_add_up" ? 0 : r.units,
+      gapUsd: r.absUsd,
+      dateAdded: earliest || _irWindowStartIso(r.window),
+      sortTier: 0,
+      sortKey: -r.absUsd,   // desc by |$|
+    });
+  }
+
+  // Nightly ledger -- overrides receipts if it gives a tighter (smaller |units|)
+  // claim, otherwise fills in where receipts-math didn't fire.
+  const agg = _irAggregate();
+  for (const a of agg.values()) {
+    if (a.ledgerDays < 7) continue;
+    const absUnits = Math.abs(a.residualSum);
+    const absUsd = a.residualUsdAbs;
+    const unitFloor = Math.max(IR_LIST_MIN_UNITS_ABS, a.onHand * IR_LIST_MIN_UNITS_PCT);
+    if (absUnits < unitFloor || absUsd < IR_LIST_MIN_USD) continue;
+    const existing = items.get(a.pn);
+    if (existing && existing.source === "receipts-math") {
+      // Prefer ledger only if tighter (smaller |units|). Keep can't-add-up
+      // categorical -- but receipts-math cant_add_up has units=0 so tighter
+      // check would replace it; guard on that.
+      if (existing.gapUnits === 0 && existing.source === "receipts-math") continue;
+      if (absUnits >= existing.gapUnits) continue;
+    }
+    const p = partsCache.get(a.pn) || {};
+    const kindText = a.residualSum > 0
+      ? "nightly tracking: ~" + Math.round(absUnits) + " units of stock appearing over " + a.ledgerDays + "d — $" + Math.round(absUsd).toLocaleString()
+      : "nightly tracking: ~" + Math.round(absUnits) + " units missing over " + a.ledgerDays + "d — $" + Math.round(absUsd).toLocaleString();
+    items.set(a.pn, {
+      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "",
+      bins: _irBinsFor(a.pn),
+      onHand: a.onHand,
+      why: kindText, source: "ledger",
+      gapUnits: absUnits, gapUsd: absUsd,
+      dateAdded: a.firstAccumDate || a.lastSnapDate,
+      sortTier: 0,
+      sortKey: -absUsd,
+    });
+  }
+
+  // Tier B -- runway (daysLeft <= 60). Only kept if not counted in
+  // 45d (or never counted); merges with $-signal for the same pn by
+  // enriching the why line.
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const runwayItems = _irRunwayItems(IR_LIST_RUNWAY_MAX_DAYS);
+  for (const a of runwayItems) {
+    const staleOrNever = (a.lastCountAgeDays == null) || (a.lastCountAgeDays > IR_LIST_UNVERIFIED_STALE_DAYS);
+    if (!staleOrNever) continue;
+    const existing = items.get(a.pn);
+    if (existing) {
+      // Enrich existing $-signal row's why line rather than replacing.
+      const suffix = " · also runs out in " + a.daysLeft + "d" + (a.lastCountAgeDays == null ? ", never verified" : ", not counted in " + a.lastCountAgeDays + "d");
+      existing.why = existing.why + suffix;
+      continue;
+    }
+    const partsCache2 = _ccPartsCache();
+    const p = partsCache2.get(a.pn) || {};
+    const why = a.lastCountAgeDays == null
+      ? "runs out in " + a.daysLeft + "d, never verified"
+      : "runs out in " + a.daysLeft + "d, not counted in " + a.lastCountAgeDays + "d";
+    items.set(a.pn, {
+      pn: a.pn, desc: a.desc || p.desc || "", cls: a.cls || p.cls || "",
+      bins: _irBinsFor(a.pn),
+      onHand: a.onHand,
+      why, source: "runway",
+      gapUnits: 0, gapUsd: 0,
+      dateAdded: todayIso,
+      sortTier: 1,
+      sortKey: a.daysLeft,   // asc
+    });
+  }
+
+  // Tier C -- never-verified Base BOM parts, capped at top N by
+  // (daily * cost) so the tail doesn't overwhelm the list.
+  if (DB && Array.isArray(DB.parts)) {
+    const neverPool = [];
+    for (const p of DB.parts) {
+      if (!p || !p.pn) continue;
+      if (String(p.itemType || "").toLowerCase().trim() !== "base_bom") continue;
+      if (items.has(p.pn)) continue;
+      const aggRow = agg.get(p.pn);
+      if (aggRow && aggRow.lastCountedAt) continue;
+      const daily = Number(p.daily) || 0;
+      if (daily <= 0) continue;
+      const cost = Number(p.cost) || 0;
+      neverPool.push({ p, weight: daily * (cost || 1) });
+    }
+    neverPool.sort((a, b) => b.weight - a.weight);
+    for (const x of neverPool.slice(0, IR_LIST_NEVER_VERIFIED_CAP)) {
+      const p = x.p;
+      items.set(p.pn, {
+        pn: p.pn, desc: p.desc || "", cls: p.partClass || "",
+        bins: _irBinsFor(p.pn),
+        onHand: _irPhysicalOnHand(p.pn, p),
+        why: "never verified", source: "never-verified",
+        gapUnits: 0, gapUsd: 0,
+        dateAdded: todayIso,
+        sortTier: 2,
+        sortKey: -x.weight,
+      });
+    }
+  }
+
+  // Apply resolution suppression.
+  const latestByPn = _irLatestResolutionByPn();
+  const kept = [];
+  let suppressedCount = 0;
+  for (const it of items.values()) {
+    const r = latestByPn.get(it.pn);
+    if (_irIsSuppressed(it, r)) { suppressedCount++; continue; }
+    kept.push(it);
+  }
+  kept.sort((a, b) => {
+    if (a.sortTier !== b.sortTier) return a.sortTier - b.sortTier;
+    return a.sortKey - b.sortKey;
+  });
+  return { items: kept, suppressedCount };
+}
+
+async function _irResolveListItem(pn, resolution) {
+  const name = _ccName();
+  if (!name) {
+    if (typeof _irReportWriteError === "function") _irReportWriteError("Resolve", "enter your name at the top first");
+    return;
+  }
+  const list = _irBuildCountList().items;
+  const it = list.find(x => x.pn === pn);
+  if (!it) return;
+  try {
+    const body = {
+      writes: [{
+        op: "resolveListItem",
+        pn,
+        resolved_by: name,
+        resolution,
+        gap_units: it.gapUnits || 0,
+        gap_usd: it.gapUsd || 0,
+        reason: it.why || null,
+        source: it.source || null,
+      }],
+    };
+    const resp = await fetch("/.netlify/functions/cycle-count-write", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-fs-edit-token": (typeof FS_EDIT_TOKEN_CLIENT !== "undefined") ? FS_EDIT_TOKEN_CLIENT : "",
+        "x-app-build": String((typeof APP_BUILD !== "undefined") ? APP_BUILD : 0),
+      },
+      body: JSON.stringify(body),
+    });
+    const json = await resp.json();
+    const opResult = json && Array.isArray(json.results) ? json.results[0] : null;
+    const opError = opResult && opResult.ok === false ? String(opResult.error || "") : "";
+    const batchError = json && json.error ? String(json.error) : "";
+    if (opError) { _irReportWriteError("Resolve", opError); return; }
+    if (!resp.ok || (json && json.ok === false)) { _irReportWriteError("Resolve", batchError || ("server " + resp.status)); return; }
+    // Prepend the new resolution locally so the list updates instantly.
+    if (opResult && opResult.id) {
+      if (!Array.isArray(IR_STATE.resolutions)) IR_STATE.resolutions = [];
+      IR_STATE.resolutions.unshift({
+        id: opResult.id,
+        pn,
+        resolved_at: opResult.resolvedAt || new Date().toISOString(),
+        resolved_by: name,
+        resolution,
+        gap_units: it.gapUnits || 0,
+        gap_usd: it.gapUsd || 0,
+        reason: it.why || null,
+        source: it.source || null,
+      });
+    }
+    if (typeof refresh === "function") refresh();
+  } catch (err) {
+    _irReportWriteError("Resolve", (err && err.message) || String(err) || "network error");
+  }
+}
+function _irToggleResolvedExpander() {
+  IR_STATE.resolvedExpanded = !IR_STATE.resolvedExpanded;
+  if (typeof refresh === "function") refresh();
+}
+if (typeof window !== "undefined") {
+  Object.assign(window, {
+    _irResolveListItem, _irToggleResolvedExpander,
+  });
+}
+
+function _irRenderCountList() {
+  const receiptsReady = IR_STATE.receipts90d != null && !IR_STATE.receipts90dLoading;
+  const snapsReady = IR_STATE.snaps != null;
+  const resolutionsReady = IR_STATE.resolutions != null && !IR_STATE.resolutionsLoading;
+  if (!receiptsReady || !snapsReady || !resolutionsReady) {
+    return `<div class="empty tiny muted">Loading count list...</div>`;
+  }
+  const { items, suppressedCount } = _irBuildCountList();
+  const totalUsd = items.reduce((s, x) => s + (Number(x.gapUsd) || 0), 0);
+  const stripUsd = totalUsd > 0 ? "$" + Math.round(totalUsd).toLocaleString() : "$0";
+  const snapAgo = IR_STATE.lastSnapshotAt || "no snapshot yet";
+  const strip = `
+    <div class="ir-list-strip">
+      <span><strong>${items.length}</strong> on the list</span>
+      <span>&middot;</span>
+      <span><strong>${stripUsd}</strong> total $ flagged</span>
+      <span>&middot;</span>
+      <span>last snapshot <strong>${esc(String(snapAgo))}</strong></span>
+      ${suppressedCount > 0 ? `<span class="dim tiny" style="margin-left:8px">${suppressedCount} suppressed by recent resolution</span>` : ""}
+    </div>`;
+  const rows = items.map(it => `
+    <tr data-pn="${esc(it.pn)}">
+      <td class="ir-list-chk"><input type="checkbox" aria-label="print check"></td>
+      <td class="mono">${esc(it.pn)}</td>
+      <td>${esc(it.desc)}${it.cls ? ` <span class="dim tiny">${esc(it.cls)}</span>` : ""}</td>
+      <td class="dim tiny">${esc(it.bins || "(no bin on file)")}</td>
+      <td class="right num">${Math.round(it.onHand)}</td>
+      <td>${esc(it.why)}</td>
+      <td class="dim tiny">${esc(it.dateAdded ? it.dateAdded.slice(0, 10) : "")}</td>
+      <td class="ir-list-actions">
+        <button class="btn xs primary" onclick="_irResolveListItem('${esc(it.pn)}','done')">Done</button>
+        <button class="btn xs ghost"   onclick="_irResolveListItem('${esc(it.pn)}','not_needed')">Not needed</button>
+      </td>
+    </tr>`).join("");
+  const toolbar = `
+    <div class="ir-list-toolbar">
+      <button class="btn" onclick="window.print()">Print</button>
+      <span class="dim tiny">Sort: $ impact desc &middot; runway by days-left &middot; never-verified last</span>
+    </div>`;
+  const table = items.length > 0
+    ? `<div class="tbl-wrap"><table class="tbl ir-list-table"><thead><tr>
+         <th class="ir-list-chk"></th>
+         <th>PN</th><th>Description</th><th>Bins</th>
+         <th class="right">On hand</th><th>Why it's here</th>
+         <th>Added</th><th></th>
+       </tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<div class="ir-ok-line" style="margin-top:12px"><span class="ir-ok-check">&#10003;</span> Nothing on the list &mdash; on-hand looks consistent with receipts and usage across the reconciled parts.</div>`;
+  return `<div id="ir-count-list-print">
+    ${strip}
+    ${toolbar}
+    ${table}
+  </div>`;
+}
+
+function _irRenderResolvedExpander() {
+  const list = (IR_STATE.resolutions || []).slice();
+  if (list.length === 0) {
+    return `<div class="dim tiny">No resolutions in the last 60 days.</div>`;
+  }
+  const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+  const recent = list.filter(r => r.resolved_at >= cutoff);
+  if (recent.length === 0) return `<div class="dim tiny">No resolutions in the last 30 days.</div>`;
+  recent.sort((a, b) => String(b.resolved_at).localeCompare(String(a.resolved_at)));
+  const body = recent.map(r => `
+    <tr>
+      <td class="dim tiny">${esc((r.resolved_at || "").slice(0, 16).replace("T", " "))}</td>
+      <td class="mono">${esc(r.pn)}</td>
+      <td>${r.resolution === "done" ? '<span class="ir-chip ir-chip-green">DONE</span>' : '<span class="ir-chip ir-chip-gray">NOT NEEDED</span>'}</td>
+      <td>${esc(r.resolved_by || "")}</td>
+      <td class="dim tiny">${esc(r.reason || "")}</td>
+      <td class="right num dim">${r.gap_usd != null ? "$" + Math.round(Math.abs(Number(r.gap_usd))).toLocaleString() : ""}</td>
+    </tr>`).join("");
+  return `<div class="tbl-wrap"><table class="tbl">
+    <thead><tr><th>When</th><th>PN</th><th>Result</th><th>By</th><th>Reason at resolution</th><th class="right">Gap ($)</th></tr></thead>
+    <tbody>${body}</tbody>
+  </table></div>`;
+}
+
 function _irRouteEnter() {
-  // v-ir-recmath: snapshot load AND receipts-90d load are independent
-  // async paths; both trigger refresh when they land. The freezefix
-  // guards (snapsLoadedFor set on all exit paths; receipts90d != null
-  // check) prevent either from re-firing after it settles.
+  // v-ir-list: three independent async loads (snaps, receipts, resolutions).
+  // Each fires once and sets its own "done" marker so re-entry loops can't
+  // spin (see v-ir-freezefix). Missing _supa retries via setTimeout
+  // (macrotask -> lets cloudInit run) up to 10s.
   const snapsDone = IR_STATE.snapsLoadedFor === IR_STATE.windowDays;
   const receiptsDone = IR_STATE.receipts90d != null;
-  if (snapsDone && receiptsDone) return;
-  if (IR_STATE.snapsLoading && IR_STATE.receipts90dLoading) return;
+  const resolutionsDone = IR_STATE.resolutions != null;
+  if (snapsDone && receiptsDone && resolutionsDone) return;
+  if (IR_STATE.snapsLoading && IR_STATE.receipts90dLoading && IR_STATE.resolutionsLoading) return;
   if (typeof _supa === "undefined" || !_supa) {
     IR_STATE._supaWaitAttempts = (IR_STATE._supaWaitAttempts || 0) + 1;
     if (IR_STATE._supaWaitAttempts > 40) {
-      // 40 * 250ms = 10s. Give up so the skeleton stops spinning.
-      console.error("[ir] gave up waiting for Supabase client after 10s -- workbench will show empty state");
+      console.error("[ir] gave up waiting for Supabase client after 10s -- count list will show empty state");
       IR_STATE.snaps = [];
       IR_STATE.snapsLoadedFor = IR_STATE.windowDays;
       IR_STATE.receipts90d = [];
+      IR_STATE.resolutions = [];
       if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
       return;
     }
@@ -3080,6 +3487,11 @@ function _irRouteEnter() {
       if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
     });
   }
+  if (!resolutionsDone && !IR_STATE.resolutionsLoading) {
+    _irLoadResolutions().then(() => {
+      if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "cycle-counts" && typeof refresh === "function") refresh();
+    });
+  }
 }
 
 // -------- MAIN RENDER ------------------------------------------------
@@ -3092,30 +3504,16 @@ function renderCycleCounts() {
   _irRouteEnter();
   const name = _ccName();
   const liveState = (typeof ccLiveState === "function") ? ccLiveState() : "connecting";
-  const skeletonSnaps = !IR_STATE.snaps || IR_STATE.snapsLoading;
-  const workbench = skeletonSnaps
-    ? `<div class="ir-strip"><div class="ir-stat"><div class="ir-stat-label">Loading ledger...</div></div></div>
-       <div class="empty tiny muted" style="margin-top:12px">Fetching parts_onhand_snapshots for the last ${IR_STATE.windowDays} days...</div>`
-    : (IR_STATE.view === "verify"
-        ? _irRenderVerifyList()
-        : `${_irRenderVerdictsSection()}
-           <div style="margin-top:24px">${_irRenderRunway()}</div>
-           <div class="row gap-sm" style="margin-top:24px;flex-wrap:wrap">
-             <button class="btn" onclick="_irToggleFullLedger()">${IR_STATE.showFullLedger ? "Hide" : "Show"} full ledger &middot; all parts &middot; residual columns &middot; sparklines</button>
-             <button class="btn" onclick="_irSetView('verify')">Open Verify List</button>
-           </div>
-           ${IR_STATE.showFullLedger ? `
-             <div class="dr-section" style="margin-top:16px">Full reconciliation ledger (${IR_STATE.windowDays}d)</div>
-             ${_irRenderTopStrip()}
-             ${_irRenderReceiptsMath()}
-             ${_irRenderMainTable()}
-           ` : ""}`);
-  const feedBlock = (DB && DB.cycleCounts && DB.cycleCounts.loaded)
-    ? `<div class="dr-section" style="margin-top:24px">Counts as they come in</div>
-       ${_ccRenderLiveFeed()}
-       <div class="dr-section" style="margin-top:20px">Accuracy</div>
-       <div id="cc-summary-strip">${_ccRenderTightSummary(_ccSummary())}</div>`
-    : `<div class="dim tiny" style="margin-top:24px">Live feed loading...</div>`;
+  const workbench = (IR_STATE.view === "verify")
+    ? _irRenderVerifyList()
+    : `${_irRenderCountList()}
+       <details class="ir-resolved" style="margin-top:24px">
+         <summary class="dim tiny" style="cursor:pointer">Resolved (last 30 days) &mdash; the paper trail</summary>
+         <div style="margin-top:8px">${_irRenderResolvedExpander()}</div>
+       </details>`;
+  // v-ir-list: live feed + accuracy strip REMOVED from the page. The
+  // /count mobile app and cycle_count_log are unchanged; the resolved
+  // expander is the paper trail on this surface.
   const html = `
     <style>
       @keyframes cc-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.35 } }
@@ -3158,6 +3556,21 @@ function renderCycleCounts() {
       .ir-record-form { padding: 10px 4px; }
       .ir-bin-grid { display: flex; flex-wrap: wrap; gap: 10px; }
       .ir-bin { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+      /* v-ir-list: count-list layout */
+      .ir-list-strip {
+        display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+        margin: 12px 0; padding: 10px 12px;
+        border: 1px solid var(--line, #cbd5e1); border-radius: 6px;
+        background: var(--surf, transparent); font-size: 14px;
+      }
+      .ir-list-toolbar { display: flex; gap: 12px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+      .ir-list-table td, .ir-list-table th { vertical-align: middle; }
+      .ir-list-table td.ir-list-actions { white-space: nowrap; display: flex; gap: 4px; }
+      .ir-list-chk { width: 22px; }
+      .ir-list-chk input { transform: scale(1.1); }
+      .ir-resolved summary { cursor: pointer; user-select: none; }
+      .ir-chip-green { background: #16a34a; }
+      .ir-chip-gray  { background: #6b7280; }
       /* v-ir-verdicts: story-card layout for the plain-English headline */
       .ir-headline h2 { margin: 4px 0 8px; font-size: 22px; }
       .ir-ok-line {
@@ -3214,40 +3627,44 @@ function renderCycleCounts() {
         .ir-card-hd { flex-direction: column; align-items: stretch; }
         .ir-card-oh { text-align: left; }
       }
-      /* Print styles for the Verify List */
+      /* Print styles -- covers both the Verify List and the Count List */
       @media print {
         body * { visibility: hidden; }
-        #ir-verify-print, #ir-verify-print * { visibility: visible; }
-        #ir-verify-print { position: absolute; left: 0; top: 0; width: 100%; padding: 12px; }
-        #ir-verify-toolbar { display: none; }
-        .ir-print-table td, .ir-print-table th {
+        #ir-verify-print, #ir-verify-print *,
+        #ir-count-list-print, #ir-count-list-print * { visibility: visible; }
+        #ir-verify-print, #ir-count-list-print {
+          position: absolute; left: 0; top: 0; width: 100%; padding: 12px;
+        }
+        #ir-verify-toolbar, .ir-list-toolbar, .ir-list-actions {
+          display: none !important;
+        }
+        .ir-print-table td, .ir-print-table th,
+        .ir-list-table td, .ir-list-table th {
           border: 1px solid #999; padding: 4px 6px; font-size: 11px;
         }
         .ir-blank { border-bottom: 1px solid #333; min-width: 80px; }
+        .ir-list-chk input { display: inline-block !important; }
         thead { display: table-header-group; }
         tr, td, th { page-break-inside: avoid; }
+        .ir-list-strip { border: 1px solid #999; }
       }
     </style>
     <div class="page" data-page="cycle-counts">
       <div class="page-hd">
         <div>
-          <h1>Inventory Reconciliation ${_ccPulseDot(liveState)}</h1>
-          <p class="muted">Nightly ledger comparing how on-hand moved vs how it should have moved. Residual is the record-keeping gap we can't account for -- that's what to count and why.</p>
+          <h1>Inventory Reconciliation</h1>
+          <p class="muted">One working count list: every part flagged by receipts math, nightly residuals, runway, or never-verified. Hand this to the team. Mark <strong>Done</strong> after Acumatica adjustment; <strong>Not needed</strong> if the flag is a false alarm.</p>
         </div>
         <div class="row gap-sm">
-          <label class="row gap-sm" style="align-items:center;cursor:pointer">
-            <span class="muted tiny">Chime on new count</span>
-            <input type="checkbox" class="chk" ${CC_STATE._chimeOn ? "checked" : ""} onchange="_ccToggleChime()">
-          </label>
+          <!-- v-ir-list: chime removed; the count-list surface no longer subscribes to the live feed -->
           <label class="row gap-sm" style="align-items:center">
             <span class="muted tiny">Your name</span>
             <input class="input" id="cc-name-input" value="${esc(name)}" placeholder="e.g. Marisol" style="width:180px" onchange="_ccOnNameInput(this.value)">
           </label>
         </div>
       </div>
-      ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before recording counts -- it's stamped on every count row.</div>` : ""}
+      ${!name ? `<div class="banner warn" style="margin-bottom:8px">Enter your name above before resolving items &mdash; it's stamped on every [Done] / [Not needed].</div>` : ""}
       ${workbench}
-      ${feedBlock}
     </div>
   `;
   main.innerHTML = html;
