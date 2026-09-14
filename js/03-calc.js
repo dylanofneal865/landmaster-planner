@@ -3618,6 +3618,13 @@ function partsWithStatus() {
     // pre-launch parts (no phasing-out predecessor) return null from
     // getChainInfo and fall through to preLaunch logic unchanged.
     const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
+    // v-handoff: evaluated once per chain member per pass (cheap — reads
+    // only fields getChainInfo already computed). Muted chains skip it
+    // like every other chain override.
+    const _handoff = (chainInfo && !muted && typeof evaluateChainHandoff === "function")
+      ? evaluateChainHandoff(chainInfo) : null;
+    const _handoffBroken = !!(_handoff && _handoff.broken);
+    const _handoffOverridden = _handoffBroken && (typeof isHandoffQueueOverride === "function") && isHandoffQueueOverride(chainInfo.anchorPn);
     return {
       ...p,
       onPO,
@@ -3661,6 +3668,12 @@ function partsWithStatus() {
         _isChainAnchor: chainInfo.anchorPn === p.pn,
         _isChainFinal: chainInfo.finalPn === p.pn,
         _isChainRepresentative: chainInfo.finalPn === p.pn,
+        // v-handoff: SAFE/BROKEN routing flags. _brokenHandoff is what
+        // queueParts excludes; _handoffOverridden means the operator
+        // clicked "Move to Base BOM Queue" (14d TTL) so it re-admits.
+        _handoff,
+        _brokenHandoff: _handoffBroken && !_handoffOverridden,
+        _handoffOverridden,
         _perPartStatus: status.status,
         _perPartDaysOfCover: status.daysOfCover,
         status: chainInfo.chainStatus,
@@ -3691,6 +3704,131 @@ function partsWithStatus() {
   });
   _statusCache = out;
   return out;
+}
+
+/* ============================================================
+   CHAIN HANDOFF HEALTH — v-handoff
+   For a part in an actively-transitioning supersession chain
+   (getChainInfo non-null), decide whether the predecessor →
+   successor handoff is SAFE or BROKEN using the SAME chain math
+   the part drawer already renders. BROKEN chains leave the Base
+   BOM Queue and surface on Coverage Gaps › Transition gaps;
+   SAFE chains follow the normal queue rules.
+
+   BROKEN if any of:
+     (a) chain out of coverage per existing math (chainShort > 0):
+         successor's covering PO isn't projected before the chain
+         runs out.
+     (b) predecessor's own stock runs out before the successor's
+         cut-in (hard cut-in present, chainRunoutDate < cut-in;
+         under hard cut-in the successor's stock can't be consumed
+         pre-cut-in, so chain runout == predecessor runout).
+     (c) cut-in is today or past and the successor has 0 on hand.
+     (d) chain order-by has passed and NO PO exists for the
+         successor.
+   SAFE otherwise (and cut-in, when present, is in the future).
+
+   Non-chain parts never reach this — they carry no _chainInfo.
+   Read-only: never writes to parts.
+   ============================================================ */
+const _HANDOFF_OVERRIDE_LS = "landmaster.handoffQueueOverride.v1";
+const _HANDOFF_OVERRIDE_DAYS = 14;
+function _handoffOverrides() {
+  try {
+    const o = JSON.parse(localStorage.getItem(_HANDOFF_OVERRIDE_LS) || "{}");
+    return (o && typeof o === "object") ? o : {};
+  } catch (_) { return {}; }
+}
+// Operator chose "Move to Base BOM Queue" for this chain (keyed on
+// the chain anchor so one click covers every member). 14-day TTL.
+function isHandoffQueueOverride(anchorPn) {
+  if (!anchorPn) return false;
+  const at = _handoffOverrides()[anchorPn];
+  if (!at) return false;
+  return (Date.now() - new Date(at).getTime()) < _HANDOFF_OVERRIDE_DAYS * 86400000;
+}
+function setHandoffQueueOverride(anchorPn, on) {
+  if (!anchorPn) return;
+  const o = _handoffOverrides();
+  if (on) o[anchorPn] = new Date().toISOString(); else delete o[anchorPn];
+  try { localStorage.setItem(_HANDOFF_OVERRIDE_LS, JSON.stringify(o)); } catch (_) {}
+  if (typeof bumpStatusCache === "function") bumpStatusCache();
+}
+function evaluateChainHandoff(ci) {
+  if (!ci || !ci.finalPn) return null;
+  const DAY = 86400000;
+  const fd = (d) => (d && typeof fmtDate === "function") ? fmtDate(d) : (d ? d.toISOString().slice(0, 10) : "?");
+  const fn = (n) => (typeof fmtNum === "function") ? fmtNum(n) : String(Math.round(n));
+  const finalPn = ci.finalPn;
+  const succ = ci.final || null;
+  const pred = ci.anchor || null;
+  const hc = ci.hardCutin || null;
+  const cutinDate = (hc && hc.hardCutinDate) ? hc.hardCutinDate : null;
+  const cutinDays = cutinDate ? Math.round((cutinDate.getTime() - TODAY.getTime()) / DAY) : null;
+  const succLines = (ci.chainPOLines || []).filter(l => l && l.pn === finalPn);
+  const succOpenLines = succLines.filter(l => !l.isOverdue);
+  let succArrival = null;
+  let succArrivalPo = "";
+  for (const l of succOpenLines) {
+    if (l.expectedDate && (!succArrival || l.expectedDate.getTime() < succArrival.getTime())) {
+      succArrival = l.expectedDate;
+      succArrivalPo = l.poNum || "";
+    }
+  }
+  const succOnHand = hc ? (Number(hc.ownStock) || 0) : (succ ? (Number(succ.onHand) || 0) : 0);
+  const succOnPO = succLines.reduce((s, l) => s + (Number(l.remaining) || 0), 0);
+  const predOnHand = hc ? (Number(hc.predecessorStock) || 0) : (pred ? (Number(pred.onHand) || 0) : 0);
+  const runoutTxt = ci.chainRunoutDate ? fd(ci.chainRunoutDate) : "soon";
+  const reasons = [];
+  if ((Number(ci.chainShort) || 0) > 0) {
+    reasons.push({
+      code: "a",
+      text: succArrival
+        ? `${finalPn}'s covering PO ${succArrivalPo} lands ${fd(succArrival)} — after the chain runs out ${runoutTxt} (short ${fn(ci.chainShort)})`
+        : `nothing on order for ${finalPn} arrives before the chain runs out ${runoutTxt} (short ${fn(ci.chainShort)})`,
+    });
+  }
+  if (cutinDate && cutinDays > 0 && ci.chainRunoutDate && ci.chainRunoutDate.getTime() < cutinDate.getTime()) {
+    reasons.push({ code: "b", text: `${ci.anchorPn} runs out ${fd(ci.chainRunoutDate)}, before ${finalPn}'s cut-in ${fd(cutinDate)}` });
+  }
+  if (cutinDate && cutinDays <= 0 && succOnHand <= 0) {
+    reasons.push({ code: "c", text: `cut-in ${fd(cutinDate)} has ${cutinDays === 0 ? "arrived" : "passed"} and ${finalPn} has 0 on hand` });
+  }
+  if (ci.chainReorderByPassed && succLines.length === 0) {
+    reasons.push({ code: "d", text: `order-by ${ci.chainReorderByDate ? fd(ci.chainReorderByDate) : ""} has passed and no PO exists for ${finalPn}` });
+  }
+  const broken = reasons.length > 0;
+  const codes = new Set(reasons.map(r => r.code));
+  let needQty = Math.max(0, Math.round(Number(ci.chainShort) || 0));
+  if (needQty <= 0 && succ && typeof cycleAwareSuggestedQty === "function") {
+    try { needQty = Math.max(0, Math.round(Number(cycleAwareSuggestedQty(succ, succOnPO)) || 0)); } catch (_) {}
+  }
+  if (needQty <= 0) needQty = 1;
+  let action = "";
+  if (codes.has("c") || codes.has("d")) {
+    action = `order ${fn(needQty)} ${finalPn}`;
+  } else if (codes.has("b")) {
+    action = ci.chainRunoutDate
+      ? `push cut-in to ${fd(ci.chainRunoutDate)} or order ${fn(needQty)} ${finalPn} now`
+      : `order ${fn(needQty)} ${finalPn}`;
+  } else if (codes.has("a")) {
+    action = succArrival
+      ? `move up ${succArrivalPo || "the PO"} to before ${runoutTxt}`
+      : `order ${fn(needQty)} ${finalPn}`;
+  }
+  if (hc && (Number(hc.strandedPredecessorQty) || 0) > 0 && (Number(ci.chainRate) || 0) > 0
+      && typeof workdaysToCalendarDays === "function" && typeof addDays === "function") {
+    const burnCal = workdaysToCalendarDays(predOnHand / ci.chainRate, TODAY);
+    action += (action ? " · " : "") +
+      `or burn down ${ci.anchorPn} to 0 by pushing cut-in to ${fd(addDays(TODAY, burnCal))} (${fn(hc.strandedPredecessorQty)} would strand)`;
+  }
+  return {
+    broken, reasons, action,
+    predPn: ci.anchorPn, succPn: finalPn,
+    cutinDate, cutinDays,
+    predOnHand, predDaysCover: ci.chainRunoutDays,
+    succOnHand, succOnPO, succArrival, succArrivalPo,
+  };
 }
 
 /* ============================================================
@@ -3866,6 +4004,12 @@ function queueParts(itemType) {
   return stats.filter(p =>
     (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease || p._forceAdmitAsPreLaunchOrder)
     && !p.phasingOut
+    // v-handoff: BROKEN chain handoffs are routed to Coverage Gaps ›
+    // Transition gaps instead of the queue (see evaluateChainHandoff),
+    // unless the operator overrode via "Move to Base BOM Queue".
+    // Non-chain parts never carry the flag, so their admission is
+    // byte-identical to before.
+    && !p._brokenHandoff
   );
 }
 

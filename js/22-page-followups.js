@@ -1915,8 +1915,128 @@ function coverageGapCount() {
   try { return computeCoverageGaps().length; } catch (e) { return 0; }
 }
 
+/* ============================================================
+   TRANSITION GAPS — v-handoff
+   One row per actively-transitioning chain whose handoff is
+   BROKEN (evaluateChainHandoff in js/03). These parts are
+   excluded from the Base BOM Queue by queueParts and land here
+   instead. Row = both chain members, cut-in, predecessor on-hand
+   + cover, successor on-hand + expected arrival, which of (a)-(d)
+   fired in plain English, and a suggested action. "Move to Base
+   BOM Queue" sets a 14-day override so the operator can just
+   place the order.
+   ============================================================ */
+let _transitionGapsLastKey = null;
+function computeTransitionGaps() {
+  const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
+  const rows = [];
+  const seen = new Set();
+  for (const p of stats) {
+    if (!p || !p._isChainMember || !p._handoff || !p._handoff.broken) continue;
+    if (p._handoffOverridden) continue;
+    const ci = p._chainInfo;
+    const key = ci && ci.anchorPn;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ part: p, ci, h: p._handoff, anchorPn: key });
+  }
+  const runoutMs = (r) => (r.ci.chainRunoutDate ? r.ci.chainRunoutDate.getTime() : Number.MAX_SAFE_INTEGER);
+  rows.sort((a, b) => runoutMs(a) - runoutMs(b));
+  // Report once per distinct set so the console isn't spammed on every
+  // refresh, but the count the ticket asked for is always visible.
+  const k = rows.map(r => r.anchorPn + ">" + r.h.succPn + ":" + r.h.reasons.map(x => x.code).join("")).join("|");
+  if (k !== _transitionGapsLastKey) {
+    _transitionGapsLastKey = k;
+    console.info(`[transition-gaps] ${rows.length} broken chain handoff(s) moved from Base BOM Queue to Coverage Gaps` +
+      (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [${r.h.reasons.map(x => x.code).join("")}]`).join(", ") : ""));
+  }
+  return rows;
+}
+function moveTransitionGapToQueue(anchorPn) {
+  if (typeof setHandoffQueueOverride === "function") setHandoffQueueOverride(anchorPn, true);
+  if (typeof showToast === "function") showToast(`${anchorPn} chain re-admitted to Base BOM Queue for 14 days`, "ok");
+  refresh();
+}
+// Console helper: prints the current transition-gap set as a table.
+function _printTransitionGaps() {
+  const rows = computeTransitionGaps().map(r => ({
+    chain: `${r.h.predPn} → ${r.h.succPn}`,
+    cutin: r.h.cutinDate ? fmtDate(r.h.cutinDate) : "-",
+    predOnHand: r.h.predOnHand,
+    chainRunout: r.ci.chainRunoutDate ? fmtDate(r.ci.chainRunoutDate) : "∞",
+    succOnHand: r.h.succOnHand,
+    succOnPO: r.h.succOnPO,
+    succArrival: r.h.succArrival ? fmtDate(r.h.succArrival) : "no PO",
+    why: r.h.reasons.map(x => x.code).join(""),
+    action: r.h.action,
+  }));
+  console.table(rows);
+  return rows.length;
+}
+function _transitionGapsPanelHtml(rows) {
+  if (!rows.length) return "";
+  const body = rows.map(r => {
+    const h = r.h;
+    const p = r.part;
+    const predCover = (h.predDaysCover === Infinity || h.predDaysCover == null)
+      ? '<span class="dim">∞</span>'
+      : `${fmtNum(h.predDaysCover)}d`;
+    const runoutCell = r.ci.chainRunoutDate ? fmtDate(r.ci.chainRunoutDate) : "—";
+    const cutinCell = h.cutinDate
+      ? `<span class="mono ${h.cutinDays <= 0 ? "text-crit bold" : ""}">${fmtDate(h.cutinDate)}</span>${h.cutinDays != null ? `<div class="dim tiny">${h.cutinDays <= 0 ? Math.abs(h.cutinDays) + "d ago" : "in " + h.cutinDays + "d"}</div>` : ""}`
+      : '<span class="dim">no cut-in date</span>';
+    const arrivalCell = h.succArrival
+      ? `${fmtDate(h.succArrival)}${h.succArrivalPo ? `<div class="dim tiny mono">${esc(h.succArrivalPo)}</div>` : ""}`
+      : (h.succOnPO > 0 ? '<span class="dim">PO, no date</span>' : '<span class="pill warn">No PO</span>');
+    const why = h.reasons.map(x => `<div><span class="pill crit" style="font-size:9px;padding:1px 5px;margin-right:4px">${esc(x.code)}</span>${esc(x.text)}</div>`).join("");
+    return `
+      <tr class="clickable" onclick="openPartDetail('${esc(h.succPn)}')">
+        <td style="white-space:normal;word-break:break-word">
+          <div><span class="pn dim">${esc(h.predPn)}</span> <span class="dim">→</span> <span class="pn bold">${esc(h.succPn)}</span></div>
+          <div class="dim tiny" style="font-family:var(--f-ui);margin-top:2px">${esc(p.desc || "")}</div>
+        </td>
+        <td>${cutinCell}</td>
+        <td class="right num">${fmtNum(h.predOnHand)}<div class="dim tiny">${predCover} · out ${runoutCell}</div></td>
+        <td class="right num ${h.succOnHand <= 0 ? "text-crit bold" : ""}">${fmtNum(h.succOnHand)}<div class="dim tiny" style="font-weight:400">${arrivalCell}</div></td>
+        <td style="white-space:normal">${why}</td>
+        <td style="white-space:normal" class="tiny">${esc(h.action || "—")}</td>
+        <td>
+          <button class="btn sm primary" onclick="event.stopPropagation(); moveTransitionGapToQueue('${esc(r.anchorPn)}')" title="Re-admit this chain to the Base BOM Queue for 14 days and just place the order">→ Queue</button>
+          <button class="btn sm" onclick="event.stopPropagation(); openPartDetail('${esc(h.succPn)}')" title="Open ${esc(h.succPn)}">Open</button>
+        </td>
+      </tr>`;
+  }).join("");
+  return `
+      <div class="panel" style="border-color: var(--warn-bd, var(--crit-bd)); margin-bottom:14px">
+        <div class="panel-head">
+          <div class="panel-title" style="color: var(--warn, var(--crit));">⇄ Transition gaps</div>
+          <div class="panel-sub">${rows.length} supersession chain${rows.length === 1 ? "" : "s"} with a broken handoff — pulled out of the Base BOM Queue until the handoff is fixed. (a) successor supply lands after chain runout · (b) predecessor runs out before cut-in · (c) cut-in reached, successor unstocked · (d) order-by passed, no successor PO</div>
+        </div>
+        <div class="panel-body flush">
+          <div class="tbl-wrap" style="overflow-x:hidden"><table class="tbl" style="table-layout:fixed">
+            <thead><tr>
+              <th>Chain</th>
+              <th style="width:96px">Cut-in</th>
+              <th class="right" style="width:110px">Predecessor</th>
+              <th class="right" style="width:110px">Successor</th>
+              <th>Why it's broken</th>
+              <th style="width:220px">Suggested action</th>
+              <th style="width:128px">Actions</th>
+            </tr></thead>
+            <tbody>${body}</tbody>
+          </table></div>
+        </div>
+      </div>`;
+}
+
 function renderCoverageGaps() {
-  const allCoverageGaps = computeCoverageGaps();
+  const _allCoverageGapsRaw = computeCoverageGaps();
+  // v-handoff: broken chains render in their own panel above; drop any
+  // member of those chains from the regular table so a chain shows once.
+  const transitionGaps = computeTransitionGaps();
+  const _tgPns = new Set();
+  for (const t of transitionGaps) for (const pn of (t.ci.chainParts || [])) _tgPns.add(pn);
+  const allCoverageGaps = _allCoverageGapsRaw.filter(g => !(g.part && _tgPns.has(g.part.pn)));
   // Attach unified handled-state per gap ONCE. Used by header count,
   // hide-sent filter, row-render checkbox state, and PN-strikethrough /
   // row-dim styling. Reads window.followMarks via isPartPoHandled —
@@ -1941,18 +2061,20 @@ function renderCoverageGaps() {
       <div class="page-head">
         <div>
           <div class="page-title">Coverage Gaps</div>
-          <div class="page-sub mono">${allCoverageGaps.length} AT RISK${overdueRiskCount ? ` · ${overdueRiskCount} WITH OVERDUE PO` : ""}${sentCount ? ` · ${sentCount} SENT THIS SESSION` : ""}</div>
+          <div class="page-sub mono">${allCoverageGaps.length} AT RISK${transitionGaps.length ? ` · ${transitionGaps.length} TRANSITION GAP${transitionGaps.length === 1 ? "" : "S"}` : ""}${overdueRiskCount ? ` · ${overdueRiskCount} WITH OVERDUE PO` : ""}${sentCount ? ` · ${sentCount} SENT THIS SESSION` : ""}</div>
         </div>
         <div class="page-actions">
           <button class="btn" onclick="navigate('followups')">Follow-Ups →</button>
         </div>
       </div>
 
+      ${_transitionGapsPanelHtml(transitionGaps)}
+
       ${allCoverageGaps.length === 0 ? `
       <div class="panel">
         <div class="panel-body">
           <div class="empty empty-lg">
-            <div class="empty-title">All parts covered</div>
+            <div class="empty-title">${transitionGaps.length ? "No other coverage gaps" : "All parts covered"}</div>
             <div class="empty-msg">No base-BOM or option parts stock out before their covering PO arrives.</div>
           </div>
         </div>
