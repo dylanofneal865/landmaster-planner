@@ -3769,11 +3769,22 @@ function evaluateChainHandoff(ci) {
   const succOpenLines = succLines.filter(l => !l.isOverdue);
   let succArrival = null;
   let succArrivalPo = "";
+  let succArrivalQty = 0;
+  let succArrivalPoId = null;
   for (const l of succOpenLines) {
     if (l.expectedDate && (!succArrival || l.expectedDate.getTime() < succArrival.getTime())) {
       succArrival = l.expectedDate;
       succArrivalPo = l.poNum || "";
+      succArrivalQty = Number(l.remaining) || 0;
+      succArrivalPoId = l.poId || null;
     }
+  }
+  // Overdue successor lines (expected date passed, not received) are the
+  // other expedite candidate — track the worst one for the chase copy.
+  let succOverdue = null;
+  for (const l of succLines) {
+    if (!l.isOverdue || !l.expectedDate) continue;
+    if (!succOverdue || l.expectedDate.getTime() < succOverdue.expectedDate.getTime()) succOverdue = l;
   }
   const succOnHand = hc ? (Number(hc.ownStock) || 0) : (succ ? (Number(succ.onHand) || 0) : 0);
   const succOnPO = succLines.reduce((s, l) => s + (Number(l.remaining) || 0), 0);
@@ -3804,17 +3815,78 @@ function evaluateChainHandoff(ci) {
     try { needQty = Math.max(0, Math.round(Number(cycleAwareSuggestedQty(succ, succOnPO)) || 0)); } catch (_) {}
   }
   if (needQty <= 0) needQty = 1;
+  // v-handoff-expedite: consider what's ALREADY on order before
+  // recommending a new order or a cut-in change. When the chain is out
+  // of coverage (a) — or cut-in has arrived unstocked (c) — and a
+  // successor PO is landing shortly AFTER the chain runs out, the right
+  // move is to expedite that PO, not to order more or defer cut-in.
+  //
+  //   gapDays = succArrival − chainRunoutDate (calendar days)
+  //     0 < gap ≤ 30   EXPEDITE is primary; order / push-cut-in are
+  //                    alternatives.
+  //     −18 < gap ≤ 0  lands before runout but inside the 18-day
+  //                    want-by cushion — still an expedite (need-by =
+  //                    want-by), not a discrepancy.
+  //     gap ≤ −18      lands before runout WITH margin: rule (a)
+  //                    shouldn't be firing. Log the discrepancy per pn
+  //                    (chainShort stale, or the PO isn't credited to the
+  //                    successor) and ask the buyer to verify the PO
+  //                    rather than order on top of it.
+  //     gap > 30       PO exists but too late to expedite meaningfully —
+  //                    fall through to order/push-cut-in, noting the PO.
+  //   no successor PO  existing suggestions stand.
+  const EXPEDITE_WINDOW_DAYS = 30;
+  const WANT_BY_CUSHION_DAYS = 18;
   let action = "";
-  if (codes.has("c") || codes.has("d")) {
+  let actionKind = "";
+  let audit = null;
+  const gapDays = (succArrival && ci.chainRunoutDate)
+    ? Math.round((succArrival.getTime() - ci.chainRunoutDate.getTime()) / DAY)
+    : null;
+  const poLabel = succArrivalPo ? `PO${succArrivalPo}` : "the PO";
+  const orderAlt = `or order ${fn(needQty)} more ${finalPn} now`;
+  const cutinAlt = (cutinDate && succArrival) ? `or push cut-in to ${fd(succArrival)}` : "";
+  const alts = [cutinAlt, orderAlt].filter(Boolean).join(" · ");
+
+  if ((codes.has("a") || codes.has("c")) && !codes.has("d") && succArrival && gapDays != null) {
+    if (gapDays > 0 && gapDays <= EXPEDITE_WINDOW_DAYS) {
+      action = `EXPEDITE ${poLabel} for ${fn(succArrivalQty)} units (currently arriving ${fd(succArrival)}, need by ${runoutTxt}, gap ${fn(gapDays)} days)`
+        + (alts ? ` · ${alts}` : "");
+      actionKind = "expedite";
+    } else if (gapDays <= 0 && gapDays > -WANT_BY_CUSHION_DAYS) {
+      const needBy = ci.wantByDate ? fd(ci.wantByDate) : runoutTxt;
+      action = `EXPEDITE ${poLabel} for ${fn(succArrivalQty)} units (arriving ${fd(succArrival)}, only ${fn(-gapDays)}d before runout — need by ${needBy} for cushion)`
+        + (alts ? ` · ${alts}` : "");
+      actionKind = "expedite";
+    } else if (gapDays <= -WANT_BY_CUSHION_DAYS) {
+      audit = `rule (a) fired (chainShort=${fn(ci.chainShort)}) but ${poLabel} (${fn(succArrivalQty)}) lands ${fd(succArrival)}, ${fn(-gapDays)}d before chain runout ${runoutTxt} — chainShort may be stale or the PO isn't credited to ${finalPn}`;
+      action = `verify ${poLabel} (${fn(succArrivalQty)} ${finalPn}, lands ${fd(succArrival)}) is credited to ${finalPn} — it arrives ${fn(-gapDays)}d before runout · then order ${fn(needQty)} only if still short`;
+      actionKind = "verify-po";
+    } else {
+      // gap > 30: PO too far out to expedite. Existing suggestion, PO noted.
+      action = codes.has("c")
+        ? `order ${fn(needQty)} ${finalPn} (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`
+        : (ci.chainRunoutDate && cutinDate
+            ? `push cut-in to ${fd(ci.chainRunoutDate)} or order ${fn(needQty)} ${finalPn} now (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`
+            : `order ${fn(needQty)} ${finalPn} (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`);
+      actionKind = codes.has("c") ? "order" : "push-cutin";
+    }
+  } else if ((codes.has("a") || codes.has("c")) && !codes.has("d") && succOverdue) {
+    // Only overdue successor lines: the chase IS the expedite.
+    const lateDays = Math.max(0, Math.floor((TODAY.getTime() - succOverdue.expectedDate.getTime()) / DAY));
+    action = `EXPEDITE PO${succOverdue.poNum || ""} for ${fn(succOverdue.remaining || 0)} units (expected ${fd(succOverdue.expectedDate)}, ${fn(lateDays)}d late, need by ${runoutTxt}) · ${orderAlt}`;
+    actionKind = "expedite";
+  } else if (codes.has("c") || codes.has("d")) {
     action = `order ${fn(needQty)} ${finalPn}`;
+    actionKind = "order";
   } else if (codes.has("b")) {
     action = ci.chainRunoutDate
       ? `push cut-in to ${fd(ci.chainRunoutDate)} or order ${fn(needQty)} ${finalPn} now`
       : `order ${fn(needQty)} ${finalPn}`;
+    actionKind = "push-cutin";
   } else if (codes.has("a")) {
-    action = succArrival
-      ? `move up ${succArrivalPo || "the PO"} to before ${runoutTxt}`
-      : `order ${fn(needQty)} ${finalPn}`;
+    action = `order ${fn(needQty)} ${finalPn}`;
+    actionKind = "order";
   }
   if (hc && (Number(hc.strandedPredecessorQty) || 0) > 0 && (Number(ci.chainRate) || 0) > 0
       && typeof workdaysToCalendarDays === "function" && typeof addDays === "function") {
@@ -3822,12 +3894,21 @@ function evaluateChainHandoff(ci) {
     action += (action ? " · " : "") +
       `or burn down ${ci.anchorPn} to 0 by pushing cut-in to ${fd(addDays(TODAY, burnCal))} (${fn(hc.strandedPredecessorQty)} would strand)`;
   }
+  if (audit && typeof console !== "undefined") {
+    if (!evaluateChainHandoff._audited) evaluateChainHandoff._audited = new Set();
+    const ak = finalPn + "|" + audit;
+    if (!evaluateChainHandoff._audited.has(ak)) {
+      evaluateChainHandoff._audited.add(ak);
+      console.warn(`[handoff-audit] ${finalPn}: ${audit}`);
+    }
+  }
   return {
-    broken, reasons, action,
+    broken, reasons, action, actionKind, audit,
     predPn: ci.anchorPn, succPn: finalPn,
     cutinDate, cutinDays,
     predOnHand, predDaysCover: ci.chainRunoutDays,
-    succOnHand, succOnPO, succArrival, succArrivalPo,
+    succOnHand, succOnPO, succArrival, succArrivalPo, succArrivalQty, succArrivalPoId,
+    gapDays,
   };
 }
 

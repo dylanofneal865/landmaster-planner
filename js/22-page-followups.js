@@ -1944,11 +1944,15 @@ function computeTransitionGaps() {
   rows.sort((a, b) => runoutMs(a) - runoutMs(b));
   // Report once per distinct set so the console isn't spammed on every
   // refresh, but the count the ticket asked for is always visible.
-  const k = rows.map(r => r.anchorPn + ">" + r.h.succPn + ":" + r.h.reasons.map(x => x.code).join("")).join("|");
+  const k = rows.map(r => r.anchorPn + ">" + r.h.succPn + ":" + r.h.reasons.map(x => x.code).join("") + ":" + (r.h.actionKind || "")).join("|");
   if (k !== _transitionGapsLastKey) {
     _transitionGapsLastKey = k;
+    const expedite = rows.filter(r => r.h.actionKind === "expedite").length;
+    const verify = rows.filter(r => r.h.actionKind === "verify-po").length;
     console.info(`[transition-gaps] ${rows.length} broken chain handoff(s) moved from Base BOM Queue to Coverage Gaps` +
-      (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [${r.h.reasons.map(x => x.code).join("")}]`).join(", ") : ""));
+      ` · ${expedite} now suggest EXPEDITE (was order/push-cut-in)` +
+      (verify ? ` · ${verify} flagged for PO-credit audit` : "") +
+      (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [${r.h.reasons.map(x => x.code).join("")}/${r.h.actionKind || "-"}]`).join(", ") : ""));
   }
   return rows;
 }
@@ -1967,10 +1971,14 @@ function _printTransitionGaps() {
     succOnHand: r.h.succOnHand,
     succOnPO: r.h.succOnPO,
     succArrival: r.h.succArrival ? fmtDate(r.h.succArrival) : "no PO",
+    gapDays: r.h.gapDays == null ? "-" : r.h.gapDays,
     why: r.h.reasons.map(x => x.code).join(""),
+    actionKind: r.h.actionKind || "-",
     action: r.h.action,
   }));
   console.table(rows);
+  const expedite = rows.filter(r => r.actionKind === "expedite").length;
+  console.info(`[transition-gaps] ${rows.length} rows · ${expedite} suggest EXPEDITE`);
   return rows.length;
 }
 function _transitionGapsPanelHtml(rows) {
