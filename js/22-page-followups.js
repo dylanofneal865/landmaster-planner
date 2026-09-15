@@ -1966,9 +1966,8 @@ function computeTransitionGaps() {
   const gapMs = (r) => (r.h.gapStart ? r.h.gapStart.getTime() : Number.MAX_SAFE_INTEGER);
   rows.sort((a, b) => gapMs(a) - gapMs(b));
 
-  // How many chains each guard took off the list this pass, plus the
-  // no-cut-in bucket (see the note below the log call).
-  let terminalSafe = 0, blanketCovered = 0, blanketPartial = 0, noCutinBroken = 0;
+  // How many chains each guard took off the list this pass.
+  let terminalSafe = 0, noCutinSafe = 0, blanketCovered = 0, blanketPartial = 0;
   const guardSeen = new Set();
   for (const p of stats) {
     if (!p || !p._chainInfo || !p._handoff) continue;
@@ -1976,37 +1975,27 @@ function computeTransitionGaps() {
     if (!key || guardSeen.has(key)) continue;
     guardSeen.add(key);
     const h = p._handoff;
-    if (h.terminalActive) { terminalSafe++; continue; }
+    if (h.safeKind === "terminal-active") { terminalSafe++; continue; }
+    if (h.safeKind === "no-cutin") { noCutinSafe++; continue; }
     if (h.sensourcing && h.blanketReleasedQty > 0) {
       if (h.broken) blanketPartial++; else blanketCovered++;
     }
-    if (h.broken && !h.cutinDate && !p._handoffOverridden) noCutinBroken++;
   }
 
   // Before/after + composition, logged once per distinct set.
   const k = rows.map(r => `${r.anchorPn}>${r.h.succPn}:${r.h.gapStartOffset}:${r.h.actionKind}`).join("|")
-    + `#${legacyBroken}/${terminalSafe}/${blanketCovered}/${blanketPartial}`;
+    + `#${legacyBroken}/${terminalSafe}/${noCutinSafe}/${blanketCovered}/${blanketPartial}`;
   if (k !== _transitionGapsLastKey) {
     _transitionGapsLastKey = k;
     const byKind = {};
     for (const r of rows) byKind[r.h.actionKind || "-"] = (byKind[r.h.actionKind || "-"] || 0) + 1;
     console.info(
       `[transition-gaps] before(a-d rules)=${legacyBroken} after(timeline)=${rows.length} broken chain handoff(s) excluded from Base BOM Queue` +
-      ` · guards: terminal-active SAFE=${terminalSafe}, Sensourcing blanket fully covered=${blanketCovered}` +
-      (blanketPartial ? `, blanket partial (gap inside lead time)=${blanketPartial}` : "") +
+      ` · guards: terminal-active SAFE=${terminalSafe}, no-cut-in SAFE=${noCutinSafe}, Sensourcing blanket fully covered=${blanketCovered}` +
+      (blanketPartial ? `, blanket partial=${blanketPartial}` : "") +
       ` · primary: ${Object.entries(byKind).map(([k2, n]) => `${k2}=${n}`).join(", ") || "-"}` +
       (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [gap ${r.h.gapStart ? r.h.gapStart.toISOString().slice(0, 10) : "?"}, min ${Math.round(r.h.minUsable)}, ${r.h.actionKind || "-"}]`).join(", ") : "")
     );
-    // Watch bucket, not a guard. A chain with NO cut-in date has no
-    // discontinuity and nothing strands — the successor simply takes
-    // over when the predecessor empties. Its "gap" is the pooled chain
-    // running out, which is the ordinary reorder signal the Base BOM
-    // Queue already owns. These rows are arguably queue work, not
-    // transition-gap work; surfaced here so the size of the category
-    // is visible before deciding whether to guard it too.
-    if (noCutinBroken > 0) {
-      console.info(`[transition-gaps] note: ${noCutinBroken} of the ${rows.length} have NO cut-in date — their gap is the pooled chain running out (ordinary reorder), not a handoff discontinuity. Candidate for a third guard.`);
-    }
   }
 
   // Sanity assertions — log, never throw.
@@ -2035,6 +2024,12 @@ function computeTransitionGaps() {
     // guarded SAFE before the walk — it can never legitimately land here.
     if (r.h.terminalActive) {
       violations.push(`${r.anchorPn}→${r.h.succPn}: terminal-active chain in transition-gaps (nothing to hand off to)`);
+    }
+    // Likewise a chain with no cut-in date at all: no discontinuity, so
+    // its depletion is ordering-queue work. A PAST cut-in is legitimate
+    // here (the discontinuity happened and the walk models it).
+    if (!r.h.cutinDate) {
+      violations.push(`${r.anchorPn}→${r.h.succPn}: chain with no cut-in date in transition-gaps (pure depletion belongs in the ordering queue)`);
     }
     // A Sensourcing successor can never have a successor-side gap —
     // the blanket substitution releases on the needed date, so every

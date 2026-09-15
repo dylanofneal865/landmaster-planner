@@ -3885,12 +3885,12 @@ function evaluateChainHandoff(ci) {
 
   // Shared SAFE shape so every early return carries the fields the
   // panel / sanity assertions read.
-  const safeShape = (why) => ({
+  const safeShape = (kind, why) => ({
     broken: false, timeline: [], horizon: 0,
     gapStart: null, gapStartOffset: -1, gapEnd: null,
     gapUnits: 0, negDays: 0, minUsable: 0, minUsableDate: null, stranded: 0,
     primary: null, alternatives: [], infeasible: [], options: [],
-    action: "", actionKind: "", reasons: [], safeReason: why,
+    action: "", actionKind: "", reasons: [], safeKind: kind, safeReason: why,
     terminalActive: roleInfo.terminalActive, activePn: roleInfo.activePn,
     sensourcing, blanketReleases: [], blanketReleasedQty: 0, negPhases: [],
     predPn: ci.anchorPn, predLabel, succPn: finalPn,
@@ -3905,7 +3905,24 @@ function evaluateChainHandoff(ci) {
   // handoff cannot be broken. Whether that member needs reordering
   // is the queue's question, answered by partStatus, not here.
   if (roleInfo.terminalActive) {
-    return safeShape(`${roleInfo.activePn} is the terminal member of ${(ci.chainParts || []).join(" → ")} — no successor to hand off to`);
+    return safeShape("terminal-active", `${roleInfo.activePn} is the terminal member of ${(ci.chainParts || []).join(" → ")} — no successor to hand off to`);
+  }
+
+  // GUARD 2 — no cut-in date anywhere on the chain. The successor
+  // simply takes over the day the predecessor empties: one pool, one
+  // rate, no discontinuity, nothing strands. Its only possible "gap"
+  // is the pooled chain running out, and the horizon is defined as
+  // runout + 14, so the walk is guaranteed to find one — the same
+  // by-construction failure the terminal-active guard fixes. These
+  // belong in the ordering queue on normal reorder rules.
+  //
+  // NOTE a PAST cut-in is deliberately NOT guarded here. cutinDate is
+  // non-null then, the discontinuity already happened, and the walk
+  // models it correctly (cutinOffset clamps to 0, the predecessor pool
+  // is dropped on day 0, and an unstocked successor goes negative
+  // immediately). That is a real broken handoff and must still fire.
+  if (!cutinDate) {
+    return safeShape("no-cutin", `${(ci.chainParts || []).join(" → ")} has no cut-in date — ${finalPn} takes over when ${predLabel} empties; depletion is an ordering-queue signal, not a handoff gap`);
   }
 
   // Horizon — same shape the drawer's runway chart uses (js/10):
