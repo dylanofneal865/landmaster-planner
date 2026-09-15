@@ -3754,6 +3754,71 @@ function setHandoffQueueOverride(anchorPn, on) {
   try { localStorage.setItem(_HANDOFF_OVERRIDE_LS, JSON.stringify(o)); } catch (_) {}
   if (typeof bumpStatusCache === "function") bumpStatusCache();
 }
+/* ------------------------------------------------------------
+   BLANKET-AGREEMENT SUPPLIERS — v-handoff-blanket.
+   Suppliers on a standing blanket pull releases as needed, so the
+   presence or absence of a DISCRETE PO on their parts is not a
+   coverage signal. Add a future blanket supplier as one more token.
+   Matched case-insensitively as a substring against every
+   supplier-ish field a parts row has historically been written
+   under (the same alias list the cycle-count VMI filter reads).
+   ------------------------------------------------------------ */
+const SENSOURCING_TOKENS = ["sensourcing"];
+const BLANKET_SUPPLIER_TOKENS = SENSOURCING_TOKENS;
+const _SUPPLIER_FIELD_ALIASES = ["supplier", "vendor", "vendorName", "supplierName", "Supplier", "SupplierName"];
+function _supplierMatchesTokens(part, tokens) {
+  if (!part || !Array.isArray(tokens) || tokens.length === 0) return false;
+  for (const f of _SUPPLIER_FIELD_ALIASES) {
+    const norm = String(part[f] || "").toLowerCase().trim();
+    if (!norm) continue;
+    for (const t of tokens) if (t && norm.indexOf(t) !== -1) return true;
+  }
+  return false;
+}
+function isBlanketSupplierPart(part) { return _supplierMatchesTokens(part, BLANKET_SUPPLIER_TOKENS); }
+
+/* ------------------------------------------------------------
+   CHAIN ACTIVE MEMBER — browser port of the server-side
+   classifyChainRole shape (lib/supersession-server.js), scoped to
+   the one question evaluateChainHandoff needs: which member is the
+   line running TODAY, and is it the last one in the lineage?
+
+     QUEUED  own transitionStartDate strictly in the future
+     ACTIVE  earliest non-queued member with stock > 0
+             (fallback: first non-queued; then lineage[0])
+     terminalActive  ACTIVE is lineage[last] — nothing after it to
+             switch to, so there is no pending handoff at all.
+   ------------------------------------------------------------ */
+function chainActiveMemberInfo(ci) {
+  const lineage = (ci && Array.isArray(ci.chainParts)) ? ci.chainParts.slice() : [];
+  if (lineage.length === 0) return { lineage, activeIdx: -1, activePn: null, terminalActive: false, queued: new Set() };
+  const byPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const today = new Date(TODAY.getTime()); today.setHours(0, 0, 0, 0);
+  const queued = new Set();
+  for (const pn of lineage) {
+    const p = byPn.get(pn);
+    const raw = p && p.transitionStartDate;
+    if (typeof raw !== "string" || !/^\d{4}-\d{2}-\d{2}/.test(raw)) continue;
+    const d = (typeof parseDateLocal === "function") ? parseDateLocal(raw) : null;
+    if (d && !isNaN(d.getTime()) && d.getTime() > today.getTime()) queued.add(pn);
+  }
+  let activeIdx = -1;
+  for (let i = 0; i < lineage.length; i++) {
+    if (queued.has(lineage[i])) continue;
+    const p = byPn.get(lineage[i]);
+    if ((Number(p && p.onHand) || 0) > 0) { activeIdx = i; break; }
+  }
+  if (activeIdx < 0) {
+    for (let i = 0; i < lineage.length; i++) { if (!queued.has(lineage[i])) { activeIdx = i; break; } }
+  }
+  if (activeIdx < 0) activeIdx = 0;
+  return {
+    lineage, activeIdx, activePn: lineage[activeIdx],
+    terminalActive: activeIdx === lineage.length - 1,
+    queued,
+  };
+}
+
 function evaluateChainHandoff(ci) {
   /* ------------------------------------------------------------
      v-handoff-timeline. ONE question: is the line covered every
@@ -3767,18 +3832,26 @@ function evaluateChainHandoff(ci) {
      left the day before cut-in strands (disappears from the line
      on cut-in day). BROKEN iff usable < 0 on any day.
 
+     Two things are NOT handoff failures and never reach the walk:
+       * TERMINAL-ACTIVE — the member the line is running today is
+         the last in the lineage. There is nothing to switch to, so
+         running low is an ordinary reorder signal the Base BOM
+         Queue owns, not a broken handoff. Guarded first.
+       * BLANKET SUPPLY — a successor supplied on a standing
+         blanket (Sensourcing) always has releases available, so a
+         successor-side shortfall is suppressed by injecting the
+         release the day it's needed, provided that day is at least
+         one lead time out. Inside lead time, no release can land
+         in time and the gap is real.
+
      Remediation is EVALUATED by re-running the same simulator with
-     the lever applied (expedite = move the PO; order = add units;
-     defer = move cut-in), so "feasible" means "the timeline goes
-     non-negative", not a heuristic. Primary = EXPEDITE if a
-     successor PO can close the gap, else ORDER; DEFER / RUN DOWN
-     listed as alternatives when feasible.
+     the lever applied (expedite = move the PO; order/release = add
+     units; defer = move cut-in), so "feasible" means "the timeline
+     goes non-negative", not a heuristic.
 
      The timeline array is returned for every downstream surface
      (drawer, Coverage Gaps row, suggested-action text) to read —
-     one source, so they cannot disagree. The old a/b/c/d rule
-     letters are retired; `reasons` now carries a single gap
-     sentence for back-compat readers.
+     one source, so they cannot disagree.
      ------------------------------------------------------------ */
   if (!ci || !ci.finalPn) return null;
   const DAY = 86400000;
@@ -3804,6 +3877,36 @@ function evaluateChainHandoff(ci) {
   const cutinOffset = cutinDate ? Math.max(0, cutinDays) : null;
   const leadDays = (succ && typeof leadTimeDays === "function") ? leadTimeDays(succ) : 0;
   const safetyDays = (typeof DB !== "undefined" && DB && DB.settings && Number(DB.settings.safetyDays)) || 0;
+  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const predStock0 = predPns.reduce((s, pn) => { const p = partsByPn.get(pn); return s + Math.max(0, Number(p && p.onHand) || 0); }, 0);
+  const succStock0 = Math.max(0, Number(succ && succ.onHand) || 0);
+  const roleInfo = chainActiveMemberInfo(ci);
+  const sensourcing = isBlanketSupplierPart(succ);
+
+  // Shared SAFE shape so every early return carries the fields the
+  // panel / sanity assertions read.
+  const safeShape = (why) => ({
+    broken: false, timeline: [], horizon: 0,
+    gapStart: null, gapStartOffset: -1, gapEnd: null,
+    gapUnits: 0, negDays: 0, minUsable: 0, minUsableDate: null, stranded: 0,
+    primary: null, alternatives: [], infeasible: [], options: [],
+    action: "", actionKind: "", reasons: [], safeReason: why,
+    terminalActive: roleInfo.terminalActive, activePn: roleInfo.activePn,
+    sensourcing, blanketReleases: [], blanketReleasedQty: 0, negPhases: [],
+    predPn: ci.anchorPn, predLabel, succPn: finalPn,
+    cutinDate, cutinDays,
+    predOnHand: predStock0, predDaysCover: ci.chainRunoutDays,
+    succOnHand: succStock0, succOnPO: 0,
+    succArrival: null, succArrivalPo: "", succArrivalQty: 0, succArrivalPoId: null,
+  });
+
+  // GUARD 1 — terminal-active. The line is already running the last
+  // member of the chain; there is no successor to hand off to, so a
+  // handoff cannot be broken. Whether that member needs reordering
+  // is the queue's question, answered by partStatus, not here.
+  if (roleInfo.terminalActive) {
+    return safeShape(`${roleInfo.activePn} is the terminal member of ${(ci.chainParts || []).join(" → ")} — no successor to hand off to`);
+  }
 
   // Horizon — same shape the drawer's runway chart uses (js/10):
   // max(90, runout+14, cutin+LT+14), capped at 365.
@@ -3812,13 +3915,11 @@ function evaluateChainHandoff(ci) {
   if (cutinDays != null) horizon = Math.max(horizon, cutinDays + leadDays + 14);
   horizon = Math.min(365, Math.max(1, Math.round(horizon)));
 
-  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
-  const predStock0 = predPns.reduce((s, pn) => { const p = partsByPn.get(pn); return s + Math.max(0, Number(p && p.onHand) || 0); }, 0);
-  const succStock0 = Math.max(0, Number(succ && succ.onHand) || 0);
-
   // Receipts from the chain's PO lines (same list the drawer plots).
   // Overdue / undated lines are assumed to land today — the drawer's
   // projectOnHand convention — so the timeline matches the chart.
+  // Discrete Sensourcing lines credit here exactly like any other:
+  // the blanket is a fallback, never a replacement.
   const receipts = [];
   for (const l of (ci.chainPOLines || [])) {
     if (!l) continue;
@@ -3837,14 +3938,17 @@ function evaluateChainHandoff(ci) {
   }
 
   // --- the simulator -------------------------------------------------
-  // opts.cutin     offset | null  (null = no hard cut-in: sequential burn,
-  //                                no stranding — successor takes over the
-  //                                day the predecessor can't cover usage)
-  // opts.moved     Map<key, newOffset>   (expedite lever)
-  // opts.extraSucc [{offset, qty}]       (order lever)
+  // opts.cutin      offset | null  (null = no hard cut-in: sequential burn,
+  //                                 no stranding — successor takes over the
+  //                                 day the predecessor can't cover usage)
+  // opts.moved      Map<key, newOffset>   (expedite lever)
+  // opts.extraSucc  [{offset, qty}]       (order / release lever)
+  // opts.noBlanket  true = disable the Sensourcing substitution (used to
+  //                 measure what the blanket is actually covering)
   function simulate(opts) {
     opts = opts || {};
     const cutin = (opts.cutin === undefined) ? cutinOffset : opts.cutin;
+    const useBlanket = sensourcing && !opts.noBlanket;
     const rec = receipts.map(r => ({ ...r, offset: (opts.moved && opts.moved.has(r.key)) ? opts.moved.get(r.key) : r.offset }));
     for (const x of (opts.extraSucc || [])) {
       rec.push({ key: "new|" + x.offset, offset: x.offset, pn: finalPn, qty: x.qty, poNum: "(new)", poId: null, isOverdue: false, expectedDate: null, member: "succ" });
@@ -3853,6 +3957,8 @@ function evaluateChainHandoff(ci) {
     let sc = succStock0;
     let stranded = 0;
     const tl = [];
+    const blanketReleases = [];
+    const negPhases = new Set();
     let firstNeg = -1, minUsable = Infinity, minIdx = -1, negDays = 0, gapEnd = -1;
     for (let i = 0; i <= horizon; i++) {
       const d = add(i);
@@ -3875,6 +3981,23 @@ function evaluateChainHandoff(ci) {
         else if (active === "pred") pred -= use;
         else sc -= use;
       }
+      // BLANKET SUBSTITUTION — successor short on a blanket supplier.
+      // Releases are pulled as needed, so coverage lands on the
+      // operationally-needed date and a SUCCESSOR-side shortfall is
+      // never a gap signal. Deliberately no lead-time gate: gating on
+      // the part's discrete-PO lead would make the blanket worth
+      // nothing (a cut-in inside lead time would still read BROKEN),
+      // which is the exact false positive this guard exists to kill.
+      //
+      // PREDECESSOR-side shortfalls are NOT suppressed — the successor
+      // isn't live yet, so no release on it can cover the old part
+      // running dry before cut-in. That stays a real broken handoff.
+      if (useBlanket && active === "succ" && sc < 0) {
+        const shortBy = -sc;
+        sc = 0;
+        blanketReleases.push({ offset: i, date: d, qty: shortBy });
+        events.push(`blanket release +${fn(shortBy)} ${finalPn} (Sensourcing — pulled on need date)`);
+      }
       if (cutin != null && i === cutin - 1 && pred > 0) {
         stranded = pred;
         events.push(`${fn(pred)} ${predLabel} strands at tomorrow's cut-in`);
@@ -3884,6 +4007,7 @@ function evaluateChainHandoff(ci) {
       const wasNeg = tl.length > 0 && tl[tl.length - 1].usable < 0;
       if (usable < 0) {
         negDays++;
+        negPhases.add(active);
         if (firstNeg < 0) { firstNeg = i; events.push("gap-start"); }
       } else if (wasNeg) {
         events.push("gap-end");
@@ -3902,11 +4026,24 @@ function evaluateChainHandoff(ci) {
       timeline: tl, broken: firstNeg >= 0, gapStart: firstNeg,
       gapEnd: (firstNeg >= 0 && gapEnd < 0) ? horizon + 1 : gapEnd,
       minUsable: (minUsable === Infinity) ? 0 : minUsable, minIdx, stranded, negDays,
+      blanketReleases, negPhases: [...negPhases],
     };
   }
 
   const base = simulate();
   const broken = base.broken;
+  const blanketReleasedQty = base.blanketReleases.reduce((s, r) => s + r.qty, 0);
+
+  // Audit the substitution at evaluate time, once per pn per session.
+  if (sensourcing && base.blanketReleases.length > 0) {
+    if (!evaluateChainHandoff._blanketAudited) evaluateChainHandoff._blanketAudited = new Set();
+    if (!evaluateChainHandoff._blanketAudited.has(finalPn)) {
+      evaluateChainHandoff._blanketAudited.add(finalPn);
+      const first = base.blanketReleases[0];
+      console.info(`[sensourcing-blanket] treating ${finalPn} as covered (no discrete PO expected) — ${fn(blanketReleasedQty)} units across ${base.blanketReleases.length} day(s), first needed ${fd(first.date)}`);
+    }
+  }
+
   const needIdx = broken ? base.gapStart : -1;
   const needDate = needIdx >= 0 ? add(needIdx) : null;
   const gapUnits = broken ? Math.ceil(-base.minUsable) : 0;
@@ -3924,27 +4061,36 @@ function evaluateChainHandoff(ci) {
   const options = [];
   let primary = null;
   if (broken) {
-    // 1. EXPEDITE — earliest successor PO landing after the gap opens
-    //    that, pulled in to the gap-start day, makes the timeline
-    //    non-negative (or at least pushes the first gap past this one).
-    const after = succReceipts.filter(r => r.expectedDate && r.offset > needIdx).sort((a, b) => a.offset - b.offset);
-    for (const r of after) {
-      const sim = simulate({ moved: new Map([[r.key, needIdx]]) });
-      const closes = !sim.broken || sim.gapStart > base.gapEnd;
-      const pull = r.offset - needIdx;
-      const text = `Expedite PO${r.poNum} for ${fn(r.qty)} ${finalPn} — pull in ${pull} day${pull === 1 ? "" : "s"} (arriving ${fd(r.expectedDate)} → need ${fd(needDate)})`;
-      if (closes) {
-        options.push({ lever: "expedite", feasible: true, text: text + (sim.broken ? ` — closes this gap; a later gap remains from ${fd(add(sim.gapStart))}` : ""), poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate, resultBroken: sim.broken });
-        break;
+    if (sensourcing) {
+      // Blanket supplier: never recommend a discrete order or a PO
+      // expedite — the relationship handles replenishment. The only
+      // ask is a release, sized to the gap plus the normal buffer.
+      const qty = Math.max(1, Math.ceil(gapUnits + safetyDays * rate));
+      options.push({
+        lever: "release", feasible: true,
+        text: `Release ${fn(qty)} against Sensourcing blanket — arrival needed ${fd(needDate)}`,
+        qty, needBy: needDate,
+      });
+    } else {
+      // 1. EXPEDITE — earliest successor PO landing after the gap opens
+      //    that, pulled in to the gap-start day, makes the timeline
+      //    non-negative (or at least pushes the first gap past this one).
+      const after = succReceipts.filter(r => r.expectedDate && r.offset > needIdx).sort((a, b) => a.offset - b.offset);
+      for (const r of after) {
+        const sim = simulate({ moved: new Map([[r.key, needIdx]]) });
+        const closes = !sim.broken || sim.gapStart > base.gapEnd;
+        const pull = r.offset - needIdx;
+        const text = `Expedite PO${r.poNum} for ${fn(r.qty)} ${finalPn} — pull in ${pull} day${pull === 1 ? "" : "s"} (arriving ${fd(r.expectedDate)} → need ${fd(needDate)})`;
+        if (closes) {
+          options.push({ lever: "expedite", feasible: true, text: text + (sim.broken ? ` — closes this gap; a later gap remains from ${fd(add(sim.gapStart))}` : ""), poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate, resultBroken: sim.broken });
+          break;
+        }
+        if (!options.some(o => o.lever === "expedite")) {
+          options.push({ lever: "expedite", feasible: false, text: text + ` — only ${fn(r.qty)} units; does not close the ${fn(gapUnits)}-unit gap alone`, poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate });
+        }
       }
-      // Too small to close alone — remember the nearest as a partial.
-      if (!options.some(o => o.lever === "expedite")) {
-        options.push({ lever: "expedite", feasible: false, text: text + ` — only ${fn(r.qty)} units; does not close the ${fn(gapUnits)}-unit gap alone`, poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate });
-      }
-    }
-    // 2. ORDER — smallest N landing on the gap-start day that keeps the
-    //    whole horizon non-negative, plus the normal safety buffer.
-    {
+      // 2. ORDER — smallest N landing on the gap-start day that keeps the
+      //    whole horizon non-negative, plus the normal safety buffer.
       let qty = Math.max(1, Math.ceil(gapUnits + safetyDays * rate));
       let sim = simulate({ extraSucc: [{ offset: needIdx, qty }] });
       let guard = 0;
@@ -4011,7 +4157,10 @@ function evaluateChainHandoff(ci) {
         });
       }
     }
-    primary = options.find(o => o.lever === "expedite" && o.feasible) || options.find(o => o.lever === "order") || null;
+    primary = options.find(o => o.lever === "release")
+           || options.find(o => o.lever === "expedite" && o.feasible)
+           || options.find(o => o.lever === "order")
+           || null;
   }
   const alternatives = options.filter(o => o !== primary && o.feasible);
   const infeasible = options.filter(o => !o.feasible);
@@ -4019,7 +4168,8 @@ function evaluateChainHandoff(ci) {
   const minDate = base.minIdx >= 0 ? add(base.minIdx) : null;
   const reasons = broken ? [{
     code: "gap",
-    text: `usable ${base.timeline[needIdx].activeMember} inventory goes negative ${fd(needDate)} (min ${fn(base.minUsable)} on ${fd(minDate)}; ${base.negDays} day${base.negDays === 1 ? "" : "s"} below zero${base.gapEnd <= horizon ? `, recovers ${fd(add(base.gapEnd))}` : ", no recovery in horizon"})`,
+    text: `usable ${base.timeline[needIdx].activeMember} inventory goes negative ${fd(needDate)} (min ${fn(base.minUsable)} on ${fd(minDate)}; ${base.negDays} day${base.negDays === 1 ? "" : "s"} below zero${base.gapEnd <= horizon ? `, recovers ${fd(add(base.gapEnd))}` : ", no recovery in horizon"})` +
+          (sensourcing ? ` — ${finalPn} is on the Sensourcing blanket, so this is a predecessor-side gap no successor release can cover` : ""),
   }] : [];
 
   return {
@@ -4035,6 +4185,11 @@ function evaluateChainHandoff(ci) {
     action: primary ? primary.text : "",
     actionKind: primary ? primary.lever : "",
     reasons,
+    terminalActive: false, activePn: roleInfo.activePn,
+    sensourcing,
+    blanketReleases: base.blanketReleases,
+    blanketReleasedQty,
+    negPhases: base.negPhases,
     predPn: ci.anchorPn, predLabel, succPn: finalPn,
     cutinDate, cutinDays,
     predOnHand: predStock0, predDaysCover: ci.chainRunoutDays,

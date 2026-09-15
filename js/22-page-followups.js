@@ -1966,17 +1966,47 @@ function computeTransitionGaps() {
   const gapMs = (r) => (r.h.gapStart ? r.h.gapStart.getTime() : Number.MAX_SAFE_INTEGER);
   rows.sort((a, b) => gapMs(a) - gapMs(b));
 
+  // How many chains each guard took off the list this pass, plus the
+  // no-cut-in bucket (see the note below the log call).
+  let terminalSafe = 0, blanketCovered = 0, blanketPartial = 0, noCutinBroken = 0;
+  const guardSeen = new Set();
+  for (const p of stats) {
+    if (!p || !p._chainInfo || !p._handoff) continue;
+    const key = p._chainInfo.anchorPn;
+    if (!key || guardSeen.has(key)) continue;
+    guardSeen.add(key);
+    const h = p._handoff;
+    if (h.terminalActive) { terminalSafe++; continue; }
+    if (h.sensourcing && h.blanketReleasedQty > 0) {
+      if (h.broken) blanketPartial++; else blanketCovered++;
+    }
+    if (h.broken && !h.cutinDate && !p._handoffOverridden) noCutinBroken++;
+  }
+
   // Before/after + composition, logged once per distinct set.
-  const k = rows.map(r => `${r.anchorPn}>${r.h.succPn}:${r.h.gapStartOffset}:${r.h.actionKind}`).join("|") + "#" + legacyBroken;
+  const k = rows.map(r => `${r.anchorPn}>${r.h.succPn}:${r.h.gapStartOffset}:${r.h.actionKind}`).join("|")
+    + `#${legacyBroken}/${terminalSafe}/${blanketCovered}/${blanketPartial}`;
   if (k !== _transitionGapsLastKey) {
     _transitionGapsLastKey = k;
     const byKind = {};
     for (const r of rows) byKind[r.h.actionKind || "-"] = (byKind[r.h.actionKind || "-"] || 0) + 1;
     console.info(
       `[transition-gaps] before(a-d rules)=${legacyBroken} after(timeline)=${rows.length} broken chain handoff(s) excluded from Base BOM Queue` +
+      ` · guards: terminal-active SAFE=${terminalSafe}, Sensourcing blanket fully covered=${blanketCovered}` +
+      (blanketPartial ? `, blanket partial (gap inside lead time)=${blanketPartial}` : "") +
       ` · primary: ${Object.entries(byKind).map(([k2, n]) => `${k2}=${n}`).join(", ") || "-"}` +
       (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [gap ${r.h.gapStart ? r.h.gapStart.toISOString().slice(0, 10) : "?"}, min ${Math.round(r.h.minUsable)}, ${r.h.actionKind || "-"}]`).join(", ") : "")
     );
+    // Watch bucket, not a guard. A chain with NO cut-in date has no
+    // discontinuity and nothing strands — the successor simply takes
+    // over when the predecessor empties. Its "gap" is the pooled chain
+    // running out, which is the ordinary reorder signal the Base BOM
+    // Queue already owns. These rows are arguably queue work, not
+    // transition-gap work; surfaced here so the size of the category
+    // is visible before deciding whether to guard it too.
+    if (noCutinBroken > 0) {
+      console.info(`[transition-gaps] note: ${noCutinBroken} of the ${rows.length} have NO cut-in date — their gap is the pooled chain running out (ordinary reorder), not a handoff discontinuity. Candidate for a third guard.`);
+    }
   }
 
   // Sanity assertions — log, never throw.
@@ -2000,6 +2030,17 @@ function computeTransitionGaps() {
   for (const r of rows) {
     if (!Array.isArray(r.h.timeline) || !r.h.timeline.some(t => t.usable < 0)) {
       violations.push(`${r.anchorPn}→${r.h.succPn}: in transition-gaps but no negative-usable day in its timeline`);
+    }
+    // A terminal-active chain has no successor to hand off to and is
+    // guarded SAFE before the walk — it can never legitimately land here.
+    if (r.h.terminalActive) {
+      violations.push(`${r.anchorPn}→${r.h.succPn}: terminal-active chain in transition-gaps (nothing to hand off to)`);
+    }
+    // A Sensourcing successor can never have a successor-side gap —
+    // the blanket substitution releases on the needed date, so every
+    // surviving Sensourcing gap must be predecessor-side.
+    if (r.h.sensourcing && Array.isArray(r.h.negPhases) && r.h.negPhases.some(ph => ph === "succ")) {
+      violations.push(`${r.anchorPn}→${r.h.succPn}: Sensourcing successor with a successor-side gap — the blanket substitution should have suppressed it (only predecessor-side gaps may survive)`);
     }
   }
   const vk = violations.join("|");
@@ -2026,7 +2067,9 @@ function _printTransitionGaps() {
     gapStart: r.h.gapStart ? fmtDate(r.h.gapStart) : "-",
     minUsable: Math.round(r.h.minUsable),
     negDays: r.h.negDays,
+    negPhase: (r.h.negPhases || []).join(","),
     strands: Math.round(r.h.stranded),
+    blanket: r.h.sensourcing ? (Math.round(r.h.blanketReleasedQty) || "yes") : "",
     primary: r.h.actionKind,
     action: r.h.action,
     alternatives: r.h.alternatives.map(a => a.lever).join(","),
@@ -2074,7 +2117,7 @@ function _transitionGapsPanelHtml(rows) {
     return `
       <tr class="clickable" onclick="openPartDetail('${esc(h.succPn)}')">
         <td style="white-space:normal;word-break:break-word">
-          <div><span class="pn dim">${esc(h.predLabel)}</span> <span class="dim">→</span> <span class="pn bold">${esc(h.succPn)}</span></div>
+          <div><span class="pn dim">${esc(h.predLabel)}</span> <span class="dim">→</span> <span class="pn bold">${esc(h.succPn)}</span>${h.sensourcing ? ' <span class="pill" style="font-size:9px;padding:1px 5px" title="Successor is on the Sensourcing standing blanket — successor-side shortfalls are covered by releases pulled on the needed date, so this gap is predecessor-side">blanket</span>' : ""}</div>
           <div class="dim tiny" style="font-family:var(--f-ui);margin-top:2px">${esc(p.desc || "")}</div>
         </td>
         <td>${cutinCell}</td>
