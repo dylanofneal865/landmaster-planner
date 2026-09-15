@@ -833,6 +833,13 @@ function computeCoverageGaps() {
     try { _printOverdueReprojectionImpact(7); }
     catch (err) { console.warn("[overdue-reproject] impact audit failed:", err && err.message); }
   }
+  // v-blanket-queue: one-shot Sensourcing admission audit.
+  if (typeof _printSensourcingQueue === "function"
+      && typeof _sensourcingQueueReported !== "undefined" && !_sensourcingQueueReported) {
+    _sensourcingQueueReported = true;
+    try { _printSensourcingQueue(); }
+    catch (err) { console.warn("[sensourcing-queue] audit failed:", err && err.message); }
+  }
   if (_overdueHorizonSuppressed.count > 0) {
     console.info(
       `[coverage-gaps] Suppressed ${_overdueHorizonSuppressed.count} overdue-risk part(s) with ignore-overdue runout beyond ${OVERDUE_RISK_HORIZON_DAYS} days` +

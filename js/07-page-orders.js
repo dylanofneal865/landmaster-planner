@@ -706,9 +706,20 @@ function renderOrderQueueFor(itemType) {
                     const blkPill = (flag === "none" && blk)
                       ? ` <span class="pill info" style="font-size:9px;padding:1px 5px;margin-left:4px;letter-spacing:0.04em" title="Blanket available — open blanket ${esc(blk.po.num)} · ${fmtNum(blk.open)} available to release against">BLKT</span>`
                       : "";
+                    // v-blanket-queue: a blanket-supplier row admitted by the
+                    // release trigger is not an ordinary buy — the action is
+                    // "release against the blanket", not "cut a PO". Carries
+                    // the computed action text + which trigger fired so the
+                    // buyer sees the need-by date without opening the drawer.
+                    // Suppresses the older RELEASE pill so rows never double up.
+                    const _bq = p._blanketQueue || null;
+                    const blanketReleasePill = (_bq && _bq.kind === "release")
+                      ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(_bq.action + (_bq.triggerReason ? ` · trigger: ${_bq.triggerReason}` : "") + (_bq.daysToTrigger != null ? ` (${_bq.daysToTrigger}d)` : "") + ` · ${fmtNum(_bq.blanketOpen || 0)} open on the blanket`)}">BLANKET RELEASE</span>`
+                      : "";
+                    const flagPillFinal = blanketReleasePill ? "" : flagPill;
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPill}${blkPill}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPillFinal}${blanketReleasePill}${blkPill}</td>
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {

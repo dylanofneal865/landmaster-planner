@@ -3665,6 +3665,130 @@ function toggleSupplierMute(name) {
   refresh();                // re-render underlying page
 }
 
+/* ============================================================
+   BLANKET-SUPPLIER QUEUE ADMISSION — v-blanket-queue
+
+   Sensourcing (and any future BLANKET_SUPPLIER_TOKENS supplier)
+   runs on a standing blanket: you don't cut a discrete PO, you
+   release against the authorization when it's time. Normal
+   reorder rules therefore ask the wrong question for these parts
+   — "order N" when the operational answer is "release N", or
+   nothing at all when the blanket already covers it.
+
+   Three-way rule, evaluated per part:
+
+     1. NO ACTIVE BLANKET  → ADMIT as an ordinary buy.
+        Normal reorder rules still decide WHETHER it's due; this
+        branch only changes the wording to "Order N from
+        <supplier>".
+
+     2. ACTIVE BLANKET + RELEASE TRIGGER → ADMIT as a release.
+        Fires on whichever comes first:
+          (a) blanket authorization ages out within
+              BLANKET_RELEASE_WINDOW_DAYS, or
+          (b) the part's runout lands within the same window —
+              substituting transitionStartDate for runout on a
+              part that hasn't cut in yet, since that's the date
+              stock actually has to be there.
+        Action: "Release N against blanket <PO> — need by <date>".
+
+     3. ACTIVE BLANKET, NEITHER TRIGGER → SILENT.
+        This is the branch that SUPPRESSES rows the old rules
+        admitted: a Sensourcing part 50-77 days from runout reads
+        "warning" under partStatus (reorderBy = LT 56 + safety 7,
+        + 14 warn) but needs no action yet, because the release
+        is a short-lead pull, not a lead-time buy.
+
+   (a) reads ln.blanketExpires — the authorization end date — NOT
+   ln.expectedDate. The ticket wrote "expected date" but its stated
+   rationale is "authorization aging out; cut a fresh release or
+   renew", which is the expiry. expectedDate is the next scheduled
+   receipt against the blanket and would fire constantly. Falls
+   back to expectedDate only when no expiry is recorded.
+
+   Read-only. Never writes to parts or POs.
+   ============================================================ */
+const BLANKET_RELEASE_WINDOW_DAYS = 50;
+function blanketReleaseDecision(part, ctx) {
+  ctx = ctx || {};
+  if (!part || !part.pn) return null;
+  if (typeof isBlanketSupplierPart !== "function" || !isBlanketSupplierPart(part)) return null;
+  const blk = (typeof findOpenBlanketForPart === "function") ? findOpenBlanketForPart(part.pn) : null;
+  const supplierName = String(part.supplier || part.vendor || part.vendorName || "Sensourcing").trim();
+  const qty = Number.isFinite(Number(ctx.suggestedQty))
+    ? Math.max(0, Math.round(Number(ctx.suggestedQty)))
+    : (typeof cycleAwareSuggestedQty === "function"
+        ? Math.max(0, Math.round(Number(cycleAwareSuggestedQty(part, Number(ctx.onPO) || 0)) || 0))
+        : 0);
+
+  // 1. No active blanket → ordinary buy; normal rules gate admission.
+  if (!blk) {
+    return {
+      isBlanketSupplier: true, hasActiveBlanket: false, blanket: null,
+      kind: "order", admitOverride: null, supplier: supplierName, qty,
+      triggerDate: null, daysToTrigger: null, triggerReason: null,
+      action: `Order ${qty} from ${supplierName}`,
+    };
+  }
+
+  // 2/3. Active blanket → release trigger, else silent.
+  const ln = blk.line || {};
+  const expiryRaw = ln.blanketExpires || ln.expectedDate || null;
+  let expiryDate = null;
+  if (expiryRaw && typeof parseDateLocal === "function") {
+    const d = parseDateLocal(expiryRaw);
+    if (d && !isNaN(d.getTime())) expiryDate = d;
+  }
+  const daysToExpiry = expiryDate
+    ? Math.round((expiryDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+
+  // (b) runout, or transitionStartDate for a part that hasn't cut in.
+  let needDate = null;
+  if (part.transitionStartDate && typeof parseDateLocal === "function") {
+    const t = parseDateLocal(part.transitionStartDate);
+    if (t && !isNaN(t.getTime()) && t.getTime() > TODAY.getTime()) needDate = t;
+  }
+  if (!needDate) {
+    const cover = Number(ctx.daysOfCover);
+    if (Number.isFinite(cover) && typeof addDays === "function") needDate = addDays(TODAY, cover);
+  }
+  const daysToNeed = needDate
+    ? Math.round((needDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+
+  const expiryFires = daysToExpiry !== null && daysToExpiry <= BLANKET_RELEASE_WINDOW_DAYS;
+  const needFires = daysToNeed !== null && daysToNeed <= BLANKET_RELEASE_WINDOW_DAYS;
+
+  if (!expiryFires && !needFires) {
+    return {
+      isBlanketSupplier: true, hasActiveBlanket: true, blanket: blk,
+      kind: "silent", admitOverride: false, supplier: supplierName, qty,
+      triggerDate: null, daysToTrigger: null, triggerReason: null,
+      blanketPo: blk.po ? blk.po.num : null, blanketOpen: blk.open,
+      action: "",
+      why: `blanket ${blk.po ? blk.po.num : "?"} covers it — ${daysToExpiry === null ? "no expiry recorded" : daysToExpiry + "d to expiry"}, ${daysToNeed === null ? "no runout in horizon" : daysToNeed + "d to need"}; both beyond the ${BLANKET_RELEASE_WINDOW_DAYS}d window`,
+    };
+  }
+
+  // Whichever fires first is the need-by date the buyer works to.
+  let triggerDate = null, daysToTrigger = null, triggerReason = null;
+  const pick = (d, n, why) => {
+    if (d === null || n === null) return;
+    if (triggerDate === null || n < daysToTrigger) { triggerDate = d; daysToTrigger = n; triggerReason = why; }
+  };
+  if (expiryFires) pick(expiryDate, daysToExpiry, "blanket authorization expires");
+  if (needFires) pick(needDate, daysToNeed, part.transitionStartDate && daysToNeed !== null ? "transition cut-in" : "projected runout");
+
+  const poNum = blk.po ? blk.po.num : "?";
+  const dateTxt = (typeof fmtDate === "function" && triggerDate) ? fmtDate(triggerDate) : "?";
+  return {
+    isBlanketSupplier: true, hasActiveBlanket: true, blanket: blk,
+    kind: "release", admitOverride: true, supplier: supplierName, qty,
+    triggerDate, daysToTrigger, triggerReason,
+    blanketPo: poNum, blanketOpen: blk.open,
+    action: `Release ${qty} against blanket ${poNum} — need by ${dateTxt}`,
+  };
+}
+
 function partsWithStatus() {
   if (_statusCache) return _statusCache;
   // Build the per-PN open-PO-line index ONCE and reuse it so we don't
@@ -3803,6 +3927,16 @@ function partsWithStatus() {
       ? evaluateChainHandoff(chainInfo) : null;
     const _handoffBroken = !!(_handoff && _handoff.broken);
     const _handoffOverridden = _handoffBroken && (typeof isHandoffQueueOverride === "function") && isHandoffQueueOverride(chainInfo.anchorPn);
+    // v-blanket-queue: blanket-supplier admission decision. Null for every
+    // non-blanket part, so their admission stays byte-identical. Muted
+    // parts skip it — mute is user-explicit and always wins.
+    const _blanketQueue = (!muted && typeof blanketReleaseDecision === "function")
+      ? blanketReleaseDecision(p, {
+          onPO,
+          daysOfCover: chainInfo ? chainInfo.chainRunoutDays : status.daysOfCover,
+          suggestedQty: undefined,
+        })
+      : null;
     return {
       ...p,
       onPO,
@@ -3876,6 +4010,7 @@ function partsWithStatus() {
         status: "critical",
         urgency: -Number(_preLaunchOrderByDaysPast || 0),
       } : {}),
+      ...(_blanketQueue ? { _blanketQueue } : {}),
       _suggestedQty: cycleAwareSuggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
     };
@@ -4567,16 +4702,82 @@ function queueParts(itemType) {
   //     also admits — the flag is kept in the filter as defense-in-
   //     depth (if someone later reverts the status elevation, the flag
   //     still admits).
-  return stats.filter(p =>
-    (p.status === "critical" || p.status === "warning" || p._forceAdmitAsRelease || p._forceAdmitAsPreLaunchOrder)
-    && !p.phasingOut
+  return stats.filter(p => {
+    if (p.phasingOut) return false;
     // v-handoff: BROKEN chain handoffs are routed to Coverage Gaps ›
     // Transition gaps instead of the queue (see evaluateChainHandoff),
     // unless the operator overrode via "Move to Base BOM Queue".
     // Non-chain parts never carry the flag, so their admission is
     // byte-identical to before.
-    && !p._brokenHandoff
-  );
+    if (p._brokenHandoff) return false;
+    // v-blanket-queue: for a blanket-supplier part the release decision
+    // is AUTHORITATIVE, because "do I need to act" is answered by the
+    // blanket's release window, not by lead-time reorder math.
+    //   release → admit (even when normal rules would stay quiet)
+    //   silent  → suppress (even when normal rules say warning/critical)
+    //   order   → no active blanket; fall through to normal rules
+    // Non-blanket parts carry no _blanketQueue and are unaffected.
+    const bq = p._blanketQueue;
+    if (bq && bq.admitOverride === true) return true;
+    if (bq && bq.admitOverride === false) return false;
+    return (p.status === "critical" || p.status === "warning"
+            || p._forceAdmitAsRelease || p._forceAdmitAsPreLaunchOrder);
+  });
+}
+
+/* ------------------------------------------------------------------
+   v-blanket-queue audit. Counts the three branches and asserts that no
+   blanket-supplier part reached the queue without a trigger firing.
+   Fired once per session from computeCoverageGaps (js/22), which runs
+   on every badge refresh; console-callable as _printSensourcingQueue().
+   ------------------------------------------------------------------ */
+let _sensourcingQueueReported = false;
+function sensourcingQueueAudit() {
+  const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
+  const queued = new Set(((typeof queueParts === "function") ? queueParts("base_bom") : []).map(p => p && p.pn));
+  let scanned = 0, release = 0, order = 0, silent = 0;
+  const violations = [];
+  const rows = [];
+  for (const p of stats) {
+    const bq = p && p._blanketQueue;
+    if (!bq) continue;
+    scanned++;
+    const inQueue = queued.has(p.pn);
+    // "admitted" counts are what actually reached the queue. A no-blanket
+    // ORDER part still has to pass normal reorder rules, so it can be
+    // scanned-but-not-admitted; SILENT is suppression by definition.
+    if (bq.kind === "silent") silent++;
+    else if (inQueue && bq.kind === "release") release++;
+    else if (inQueue && bq.kind === "order") order++;
+    if (inQueue) {
+      rows.push({
+        pn: p.pn, kind: bq.kind, qty: bq.qty,
+        blanket: bq.blanketPo || "-", open: bq.blanketOpen || 0,
+        trigger: bq.triggerReason || "-",
+        daysToTrigger: bq.daysToTrigger == null ? "-" : bq.daysToTrigger,
+        action: bq.action,
+      });
+      // A blanket part may sit in the queue ONLY via a fired release
+      // trigger or via the no-blanket ordinary-buy branch.
+      if (bq.kind === "silent") {
+        violations.push(`${p.pn}: in Base BOM Queue but decision is SILENT (${bq.why || "no trigger"})`);
+      } else if (bq.kind === "release" && bq.daysToTrigger == null) {
+        violations.push(`${p.pn}: admitted as RELEASE but no trigger date resolved`);
+      }
+    }
+  }
+  return { scanned, release, order, silent, violations, rows };
+}
+function _printSensourcingQueue() {
+  const a = sensourcingQueueAudit();
+  console.info(`[sensourcing-queue] ${a.scanned} Sensourcing parts scanned · ${a.release} admitted (release), ${a.order} admitted (order — no blanket), ${a.silent} silent`);
+  if (a.rows.length) console.table(a.rows);
+  if (a.violations.length) {
+    console.warn(`[sensourcing-queue] violations: ${a.violations.length}\n  ` + a.violations.join("\n  "));
+  } else {
+    console.info("[sensourcing-queue] violations: none — every queued Sensourcing part has a fired trigger or no blanket");
+  }
+  return a;
 }
 
 /* ============================================================
