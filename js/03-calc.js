@@ -3755,160 +3755,290 @@ function setHandoffQueueOverride(anchorPn, on) {
   if (typeof bumpStatusCache === "function") bumpStatusCache();
 }
 function evaluateChainHandoff(ci) {
+  /* ------------------------------------------------------------
+     v-handoff-timeline. ONE question: is the line covered every
+     workday from today through the successor's steady-state?
+
+     Day-by-day timeline per chain across the same horizon the
+     drawer's runway chart draws. Each day: usable inventory of
+     the ACTIVE member (predecessor until cut-in, successor from
+     cut-in on). PO arrivals credit on their expected date;
+     consumption debits chain rate on workdays. Predecessor stock
+     left the day before cut-in strands (disappears from the line
+     on cut-in day). BROKEN iff usable < 0 on any day.
+
+     Remediation is EVALUATED by re-running the same simulator with
+     the lever applied (expedite = move the PO; order = add units;
+     defer = move cut-in), so "feasible" means "the timeline goes
+     non-negative", not a heuristic. Primary = EXPEDITE if a
+     successor PO can close the gap, else ORDER; DEFER / RUN DOWN
+     listed as alternatives when feasible.
+
+     The timeline array is returned for every downstream surface
+     (drawer, Coverage Gaps row, suggested-action text) to read —
+     one source, so they cannot disagree. The old a/b/c/d rule
+     letters are retired; `reasons` now carries a single gap
+     sentence for back-compat readers.
+     ------------------------------------------------------------ */
   if (!ci || !ci.finalPn) return null;
   const DAY = 86400000;
   const fd = (d) => (d && typeof fmtDate === "function") ? fmtDate(d) : (d ? d.toISOString().slice(0, 10) : "?");
   const fn = (n) => (typeof fmtNum === "function") ? fmtNum(n) : String(Math.round(n));
-  const finalPn = ci.finalPn;
+  const fm = (v) => "$" + Math.round(Number(v) || 0).toLocaleString();
+  const today = new Date(TODAY.getTime()); today.setHours(0, 0, 0, 0);
+  const add = (i) => (typeof addDays === "function") ? addDays(today, i) : new Date(today.getTime() + i * DAY);
+  const wpw = (typeof effectiveWorkdaysPerWeek === "function") ? effectiveWorkdaysPerWeek() : 5;
+  const isWd = (d) => (typeof isWorkday === "function") ? isWorkday(d, wpw) : (((d.getDay() + 6) % 7) < wpw);
+  const anchor = ci.anchor || null;
   const succ = ci.final || null;
-  const pred = ci.anchor || null;
+  const finalPn = ci.finalPn;
+  const predPns = (ci.chainParts || []).filter(pn => pn !== finalPn);
+  const predPnSet = new Set(predPns);
+  const predLabel = predPns.length ? predPns[predPns.length - 1] : ci.anchorPn;
+  const rate = Number(ci.chainRate) || 0;
+  const rateOn = (d) => (anchor && typeof hasActiveRateStep === "function" && hasActiveRateStep(anchor) && typeof dailyOnDate === "function")
+    ? (Number(dailyOnDate(anchor, d)) || 0) : rate;
   const hc = ci.hardCutin || null;
   const cutinDate = (hc && hc.hardCutinDate) ? hc.hardCutinDate : null;
-  const cutinDays = cutinDate ? Math.round((cutinDate.getTime() - TODAY.getTime()) / DAY) : null;
-  const succLines = (ci.chainPOLines || []).filter(l => l && l.pn === finalPn);
-  const succOpenLines = succLines.filter(l => !l.isOverdue);
-  let succArrival = null;
-  let succArrivalPo = "";
-  let succArrivalQty = 0;
-  let succArrivalPoId = null;
-  for (const l of succOpenLines) {
-    if (l.expectedDate && (!succArrival || l.expectedDate.getTime() < succArrival.getTime())) {
-      succArrival = l.expectedDate;
-      succArrivalPo = l.poNum || "";
-      succArrivalQty = Number(l.remaining) || 0;
-      succArrivalPoId = l.poId || null;
-    }
-  }
-  // Overdue successor lines (expected date passed, not received) are the
-  // other expedite candidate — track the worst one for the chase copy.
-  let succOverdue = null;
-  for (const l of succLines) {
-    if (!l.isOverdue || !l.expectedDate) continue;
-    if (!succOverdue || l.expectedDate.getTime() < succOverdue.expectedDate.getTime()) succOverdue = l;
-  }
-  const succOnHand = hc ? (Number(hc.ownStock) || 0) : (succ ? (Number(succ.onHand) || 0) : 0);
-  const succOnPO = succLines.reduce((s, l) => s + (Number(l.remaining) || 0), 0);
-  const predOnHand = hc ? (Number(hc.predecessorStock) || 0) : (pred ? (Number(pred.onHand) || 0) : 0);
-  const runoutTxt = ci.chainRunoutDate ? fd(ci.chainRunoutDate) : "soon";
-  const reasons = [];
-  if ((Number(ci.chainShort) || 0) > 0) {
-    reasons.push({
-      code: "a",
-      text: succArrival
-        ? `${finalPn}'s covering PO ${succArrivalPo} lands ${fd(succArrival)} — after the chain runs out ${runoutTxt} (short ${fn(ci.chainShort)})`
-        : `nothing on order for ${finalPn} arrives before the chain runs out ${runoutTxt} (short ${fn(ci.chainShort)})`,
+  const cutinDays = cutinDate ? Math.round((cutinDate.getTime() - today.getTime()) / DAY) : null;
+  const cutinOffset = cutinDate ? Math.max(0, cutinDays) : null;
+  const leadDays = (succ && typeof leadTimeDays === "function") ? leadTimeDays(succ) : 0;
+  const safetyDays = (typeof DB !== "undefined" && DB && DB.settings && Number(DB.settings.safetyDays)) || 0;
+
+  // Horizon — same shape the drawer's runway chart uses (js/10):
+  // max(90, runout+14, cutin+LT+14), capped at 365.
+  let horizon = Math.max(90, leadDays + 14);
+  if (Number.isFinite(ci.chainRunoutDays)) horizon = Math.max(horizon, ci.chainRunoutDays + 14);
+  if (cutinDays != null) horizon = Math.max(horizon, cutinDays + leadDays + 14);
+  horizon = Math.min(365, Math.max(1, Math.round(horizon)));
+
+  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const predStock0 = predPns.reduce((s, pn) => { const p = partsByPn.get(pn); return s + Math.max(0, Number(p && p.onHand) || 0); }, 0);
+  const succStock0 = Math.max(0, Number(succ && succ.onHand) || 0);
+
+  // Receipts from the chain's PO lines (same list the drawer plots).
+  // Overdue / undated lines are assumed to land today — the drawer's
+  // projectOnHand convention — so the timeline matches the chart.
+  const receipts = [];
+  for (const l of (ci.chainPOLines || [])) {
+    if (!l) continue;
+    const qty = Number(l.remaining) || 0;
+    if (qty <= 0) continue;
+    const member = l.pn === finalPn ? "succ" : (predPnSet.has(l.pn) ? "pred" : null);
+    if (!member) continue;
+    let offset = 0;
+    if (l.expectedDate) offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY);
+    if (offset < 0) offset = 0;
+    receipts.push({
+      key: String(l.poNum || "") + "|" + String(l.pn) + "|" + String(l.poId || ""),
+      offset, pn: l.pn, qty, poNum: l.poNum || "", poId: l.poId || null,
+      isOverdue: !!l.isOverdue, expectedDate: l.expectedDate || null, member,
     });
   }
-  if (cutinDate && cutinDays > 0 && ci.chainRunoutDate && ci.chainRunoutDate.getTime() < cutinDate.getTime()) {
-    reasons.push({ code: "b", text: `${ci.anchorPn} runs out ${fd(ci.chainRunoutDate)}, before ${finalPn}'s cut-in ${fd(cutinDate)}` });
-  }
-  if (cutinDate && cutinDays <= 0 && succOnHand <= 0) {
-    reasons.push({ code: "c", text: `cut-in ${fd(cutinDate)} has ${cutinDays === 0 ? "arrived" : "passed"} and ${finalPn} has 0 on hand` });
-  }
-  if (ci.chainReorderByPassed && succLines.length === 0) {
-    reasons.push({ code: "d", text: `order-by ${ci.chainReorderByDate ? fd(ci.chainReorderByDate) : ""} has passed and no PO exists for ${finalPn}` });
-  }
-  const broken = reasons.length > 0;
-  const codes = new Set(reasons.map(r => r.code));
-  let needQty = Math.max(0, Math.round(Number(ci.chainShort) || 0));
-  if (needQty <= 0 && succ && typeof cycleAwareSuggestedQty === "function") {
-    try { needQty = Math.max(0, Math.round(Number(cycleAwareSuggestedQty(succ, succOnPO)) || 0)); } catch (_) {}
-  }
-  if (needQty <= 0) needQty = 1;
-  // v-handoff-expedite: consider what's ALREADY on order before
-  // recommending a new order or a cut-in change. When the chain is out
-  // of coverage (a) — or cut-in has arrived unstocked (c) — and a
-  // successor PO is landing shortly AFTER the chain runs out, the right
-  // move is to expedite that PO, not to order more or defer cut-in.
-  //
-  //   gapDays = succArrival − chainRunoutDate (calendar days)
-  //     0 < gap ≤ 30   EXPEDITE is primary; order / push-cut-in are
-  //                    alternatives.
-  //     −18 < gap ≤ 0  lands before runout but inside the 18-day
-  //                    want-by cushion — still an expedite (need-by =
-  //                    want-by), not a discrepancy.
-  //     gap ≤ −18      lands before runout WITH margin: rule (a)
-  //                    shouldn't be firing. Log the discrepancy per pn
-  //                    (chainShort stale, or the PO isn't credited to the
-  //                    successor) and ask the buyer to verify the PO
-  //                    rather than order on top of it.
-  //     gap > 30       PO exists but too late to expedite meaningfully —
-  //                    fall through to order/push-cut-in, noting the PO.
-  //   no successor PO  existing suggestions stand.
-  const EXPEDITE_WINDOW_DAYS = 30;
-  const WANT_BY_CUSHION_DAYS = 18;
-  let action = "";
-  let actionKind = "";
-  let audit = null;
-  const gapDays = (succArrival && ci.chainRunoutDate)
-    ? Math.round((succArrival.getTime() - ci.chainRunoutDate.getTime()) / DAY)
-    : null;
-  const poLabel = succArrivalPo ? `PO${succArrivalPo}` : "the PO";
-  const orderAlt = `or order ${fn(needQty)} more ${finalPn} now`;
-  const cutinAlt = (cutinDate && succArrival) ? `or push cut-in to ${fd(succArrival)}` : "";
-  const alts = [cutinAlt, orderAlt].filter(Boolean).join(" · ");
 
-  if ((codes.has("a") || codes.has("c")) && !codes.has("d") && succArrival && gapDays != null) {
-    if (gapDays > 0 && gapDays <= EXPEDITE_WINDOW_DAYS) {
-      action = `EXPEDITE ${poLabel} for ${fn(succArrivalQty)} units (currently arriving ${fd(succArrival)}, need by ${runoutTxt}, gap ${fn(gapDays)} days)`
-        + (alts ? ` · ${alts}` : "");
-      actionKind = "expedite";
-    } else if (gapDays <= 0 && gapDays > -WANT_BY_CUSHION_DAYS) {
-      const needBy = ci.wantByDate ? fd(ci.wantByDate) : runoutTxt;
-      action = `EXPEDITE ${poLabel} for ${fn(succArrivalQty)} units (arriving ${fd(succArrival)}, only ${fn(-gapDays)}d before runout — need by ${needBy} for cushion)`
-        + (alts ? ` · ${alts}` : "");
-      actionKind = "expedite";
-    } else if (gapDays <= -WANT_BY_CUSHION_DAYS) {
-      audit = `rule (a) fired (chainShort=${fn(ci.chainShort)}) but ${poLabel} (${fn(succArrivalQty)}) lands ${fd(succArrival)}, ${fn(-gapDays)}d before chain runout ${runoutTxt} — chainShort may be stale or the PO isn't credited to ${finalPn}`;
-      action = `verify ${poLabel} (${fn(succArrivalQty)} ${finalPn}, lands ${fd(succArrival)}) is credited to ${finalPn} — it arrives ${fn(-gapDays)}d before runout · then order ${fn(needQty)} only if still short`;
-      actionKind = "verify-po";
-    } else {
-      // gap > 30: PO too far out to expedite. Existing suggestion, PO noted.
-      action = codes.has("c")
-        ? `order ${fn(needQty)} ${finalPn} (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`
-        : (ci.chainRunoutDate && cutinDate
-            ? `push cut-in to ${fd(ci.chainRunoutDate)} or order ${fn(needQty)} ${finalPn} now (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`
-            : `order ${fn(needQty)} ${finalPn} (${poLabel} not until ${fd(succArrival)}, ${fn(gapDays)}d after runout)`);
-      actionKind = codes.has("c") ? "order" : "push-cutin";
+  // --- the simulator -------------------------------------------------
+  // opts.cutin     offset | null  (null = no hard cut-in: sequential burn,
+  //                                no stranding — successor takes over the
+  //                                day the predecessor can't cover usage)
+  // opts.moved     Map<key, newOffset>   (expedite lever)
+  // opts.extraSucc [{offset, qty}]       (order lever)
+  function simulate(opts) {
+    opts = opts || {};
+    const cutin = (opts.cutin === undefined) ? cutinOffset : opts.cutin;
+    const rec = receipts.map(r => ({ ...r, offset: (opts.moved && opts.moved.has(r.key)) ? opts.moved.get(r.key) : r.offset }));
+    for (const x of (opts.extraSucc || [])) {
+      rec.push({ key: "new|" + x.offset, offset: x.offset, pn: finalPn, qty: x.qty, poNum: "(new)", poId: null, isOverdue: false, expectedDate: null, member: "succ" });
     }
-  } else if ((codes.has("a") || codes.has("c")) && !codes.has("d") && succOverdue) {
-    // Only overdue successor lines: the chase IS the expedite.
-    const lateDays = Math.max(0, Math.floor((TODAY.getTime() - succOverdue.expectedDate.getTime()) / DAY));
-    action = `EXPEDITE PO${succOverdue.poNum || ""} for ${fn(succOverdue.remaining || 0)} units (expected ${fd(succOverdue.expectedDate)}, ${fn(lateDays)}d late, need by ${runoutTxt}) · ${orderAlt}`;
-    actionKind = "expedite";
-  } else if (codes.has("c") || codes.has("d")) {
-    action = `order ${fn(needQty)} ${finalPn}`;
-    actionKind = "order";
-  } else if (codes.has("b")) {
-    action = ci.chainRunoutDate
-      ? `push cut-in to ${fd(ci.chainRunoutDate)} or order ${fn(needQty)} ${finalPn} now`
-      : `order ${fn(needQty)} ${finalPn}`;
-    actionKind = "push-cutin";
-  } else if (codes.has("a")) {
-    action = `order ${fn(needQty)} ${finalPn}`;
-    actionKind = "order";
+    let pred = predStock0;
+    let sc = succStock0;
+    let stranded = 0;
+    const tl = [];
+    let firstNeg = -1, minUsable = Infinity, minIdx = -1, negDays = 0, gapEnd = -1;
+    for (let i = 0; i <= horizon; i++) {
+      const d = add(i);
+      const events = [];
+      if (cutin != null && i === cutin) events.push(`cut-in → ${finalPn}`);
+      for (const r of rec) {
+        if (r.offset !== i) continue;
+        if (r.member === "pred") {
+          if (cutin != null && i >= cutin) { events.push(`PO${r.poNum} +${fn(r.qty)} ${r.pn} lands after cut-in — stranded`); continue; }
+          pred += r.qty;
+        } else {
+          sc += r.qty;
+        }
+        events.push(`PO${r.poNum} +${fn(r.qty)} ${r.pn}${r.isOverdue ? " (overdue, assumed today)" : ""}`);
+      }
+      let active = (cutin != null) ? (i < cutin ? "pred" : "succ") : (pred > 0 ? "pred" : "succ");
+      if (i > 0 && isWd(d)) {
+        const use = rateOn(d);
+        if (cutin == null && active === "pred" && pred < use) { sc -= (use - pred); pred = 0; active = "succ"; }
+        else if (active === "pred") pred -= use;
+        else sc -= use;
+      }
+      if (cutin != null && i === cutin - 1 && pred > 0) {
+        stranded = pred;
+        events.push(`${fn(pred)} ${predLabel} strands at tomorrow's cut-in`);
+      }
+      if (cutin != null && i === cutin) pred = 0;
+      const usable = (active === "pred") ? pred : sc;
+      const wasNeg = tl.length > 0 && tl[tl.length - 1].usable < 0;
+      if (usable < 0) {
+        negDays++;
+        if (firstNeg < 0) { firstNeg = i; events.push("gap-start"); }
+      } else if (wasNeg) {
+        events.push("gap-end");
+        if (gapEnd < 0) gapEnd = i;
+      }
+      if (usable < minUsable) { minUsable = usable; minIdx = i; }
+      tl.push({
+        offset: i, date: d, iso: d.toISOString().slice(0, 10),
+        activeMember: active === "pred" ? predLabel : finalPn,
+        usable: Math.round(usable * 100) / 100,
+        workday: isWd(d),
+        events,
+      });
+    }
+    return {
+      timeline: tl, broken: firstNeg >= 0, gapStart: firstNeg,
+      gapEnd: (firstNeg >= 0 && gapEnd < 0) ? horizon + 1 : gapEnd,
+      minUsable: (minUsable === Infinity) ? 0 : minUsable, minIdx, stranded, negDays,
+    };
   }
-  if (hc && (Number(hc.strandedPredecessorQty) || 0) > 0 && (Number(ci.chainRate) || 0) > 0
-      && typeof workdaysToCalendarDays === "function" && typeof addDays === "function") {
-    const burnCal = workdaysToCalendarDays(predOnHand / ci.chainRate, TODAY);
-    action += (action ? " · " : "") +
-      `or burn down ${ci.anchorPn} to 0 by pushing cut-in to ${fd(addDays(TODAY, burnCal))} (${fn(hc.strandedPredecessorQty)} would strand)`;
-  }
-  if (audit && typeof console !== "undefined") {
-    if (!evaluateChainHandoff._audited) evaluateChainHandoff._audited = new Set();
-    const ak = finalPn + "|" + audit;
-    if (!evaluateChainHandoff._audited.has(ak)) {
-      evaluateChainHandoff._audited.add(ak);
-      console.warn(`[handoff-audit] ${finalPn}: ${audit}`);
+
+  const base = simulate();
+  const broken = base.broken;
+  const needIdx = broken ? base.gapStart : -1;
+  const needDate = needIdx >= 0 ? add(needIdx) : null;
+  const gapUnits = broken ? Math.ceil(-base.minUsable) : 0;
+  const succReceipts = receipts.filter(r => r.member === "succ");
+  const succOnPO = succReceipts.reduce((s, r) => s + r.qty, 0);
+  let succArrival = null, succArrivalPo = "", succArrivalQty = 0, succArrivalPoId = null;
+  for (const r of succReceipts) {
+    if (!r.expectedDate) continue;
+    if (!succArrival || r.expectedDate.getTime() < succArrival.getTime()) {
+      succArrival = r.expectedDate; succArrivalPo = r.poNum; succArrivalQty = r.qty; succArrivalPoId = r.poId;
     }
   }
+
+  // --- remediation levers (each one re-simulated) ---------------------
+  const options = [];
+  let primary = null;
+  if (broken) {
+    // 1. EXPEDITE — earliest successor PO landing after the gap opens
+    //    that, pulled in to the gap-start day, makes the timeline
+    //    non-negative (or at least pushes the first gap past this one).
+    const after = succReceipts.filter(r => r.expectedDate && r.offset > needIdx).sort((a, b) => a.offset - b.offset);
+    for (const r of after) {
+      const sim = simulate({ moved: new Map([[r.key, needIdx]]) });
+      const closes = !sim.broken || sim.gapStart > base.gapEnd;
+      const pull = r.offset - needIdx;
+      const text = `Expedite PO${r.poNum} for ${fn(r.qty)} ${finalPn} — pull in ${pull} day${pull === 1 ? "" : "s"} (arriving ${fd(r.expectedDate)} → need ${fd(needDate)})`;
+      if (closes) {
+        options.push({ lever: "expedite", feasible: true, text: text + (sim.broken ? ` — closes this gap; a later gap remains from ${fd(add(sim.gapStart))}` : ""), poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate, resultBroken: sim.broken });
+        break;
+      }
+      // Too small to close alone — remember the nearest as a partial.
+      if (!options.some(o => o.lever === "expedite")) {
+        options.push({ lever: "expedite", feasible: false, text: text + ` — only ${fn(r.qty)} units; does not close the ${fn(gapUnits)}-unit gap alone`, poNum: r.poNum, poId: r.poId, qty: r.qty, pullInDays: pull, needBy: needDate });
+      }
+    }
+    // 2. ORDER — smallest N landing on the gap-start day that keeps the
+    //    whole horizon non-negative, plus the normal safety buffer.
+    {
+      let qty = Math.max(1, Math.ceil(gapUnits + safetyDays * rate));
+      let sim = simulate({ extraSucc: [{ offset: needIdx, qty }] });
+      let guard = 0;
+      while (sim.broken && guard++ < 8) {
+        qty += Math.max(1, Math.ceil(-sim.minUsable));
+        sim = simulate({ extraSucc: [{ offset: needIdx, qty }] });
+      }
+      const ltWeeks = succ ? (Number(succ.ltWeeks) || 0) : 0;
+      const earliest = add(leadDays);
+      const lateBy = Math.round((earliest.getTime() - needDate.getTime()) / DAY);
+      options.push({
+        lever: "order", feasible: true,
+        text: `Order ${fn(qty)} ${finalPn} — supplier LT is ${ltWeeks}w, arrival must be by ${fd(needDate)} to avoid stockout` +
+              (lateBy > 0 ? ` (standard LT lands ${fd(earliest)}, ${lateBy}d late — needs an expedited order)` : ""),
+        qty, needBy: needDate, ltWeeks, lateByDays: Math.max(0, lateBy),
+      });
+    }
+    // 3. DEFER CUT-IN — only with a hard cut-in still ahead, and only if
+    //    the predecessor (with its own pre-cut-in receipts) can carry the
+    //    line to a later date that the simulator confirms is covered.
+    if (cutinOffset != null && cutinOffset > 0 && rate > 0) {
+      let ps = predStock0, P = null;
+      for (let i = 0; i <= horizon; i++) {
+        const d = add(i);
+        for (const r of receipts) if (r.member === "pred" && r.offset === i) ps += r.qty;
+        if (i > 0 && isWd(d)) ps -= rateOn(d);
+        if (ps < 0) { P = i; break; }
+      }
+      if (P == null) P = horizon;
+      if (P > cutinOffset) {
+        const cands = new Set([P]);
+        for (const r of succReceipts) if (r.offset > cutinOffset && r.offset <= P) cands.add(r.offset);
+        let best = null;
+        for (const c of [...cands].sort((a, b) => a - b)) {
+          const sim = simulate({ cutin: c });
+          if (!sim.broken) { best = { c, sim }; break; }
+        }
+        if (best) {
+          options.push({
+            lever: "defer", feasible: true,
+            text: `Defer cut-in to ${fd(add(best.c))} (+${best.c - cutinOffset}d) — ${predLabel} carries the line until then; ${fn(best.sim.stranded)} ${predLabel} still strand`,
+            newCutinDate: add(best.c), newCutinOffset: best.c, strands: best.sim.stranded,
+          });
+        } else {
+          options.push({ lever: "defer", feasible: false, text: `Defer cut-in — ${predLabel} only covers to ${fd(add(P))}; no later cut-in date is fully covered` });
+        }
+      } else {
+        options.push({ lever: "defer", feasible: false, text: `Defer cut-in — ${predLabel} runs out ${fd(add(P))}, on or before the ${fd(cutinDate)} cut-in` });
+      }
+    }
+    // 4. RUN DOWN — predecessor surplus that would strand is worth more
+    //    than the gap; burn it first (needs a feasible defer to lean on).
+    if (cutinOffset != null && base.stranded > 0) {
+      const predCost = predPns.reduce((s, pn) => { const p = partsByPn.get(pn); return Math.max(s, Number(p && p.cost) || 0); }, 0);
+      const succCost = Number(succ && succ.cost) || 0;
+      const strandValue = base.stranded * predCost;
+      const gapValue = gapUnits * succCost;
+      const defer = options.find(o => o.lever === "defer" && o.feasible);
+      if (defer && strandValue > gapValue) {
+        options.push({
+          lever: "rundown", feasible: true,
+          text: `Run down ${fn(base.stranded)} ${predLabel} first (${fm(strandValue)} would strand vs ${fm(gapValue)} gap) — move cut-in to ${fd(defer.newCutinDate)}`,
+          strandValue, gapValue, newCutinDate: defer.newCutinDate,
+        });
+      }
+    }
+    primary = options.find(o => o.lever === "expedite" && o.feasible) || options.find(o => o.lever === "order") || null;
+  }
+  const alternatives = options.filter(o => o !== primary && o.feasible);
+  const infeasible = options.filter(o => !o.feasible);
+
+  const minDate = base.minIdx >= 0 ? add(base.minIdx) : null;
+  const reasons = broken ? [{
+    code: "gap",
+    text: `usable ${base.timeline[needIdx].activeMember} inventory goes negative ${fd(needDate)} (min ${fn(base.minUsable)} on ${fd(minDate)}; ${base.negDays} day${base.negDays === 1 ? "" : "s"} below zero${base.gapEnd <= horizon ? `, recovers ${fd(add(base.gapEnd))}` : ", no recovery in horizon"})`,
+  }] : [];
+
   return {
-    broken, reasons, action, actionKind, audit,
-    predPn: ci.anchorPn, succPn: finalPn,
+    broken,
+    timeline: base.timeline,
+    horizon,
+    gapStart: needDate, gapStartOffset: needIdx,
+    gapEnd: (broken && base.gapEnd <= horizon) ? add(base.gapEnd) : null,
+    gapUnits, negDays: base.negDays,
+    minUsable: base.minUsable, minUsableDate: minDate,
+    stranded: base.stranded,
+    primary, alternatives, infeasible, options,
+    action: primary ? primary.text : "",
+    actionKind: primary ? primary.lever : "",
+    reasons,
+    predPn: ci.anchorPn, predLabel, succPn: finalPn,
     cutinDate, cutinDays,
-    predOnHand, predDaysCover: ci.chainRunoutDays,
-    succOnHand, succOnPO, succArrival, succArrivalPo, succArrivalQty, succArrivalPoId,
-    gapDays,
+    predOnHand: predStock0, predDaysCover: ci.chainRunoutDays,
+    succOnHand: succStock0, succOnPO, succArrival, succArrivalPo, succArrivalQty, succArrivalPoId,
   };
 }
 

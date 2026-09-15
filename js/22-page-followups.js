@@ -1927,32 +1927,86 @@ function coverageGapCount() {
    place the order.
    ============================================================ */
 let _transitionGapsLastKey = null;
+let _handoffSanityLastKey = null;
+
+// One-release comparator: the retired a/b/c/d rule model, kept only
+// so the console can report before(a-d) vs after(timeline) counts on
+// live data. Not read by any render path. Remove after the numbers
+// have been seen.
+function _legacyHandoffBrokenAtoD(ci) {
+  if (!ci || !ci.finalPn) return false;
+  const hc = ci.hardCutin || null;
+  const cutinDate = hc && hc.hardCutinDate ? hc.hardCutinDate : null;
+  const cutinDays = cutinDate ? Math.round((cutinDate.getTime() - TODAY.getTime()) / 86400000) : null;
+  const succLines = (ci.chainPOLines || []).filter(l => l && l.pn === ci.finalPn);
+  const succOnHand = hc ? (Number(hc.ownStock) || 0) : (ci.final ? (Number(ci.final.onHand) || 0) : 0);
+  if ((Number(ci.chainShort) || 0) > 0) return true;                                                   // a
+  if (cutinDate && cutinDays > 0 && ci.chainRunoutDate && ci.chainRunoutDate.getTime() < cutinDate.getTime()) return true; // b
+  if (cutinDate && cutinDays <= 0 && succOnHand <= 0) return true;                                      // c
+  if (ci.chainReorderByPassed && succLines.length === 0) return true;                                   // d
+  return false;
+}
+
 function computeTransitionGaps() {
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const rows = [];
   const seen = new Set();
+  let legacyBroken = 0;
+  const legacySeen = new Set();
   for (const p of stats) {
-    if (!p || !p._isChainMember || !p._handoff || !p._handoff.broken) continue;
+    if (!p || !p._isChainMember || !p._chainInfo) continue;
+    const key = p._chainInfo.anchorPn;
+    if (key && !legacySeen.has(key)) { legacySeen.add(key); if (_legacyHandoffBrokenAtoD(p._chainInfo)) legacyBroken++; }
+    if (!p._handoff || !p._handoff.broken) continue;
     if (p._handoffOverridden) continue;
-    const ci = p._chainInfo;
-    const key = ci && ci.anchorPn;
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    rows.push({ part: p, ci, h: p._handoff, anchorPn: key });
+    rows.push({ part: p, ci: p._chainInfo, h: p._handoff, anchorPn: key });
   }
-  const runoutMs = (r) => (r.ci.chainRunoutDate ? r.ci.chainRunoutDate.getTime() : Number.MAX_SAFE_INTEGER);
-  rows.sort((a, b) => runoutMs(a) - runoutMs(b));
-  // Report once per distinct set so the console isn't spammed on every
-  // refresh, but the count the ticket asked for is always visible.
-  const k = rows.map(r => r.anchorPn + ">" + r.h.succPn + ":" + r.h.reasons.map(x => x.code).join("") + ":" + (r.h.actionKind || "")).join("|");
+  const gapMs = (r) => (r.h.gapStart ? r.h.gapStart.getTime() : Number.MAX_SAFE_INTEGER);
+  rows.sort((a, b) => gapMs(a) - gapMs(b));
+
+  // Before/after + composition, logged once per distinct set.
+  const k = rows.map(r => `${r.anchorPn}>${r.h.succPn}:${r.h.gapStartOffset}:${r.h.actionKind}`).join("|") + "#" + legacyBroken;
   if (k !== _transitionGapsLastKey) {
     _transitionGapsLastKey = k;
-    const expedite = rows.filter(r => r.h.actionKind === "expedite").length;
-    const verify = rows.filter(r => r.h.actionKind === "verify-po").length;
-    console.info(`[transition-gaps] ${rows.length} broken chain handoff(s) moved from Base BOM Queue to Coverage Gaps` +
-      ` · ${expedite} now suggest EXPEDITE (was order/push-cut-in)` +
-      (verify ? ` · ${verify} flagged for PO-credit audit` : "") +
-      (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [${r.h.reasons.map(x => x.code).join("")}/${r.h.actionKind || "-"}]`).join(", ") : ""));
+    const byKind = {};
+    for (const r of rows) byKind[r.h.actionKind || "-"] = (byKind[r.h.actionKind || "-"] || 0) + 1;
+    console.info(
+      `[transition-gaps] before(a-d rules)=${legacyBroken} after(timeline)=${rows.length} broken chain handoff(s) excluded from Base BOM Queue` +
+      ` · primary: ${Object.entries(byKind).map(([k2, n]) => `${k2}=${n}`).join(", ") || "-"}` +
+      (rows.length ? ": " + rows.map(r => `${r.anchorPn}→${r.h.succPn} [gap ${r.h.gapStart ? r.h.gapStart.toISOString().slice(0, 10) : "?"}, min ${Math.round(r.h.minUsable)}, ${r.h.actionKind || "-"}]`).join(", ") : "")
+    );
+  }
+
+  // Sanity assertions — log, never throw.
+  const violations = [];
+  const repSeen = new Set();
+  for (const p of stats) {
+    if (!p || !p._chainInfo || p._muted || !p._handoff) continue;
+    const key = p._chainInfo.anchorPn;
+    if (repSeen.has(key)) continue;
+    repSeen.add(key);
+    if (p._chainInfo.chainReorderByPassed && !p._handoff.broken) {
+      violations.push(`${key}→${p._chainInfo.finalPn}: drawer banner says ORDER-BY PASSED but the timeline is SAFE (min usable ${Math.round(p._handoff.minUsable)} over ${p._handoff.horizon}d)`);
+    }
+  }
+  const queued = (typeof queueParts === "function") ? queueParts("base_bom") : [];
+  for (const p of queued) {
+    if (p && p._isChainMember && p._handoff && p._handoff.broken && !p._handoffOverridden) {
+      violations.push(`${p.pn}: on Base BOM Queue but the timeline is BROKEN (gap ${p._handoff.gapStart ? p._handoff.gapStart.toISOString().slice(0, 10) : "?"})`);
+    }
+  }
+  for (const r of rows) {
+    if (!Array.isArray(r.h.timeline) || !r.h.timeline.some(t => t.usable < 0)) {
+      violations.push(`${r.anchorPn}→${r.h.succPn}: in transition-gaps but no negative-usable day in its timeline`);
+    }
+  }
+  const vk = violations.join("|");
+  if (vk !== _handoffSanityLastKey) {
+    _handoffSanityLastKey = vk;
+    if (violations.length) console.warn(`[handoff-sanity] ${violations.length} violation(s):\n  ` + violations.join("\n  "));
+    else console.info("[handoff-sanity] OK — order-by-passed⇒broken, queued⇒safe, transition-gaps⇒negative-day all hold");
   }
   return rows;
 }
@@ -1961,25 +2015,38 @@ function moveTransitionGapToQueue(anchorPn) {
   if (typeof showToast === "function") showToast(`${anchorPn} chain re-admitted to Base BOM Queue for 14 days`, "ok");
   refresh();
 }
-// Console helper: prints the current transition-gap set as a table.
+// Console helpers.
 function _printTransitionGaps() {
   const rows = computeTransitionGaps().map(r => ({
-    chain: `${r.h.predPn} → ${r.h.succPn}`,
+    chain: `${r.h.predLabel} → ${r.h.succPn}`,
     cutin: r.h.cutinDate ? fmtDate(r.h.cutinDate) : "-",
     predOnHand: r.h.predOnHand,
-    chainRunout: r.ci.chainRunoutDate ? fmtDate(r.ci.chainRunoutDate) : "∞",
     succOnHand: r.h.succOnHand,
     succOnPO: r.h.succOnPO,
-    succArrival: r.h.succArrival ? fmtDate(r.h.succArrival) : "no PO",
-    gapDays: r.h.gapDays == null ? "-" : r.h.gapDays,
-    why: r.h.reasons.map(x => x.code).join(""),
-    actionKind: r.h.actionKind || "-",
+    gapStart: r.h.gapStart ? fmtDate(r.h.gapStart) : "-",
+    minUsable: Math.round(r.h.minUsable),
+    negDays: r.h.negDays,
+    strands: Math.round(r.h.stranded),
+    primary: r.h.actionKind,
     action: r.h.action,
+    alternatives: r.h.alternatives.map(a => a.lever).join(","),
   }));
   console.table(rows);
-  const expedite = rows.filter(r => r.actionKind === "expedite").length;
-  console.info(`[transition-gaps] ${rows.length} rows · ${expedite} suggest EXPEDITE`);
   return rows.length;
+}
+function _printHandoffTimeline(pn) {
+  const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
+  const p = stats.find(x => x && x.pn === pn);
+  if (!p || !p._handoff) { console.log(`[handoff] ${pn}: not in an actively-transitioning chain`); return null; }
+  const h = p._handoff;
+  console.log(`[handoff] ${h.predLabel} → ${h.succPn} · ${h.broken ? "BROKEN" : "SAFE"} · horizon ${h.horizon}d · cut-in ${h.cutinDate ? fmtDate(h.cutinDate) : "none"} · strands ${Math.round(h.stranded)}`);
+  if (h.primary) console.log(`  PRIMARY: ${h.primary.text}`);
+  for (const a of h.alternatives) console.log(`  alt (${a.lever}): ${a.text}`);
+  for (const a of h.infeasible) console.log(`  n/a (${a.lever}): ${a.text}`);
+  console.table(h.timeline.filter(t => t.events.length || t.usable < 0 || t.offset % 7 === 0).map(t => ({
+    date: t.iso, wd: t.workday ? "•" : "", active: t.activeMember, usable: t.usable, events: t.events.join(" · "),
+  })));
+  return h;
 }
 function _transitionGapsPanelHtml(rows) {
   if (!rows.length) return "";
@@ -1987,29 +2054,37 @@ function _transitionGapsPanelHtml(rows) {
     const h = r.h;
     const p = r.part;
     const predCover = (h.predDaysCover === Infinity || h.predDaysCover == null)
-      ? '<span class="dim">∞</span>'
-      : `${fmtNum(h.predDaysCover)}d`;
-    const runoutCell = r.ci.chainRunoutDate ? fmtDate(r.ci.chainRunoutDate) : "—";
+      ? '<span class="dim">∞</span>' : `${fmtNum(h.predDaysCover)}d`;
     const cutinCell = h.cutinDate
-      ? `<span class="mono ${h.cutinDays <= 0 ? "text-crit bold" : ""}">${fmtDate(h.cutinDate)}</span>${h.cutinDays != null ? `<div class="dim tiny">${h.cutinDays <= 0 ? Math.abs(h.cutinDays) + "d ago" : "in " + h.cutinDays + "d"}</div>` : ""}`
+      ? `<span class="mono ${h.cutinDays <= 0 ? "text-crit bold" : ""}">${fmtDate(h.cutinDate)}</span><div class="dim tiny">${h.cutinDays <= 0 ? Math.abs(h.cutinDays) + "d ago" : "in " + h.cutinDays + "d"}${h.stranded > 0 ? ` · ${fmtNum(h.stranded)} strand` : ""}</div>`
       : '<span class="dim">no cut-in date</span>';
     const arrivalCell = h.succArrival
-      ? `${fmtDate(h.succArrival)}${h.succArrivalPo ? `<div class="dim tiny mono">${esc(h.succArrivalPo)}</div>` : ""}`
+      ? `${fmtDate(h.succArrival)}${h.succArrivalPo ? `<div class="dim tiny mono">PO${esc(h.succArrivalPo)} ×${fmtNum(h.succArrivalQty)}</div>` : ""}`
       : (h.succOnPO > 0 ? '<span class="dim">PO, no date</span>' : '<span class="pill warn">No PO</span>');
-    const why = h.reasons.map(x => `<div><span class="pill crit" style="font-size:9px;padding:1px 5px;margin-right:4px">${esc(x.code)}</span>${esc(x.text)}</div>`).join("");
+    const gapCell = h.gapStart
+      ? `<span class="text-crit bold mono">${fmtDate(h.gapStart)}</span><div class="dim tiny">min ${fmtNum(h.minUsable)} · ${fmtNum(h.negDays)} day${h.negDays === 1 ? "" : "s"} &lt; 0${h.gapEnd ? ` · recovers ${fmtDate(h.gapEnd)}` : " · no recovery"}</div>`
+      : '<span class="dim">—</span>';
+    const primaryHtml = h.primary
+      ? `<div><strong>${esc(h.primary.text)}</strong></div>`
+      : '<div class="dim">—</div>';
+    const altHtml = h.alternatives.map(a => `<div class="dim tiny">or: ${esc(a.text)}</div>`).join("");
+    const naHtml = h.infeasible.map(a => `<div class="dim tiny" style="opacity:.7">n/a: ${esc(a.text)}</div>`).join("");
+    const expBtn = (h.primary && h.primary.lever === "expedite" && h.primary.poId)
+      ? `<button class="btn sm" onclick="event.stopPropagation(); openPODetail('${esc(h.primary.poId)}')" title="Open PO${esc(h.primary.poNum)}">PO</button>` : "";
     return `
       <tr class="clickable" onclick="openPartDetail('${esc(h.succPn)}')">
         <td style="white-space:normal;word-break:break-word">
-          <div><span class="pn dim">${esc(h.predPn)}</span> <span class="dim">→</span> <span class="pn bold">${esc(h.succPn)}</span></div>
+          <div><span class="pn dim">${esc(h.predLabel)}</span> <span class="dim">→</span> <span class="pn bold">${esc(h.succPn)}</span></div>
           <div class="dim tiny" style="font-family:var(--f-ui);margin-top:2px">${esc(p.desc || "")}</div>
         </td>
         <td>${cutinCell}</td>
-        <td class="right num">${fmtNum(h.predOnHand)}<div class="dim tiny">${predCover} · out ${runoutCell}</div></td>
+        <td class="right num">${fmtNum(h.predOnHand)}<div class="dim tiny">${predCover} cover</div></td>
         <td class="right num ${h.succOnHand <= 0 ? "text-crit bold" : ""}">${fmtNum(h.succOnHand)}<div class="dim tiny" style="font-weight:400">${arrivalCell}</div></td>
-        <td style="white-space:normal">${why}</td>
-        <td style="white-space:normal" class="tiny">${esc(h.action || "—")}</td>
+        <td>${gapCell}</td>
+        <td style="white-space:normal" class="tiny">${primaryHtml}${altHtml}${naHtml}</td>
         <td>
           <button class="btn sm primary" onclick="event.stopPropagation(); moveTransitionGapToQueue('${esc(r.anchorPn)}')" title="Re-admit this chain to the Base BOM Queue for 14 days and just place the order">→ Queue</button>
+          ${expBtn}
           <button class="btn sm" onclick="event.stopPropagation(); openPartDetail('${esc(h.succPn)}')" title="Open ${esc(h.succPn)}">Open</button>
         </td>
       </tr>`;
@@ -2018,18 +2093,18 @@ function _transitionGapsPanelHtml(rows) {
       <div class="panel" style="border-color: var(--warn-bd, var(--crit-bd)); margin-bottom:14px">
         <div class="panel-head">
           <div class="panel-title" style="color: var(--warn, var(--crit));">⇄ Transition gaps</div>
-          <div class="panel-sub">${rows.length} supersession chain${rows.length === 1 ? "" : "s"} with a broken handoff — pulled out of the Base BOM Queue until the handoff is fixed. (a) successor supply lands after chain runout · (b) predecessor runs out before cut-in · (c) cut-in reached, successor unstocked · (d) order-by passed, no successor PO</div>
+          <div class="panel-sub">${rows.length} supersession chain${rows.length === 1 ? "" : "s"} where the line's usable inventory goes below zero on some workday in the runway horizon — pulled out of the Base BOM Queue until the handoff is fixed. Primary action in bold; feasible alternatives beneath. <span class="mono">_printHandoffTimeline('&lt;pn&gt;')</span> prints the day-by-day.</div>
         </div>
         <div class="panel-body flush">
           <div class="tbl-wrap" style="overflow-x:hidden"><table class="tbl" style="table-layout:fixed">
             <thead><tr>
               <th>Chain</th>
-              <th style="width:96px">Cut-in</th>
-              <th class="right" style="width:110px">Predecessor</th>
-              <th class="right" style="width:110px">Successor</th>
-              <th>Why it's broken</th>
-              <th style="width:220px">Suggested action</th>
-              <th style="width:128px">Actions</th>
+              <th style="width:104px">Cut-in</th>
+              <th class="right" style="width:96px">Predecessor</th>
+              <th class="right" style="width:120px">Successor</th>
+              <th style="width:150px">Gap</th>
+              <th>Suggested action</th>
+              <th style="width:150px">Actions</th>
             </tr></thead>
             <tbody>${body}</tbody>
           </table></div>
