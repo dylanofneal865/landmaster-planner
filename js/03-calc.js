@@ -1006,6 +1006,17 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   const cutinOffset = (hardCutin && cutinMs)
     ? Math.max(0, Math.round((cutinMs - TODAY.getTime()) / DAY_MS))
     : null;
+  // v-overdue-reproject fix: the sweep moves pre-cut-in own receipts onto
+  // the cut-in day so the PLOTTED LINE doesn't step during phase 1 (phase 1
+  // shows the predecessor pool, which those units can't supply). That is
+  // correct for the line — but it also used to move the receipt MARKER,
+  // so a PO reprojected to +3d rendered its dot 60 days out on the cut-in,
+  // reading as "the late PO lands in November". The dot is cosmetic
+  // (js/10 uses series[].recv only for the marker + "+N" label; it never
+  // feeds the curve), so markers now keep their TRUE arrival day while the
+  // line keeps its cut-in step. A chain part and a non-chain part with the
+  // same past-due PO now render that PO in the same place.
+  const recvMarkers = receipts.slice();
   if (cutinOffset != null) {
     let bank = 0;
     const sweepEnd = Math.min(cutinOffset, days);
@@ -1015,8 +1026,12 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     }
     if (cutinOffset <= days) {
       receipts[cutinOffset] += bank;
+      // Don't double-draw: the bank's marker already sits on each true
+      // arrival day, so only genuinely-arriving-on-cut-in units get a dot.
+      recvMarkers[cutinOffset] = receipts[cutinOffset] - bank;
     }
     // else: cutinOffset > days → bank dropped (out-of-horizon).
+    series.bankedToCutin = bank;
   }
 
   const wpw = effectiveWorkdaysPerWeek();
@@ -1073,7 +1088,14 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     // header text and chart agree. Non-hardCutin path unchanged
     // because beforeCutin is false — displayOh = oh throughout.
     const displayOh = beforeCutin ? Math.max(0, predStock) : oh;
-    series.push({ d, oh: displayOh, recv: receipts[i] + predRecvToday });
+    series.push({
+      d, oh: displayOh,
+      recv: recvMarkers[i] + predRecvToday,
+      // Units that physically arrive on THIS day but aren't consumable
+      // until cut-in (swept into the bank). Lets the drawer distinguish
+      // "arrived, waiting for cut-in" from "arrived and available".
+      bankedRecv: (cutinOffset != null && i < cutinOffset) ? recvMarkers[i] : 0,
+    });
   }
   // Attach the overdue summary as plain properties on the array. Existing
   // callers (.map / .length / indexing / .findIndex) are unaffected.
@@ -1559,7 +1581,9 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     if (!l.expectedDate) continue;
     const qty = Number(l.remaining) || 0;
     if (qty <= 0) continue;
-    const offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    let offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    // Same reprojection for a past-due blanket line (v-overdue-reproject).
+    if (offset < 0) offset = overdueReprojectOffset(finalMember);
     if (offset < 0 || offset >= cutinOffset) continue;
     ownStockAtCutinBlanketOnly += qty;
   }
@@ -1571,6 +1595,7 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
   // convention above.
   const predecessorPns = predecessors.map(m => m && m.pn).filter(Boolean);
   const predPnSet = new Set(predecessorPns);
+  const predByPn = new Map(predecessors.map(m => [m && m.pn, m]));
   const predReceiptsByDay = new Map();
   let predPOsPreCutin = 0;
   for (const l of (chainOnPOLines || [])) {
@@ -1578,7 +1603,13 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     if (!l.expectedDate) continue;
     const qty = Number(l.remaining) || 0;
     if (qty <= 0) continue;
-    const offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    let offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
+    // v-overdue-reproject fix: a PAST-DUE predecessor PO used to be
+    // dropped outright by the `offset < 0` test below, erasing real
+    // phase-1 supply. It is late, not cancelled — reproject it into the
+    // same confirmation window projectOnHand uses. Still dropped when
+    // the reprojected day lands on/after cut-in (it would strand).
+    if (offset < 0) offset = overdueReprojectOffset(predByPn.get(l.pn) || anchor);
     if (offset < 0 || offset >= cutinOffset) continue;
     predReceiptsByDay.set(offset, (predReceiptsByDay.get(offset) || 0) + qty);
     predPOsPreCutin += qty;
