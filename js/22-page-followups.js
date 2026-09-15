@@ -823,6 +823,16 @@ function computeCoverageGaps() {
         : "")
     );
   }
+  // v-overdue-reproject: one-shot impact report. Past-due POs are no
+  // longer credited as already-landed, so any part whose cover moved was
+  // previously being under-reported as safe. Scoped to parts that carry a
+  // past-due open line, so the double-projection stays cheap.
+  if (typeof _printOverdueReprojectionImpact === "function"
+      && typeof _overdueImpactReported !== "undefined" && !_overdueImpactReported) {
+    _overdueImpactReported = true;
+    try { _printOverdueReprojectionImpact(7); }
+    catch (err) { console.warn("[overdue-reproject] impact audit failed:", err && err.message); }
+  }
   if (_overdueHorizonSuppressed.count > 0) {
     console.info(
       `[coverage-gaps] Suppressed ${_overdueHorizonSuppressed.count} overdue-risk part(s) with ignore-overdue runout beyond ${OVERDUE_RISK_HORIZON_DAYS} days` +
@@ -2263,7 +2273,7 @@ function renderCoverageGaps() {
                 // Retains the .pill.crit style used elsewhere for the
                 // "Nd late" pill on the Follow-Ups page.
                 const overdueTagBlock = risk
-                  ? `<div style="margin-top:2px"><span class="pill crit" style="font-weight:700" title="Covering PO past due — exposure surfaces once the late PO is ignored">PO ${fmtNum(risk.daysPastDue)}d overdue</span></div>`
+                  ? `<div style="margin-top:2px"><span class="pill crit" style="font-weight:700" title="PO past due — confirm with supplier. The runway projection does NOT treat it as arrived; it reprojects it ${typeof OVERDUE_GRACE_DAYS !== "undefined" ? OVERDUE_GRACE_DAYS : 3} days out (lead-capped), so cover shown elsewhere already assumes it lands late.">PO ${fmtNum(risk.daysPastDue)}d overdue — confirm with supplier</span></div>`
                   : "";
                 const _findPoId = (poNum) => {
                   const rec = poNum ? (DB.pos || []).find(x => x && x.num === poNum) : null;

@@ -580,7 +580,11 @@ function renderPartDetail(part) {
   const overdueUnits = series.overdueUnits || 0;
   const overdueLines = series.overdueLines || [];
   const overdueBanner = overdueUnits > 0 ? `
-    <div class="tiny" style="margin-bottom:8px;color:var(--warn)">${overdueLines.length} PO line${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes they've arrived. Confirm with supplier.</div>
+    <div class="tiny" style="margin-bottom:8px;color:var(--warn)">&#9888; ${overdueLines.length} PO${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes ${overdueLines.length === 1 ? 'it lands' : 'they land'} ${fmtNum(series.overdueReprojectDays || 0)} day${(series.overdueReprojectDays || 0) === 1 ? '' : 's'} late, not that ${overdueLines.length === 1 ? 'it has' : 'they have'} arrived. Shelf-only runway is ${fmtNum(Math.floor((Number(part.onHand) || 0) / Math.max(1e-9, Number(part.daily) || 0)))} workdays. Confirm with supplier.${
+      (series.firstNegativeDay != null && series.firstNegativeDay >= 0)
+        ? ` <strong style="color:var(--crit)">Line goes below zero ${fmtDate(addDays(TODAY, series.firstNegativeDay))} (day ${fmtNum(series.firstNegativeDay)}) before ${overdueLines.length === 1 ? 'it arrives' : 'they arrive'} — the days-cover figure above reports the LAST day stock is positive and does not reflect this dip.</strong>`
+        : ""
+    }</div>
   ` : "";
   // Overdue cue is the hollow amber circle ONLY — the detail lives in the
   // banner row above the chart, so no in-plot text label is needed.

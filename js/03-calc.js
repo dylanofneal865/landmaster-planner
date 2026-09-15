@@ -730,24 +730,144 @@ function openPOQty(pn, lines) {
   return total;
 }
 
+/* ------------------------------------------------------------------
+   PAST-DUE RECEIPT REPROJECTION — v-overdue-reproject.
+
+   A PO whose expected date has passed has NOT arrived. Crediting it on
+   its expected date (or clamping it to today, which the old code did)
+   puts units on the shelf that aren't there and inflates every cover
+   number derived from the projection.
+
+   Model: a late PO is usually a shipment that's tracking behind, not a
+   cancelled one — so reproject it a short CONFIRMATION GRACE window
+   ahead of today rather than dropping it. Bounded by the part's own
+   lead time (a 2-day-lead part can't reasonably be 3 days out), floored
+   at 1 day so a past-due line is never treated as on-hand today.
+
+     offset = max(1, min(leadTimeDays(part), OVERDUE_GRACE_DAYS))
+
+   The grace does NOT scale with how late the PO is: a 90-day-late PO
+   isn't 90 more days away, it's un-confirmed. That's what the past-due
+   flag is for — the projection stays usable, the UI says out loud that
+   it rests on an assumption, and Follow-Ups owns the chase.
+
+   Callers wanting the harsher "what if it never lands" world still pass
+   opts.ignoreOverdue. opts.overdueAsToday restores the pre-fix clamp and
+   exists ONLY for the before/after impact audit.
+   ------------------------------------------------------------------ */
+const OVERDUE_GRACE_DAYS = 3;
+function overdueReprojectOffset(part) {
+  const lt = (typeof leadTimeDays === "function") ? (Number(leadTimeDays(part)) || 0) : 0;
+  const capped = lt > 0 ? Math.min(lt, OVERDUE_GRACE_DAYS) : OVERDUE_GRACE_DAYS;
+  return Math.max(1, Math.round(capped));
+}
+
+// Impact audit for the reprojection. Re-derives daysUntilStockout's
+// lastPositive scan against both conventions and reports the parts whose
+// cover moved — those were being under-reported as safe. Scoped to parts
+// that actually carry a past-due open line, so it stays cheap.
+// Console-callable; also fired once per session from computeCoverageGaps.
+let _overdueImpactReported = false;
+function _coverFromProjection(series) {
+  let lastPositive = -1;
+  for (let i = 0; i < series.length; i++) if (series[i].oh > 0) lastPositive = i;
+  if (lastPositive === -1) return 0;
+  if (lastPositive === series.length - 1) return Infinity;
+  return lastPositive + 1;
+}
+function overdueReprojectionImpact(shiftThresholdDays) {
+  const TH = Number.isFinite(shiftThresholdDays) ? shiftThresholdDays : 7;
+  const pnsWithOverdue = new Set();
+  for (const po of (DB.pos || [])) {
+    for (const ln of (po.lines || [])) {
+      if (!ln || !ln.pn) continue;
+      if (typeof isLineOpen === "function" && !isLineOpen(po, ln)) continue;
+      const remaining = Math.max(0, (ln.qty || 0) - (ln.qtyReceived || 0));
+      if (!remaining) continue;
+      const exp = ln.expectedDate ? parseDateLocal(ln.expectedDate) : null;
+      if (!exp || isNaN(exp)) continue;
+      exp.setHours(0, 0, 0, 0);
+      if (exp.getTime() < TODAY.getTime()) pnsWithOverdue.add(ln.pn);
+    }
+  }
+  const rows = [];
+  const dipRows = [];
+  for (const p of (DB.parts || [])) {
+    if (!p || !p.pn || !pnsWithOverdue.has(p.pn)) continue;
+    if ((Number(p.daily) || 0) <= 0) continue;
+    const sBefore = projectOnHand(p, 365, undefined, { overdueAsToday: true });
+    const sAfter = projectOnHand(p, 365);
+    const before = _coverFromProjection(sBefore);
+    const after = _coverFromProjection(sAfter);
+    const b = before === Infinity ? 365 : before;
+    const a = after === Infinity ? 365 : after;
+    const shift = b - a;   // positive = we were over-reporting cover
+    const shelfOnly = Math.floor((Number(p.onHand) || 0) / (Number(p.daily) || 1));
+    if (Math.abs(shift) > TH) {
+      rows.push({
+        pn: p.pn, desc: p.desc || "",
+        onHand: Number(p.onHand) || 0, daily: Number(p.daily) || 0,
+        shelfOnlyDays: shelfOnly,
+        coverBefore: before === Infinity ? "365+" : before,
+        coverAfter: after === Infinity ? "365+" : after,
+        shiftDays: shift,
+      });
+    }
+    // The real exposure signal: a near-term dip that the day-0 credit was
+    // hiding. daysUntilStockout's lastPositive semantics cannot see these,
+    // so they never show up in the cover-shift count above.
+    const dBefore = sBefore.firstNegativeDay;
+    const dAfter = sAfter.firstNegativeDay;
+    if (dAfter >= 0 && (dBefore < 0 || dAfter < dBefore)) {
+      dipRows.push({
+        pn: p.pn, desc: p.desc || "",
+        onHand: Number(p.onHand) || 0, daily: Number(p.daily) || 0,
+        shelfOnlyDays: shelfOnly,
+        dipDayBefore: dBefore < 0 ? "none" : dBefore,
+        dipDayAfter: dAfter,
+        coverShown: after === Infinity ? "365+" : after,
+        overdueUnits: sAfter.overdueUnits || 0,
+      });
+    }
+  }
+  rows.sort((x, y) => y.shiftDays - x.shiftDays);
+  dipRows.sort((x, y) => x.dipDayAfter - y.dipDayAfter);
+  return { rows, dipRows, scanned: pnsWithOverdue.size, threshold: TH };
+}
+function _printOverdueReprojectionImpact(threshold) {
+  const r = overdueReprojectionImpact(threshold);
+  console.info(`[overdue-reproject] scanned ${r.scanned} part(s) with a past-due open PO (grace=${OVERDUE_GRACE_DAYS}d, lead-capped)`);
+  console.info(`[overdue-reproject] ${r.rows.length} shift daysCover by >${r.threshold}d`);
+  if (r.rows.length) console.table(r.rows);
+  console.info(`[overdue-reproject] ${r.dipRows.length} gain a NEW or EARLIER below-zero day that the old day-0 credit was hiding — these were the ones under-reported as safe. daysUntilStockout reports lastPositive+1 so it does NOT see them; the chart and series.firstNegativeDay do.`);
+  if (r.dipRows.length) console.table(r.dipRows);
+  return { coverShifted: r.rows.length, newDips: r.dipRows.length };
+}
+
 // Project on-hand over the next N days, treating PO lines as receipts on their expected dates.
 // `lines` is the optional precomputed index entry for this part.
-// Past-due lines (genuine expected date < today) are still clamped to offset
-// 0 — they continue to prop up the projection — but the units and source
-// lines are surfaced via series.overdueUnits / series.overdueLines so the
-// UI can flag the assumption without changing any math.
+// Past-due lines (genuine expected date < today) are REPROJECTED to
+// overdueReprojectOffset(part) days out — never credited as already
+// arrived — and surfaced via series.overdueUnits / series.overdueLines /
+// series.overdueReprojectDays so the UI can state the assumption.
 //
 // `opts.ignoreOverdue` (default false): when true, past-due lines are NOT
 // credited into receipts[] — the projection shows the "what if the late PO
 // never lands" world. overdueUnits / overdueLines are still reported so
-// callers can identify which lines drove the divergence. All existing
-// callers pass no opts and see byte-identical behavior.
+// callers can identify which lines drove the divergence.
+// `opts.overdueAsToday` (default false): restores the pre-fix day-0 clamp.
+// Audit-only; no render path sets it.
 function projectOnHand(part, days = 365, lines, opts = {}) {
   const series = [];
   let oh = part.onHand || 0;
   const receipts = new Array(days + 1).fill(0);
   let overdueAtZero = 0;
   const overdueLines = [];
+  // v-overdue-reproject: a past-due PO has NOT arrived. Crediting it on
+  // day 0 (the old behavior) put units on the shelf that aren't there and
+  // inflated every downstream cover number — the drawer could show 13d of
+  // cover on a part whose real shelf runway was 8d. Reproject instead.
+  const reprojOffset = overdueReprojectOffset(part);
   const accumReceipt = (ln, remaining, po) => {
     let offset;
     let isOverdue = false;
@@ -759,10 +879,13 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
     } else {
       expDate.setHours(0,0,0,0);
       offset = Math.round((expDate - TODAY) / DAY_MS);
-      // Past expected date → treat as arriving today (don't drop the receipt)
       if (offset < 0) {
         isOverdue = true;
-        offset = 0;
+        // Reproject to a confirmation grace window from TODAY rather than
+        // crediting it as already-landed. opts.overdueAsToday restores the
+        // pre-fix clamp and exists ONLY so the impact audit can measure
+        // before/after; no render path sets it.
+        offset = opts.overdueAsToday ? 0 : reprojOffset;
       }
     }
     // Credit the receipt UNLESS the caller asked to ignore overdue lines
@@ -777,6 +900,8 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
         qty: remaining,
         expected: ln.expectedDate,
         po: po ? (po.num || null) : null,
+        daysPastDue: Math.max(0, Math.round((TODAY - expDate) / DAY_MS)),
+        reprojectedOffset: offset,
       });
     }
   };
@@ -954,6 +1079,26 @@ function projectOnHand(part, days = 365, lines, opts = {}) {
   // callers (.map / .length / indexing / .findIndex) are unaffected.
   series.overdueUnits = overdueAtZero;
   series.overdueLines = overdueLines;
+  // How many days out a past-due receipt was reprojected to, so the drawer
+  // can state the assumption instead of hiding it.
+  series.overdueReprojectDays = opts.overdueAsToday ? 0 : reprojOffset;
+  // FIRST DIP — index of the first day the line goes below zero, or -1.
+  //
+  // daysUntilStockout reports lastPositive + 1: the LAST day on-hand is
+  // positive, which by design ignores a transient dip that recovers when
+  // a PO lands. That is the right answer for "when does this part finally
+  // run dry", and the wrong answer for "will the line stop next week" —
+  // and it is why the drawer could say 13d cover while the runway text
+  // said "no coverage Sep 28 - Oct 2" from the same series.
+  //
+  // Reprojecting past-due receipts makes these near-term dips REAL rather
+  // than papered over by a phantom day-0 credit, so surface the dip day
+  // as its own number. Additive: no existing consumer changes behavior.
+  let firstNeg = -1;
+  for (let i = 0; i < series.length; i++) {
+    if (series[i].oh < 0) { firstNeg = i; break; }
+  }
+  series.firstNegativeDay = firstNeg;
   return series;
 }
 
@@ -1504,12 +1649,14 @@ function _chainHardCutinSupply(members, chainOnPOLines) {
     if (!l || l.pn !== finalMember.pn) continue;
     const qty = Number(l.remaining) || 0;
     if (qty <= 0) continue;
-    // Bucket by day offset from today. Undated / overdue clamp to today's
-    // pile (matches projectOnHand's offset=0 clamp for overdue receipts).
+    // Bucket by day offset from today. Overdue lines REPROJECT to the
+    // confirmation grace window — same helper projectOnHand uses, so the
+    // drawer chart and this walk can never tell different stories about
+    // the same late PO (v-overdue-reproject).
     let offset = 0;
     if (l.expectedDate) {
       offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY_MS);
-      if (offset < 0) offset = 0;
+      if (offset < 0) offset = overdueReprojectOffset(finalMember);
     }
     if (offset > 365) continue;
     receiptsByDay.set(offset, (receiptsByDay.get(offset) || 0) + qty);
@@ -3946,7 +4093,12 @@ function evaluateChainHandoff(ci) {
     if (!member) continue;
     let offset = 0;
     if (l.expectedDate) offset = Math.round((l.expectedDate.getTime() - today.getTime()) / DAY);
-    if (offset < 0) offset = 0;
+    // v-overdue-reproject: a past-due line is not on the shelf. Same
+    // grace window projectOnHand uses, keyed on the member that owns it.
+    if (offset < 0) {
+      const ownerPart = partsByPn.get(l.pn) || succ;
+      offset = (typeof overdueReprojectOffset === "function") ? overdueReprojectOffset(ownerPart) : 1;
+    }
     receipts.push({
       key: String(l.poNum || "") + "|" + String(l.pn) + "|" + String(l.poId || ""),
       offset, pn: l.pn, qty, poNum: l.poNum || "", poId: l.poId || null,
