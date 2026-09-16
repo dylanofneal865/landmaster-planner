@@ -1177,7 +1177,14 @@ async function _fetchAllPartLocations() {
   while (true) {
     const { data, error } = await _supa
       .from("part_locations")
+      // ORDER BY IS LOAD-BEARING, not cosmetic. Each .range() call is a
+      // separate query with its own snapshot, and acumatica-sync rebuilds
+      // this whole table by delete+insert every 2 minutes, so without a
+      // total order the pages overlap and skip arbitrarily -- some bins
+      // arrive twice, others never. (pn, location) is unique per row.
       .select("pn, location, location_desc, qty, synced_at")
+      .order("pn", { ascending: true })
+      .order("location", { ascending: true })
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] part_locations fetch failed:", error);

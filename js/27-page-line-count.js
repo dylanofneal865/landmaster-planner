@@ -136,7 +136,7 @@ async function _lcLoad() {
   try {
     const [rowsRes, metaRes, countsRes, sessRes] = await Promise.all([
       _supa.from("line_float")
-        .select("pn, band_low, band_high, onhand_at_line, avail_at_line, allocated_at_line, released_float, check_delta, check_flag, avail_known, computed_at")
+        .select("pn, band_low, band_high, onhand_at_line, avail_at_line, allocated_at_line, released_float, check_delta, check_flag, avail_known, at_line, computed_at")
         .limit(5000),
       _supa.from("line_float_meta").select("data").eq("id", "current").maybeSingle(),
       // Newest 2000 counts. Reduced to latest-per-pn for the rows and
@@ -827,6 +827,11 @@ function _lcRowHtml(r) {
   const saving = !!LC_STATE.saving[pn];
   const lo = Math.round(band.low), hi = Math.round(band.high);
   const degenerate = r.avail_known === false;
+  // No row at the line at all, as opposed to a row with no availability.
+  // Both render without a low end, but only one of them means "we have
+  // no data for this part here" — and that one must say so, because 0-0
+  // otherwise reads as a confident "the line holds none of these".
+  const absent = r.at_line === false;
   const d = Number(r.check_delta) || 0;
 
   let verdictHtml = "";
@@ -854,9 +859,11 @@ function _lcRowHtml(r) {
       <td class="right num">${degenerate
         ? '<span class="dim" title="Available missing for this part — no allocation figure to compare against">n/a</span>'
         : `<span class="${r.check_flag ? "text-warn bold" : "dim"}">${d > 0 ? "+" : ""}${_lcNum(d, 1)}</span>`}</td>
-      <td class="mono bold">${degenerate
-        ? `<span class="text-warn" title="QtyAvailable missing at the line, so there is no low end. Treat this as on-hand only, not a band.">${hi} (no low)</span>`
-        : `${lo} &ndash; ${hi}`}${band.frozen ? '<span class="lc-frozen" title="Frozen by the open count session">&#10052;</span>' : ""}</td>
+      <td class="mono bold">${absent
+        ? `<span class="text-warn" title="This part has NO row at ${LC_LINE_WAREHOUSE}/${LC_LINE_LOCATION}. It is either issued from another location or missing from the location feed — this is not a statement that the line holds none.">no line row</span>`
+        : (degenerate
+          ? `<span class="text-warn" title="QtyAvailable missing at the line, so there is no low end. Treat this as on-hand only, not a band.">${hi} (no low)</span>`
+          : `${lo} &ndash; ${hi}`)}${band.frozen ? '<span class="lc-frozen" title="Frozen by the open count session">&#10052;</span>' : ""}</td>
       <td>
         <div class="row gap-sm" style="align-items:center">
           <input class="input num" type="number" min="0" step="1" style="width:78px"
@@ -928,7 +935,16 @@ function renderLineCount() {
   const loading = LC_STATE.rows === null || LC_STATE.loading;
   const all = LC_STATE.rows || [];
   const flaggedCount = all.filter(r => r.check_flag).length;
-  const availUnknown = all.filter(r => r.avail_known === false).length;
+  // Two distinct failures. `at_line === false` means the part has no row
+  // at WHI900/RMSTOR-LM at all (not stocked there, or the location feed
+  // dropped it — a truncated read of part_locations looks exactly like
+  // this). `at_line === true` with no availability means the row is
+  // there but QtyAvailableinLocation did not parse. Different causes,
+  // different fixes; one banner for both hid a real data-loss bug.
+  // at_line is undefined on pre-r3 rows — treat those as unknown rather
+  // than asserting either way.
+  const notAtLine = all.filter(r => r.at_line === false).length;
+  const availUnknown = all.filter(r => r.at_line !== false && r.avail_known === false).length;
   const name = (typeof _ccName === "function") ? _ccName() : "";
 
   main.innerHTML = `
@@ -986,7 +1002,8 @@ function renderLineCount() {
       ${_lcSessionHtml()}
 
       ${!name ? `<div class="lc-banner">Enter your name on the Inventory Reconciliation tab before counting &mdash; it is stamped on every count.</div>` : ""}
-      ${availUnknown > 0 ? `<div class="lc-banner">${availUnknown} part(s) have no QtyAvailable at the line, so they show an on-hand figure with no low end rather than a band. Those rows cannot read SHORT.</div>` : ""}
+      ${availUnknown > 0 ? `<div class="lc-banner">${availUnknown} part(s) have a row at the line but no QtyAvailable, so they show an on-hand figure with no low end rather than a band. Those rows cannot read SHORT.</div>` : ""}
+      ${notAtLine > 0 ? `<div class="lc-banner">${notAtLine} part(s) are consumed by open orders but have <strong>no location row at all</strong> at <span class="mono">${LC_LINE_WAREHOUSE}/${LC_LINE_LOCATION}</span>, so they read 0. Either they are issued from a different location, or the location feed is incomplete for them &mdash; do not read a count of 0 on those rows as agreement. If this number jumps between computes, the location read is coming back short; check the <span class="mono">[FETCH]</span> and <span class="mono">[LINE]</span> lines in the compute log.</div>` : ""}
 
       <div class="lc-toolbar">
         <input class="input" id="lc-filter" placeholder="Filter part or description..."

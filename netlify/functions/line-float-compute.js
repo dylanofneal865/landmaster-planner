@@ -97,7 +97,11 @@
 //     ADD COLUMN IF NOT EXISTS check_flag        boolean NOT NULL DEFAULT false,
 //     ADD COLUMN IF NOT EXISTS avail_known       boolean NOT NULL DEFAULT true,
 //     ADD COLUMN IF NOT EXISTS band_low          numeric NOT NULL DEFAULT 0,
-//     ADD COLUMN IF NOT EXISTS band_high         numeric NOT NULL DEFAULT 0;
+//     ADD COLUMN IF NOT EXISTS band_high         numeric NOT NULL DEFAULT 0,
+//     -- r3: does the part have a row at the line AT ALL? Distinguishes
+//     -- "not stocked / feed dropped it" from "row present, availability
+//     -- column missing" — the two used to be one flag.
+//     ADD COLUMN IF NOT EXISTS at_line           boolean NOT NULL DEFAULT false;
 //
 //   -- units_on_line is OBSOLETE (units now come from production_orders).
 //   -- Left in place so nothing 404s mid-deploy; drop when convenient:
@@ -185,12 +189,35 @@ const { createClient } = require("@supabase/supabase-js");
 
 const MAX_DEPTH = 64;   // hard stop; real trees are <10 deep
 
-async function _fetchAll(supa, table, cols, filter) {
+// Paged read of an entire table.
+//
+// `orderBy` IS NOT OPTIONAL, and the columns given must form a TOTAL
+// order (i.e. be unique together). Offset pagination over an UNORDERED
+// query is silently lossy: each .range() call is its own query with its
+// own snapshot, Postgres makes no promise about row order without an
+// ORDER BY, and acumatica-sync DELETEs and re-INSERTs every
+// part_locations row every two minutes — which rewrites the heap and so
+// changes physical order wholesale. A compute paging through that
+// straddles the rewrite and gets some rows twice and others never. That
+// is exactly how part 18051's RMSTOR-LM row could exist in Acumatica and
+// in part_locations and still be missing from the band, and why the
+// "no QtyAvailable" count wandered between runs with no data change.
+//
+// Ordering fixes the ordering half. The remaining hazard is that the
+// table is genuinely INCOMPLETE mid-rewrite (rows deleted, not yet
+// re-inserted), so the caller also gets a count check below.
+async function _fetchAll(supa, table, cols, orderBy, filter) {
+  const order = Array.isArray(orderBy) ? orderBy : [orderBy];
+  if (order.length === 0 || order.some(c => !c)) {
+    throw new Error(`_fetchAll(${table}) needs an explicit, unique orderBy — offset paging without one drops rows`);
+  }
   const all = [];
   const PAGE = 1000;
   let from = 0;
   while (true) {
-    let q = supa.from(table).select(cols).range(from, from + PAGE - 1);
+    let q = supa.from(table).select(cols);
+    for (const c of order) q = q.order(c, { ascending: true });
+    q = q.range(from, from + PAGE - 1);
     if (typeof filter === "function") q = filter(q);
     const { data, error } = await q;
     if (error) throw new Error(`fetch ${table} failed: ${error.message}`);
@@ -200,6 +227,37 @@ async function _fetchAll(supa, table, cols, filter) {
     from += PAGE;
   }
   return all;
+}
+
+// Fetch a whole table and prove we got all of it.
+//
+// Reads the exact row count first, pages, then compares. A short read
+// means the table was being rewritten underneath us (acumatica-sync
+// runs every 2 minutes and rebuilds part_locations by delete+insert);
+// one retry almost always lands in a quiet window. If it still does not
+// match, the caller is TOLD rather than silently handed a partial band —
+// a band computed from a partial location table understates on-hand and
+// invents shortages, which is worse than no band at all.
+async function _fetchAllVerified(supa, table, cols, orderBy, log) {
+  let expected = null;
+  try {
+    const { count, error } = await supa.from(table).select(orderBy[0] || "*", { count: "exact", head: true });
+    if (!error && Number.isFinite(count)) expected = count;
+  } catch (_) { /* count is a nicety; pagination still runs */ }
+
+  let rows = await _fetchAll(supa, table, cols, orderBy);
+  if (expected !== null && rows.length < expected) {
+    log(`[FETCH] ${table}: read ${rows.length} of ${expected} row(s) — the table was being rewritten mid-read; retrying once`);
+    rows = await _fetchAll(supa, table, cols, orderBy);
+    const { count: after } = await supa.from(table).select(orderBy[0] || "*", { count: "exact", head: true });
+    if (Number.isFinite(after) && rows.length < after) {
+      throw new Error(
+        `${table} read short twice (${rows.length} of ${after}) — refusing to compute a band from a partial location table. ` +
+        `This is usually a long-running acumatica-sync rewrite; re-run in a minute.`
+      );
+    }
+  }
+  return rows;
 }
 
 /* ------------------------------------------------------------------
@@ -367,13 +425,21 @@ async function runLineFloat(event) {
 
   let bomRows, prodRows, locRows;
   try {
+    // Every one of these is ordered by a UNIQUE key. See _fetchAll —
+    // offset paging without a total order silently drops rows, which is
+    // how a part with real line stock showed up as a 0-0 band.
     [bomRows, prodRows, locRows] = await Promise.all([
-      _fetchAll(supa, "bom_links", "id, data"),
-      _fetchAll(supa, "production_orders", "id, data"),
-      // Only the line location. warehouse is nullable on rows written
-      // before the v-line-count schema addition, so the warehouse test
-      // is applied in JS rather than as a .eq() that would drop them.
-      _fetchAll(supa, "part_locations", "pn, location, location_raw, warehouse, qty, qty_available, synced_at"),
+      _fetchAll(supa, "bom_links", "id, data", ["id"]),
+      _fetchAll(supa, "production_orders", "id, data", ["id"]),
+      // warehouse is nullable on rows written before the v-line-count
+      // schema addition, so the warehouse test is applied in JS rather
+      // than as a .eq() that would drop them. (pn, location) is unique:
+      // acumatica-sync builds each pn's rows from a Map keyed by
+      // warehouse|location, and prefixes the warehouse into `location`
+      // whenever a pn spans more than one.
+      _fetchAllVerified(supa, "part_locations",
+        "pn, location, location_raw, warehouse, qty, qty_available, synced_at",
+        ["pn", "location"], log),
     ]);
   } catch (err) {
     log("input fetch failed: " + err.message);
@@ -527,8 +593,17 @@ async function runLineFloat(event) {
   const availByPn = new Map();     // pn -> { avail, onhand, availIsFallback }
   const locSeen = new Set();
   let locRowsAtLine = 0, availFallbacks = 0;
+  // Duplicate guard. availByPn ACCUMULATES across rows (a pn can legitimately
+  // hold stock in several bins), so a row counted twice silently inflates
+  // on-hand. Paging used to be able to hand back the same row twice; it no
+  // longer can, and this makes sure of it instead of trusting it.
+  const seenRowKeys = new Set();
+  let dupeRows = 0;
   for (const r of (locRows || [])) {
     if (!r || !r.pn) continue;
+    const rowKey = r.pn + " " + String(r.location || "");
+    if (seenRowKeys.has(rowKey)) { dupeRows++; continue; }
+    seenRowKeys.add(rowKey);
     const rawLoc = String(r.location_raw || r.location || "").trim();
     if (!rawLoc || rawLoc === "__warehouse__") continue;
     locSeen.add(rawLoc);
@@ -549,7 +624,10 @@ async function runLineFloat(event) {
     else availByPn.set(r.pn, { avail, onhand, availIsFallback });
     locRowsAtLine++;
   }
-  log(`[LINE] ${LINE_WAREHOUSE}/${LINE_LOCATION}: ${locRowsAtLine} part row(s); ${availFallbacks} fell back to OnHand for lack of qty_available`);
+  if (dupeRows > 0) {
+    log(`[LINE] WARNING: ${dupeRows} duplicate (pn, location) row(s) came back from part_locations and were ignored — paging or the sync is emitting the same bin twice`);
+  }
+  log(`[LINE] ${LINE_WAREHOUSE}/${LINE_LOCATION}: ${locRowsAtLine} part row(s); ${availFallbacks} fell back to OnHand for lack of qty_available (of ${(locRows || []).length} part_locations row(s) read across ${locSeen.size} location(s))`);
   if (locRowsAtLine > 0 && availFallbacks === locRowsAtLine) {
     log(`[LINE] WARNING: qty_available is null on EVERY ${LINE_LOCATION} row — band_high is running on On Hand, not Available. Confirm QtyAvailableinLocation is parsing in acumatica-sync (it logs coverage each run).`);
   }
@@ -637,6 +715,16 @@ async function runLineFloat(event) {
       check_delta: Math.round(checkDelta * 10000) / 10000,
       check_flag: checkFlag,
       avail_known: availKnown,
+      // TWO DIFFERENT FAILURES, previously indistinguishable downstream.
+      //   at_line=false  -> the part has NO row at WHI900/RMSTOR-LM at all.
+      //                     Either it is genuinely not stocked there, or the
+      //                     location feed dropped it. Everything reads 0.
+      //   at_line=true, avail_known=false
+      //                  -> the row exists, but QtyAvailableinLocation did
+      //                     not parse, so there is no low end.
+      // Collapsing both into avail_known is what let a truncated read of
+      // part_locations look like a column-parsing problem.
+      at_line: !!av,
       band_low: Math.round(bandLow * 10000) / 10000,
       band_high: Math.round(bandHigh * 10000) / 10000,
       qty_per_unit: rec ? rec.byModel : {},
