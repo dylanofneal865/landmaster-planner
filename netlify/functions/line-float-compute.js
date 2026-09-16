@@ -263,7 +263,18 @@ function tracePaths(adjacency, isParent, fg, target, maxPaths) {
   return found;
 }
 
-exports.handler = async (event) => {
+/* ------------------------------------------------------------------
+   SHARED RUNNER. Exported so the unscheduled HTTP wrapper
+   (line-float-run.js) can invoke the identical computation.
+
+   WHY THE SPLIT: Netlify does not route HTTP requests to a function
+   that carries a `schedule` in netlify.toml — it answers 403 "Access
+   denied". That is why ?dry=1 on THIS function is unreachable from a
+   browser no matter what the handler does. Same shape the repo already
+   uses for po-receipts: acumatica-po-receipts-sync.js is an unscheduled
+   shared runner with thin scheduled wrappers around it.
+   ------------------------------------------------------------------ */
+async function runLineFloat(event) {
   const t0 = Date.now();
   const log = (m, d) => console.log(`[line-float] ${m}`, d === undefined ? "" : d);
   const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
@@ -549,4 +560,11 @@ exports.handler = async (event) => {
     statusCode: 200,
     body: JSON.stringify({ ok: true, written, meta, explain, elapsedMs: Date.now() - t0 }, null, 2),
   };
-};
+}
+
+// Scheduled entry point (cron only — Netlify 403s HTTP to this).
+// Browser/manual access goes through line-float-run.js.
+exports.handler = async (event) => runLineFloat(event);
+
+// Shared runner for the unscheduled HTTP wrapper.
+exports.runLineFloat = runLineFloat;
