@@ -192,6 +192,20 @@ exports.handler = async (event) => {
     }
     const sortedTags = [...tagNames].sort();
     log(`[LOC-DIAG] first-entry columns (${sortedTags.length}): ${sortedTags.join(", ")}`);
+    // v-line-count: qty_available came back null on every part_locations
+    // row in the first live run, so QtyAvailableinLocation is either
+    // absent from the GI or named differently. Print EVERY qty-ish and
+    // availability-ish column the GI actually returns, so the correct
+    // name can be mapped from evidence instead of guessed. Cheap: one
+    // line, first entry only, every run.
+    const qtyish = sortedTags.filter(t => /qty|quantity|avail|onhand|on_hand/i.test(t));
+    log(`[LOC-DIAG] qty/availability columns present (${qtyish.length}): ${qtyish.join(", ") || "<none>"}`);
+    const availInLoc = sortedTags.filter(t => /avail/i.test(t) && /loc/i.test(t));
+    if (availInLoc.length === 0) {
+      log(`[LOC-DIAG] NO column matches /avail/i AND /loc/i — the GI does not expose per-LOCATION availability under any name. band_low cannot come from Acumatica until that column is added to the LM Planner Inventory GI; every band is currently degrading to the on-hand point.`);
+    } else if (!availInLoc.includes("QtyAvailableinLocation")) {
+      log(`[LOC-DIAG] per-location availability IS present but NOT under the name this sync parses. Expected "QtyAvailableinLocation"; GI returns: ${availInLoc.join(", ")}. Map one of those.`);
+    }
     const anyLocationTag = sortedTags.some(t => /location/i.test(t) || /^siteid$/i.test(t) || /^bin/i.test(t));
     if (anyLocationTag) {
       log(`[LOC-DIAG] location-like column(s) detected in first-entry tag set. Confirm with the row-count check below.`);
@@ -253,6 +267,9 @@ exports.handler = async (event) => {
   // reads as a bin list.
   const physicalByPn = new Map();
   const locByPn = new Map();
+  // Which of AVAIL_LOC_CANDIDATES actually matched, reported once per run
+  // so the working field name is recorded rather than re-guessed.
+  let availFieldUsed = null;
   for (const raw of entries) {
     const { get, isNull } = makeFieldGetters(raw);
 
@@ -306,7 +323,28 @@ exports.handler = async (event) => {
     // whenever they disagree at RMSTOR-LM. Null-tolerant: a GI that
     // hasn't got the column yet leaves qty_available null and every
     // consumer falls back to qty (On Hand) rather than reading 0.
-    const locAvailStr = isNull("QtyAvailableinLocation") ? null : get("QtyAvailableinLocation");
+    // Candidate names for per-location availability. The GI's real column
+    // name is confirmed by the [LOC-DIAG] qty/availability line logged
+    // above; these cover the spellings Acumatica uses across GI versions
+    // (user-added columns arrive with a leading underscore). First hit
+    // wins; null when none match, which degrades the band visibly rather
+    // than inventing a number.
+    const AVAIL_LOC_CANDIDATES = [
+      "QtyAvailableinLocation", "_QtyAvailableinLocation",
+      "QtyAvailableInLocation", "_QtyAvailableInLocation",
+      "QtyAvailable", "_QtyAvailable",
+      "AvailableQtyinLocation", "QtyAvailLocation",
+    ];
+    let locAvailStr = null;
+    for (const cand of AVAIL_LOC_CANDIDATES) {
+      if (isNull(cand)) continue;
+      const v = get(cand);
+      if (v !== undefined && v !== null && String(v).trim() !== "") {
+        locAvailStr = v;
+        if (!availFieldUsed) { availFieldUsed = cand; }
+        break;
+      }
+    }
     const locAvailRaw = locAvailStr === null ? null : parseFloat(locAvailStr);
     const locAvail = (locAvailRaw !== null && isFinite(locAvailRaw)) ? locAvailRaw : null;
     const key = warehouse + "|" + location;
@@ -586,9 +624,9 @@ exports.handler = async (event) => {
         if (gap > lineWidest) { lineWidest = gap; lineWidestPn = r.pn; }
       }
     }
-    log(`[LOC] QtyAvailableinLocation coverage: ${withAvail}/${real.length} location row(s) parsed a value`);
+    log(`[LOC] per-location availability: ${withAvail}/${real.length} row(s) parsed a value${availFieldUsed ? ` via GI column "${availFieldUsed}"` : ""}`);
     if (real.length > 0 && withAvail === 0) {
-      log(`[LOC] WARNING: QtyAvailableinLocation parsed on ZERO rows. The column is missing or renamed on the LM Planner Inventory GI — qty_available is null everywhere and any Line Count band built on it would be wrong. Check the first-entry tag list above for the real column name.`);
+      log(`[LOC] WARNING: per-location availability parsed on ZERO rows — none of the candidate column names matched. qty_available is null everywhere, so the Line Count band degrades to the on-hand point (band_low == band_high) and cannot flag SHORT. See the [LOC-DIAG] qty/availability line above for the columns this GI actually returns, and add the right one to AVAIL_LOC_CANDIDATES.`);
     }
     log(`[LOC] distinct locations seen: ${locSet.size}${locSet.size > 1 && locSet.size <= 25 ? " — " + [...locSet].sort().join(", ") : ""}`);
     log(`[LOC] ${LINE_WAREHOUSE}/${LINE_LOCATION}: ${lineRows.length} part row(s); Available differs from OnHand on ${lineDiffer}${lineWidest ? `, widest gap ${lineWidest.toFixed(1)} on ${lineWidestPn}` : ""}`);

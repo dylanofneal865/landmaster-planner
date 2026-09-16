@@ -348,25 +348,45 @@ async function runLineFloat(event) {
      an explicit single-row select instead of the paginating _fetchAll,
      and each wrapped so a timeout is survivable.
      ---------------------------------------------------------------- */
-  async function latestAuditTs(type) {
-    try {
-      const { data, error } = await supa
-        .from("audit")
-        .select("data")
-        .eq("data->>type", type)
-        .order("data->>ts", { ascending: false })
-        .limit(1);
-      if (error) { log(`as-of stamp for ${type} unavailable: ${error.message}`); return null; }
-      return (data && data[0] && data[0].data && data[0].data.ts) || null;
-    } catch (err) {
-      log(`as-of stamp for ${type} threw (non-fatal): ${err && err.message}`);
-      return null;
+  // ONE bounded query on the PRIMARY KEY, then filter in JS. The previous
+  // shape used .eq("data->>type", …).order("data->>ts", …), which is an
+  // unindexed jsonb filter AND an unindexed jsonb sort over the entire
+  // audit history — slow at best, and it returned nothing here (both
+  // stamps came back null in the live run even though the type strings
+  // are correct). Audit ids are `audit_<something>_<epochMillis>_<rand>`,
+  // so descending id order is descending time order for same-length
+  // epochs; taking the newest slice and scanning it in JS needs no jsonb
+  // operators at all. Still fully non-fatal: these are display-only.
+  let bomPulledAtRaw = null, prodSyncedAtRaw = null;
+  try {
+    const { data, error } = await supa
+      .from("audit")
+      .select("id, data")
+      .order("id", { ascending: false })
+      .limit(750);
+    if (error) {
+      log(`as-of stamps unavailable (non-fatal): ${error.message}`);
+    } else {
+      const newestOfType = (type) => {
+        let best = null;
+        for (const r of (data || [])) {
+          const d = r && r.data;
+          if (!d || d.type !== type) continue;
+          const ts = d.ts || null;
+          if (ts && (!best || ts > best)) best = ts;
+        }
+        return best;
+      };
+      bomPulledAtRaw = newestOfType("acumatica-bom-sync");
+      prodSyncedAtRaw = newestOfType("acumatica-production-orders-sync");
+      const typesSeen = [...new Set((data || []).map(r => r && r.data && r.data.type).filter(Boolean))];
+      if (!bomPulledAtRaw || !prodSyncedAtRaw) {
+        log(`as-of stamp missing (bom=${bomPulledAtRaw || "null"}, prodOrders=${prodSyncedAtRaw || "null"}). Types present in the newest ${data ? data.length : 0} audit rows: [${typesSeen.join(", ")}]`);
+      }
     }
+  } catch (err) {
+    log(`as-of stamps threw (non-fatal): ${err && err.message}`);
   }
-  const [bomPulledAtRaw, prodSyncedAtRaw] = await Promise.all([
-    latestAuditTs("acumatica-bom-sync"),
-    latestAuditTs("acumatica-production-orders-sync"),
-  ]);
 
   const bomPulledAt = bomPulledAtRaw;
   const anomalies = [];
@@ -409,21 +429,36 @@ async function runLineFloat(event) {
   const statusCounts = Object.create(null);
   const byModel = new Map();   // sku -> { units, orders, desc }
   let releasedOrders = 0;
+  // production_orders stores SNAKE_CASE keys (fg_sku, qty_remaining,
+  // fg_description) — see the `const data = {...}` block in
+  // acumatica-production-orders-sync.js. Reading camelCase here silently
+  // yielded undefined for every field EXCEPT status, whose key happens to
+  // match both ways: the status counter looked healthy while every row
+  // was dropped at the sku check. Accept both spellings so neither a
+  // future rename nor this mistake can repeat silently, and COUNT the
+  // drops so a mismatch is loud instead of reading as "nothing on line".
+  let droppedNoSku = 0;
+  const sampleKeys = new Set();
   for (const r of (prodRows || [])) {
     const d = r && r.data ? r.data : r;
     if (!d) continue;
+    if (sampleKeys.size === 0) for (const k of Object.keys(d)) sampleKeys.add(k);
     const st = String(d.status || "").trim();
     statusCounts[st || "<empty>"] = (statusCounts[st || "<empty>"] || 0) + 1;
     if (!ON_LINE_STATUSES.has(normStatus(st))) continue;
-    const sku = String(d.fgSku || "").trim();
-    if (!sku) continue;
-    const rem = Number(d.qtyRemaining);
+    const sku = String(d.fg_sku || d.fgSku || "").trim();
+    if (!sku) { droppedNoSku++; continue; }
+    const remRaw = (d.qty_remaining !== undefined) ? d.qty_remaining : d.qtyRemaining;
+    const rem = Number(remRaw);
     const n = Number.isFinite(rem) ? rem : 0;
     let rec = byModel.get(sku);
-    if (!rec) { rec = { units: 0, orders: 0, desc: d.fgDesc || "" }; byModel.set(sku, rec); }
+    if (!rec) { rec = { units: 0, orders: 0, desc: d.fg_description || d.fgDesc || "" }; byModel.set(sku, rec); }
     rec.units += n;
     rec.orders += 1;
     releasedOrders++;
+  }
+  if (droppedNoSku > 0) {
+    log(`[LINE] WARNING: ${droppedNoSku} on-line order(s) dropped for having no FG SKU. Keys present on a production_orders row: [${[...sampleKeys].join(", ")}] — if fg_sku is absent or null there, the production-orders GI field mapping is the problem, not this function.`);
   }
   const units = [...byModel.entries()].map(([sku, rec]) => ({ sku, units: rec.units, orders: rec.orders, desc: rec.desc }));
   for (const u of units) {
