@@ -1058,10 +1058,13 @@ function bbuCommitImport() {
   let newlyClassifiedApplied = 0;
   let reRatedApplied = 0;
   let reRatedUnchanged = 0;
+  let skippedRateStep = 0;
 
   for (const b of buckets.newlyClassified) {
     const part = b.part;
     if (!part) continue;
+    // v-ratestep-drawer: a declared step outranks a bulk trailing average.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) { skippedRateStep++; continue; }
     part.itemType = "base_bom";
     part.daily = b.newDaily;
     newlyClassifiedApplied++;
@@ -1069,10 +1072,15 @@ function bbuCommitImport() {
   for (const b of buckets.reRated) {
     const part = b.part;
     if (!part) continue;
+    // v-ratestep-drawer: a declared step outranks a bulk trailing average.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) { skippedRateStep++; continue; }
     const old = Number(part.daily) || 0;
     if (Math.abs(b.newDaily - old) < 0.0001) { reRatedUnchanged++; continue; }
     part.daily = b.newDaily;
     reRatedApplied++;
+  }
+  if (skippedRateStep > 0) {
+    console.info(`[bbu-import] skipped ${skippedRateStep} part(s) with a scheduled rate change — clear the step in the part drawer to resume bulk rating`);
   }
 
   logAudit(
@@ -1135,7 +1143,7 @@ function bbuApplyPaste() {
   const divisor = mode === "monthly" ? 30 : 1;
   const baseBomPns = new Set(DB.parts.filter(p => p.itemType === "base_bom" && !isKit(p)).map(p => p.pn));
   const lines = txt.split(/\r?\n/);
-  let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0;
+  let updated = 0, skippedNotBaseBom = 0, skippedInvalid = 0, unchanged = 0, skippedRateStep = 0;
   for (const line of lines) {
     if (!line.trim()) continue;
     const cells = line.split(/\t|,/).map(s => s.trim());
@@ -1146,12 +1154,17 @@ function bbuApplyPaste() {
     if (!isFinite(raw) || raw < 0) { skippedInvalid++; continue; }
     const newDaily = raw / divisor;
     const part = DB.parts.find(p => p.pn === pn);
+    // v-ratestep-drawer: a declared step outranks a pasted bulk rate.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) { skippedRateStep++; continue; }
     const old = Number(part.daily) || 0;
     if (Math.abs(newDaily - old) < 0.0001) { unchanged++; continue; }
     part.daily = newDaily;
     updated++;
   }
-  logAudit("daily-bulk-edit", `Base BOM rates pasted: ${updated} updated, ${unchanged} unchanged, ${skippedNotBaseBom} not base_bom, ${skippedInvalid} invalid`, { mode });
+  if (skippedRateStep > 0) {
+    console.info(`[bbu-paste] skipped ${skippedRateStep} part(s) with a scheduled rate change — clear the step in the part drawer to resume bulk rating`);
+  }
+  logAudit("daily-bulk-edit", `Base BOM rates pasted: ${updated} updated, ${unchanged} unchanged, ${skippedNotBaseBom} not base_bom, ${skippedInvalid} invalid, ${skippedRateStep} scheduled-step`, { mode, skippedRateStep });
   saveDB();
   bumpStatusCache();
   closeModal();
@@ -1335,8 +1348,11 @@ function bulkApplyComputedDaily() {
   const demand = getAllDemand();
   let updated = 0;
   let skippedService = 0;
+  let skippedRateStep = 0;
   for (const part of DB.parts) {
     if (String(part.itemType || "").toLowerCase().trim() === "service") { skippedService++; continue; }
+    // v-ratestep-drawer: a declared step outranks the trailing average.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) { skippedRateStep++; continue; }
     const d = demand.get(part.pn);
     if (!d) continue;
     const newDaily = d.appliedDaily;
@@ -1652,10 +1668,13 @@ function recomputeDailyFromUsage() {
   }
   let updated = 0;
   let skippedService = 0;
+  let skippedRateStep = 0;
   for (const part of DB.parts) {
     // Service parts: daily is owned by the 06:00 UTC Acumatica sync.
     // Skip so this bulk recompute can't overwrite the auto-driven value.
     if (String(part.itemType || "").toLowerCase().trim() === "service") { skippedService++; continue; }
+    // v-ratestep-drawer: a declared step outranks a bulk recompute.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) { skippedRateStep++; continue; }
     const total = map[part.pn] || 0;
     const newDaily = round(total / Math.max(1, days), 4);
     if (newDaily > 0 && Math.abs(newDaily - (part.daily || 0)) > 0.005) {
@@ -1663,7 +1682,8 @@ function recomputeDailyFromUsage() {
       updated++;
     }
   }
-  logAudit("daily-recalc", `Recomputed calendar daily-use rates from ${days}-day usage history (${updated} parts updated, ${skippedService} service skipped)`);
+  logAudit("daily-recalc", `Recomputed calendar daily-use rates from ${days}-day usage history (${updated} parts updated, ${skippedService} service skipped, ${skippedRateStep} scheduled-step skipped)`);
+  if (skippedRateStep > 0) console.info(`[daily-recalc] skipped ${skippedRateStep} part(s) with a scheduled rate change — clear the step in the part drawer to resume recompute`);
   saveDB();
   bumpStatusCache();
   autoSyncExcel();

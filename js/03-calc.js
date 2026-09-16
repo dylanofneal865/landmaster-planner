@@ -338,6 +338,41 @@ function hasActiveRateStep(part) {
   return !!(eff && eff.getTime() > TODAY.getTime());
 }
 
+/* ------------------------------------------------------------------
+   RATE-STEP PROTECTION — v-ratestep-drawer.
+
+   A rateStep is an OPERATOR STATEMENT about the future: "this part
+   drops to 1.24/day on 11/2". The trailing kit-sales average is
+   exactly the thing that statement overrides, and that average stays
+   polluted by the old volume for weeks after the date passes. So any
+   BULK recompute that would blindly stamp the trailing number over a
+   declared step must skip the part instead.
+
+   Protection covers a step whose date is still in the FUTURE **and**
+   one that has already passed but whose rateStep is still present —
+   the post-date window is precisely when the trailing average is most
+   wrong. The override holds until an operator clears it from the part
+   drawer, which deletes rateStep and lets demand recompute resume.
+
+   bpApplyRates (Build Plan Apply) is NOT gated here — it owns its own
+   steps and deliberately rewrites/clears them; see its header.
+   ------------------------------------------------------------------ */
+function isRateStepProtected(part) {
+  const rs = part && part.rateStep;
+  return !!(rs && rs.prevDaily != null && rs.effectiveDate);
+}
+
+// "12.28 → 1.24 on 11/2" for a step that hasn't taken effect yet;
+// "" once it has (the tile then just shows the live rate).
+function rateStepLabel(part) {
+  if (!hasActiveRateStep(part)) return "";
+  const rs = part.rateStep;
+  const eff = (typeof parseDateLocal === "function") ? parseDateLocal(rs.effectiveDate) : null;
+  const when = eff ? ((eff.getMonth() + 1) + "/" + eff.getDate()) : String(rs.effectiveDate);
+  const f = (n) => (typeof fmtNum === "function") ? fmtNum(n, 2) : String(Math.round(Number(n) * 100) / 100);
+  return `${f(rs.prevDaily)} → ${f(part.daily)} on ${when}`;
+}
+
 // ----- Shared "is this PO line actually open?" gate -------------------------
 //
 // The PO Lines GI was changed to also feed back received / closed lines so

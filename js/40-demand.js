@@ -77,15 +77,26 @@ function bumpDemandCache() {
 function applyDemandToParts() {
   const demand = getAllDemand();
   let updated = 0;
+  let skippedRateStep = 0;
   for (const part of DB.parts) {
     const d = demand.get(part.pn);
     if (!d) continue;
+    // v-ratestep-drawer: a declared rate step overrides the trailing
+    // kit-sales average by definition — never let the average stamp
+    // back over it. Holds until cleared from the part drawer.
+    if (typeof isRateStepProtected === "function" && isRateStepProtected(part)) {
+      skippedRateStep++;
+      continue;
+    }
     const newDaily = d.appliedDaily;
     const oldDaily = Number(part.daily) || 0;
     if (newDaily !== oldDaily) {
       part.daily = newDaily;
       updated++;
     }
+  }
+  if (skippedRateStep > 0) {
+    console.info(`[demand] skipped ${skippedRateStep} part(s) with a scheduled rate change — clear the step in the part drawer to resume demand recompute`);
   }
   return updated;
 }

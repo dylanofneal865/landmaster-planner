@@ -266,6 +266,25 @@ function renderPartDetail(part) {
     `;
   }
 
+  // v-ratestep-drawer: RATE-STEP marker — vertical dashed line on the day
+  // the declared rate change takes effect, so the kink in the curve has a
+  // visible cause. Same neutral t3 styling as the handoff marker (this is
+  // informational, not alarming). Absent for every part without an active
+  // future step.
+  let rateStepMarker = "";
+  if (typeof hasActiveRateStep === "function" && hasActiveRateStep(part)) {
+    const _rsEff = (typeof parseDateLocal === "function") ? parseDateLocal(part.rateStep.effectiveDate) : null;
+    const _rsDay = _rsEff ? Math.round((_rsEff.getTime() - TODAY.getTime()) / DAY_MS) : null;
+    if (_rsDay != null && _rsDay >= 0 && _rsDay <= horizon) {
+      const rx = xS(_rsDay);
+      rateStepMarker = `
+        <line x1="${rx}" y1="${PT}" x2="${rx}" y2="${H-PB}" stroke="var(--t3)" stroke-width="1" stroke-dasharray="4 2" opacity="0.7"/>
+        <text x="${rx + 4}" y="${PT + 34}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">rate ${fmtNum(part.rateStep.prevDaily, 2)} &#8594; ${fmtNum(part.daily, 2)}/day</text>
+        <text x="${rx + 4}" y="${PT + 46}" fill="var(--t3)" font-size="9" font-family="var(--f-mono)">${fmtDate(_rsEff)}</text>
+      `;
+    }
+  }
+
   // PO receipt dots + labels. Two crowding rules:
   //   (a) if a dot is within 55px of the left gutter, anchor the label start
   //       at dot.x+6 so it can't land on the y-axis numbers or today line;
@@ -580,7 +599,7 @@ function renderPartDetail(part) {
   const overdueUnits = series.overdueUnits || 0;
   const overdueLines = series.overdueLines || [];
   const overdueBanner = overdueUnits > 0 ? `
-    <div class="tiny" style="margin-bottom:8px;color:var(--warn)">&#9888; ${overdueLines.length} PO${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes ${overdueLines.length === 1 ? 'it lands' : 'they land'} ${fmtNum(series.overdueReprojectDays || 0)} day${(series.overdueReprojectDays || 0) === 1 ? '' : 's'} late, not that ${overdueLines.length === 1 ? 'it has' : 'they have'} arrived. Shelf-only runway is ${fmtNum(Math.floor((Number(part.onHand) || 0) / Math.max(1e-9, Number(part.daily) || 0)))} workdays. Confirm with supplier.${
+    <div class="tiny" style="margin-bottom:8px;color:var(--warn)">&#9888; ${overdueLines.length} PO${overdueLines.length === 1 ? '' : 's'} past due (${fmtNum(overdueUnits)} units) — projection assumes ${overdueLines.length === 1 ? 'it lands' : 'they land'} ${fmtNum(series.overdueReprojectDays || 0)} day${(series.overdueReprojectDays || 0) === 1 ? '' : 's'} late, not that ${overdueLines.length === 1 ? 'it has' : 'they have'} arrived. Shelf-only runway is ${fmtNum(Math.floor((Number(part.onHand) || 0) / Math.max(1e-9, (typeof dailyOnDate === "function" ? dailyOnDate(part, TODAY) : Number(part.daily)) || 0)))} workdays. Confirm with supplier.${
       (series.firstNegativeDay != null && series.firstNegativeDay >= 0)
         ? ` <strong style="color:var(--crit)">Line goes below zero ${fmtDate(addDays(TODAY, series.firstNegativeDay))} (day ${fmtNum(series.firstNegativeDay)}) before ${overdueLines.length === 1 ? 'it arrives' : 'they arrive'} — the days-cover figure above reports the LAST day stock is positive and does not reflect this dip.</strong>`
         : ""
@@ -763,7 +782,10 @@ function renderPartDetail(part) {
         <div class="stat"><div class="stat-label">On PO</div><div class="stat-value ${onPO>0?'':'dim'}">${fmtNum(onPO)}</div></div>
         <div class="stat">
           <div class="stat-label">Daily Use</div>
-          <div class="stat-value">${fmtNum(dailySrc.daily, 2)}</div>
+          ${(typeof hasActiveRateStep === "function" && hasActiveRateStep(part) && !dailyInherited)
+            ? `<div class="stat-value" style="font-size:20px" title="Scheduled rate change — projections burn ${fmtNum(part.rateStep.prevDaily, 2)}/day on workdays until ${esc(part.rateStep.effectiveDate)}, then ${fmtNum(part.daily, 2)}/day.">${esc(rateStepLabel(part))}</div>
+               <div class="dim tiny" style="margin-top:2px">scheduled change &middot; burning ${fmtNum(part.rateStep.prevDaily, 2)} today</div>`
+            : `<div class="stat-value">${fmtNum(dailySrc.daily, 2)}</div>`}
           ${dailyInherited ? `<div class="dim tiny" style="margin-top:2px">from chain anchor ${esc(dailySrc.anchorPn)}</div>` : ''}
         </div>
         <div class="stat"><div class="stat-label">Days Cover</div><div class="stat-value ${status.status==='critical'?'crit':status.status==='warning'?'warn':'ok'}">${status.daysOfCover === Infinity ? '∞' : status.daysOfCover + 'd'}</div>${(() => { const s = stockoutDateStr(status.daysOfCover); return s ? `<div class="dim tiny mono" style="margin-top:2px">${s}</div>` : ''; })()}</div>
@@ -780,6 +802,7 @@ function renderPartDetail(part) {
           ${todayMark}
           ${leadLine}
           ${handoffMarker}
+          ${rateStepMarker}
           <path d="${areaPath}" class="spark-area" style="fill-opacity:0.08"/>
           ${gapBand}
           <path d="${linePath}" class="spark-line"/>
@@ -820,6 +843,23 @@ function renderPartDetail(part) {
             : (_svcOwned
               ? `<div class="muted tiny mt-xs">auto-computed from sales orders in the last 180 days — see the Service Usage tab</div>`
               : '')}
+          ${_dailyLocked ? '' : `
+            <div class="mt-xs" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+              <span class="muted tiny" style="white-space:nowrap">scheduled change:</span>
+              <input class="input num" type="number" min="0" step="0.01" id="pd-ratestep-daily"
+                     style="width:88px" placeholder="new rate"
+                     value="${(typeof hasActiveRateStep === "function" && hasActiveRateStep(part)) ? (part.daily || 0) : ''}">
+              <span class="muted tiny">effective</span>
+              <input class="input" type="date" id="pd-ratestep-date" style="width:150px"
+                     value="${(typeof hasActiveRateStep === "function" && hasActiveRateStep(part)) ? esc(String(part.rateStep.effectiveDate).slice(0, 10)) : ''}">
+              ${(part.rateStep && part.rateStep.effectiveDate) ? `
+                <label class="row" style="gap:5px;align-items:center;cursor:pointer" title="Clear the scheduled change on save. Before the effective date this restores the previous rate (${fmtNum(part.rateStep.prevDaily, 2)}/day); after it, the stepped-to rate stays and only the step record is removed.">
+                  <input type="checkbox" class="chk" id="pd-ratestep-clear">
+                  <span class="muted tiny">clear</span>
+                </label>` : ''}
+            </div>
+            <div class="muted tiny mt-xs">Leave blank for no scheduled change. While set, bulk demand recompute skips this part &mdash; the step is your statement about the future, not the trailing average.</div>
+          `}
         </div>
         <div class="field"><label>Unit Cost</label><input class="input num" type="number" min="0" step="0.01" id="pd-cost" value="${part.cost||0}"></div>
         <div class="field"><label>Lead Time (weeks)</label><input class="input num" type="number" min="0" step="0.5" id="pd-lt" value="${part.ltWeeks||0}"></div>
@@ -949,6 +989,64 @@ function savePartFromDetail(originalPn) {
   // `dailyInput` is already in scope from the gate-check block above.
   if (dailyInput && !dailyInput.disabled) {
     part.daily = Math.max(0, parseFloat(dailyInput.value) || 0);
+  }
+  // v-ratestep-drawer: scheduled rate change. Writes the SAME shape
+  // bpApplyRates writes — part.daily = the new rate, part.rateStep =
+  // { prevDaily: <the rate in force before the step>, effectiveDate }.
+  // Disabled for chain-inheriting parts alongside the daily field
+  // itself (the anchor is the single source of truth).
+  //
+  // Clear semantics differ by whether the step has taken effect:
+  //   before effectiveDate → the new rate was never in force, so
+  //     restore part.daily = prevDaily and drop the step.
+  //   on/after             → the new rate IS the live rate now;
+  //     keep it and drop only the step record.
+  if (dailyInput && !dailyInput.disabled) {
+    const rsQtyEl = document.getElementById("pd-ratestep-daily");
+    const rsDateEl = document.getElementById("pd-ratestep-date");
+    const rsClearEl = document.getElementById("pd-ratestep-clear");
+    const wantClear = !!(rsClearEl && rsClearEl.checked);
+    const rsDateRaw = rsDateEl ? String(rsDateEl.value || "").trim() : "";
+    const rsQtyRaw = rsQtyEl ? String(rsQtyEl.value || "").trim() : "";
+    const existing = part.rateStep || null;
+    const stepTookEffect = (() => {
+      if (!existing || !existing.effectiveDate) return false;
+      const d = (typeof parseDateLocal === "function") ? parseDateLocal(existing.effectiveDate) : null;
+      return !!(d && d.getTime() <= TODAY.getTime());
+    })();
+
+    if (wantClear || (existing && !rsDateRaw && !rsQtyRaw)) {
+      if (existing) {
+        if (!stepTookEffect && existing.prevDaily != null) {
+          part.daily = Math.max(0, Number(existing.prevDaily) || 0);
+        }
+        delete part.rateStep;
+        logAudit("rate-step", `${part.pn}: cleared scheduled rate change${stepTookEffect ? " (already in effect — kept current rate)" : ` (restored ${fmtNum(existing.prevDaily, 2)}/day)`}`, { pn: part.pn, cleared: true, stepTookEffect });
+      }
+    } else if (rsDateRaw && rsQtyRaw !== "") {
+      const newRate = Math.max(0, parseFloat(rsQtyRaw) || 0);
+      const effD = (typeof parseDateLocal === "function") ? parseDateLocal(rsDateRaw) : null;
+      if (!effD || isNaN(effD.getTime())) {
+        showToast("Scheduled change: effective date is not a valid date", "warn");
+      } else if (effD.getTime() <= TODAY.getTime()) {
+        showToast("Scheduled change: effective date must be in the future", "warn");
+      } else {
+        // prevDaily is whatever rate is in force TODAY — for a part that
+        // already carries an un-triggered step that's the existing
+        // prevDaily, not the stored daily (which is the stepped-TO rate).
+        const inForceToday = (existing && existing.prevDaily != null && !stepTookEffect)
+          ? Math.max(0, Number(existing.prevDaily) || 0)
+          : Math.max(0, Number(part.daily) || 0);
+        if (Math.abs(newRate - inForceToday) < 0.0001) {
+          // No real change — don't record a step that does nothing.
+          if (part.rateStep) delete part.rateStep;
+        } else {
+          part.daily = newRate;
+          part.rateStep = { prevDaily: inForceToday, effectiveDate: rsDateRaw };
+          logAudit("rate-step", `${part.pn}: scheduled rate change ${fmtNum(inForceToday, 2)} → ${fmtNum(newRate, 2)}/day effective ${rsDateRaw}`, { pn: part.pn, prevDaily: inForceToday, newDaily: newRate, effectiveDate: rsDateRaw });
+        }
+      }
+    }
   }
   // Stamp costUpdatedAt only when the cost actually changes — this is what
   // lets orderUnitCostSource() decide "newer wins" against the last PO date.
