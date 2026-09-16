@@ -11,34 +11,59 @@
 // (units on line) x (qty per unit) into a per-purchased-part line_float
 // estimate the Line & Shelf tab reads.
 //
-// THE BAND
-//   band_high = qty AVAILABLE at WHI900/RMSTOR-LM, straight from Acumatica
-//   band_low  = band_high - released_float, floored at 0
-//   released_float = sum over models(Released units x qty_per_unit)
-// A physical count of the location inside [band_low, band_high] is OK.
-// Below band_low is a real SHORT. Above band_high is OVER.
+// THE BAND  (corrected 2026-09-16 — Acumatica allocates on open orders)
+//   band_high = qty ON HAND  at WHI900/RMSTOR-LM  — the books; does not
+//               move until a unit completes
+//   band_low  = qty AVAILABLE at WHI900/RMSTOR-LM — books minus what is
+//               already allocated to open orders; floored at 0
+//   allocated = band_high - band_low
+// A physical count inside [band_low, band_high] is OK. Below band_low is
+// a real SHORT. Above band_high is OVER.
+//
+// The earlier shape had this inverted (Available as the high end, with
+// the BOM explosion subtracted to reach the low end). That double-counted
+// consumption: Acumatica's allocation ALREADY removes what open orders
+// have claimed, so subtracting the BOM float from it again pushed the low
+// end far too low and no count could ever read SHORT.
+//
+// THE BOM EXPLOSION IS NOW A CROSS-CHECK, NOT THE BAND SOURCE
+//   released_float = sum over models(units on line x qty_per_unit)
+//   check_delta    = (on_hand - available) - released_float
+//                  = what Acumatica says is allocated, minus what the BOM
+//                    says those open units should have consumed
+// Near zero means the two independent views agree. Materially nonzero
+// means missing BOM lines, partial allocation, or a stale sync — flagged
+// per row rather than folded into the band.
 //
 // INPUTS  (all existing; this function ingests nothing itself)
 //   bom_links              flat parent->child edges, written daily at
 //                          06:00 UTC by acumatica-bom-sync.js
 //   production_orders      hourly from acumatica-production-orders-sync.js.
-//                          "On the line" = status 'Released' EXACTLY, all
-//                          FG SKUs including UT1010xx frames (Dylan,
-//                          2026-09-16: frame builds also consume
-//                          RMSTOR-LM). Units per model = SUM(qty_remaining).
+//                          "On the line" = status Released OR In Process
+//                          (Dylan, 2026-09-16), all FG SKUs including
+//                          UT1010xx frames — frame builds also consume
+//                          RMSTOR-LM. Units per model = SUM(qty_remaining).
 //   part_locations         per-location rows from acumatica-sync.js.
+//                          qty = QtyOnHandinLocation is band_high;
 //                          qty_available = QtyAvailableinLocation is
-//                          band_high; qty = QtyOnHandinLocation is carried
-//                          alongside so the UI can show both.
+//                          band_low. Both are stored, and the gap between
+//                          them IS the allocation.
 //   audit                  latest acumatica-bom-sync row, for bom_pulled_at
 //
 // The manual units_on_line table is OBSOLETE — units now come from real
 // production orders. Do not populate it; nothing reads it.
 //
 // OUTPUTS
-//   line_float             one row per part: avail_at_line (band_high),
-//                          onhand_at_line, released_float, band_low, and
-//                          qty_per_unit broken out by FG model
+//   line_float             one row per part:
+//                            band_high / onhand_at_line  (books)
+//                            band_low  / avail_at_line   (books - alloc)
+//                            allocated_at_line           (high - low)
+//                            released_float              (BOM cross-check)
+//                            check_delta, check_flag     (the disagreement)
+//                            avail_known                 (false => band is
+//                                                         a single point;
+//                                                         Available missing)
+//                            qty_per_unit by FG model
 //   line_float_meta        single 'current' row: run stats + anomalies
 //
 // NEVER writes to Acumatica, parts, or on-hand. Counts and variances live
@@ -64,11 +89,15 @@
 //   );
 //   -- v-line-count band columns (safe to re-run):
 //   ALTER TABLE public.line_float
-//     ADD COLUMN IF NOT EXISTS avail_at_line   numeric,
-//     ADD COLUMN IF NOT EXISTS onhand_at_line  numeric,
-//     ADD COLUMN IF NOT EXISTS released_float  numeric NOT NULL DEFAULT 0,
-//     ADD COLUMN IF NOT EXISTS band_low        numeric NOT NULL DEFAULT 0,
-//     ADD COLUMN IF NOT EXISTS band_high       numeric NOT NULL DEFAULT 0;
+//     ADD COLUMN IF NOT EXISTS avail_at_line     numeric,
+//     ADD COLUMN IF NOT EXISTS onhand_at_line    numeric,
+//     ADD COLUMN IF NOT EXISTS allocated_at_line numeric,
+//     ADD COLUMN IF NOT EXISTS released_float    numeric NOT NULL DEFAULT 0,
+//     ADD COLUMN IF NOT EXISTS check_delta       numeric NOT NULL DEFAULT 0,
+//     ADD COLUMN IF NOT EXISTS check_flag        boolean NOT NULL DEFAULT false,
+//     ADD COLUMN IF NOT EXISTS avail_known       boolean NOT NULL DEFAULT true,
+//     ADD COLUMN IF NOT EXISTS band_low          numeric NOT NULL DEFAULT 0,
+//     ADD COLUMN IF NOT EXISTS band_high         numeric NOT NULL DEFAULT 0;
 //
 //   -- units_on_line is OBSOLETE (units now come from production_orders).
 //   -- Left in place so nothing 404s mid-deploy; drop when convenient:
@@ -289,26 +318,57 @@ async function runLineFloat(event) {
     auth: { autoRefreshToken: false, persistSession: false },
   });
 
-  let bomRows, prodRows, locRows, auditRows, prodAuditRows;
+  let bomRows, prodRows, locRows;
   try {
-    [bomRows, prodRows, locRows, auditRows, prodAuditRows] = await Promise.all([
+    [bomRows, prodRows, locRows] = await Promise.all([
       _fetchAll(supa, "bom_links", "id, data"),
       _fetchAll(supa, "production_orders", "id, data"),
       // Only the line location. warehouse is nullable on rows written
       // before the v-line-count schema addition, so the warehouse test
       // is applied in JS rather than as a .eq() that would drop them.
       _fetchAll(supa, "part_locations", "pn, location, location_raw, warehouse, qty, qty_available, synced_at"),
-      _fetchAll(supa, "audit", "id, data", qq =>
-        qq.eq("data->>type", "acumatica-bom-sync").order("data->>ts", { ascending: false }).limit(1)),
-      _fetchAll(supa, "audit", "id, data", qq =>
-        qq.eq("data->>type", "acumatica-production-orders-sync").order("data->>ts", { ascending: false }).limit(1)),
     ]);
   } catch (err) {
     log("input fetch failed: " + err.message);
     return { statusCode: 500, body: JSON.stringify({ error: "input fetch failed", detail: err.message }) };
   }
 
-  const bomPulledAt = (auditRows && auditRows[0] && auditRows[0].data && auditRows[0].data.ts) || null;
+  /* ----------------------------------------------------------------
+     AS-OF STAMPS — best effort, never fatal.
+
+     These were previously fetched inside the Promise.all above, which
+     made the whole compute fail if either query was slow or errored.
+     They are display-only timestamps for the tab header; the band does
+     not depend on them, so a failure here must degrade to "unknown"
+     rather than take the run down.
+
+     They are also the slowest queries in the function: `audit` has no
+     index on data->>type or data->>ts, so each one is an unindexed
+     jsonb scan-and-sort over the full audit history. Bounded now with
+     an explicit single-row select instead of the paginating _fetchAll,
+     and each wrapped so a timeout is survivable.
+     ---------------------------------------------------------------- */
+  async function latestAuditTs(type) {
+    try {
+      const { data, error } = await supa
+        .from("audit")
+        .select("data")
+        .eq("data->>type", type)
+        .order("data->>ts", { ascending: false })
+        .limit(1);
+      if (error) { log(`as-of stamp for ${type} unavailable: ${error.message}`); return null; }
+      return (data && data[0] && data[0].data && data[0].data.ts) || null;
+    } catch (err) {
+      log(`as-of stamp for ${type} threw (non-fatal): ${err && err.message}`);
+      return null;
+    }
+  }
+  const [bomPulledAtRaw, prodSyncedAtRaw] = await Promise.all([
+    latestAuditTs("acumatica-bom-sync"),
+    latestAuditTs("acumatica-production-orders-sync"),
+  ]);
+
+  const bomPulledAt = bomPulledAtRaw;
   const anomalies = [];
 
   // ---- edges ------------------------------------------------------
@@ -339,7 +399,13 @@ async function runLineFloat(event) {
   // consume RMSTOR-LM, so no SKU filter). Units per model =
   // SUM(qty_remaining) — what those open orders have left to build, which
   // is what is still sitting on the line.
-  const RELEASED_STATUS = "released";
+  // "On the line" = Released OR In Process (Dylan, 2026-09-16). Compared
+  // case- and separator-insensitively so "In Process", "InProcess" and
+  // "IN PROCESS" all match one entry. A status Acumatica renames drops
+  // out of this set silently, which is why the distinct-status counts are
+  // logged every run.
+  const ON_LINE_STATUSES = new Set(["released", "inprocess"]);
+  const normStatus = (s) => String(s || "").toLowerCase().replace(/[\s_-]+/g, "");
   const statusCounts = Object.create(null);
   const byModel = new Map();   // sku -> { units, orders, desc }
   let releasedOrders = 0;
@@ -348,7 +414,7 @@ async function runLineFloat(event) {
     if (!d) continue;
     const st = String(d.status || "").trim();
     statusCounts[st || "<empty>"] = (statusCounts[st || "<empty>"] || 0) + 1;
-    if (st.toLowerCase() !== RELEASED_STATUS) continue;
+    if (!ON_LINE_STATUSES.has(normStatus(st))) continue;
     const sku = String(d.fgSku || "").trim();
     if (!sku) continue;
     const rem = Number(d.qtyRemaining);
@@ -369,8 +435,8 @@ async function runLineFloat(event) {
     }
   }
   log(`[LINE] distinct Status values seen:`, statusCounts);
-  if (!Object.keys(statusCounts).some(s => s.toLowerCase() === RELEASED_STATUS)) {
-    log(`[LINE] WARNING: no production order carries status '${RELEASED_STATUS}'. Either nothing is on the line, or Acumatica renamed the status. Every band collapses to band_low == band_high while this holds.`);
+  if (!Object.keys(statusCounts).some(s => ON_LINE_STATUSES.has(normStatus(s)))) {
+    log(`[LINE] WARNING: no production order carries an on-line status (${[...ON_LINE_STATUSES].join(" / ")}). Either nothing is on the line, or Acumatica renamed a status — check the distinct list above. The BOM cross-check reads 0 for every part while this holds; the BAND itself is unaffected (it comes from Acumatica on-hand/available).`);
   }
 
   // ---- availability at the line location ---------------------------
@@ -431,43 +497,82 @@ async function runLineFloat(event) {
   log(`explosion: ${units.length} FG SKUs (${totalUnits} units on line) · ${perPart.size} purchased parts carry float · per-FG leaf counts ${JSON.stringify(perFgLeafCount)}`);
 
   // ---- band ---------------------------------------------------------
-  // band_high = Available at the line location. band_low = band_high -
-  // released_float, floored at 0. Union of "has stock at the line" and
-  // "has nonzero float" — a part can be in either set alone and still
-  // needs a row (float with no stock is exactly the anomaly below).
+  // band_high = ON HAND at the line (books). band_low = AVAILABLE at the
+  // line (books minus allocation), floored at 0. Both come straight from
+  // Acumatica; the BOM explosion no longer touches the band.
+  //
+  // The BOM result becomes an independent cross-check:
+  //   check_delta = allocated - released_float
+  //               = (on_hand - available) - (units on line x qty/unit)
+  // Flagged when |check_delta| > max(1, 5% of on_hand): that size of
+  // disagreement between Acumatica's allocation and the BOM's own
+  // arithmetic means missing BOM lines, partial allocation, or a stale
+  // sync — worth surfacing, never worth quietly folding into the band.
+  //
+  // Row set is the UNION of "has stock at the line" and "has nonzero
+  // float": a part in either set alone still needs a row.
+  const CHECK_ABS_FLOOR = 1;
+  const CHECK_PCT = 0.05;
   const allPns = new Set([...perPart.keys(), ...availByPn.keys()]);
   const bandRows = [];
-  let floatNoStock = 0;
+  let floatNoStock = 0, checkFlagged = 0, availMissing = 0;
   for (const pn of allPns) {
     const rec = perPart.get(pn);
     const av = availByPn.get(pn);
     const releasedFloat = rec ? rec.total : 0;
-    const bandHigh = av ? av.avail : 0;
-    const bandLow = Math.max(0, bandHigh - releasedFloat);
-    if (releasedFloat > 0 && (!av || av.avail === 0)) {
+    const onHand = av ? av.onhand : 0;
+    // Available is the low end. When the column is absent we cannot know
+    // the allocation, so the band degrades to a single point at on-hand
+    // and the row is marked — better a visibly unusable band than a
+    // confidently wrong one.
+    const availKnown = !!(av && !av.availIsFallback);
+    const available = av ? av.avail : 0;
+    if (av && !availKnown) availMissing++;
+    const bandHigh = onHand;
+    const bandLow = Math.max(0, Math.min(available, bandHigh));
+    const allocated = Math.max(0, bandHigh - bandLow);
+    const checkDelta = allocated - releasedFloat;
+    const checkThreshold = Math.max(CHECK_ABS_FLOOR, Math.abs(onHand) * CHECK_PCT);
+    const checkFlag = availKnown && Math.abs(checkDelta) > checkThreshold;
+    if (checkFlag) checkFlagged++;
+
+    if (releasedFloat > 0 && (!av || onHand === 0)) {
       floatNoStock++;
       anomalies.push({
         kind: "float-no-line-stock", parent: pn,
-        detail: `${pn} has released_float ${Math.round(releasedFloat * 100) / 100} but ${av ? "zero" : "no"} availability at ${LINE_WAREHOUSE}/${LINE_LOCATION} — band collapses to 0-0. Either it is issued from a different location or the location feed is incomplete for it; do NOT read a count of 0 here as agreement`,
+        detail: `${pn} is consumed by open orders (BOM float ${Math.round(releasedFloat * 100) / 100}) but has ${av ? "zero" : "no"} on-hand at ${LINE_WAREHOUSE}/${LINE_LOCATION} — band is 0-0. Either it is issued from a different location or the location feed is incomplete for it; do NOT read a count of 0 here as agreement`,
       });
     }
     bandRows.push({
       pn,
+      // line_float retained under its original name for any existing
+      // reader; released_float is the name the tab uses.
       line_float: Math.round(releasedFloat * 10000) / 10000,
       released_float: Math.round(releasedFloat * 10000) / 10000,
-      avail_at_line: av ? Math.round(av.avail * 10000) / 10000 : 0,
-      onhand_at_line: av ? Math.round(av.onhand * 10000) / 10000 : 0,
+      onhand_at_line: Math.round(onHand * 10000) / 10000,
+      avail_at_line: Math.round(available * 10000) / 10000,
+      allocated_at_line: Math.round(allocated * 10000) / 10000,
+      check_delta: Math.round(checkDelta * 10000) / 10000,
+      check_flag: checkFlag,
+      avail_known: availKnown,
       band_low: Math.round(bandLow * 10000) / 10000,
       band_high: Math.round(bandHigh * 10000) / 10000,
       qty_per_unit: rec ? rec.byModel : {},
       computed_at: new Date().toISOString(),
     });
   }
-  bandRows.sort((a, b) => b.released_float - a.released_float);
-  log(`[LINE] band: ${bandRows.length} part row(s); ${floatNoStock} have float but no stock at the line`);
-  log(`[LINE] top 20 by released_float:`);
+  // Sorted by the size of the cross-check disagreement — the rows most
+  // worth a human look sit at the top.
+  bandRows.sort((a, b) => Math.abs(b.check_delta) - Math.abs(a.check_delta));
+  log(`[LINE] band: ${bandRows.length} part row(s); ${floatNoStock} consumed but absent at the line; ${checkFlagged} cross-check flagged (|delta| > max(${CHECK_ABS_FLOOR}, ${CHECK_PCT * 100}% of on-hand)); ${availMissing} missing Available`);
+  log(`[LINE] top 20 by |check_delta| (allocated vs BOM float):`);
   for (const r of bandRows.slice(0, 20)) {
-    log(`[LINE]   ${r.pn.padEnd(14)} float ${String(r.released_float).padStart(9)}  avail ${String(r.avail_at_line).padStart(9)}  band ${r.band_low}-${r.band_high}`);
+    log(`[LINE]   ${r.pn.padEnd(14)} band ${r.band_low}-${r.band_high}  alloc ${String(r.allocated_at_line).padStart(8)}  bomFloat ${String(r.released_float).padStart(8)}  delta ${String(r.check_delta).padStart(9)}${r.check_flag ? "  << FLAG" : ""}`);
+  }
+  log(`[LINE] top 20 by released_float:`);
+  const byFloat = [...bandRows].sort((a, b) => b.released_float - a.released_float);
+  for (const r of byFloat.slice(0, 20)) {
+    log(`[LINE]   ${r.pn.padEnd(14)} float ${String(r.released_float).padStart(9)}  onhand ${String(r.onhand_at_line).padStart(9)}  avail ${String(r.avail_at_line).padStart(9)}  band ${r.band_low}-${r.band_high}`);
   }
   log(`anomalies: ${anomalies.length} (${["cycle","duplicate-bom","missing-fg-bom","leaf-also-parent","max-depth","float-no-line-stock"].map(k => `${k}=${anomalies.filter(a => a.kind === k).length}`).join(", ")})`);
 
@@ -503,11 +608,11 @@ async function runLineFloat(event) {
   const meta = {
     computed_at: new Date().toISOString(),
     bom_pulled_at: bomPulledAt,
-    prod_orders_synced_at: (prodAuditRows && prodAuditRows[0] && prodAuditRows[0].data && prodAuditRows[0].data.ts) || null,
+    prod_orders_synced_at: prodSyncedAtRaw,
     locations_synced_at: (locRows || []).reduce((m, r) => (r.synced_at && (!m || r.synced_at > m)) ? r.synced_at : m, null),
     line_warehouse: LINE_WAREHOUSE,
     line_location: LINE_LOCATION,
-    released_status: RELEASED_STATUS,
+    on_line_statuses: [...ON_LINE_STATUSES],
     edges: edges.length,
     raw_rows: bomRows.length,
     duplicate_pairs: dupePairs,
