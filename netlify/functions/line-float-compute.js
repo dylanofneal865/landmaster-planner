@@ -124,6 +124,53 @@
 //   CREATE INDEX IF NOT EXISTS shelf_counts_pn_counted_at_idx
 //     ON public.shelf_counts (pn, counted_at DESC);
 //
+//   -- ---- r2 MIGRATION (count sessions, recount confirmation) --------
+//   -- The band a count was graded against, frozen onto the count row
+//   -- itself; `miss` is the signed distance OUTSIDE the band (0 when
+//   -- the count landed inside). Whether a given miss is material is a
+//   -- render-time policy (LC_NOISE_* in js/27-page-line-count.js), so
+//   -- it is deliberately NOT stored -- retuning the noise floor
+//   -- re-grades history consistently instead of leaving a mix of rows
+//   -- judged under different thresholds.
+//   ALTER TABLE public.shelf_counts
+//     ADD COLUMN IF NOT EXISTS band_low     numeric,
+//     ADD COLUMN IF NOT EXISTS band_high    numeric,
+//     ADD COLUMN IF NOT EXISTS miss         numeric,
+//     ADD COLUMN IF NOT EXISTS session_id   uuid,
+//     ADD COLUMN IF NOT EXISTS confirmed    boolean NOT NULL DEFAULT false,
+//     ADD COLUMN IF NOT EXISTS confirmed_by text,
+//     ADD COLUMN IF NOT EXISTS confirmed_at timestamptz;
+//   CREATE INDEX IF NOT EXISTS shelf_counts_session_idx
+//     ON public.shelf_counts (session_id);
+//   -- Chronic-leak lookup: confirmed shorts per part.
+//   CREATE INDEX IF NOT EXISTS shelf_counts_confirmed_idx
+//     ON public.shelf_counts (pn) WHERE confirmed;
+//
+//   -- A counting walk. snapshot.parts freezes {pn, band_low, band_high,
+//   -- allocated, bom_float} for every part as of the moment the walk
+//   -- began, so a count taken at 09:05 and one taken at 09:40 are
+//   -- graded against the SAME line, even if a sync moved the band in
+//   -- between. snapshot.feeds carries the four as-of stamps.
+//   CREATE TABLE IF NOT EXISTS public.count_sessions (
+//     id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+//     started_at  timestamptz NOT NULL DEFAULT now(),
+//     started_by  text        NOT NULL,
+//     finished_at timestamptz,
+//     finished_by text,
+//     note        text,
+//     snapshot    jsonb       NOT NULL DEFAULT '{}'::jsonb,
+//     summary     jsonb
+//   );
+//   -- At most one open session: grading is ambiguous if two walks with
+//   -- different frozen bands are live at once.
+//   CREATE UNIQUE INDEX IF NOT EXISTS count_sessions_one_open_idx
+//     ON public.count_sessions ((finished_at IS NULL)) WHERE finished_at IS NULL;
+//   CREATE INDEX IF NOT EXISTS count_sessions_started_idx
+//     ON public.count_sessions (started_at DESC);
+//   ALTER TABLE public.count_sessions ENABLE ROW LEVEL SECURITY;
+//   DROP POLICY IF EXISTS count_sessions_anon_select ON public.count_sessions;
+//   CREATE POLICY count_sessions_anon_select ON public.count_sessions FOR SELECT TO anon USING (true);
+//
 //   ALTER TABLE public.line_float      ENABLE ROW LEVEL SECURITY;
 //   ALTER TABLE public.line_float_meta ENABLE ROW LEVEL SECURITY;
 //   ALTER TABLE public.shelf_counts    ENABLE ROW LEVEL SECURITY;

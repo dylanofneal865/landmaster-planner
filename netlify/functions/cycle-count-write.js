@@ -32,6 +32,28 @@
 //                              count" action so a supervisor can
 //                              record a count without pre-seeding
 //                              an assignment.
+//   { op: "recordShelfCount",  pn, counted_qty, counted_by, band_low,
+//                              band_high, line_float_at_count?,
+//                              session_id? -- a physical count of the
+//                              LINE location (WHI900/RMSTOR-LM) judged
+//                              against the band. The verdict and the
+//                              miss magnitude are computed HERE from the
+//                              band sent with the count, so a later sync
+//                              moving on-hand cannot re-grade a count
+//                              that was already taken. Writes
+//                              shelf_counts ONLY.
+//   { op: "startCountSession", started_by, snapshot[], feeds?, note?
+//                              -- opens a counting walk and FREEZES
+//                              every part's band into count_sessions.
+//                              One open session at a time.
+//   { op: "finishCountSession",session_id, finished_by -- closes it and
+//                              stores a summary recomputed from
+//                              shelf_counts, not trusted from the client.
+//   { op: "confirmShelfCount", count_id, confirmed_by, confirmed?
+//                              -- "confirmed after recount" on a SHORT /
+//                              OVER. Only confirmed shorts reach the
+//                              chronic-leak list. Recording only; the
+//                              Acumatica adjustment is done by hand.
 //   { op: "skip",              itemId, reason }
 //   { op: "reconcileFromLive", itemId, currentOnHand }
 //   { op: "resolveListItem",   pn, resolved_by, resolution ('done' |
@@ -50,7 +72,9 @@
 //   500 { error }
 //
 // ISOLATION:
-//   * Writes ONLY to cycle_count_items + cycle_count_log.
+//   * Writes ONLY to cycle_count_items + cycle_count_log, plus
+//     count_list_resolutions (resolveListItem) and shelf_counts /
+//     count_sessions (the Line Count ops).
 //   * NEVER touches parts, pos, po_receipts, frame_schedule, etc.
 //   * Never writes parts.data.onHand -- Acumatica stays the SoR.
 
@@ -179,27 +203,224 @@ async function _applyOp(supa, w, i, log) {
         }
         const counted = Math.round(countedRaw * 10000) / 10000;
         const verdict = counted < bandLow ? "short" : (counted > bandHigh ? "over" : "ok");
+        // Signed distance OUTSIDE the band; 0 when the count landed
+        // inside it. This is the raw magnitude of the miss. Whether a
+        // given miss is worth chasing is a PRESENTATION policy (see
+        // LC_NOISE_* in js/27-page-line-count.js) applied at render
+        // time, deliberately not frozen into the stored row -- Dylan
+        // can retune the noise floor and have history re-grade with
+        // it, while the hard verdict above stays a fact about the band.
+        const miss = counted < bandLow ? counted - bandLow
+                   : counted > bandHigh ? counted - bandHigh
+                   : 0;
         const floatAt = Number.isFinite(Number(w.line_float_at_count)) ? Number(w.line_float_at_count) : null;
-        const { data, error } = await supa
-          .from("shelf_counts")
-          .insert({
-            pn,
-            counted_qty: counted,
-            counted_by: counter,
-            // band_high is the on-hand book figure the count was judged
-            // against; the column predates the band and keeps its name.
-            on_hand_at_count: bandHigh,
-            line_float_at_count: floatAt,
-            verdict,
-          })
-          .select("id, counted_at")
-          .single();
+        // v-line-count-r2: when a session is open the client grades
+        // against that session's FROZEN snapshot, so the band above is
+        // the snapshot's, not live. Stamping session_id records which.
+        const sessionId = w.session_id ? String(w.session_id).trim() : null;
+        const row = {
+          pn,
+          counted_qty: counted,
+          counted_by: counter,
+          // band_high is the on-hand book figure the count was judged
+          // against; the column predates the band and keeps its name.
+          on_hand_at_count: bandHigh,
+          line_float_at_count: floatAt,
+          verdict,
+        };
+        // Optional columns -- tolerated as missing so this op still
+        // works against a database that has not run the r2 migration.
+        const optional = { band_low: bandLow, band_high: bandHigh, miss, session_id: sessionId };
+        let data, error;
+        ({ data, error } = await supa.from("shelf_counts")
+          .insert({ ...row, ...optional }).select("id, counted_at").single());
+        if (error && /column .* does not exist|schema cache/i.test(String(error.message || ""))) {
+          log(`recordShelfCount: r2 columns absent (${error.message}) — inserting the pre-r2 shape. Run the migration in line-float-compute.js to keep sessions and miss magnitude.`);
+          ({ data, error } = await supa.from("shelf_counts")
+            .insert(row).select("id, counted_at").single());
+        }
         if (error) return { index: i, ok: false, error: "recordShelfCount: insert failed: " + error.message };
         return {
           index: i, ok: true, kind: "recordShelfCount",
-          id: data && data.id, pn, counted, verdict,
-          bandLow, bandHigh,
+          id: data && data.id, pn, counted, verdict, miss,
+          bandLow, bandHigh, sessionId,
           countedAt: data && data.counted_at,
+        };
+      }
+
+      case "startCountSession": {
+        // v-line-count-r2: open a counting session and FREEZE the band.
+        //
+        // WHY FREEZE. The band moves whenever orders or location qty
+        // sync. Without a snapshot, a part counted at 09:05 and graded
+        // at 09:40 is graded against a band that shifted underneath it,
+        // so the same physical count can read OK in the morning and
+        // SHORT in the afternoon. A session pins one set of numbers for
+        // the whole walk: every count in the session is judged against
+        // the line as it was when the walk began.
+        //
+        // The snapshot is supplied by the client because the client
+        // already holds the exact rows it is displaying -- freezing what
+        // Dylan can SEE is the point. Re-reading line_float here could
+        // capture a band a cron changed a second ago, which is precisely
+        // the drift being defended against.
+        const startedBy = String(w.started_by || "").trim();
+        if (!startedBy) return { index: i, ok: false, error: "startCountSession: started_by required" };
+        const snapIn = Array.isArray(w.snapshot) ? w.snapshot : null;
+        if (!snapIn || snapIn.length === 0) {
+          return { index: i, ok: false, error: "startCountSession: snapshot must be a non-empty array of band rows" };
+        }
+        if (snapIn.length > 5000) {
+          return { index: i, ok: false, error: `startCountSession: snapshot too large (${snapIn.length} rows, max 5000)` };
+        }
+        // One open session at a time. Two concurrent sessions would make
+        // "which snapshot was this graded against" ambiguous for anyone
+        // reading the history later.
+        const { data: openRows, error: openErr } = await supa
+          .from("count_sessions").select("id, started_at, started_by")
+          .is("finished_at", null).limit(1);
+        if (openErr) return { index: i, ok: false, error: "startCountSession: open-session check failed: " + openErr.message };
+        if (openRows && openRows.length > 0) {
+          const o = openRows[0];
+          return {
+            index: i, ok: false,
+            error: `startCountSession: a session opened by ${o.started_by || "someone"} at ${o.started_at} is still open — finish it first`,
+            openSessionId: o.id,
+          };
+        }
+        // Normalise to exactly the fields grading needs. Anything else
+        // the client happened to be holding is dropped.
+        const snapshot = snapIn.map(r => ({
+          pn: String(r.pn || "").trim(),
+          band_low: Number(r.band_low) || 0,
+          band_high: Number(r.band_high) || 0,
+          allocated: Number(r.allocated_at_line) || 0,
+          bom_float: Number(r.released_float) || 0,
+        })).filter(r => r.pn);
+        const feeds = (w.feeds && typeof w.feeds === "object") ? {
+          prod_orders_synced_at: w.feeds.prod_orders_synced_at || null,
+          locations_synced_at: w.feeds.locations_synced_at || null,
+          bom_pulled_at: w.feeds.bom_pulled_at || null,
+          computed_at: w.feeds.computed_at || null,
+        } : {};
+        const { data, error } = await supa.from("count_sessions").insert({
+          started_by: startedBy,
+          note: typeof w.note === "string" ? w.note.trim().slice(0, 500) : null,
+          snapshot: { parts: snapshot, feeds, partCount: snapshot.length },
+        }).select("id, started_at").single();
+        if (error) return { index: i, ok: false, error: "startCountSession: insert failed: " + error.message };
+        return {
+          index: i, ok: true, kind: "startCountSession",
+          id: data && data.id, startedAt: data && data.started_at,
+          startedBy, parts: snapshot.length,
+        };
+      }
+
+      case "finishCountSession": {
+        // Close a session and store its summary. The tallies are
+        // recomputed HERE from shelf_counts rather than trusted from the
+        // client, so the closing summary reflects what is actually on
+        // record -- including counts taken on another device during the
+        // same session.
+        const sessionId = String(w.session_id || "").trim();
+        const finishedBy = String(w.finished_by || "").trim();
+        if (!sessionId) return { index: i, ok: false, error: "finishCountSession: session_id required" };
+        if (!finishedBy) return { index: i, ok: false, error: "finishCountSession: finished_by required" };
+        const { data: sess, error: sErr } = await supa
+          .from("count_sessions").select("id, started_at, finished_at, snapshot")
+          .eq("id", sessionId).maybeSingle();
+        if (sErr) return { index: i, ok: false, error: "finishCountSession: lookup failed: " + sErr.message };
+        if (!sess) return { index: i, ok: false, error: `finishCountSession: no session ${sessionId}` };
+        if (sess.finished_at) {
+          return { index: i, ok: false, error: `finishCountSession: session already closed at ${sess.finished_at}` };
+        }
+        let counts = [];
+        {
+          const { data: cRows, error: cErr } = await supa
+            .from("shelf_counts")
+            .select("pn, counted_qty, verdict, miss, counted_by")
+            .eq("session_id", sessionId).limit(5000);
+          if (cErr) {
+            // Pre-migration fallback: no session_id column. Scope by the
+            // session's time window instead, which is the same set as
+            // long as sessions do not overlap (enforced on open).
+            const { data: tRows, error: tErr } = await supa
+              .from("shelf_counts")
+              .select("pn, counted_qty, verdict, counted_by, counted_at")
+              .gte("counted_at", sess.started_at).limit(5000);
+            if (tErr) return { index: i, ok: false, error: "finishCountSession: count lookup failed: " + tErr.message };
+            counts = tRows || [];
+          } else {
+            counts = cRows || [];
+          }
+        }
+        const tally = { counted: counts.length, ok: 0, short: 0, over: 0 };
+        for (const c of counts) {
+          if (c.verdict === "short") tally.short++;
+          else if (c.verdict === "over") tally.over++;
+          else tally.ok++;
+        }
+        // Biggest misses by absolute distance outside the band. `miss`
+        // is absent pre-migration, so fall back to a band lookup in the
+        // frozen snapshot -- the exact numbers the count was graded on.
+        const bandOf = new Map(
+          (((sess.snapshot || {}).parts) || []).map(p => [p.pn, p])
+        );
+        const withMiss = counts.map(c => {
+          let m = Number(c.miss);
+          if (!Number.isFinite(m)) {
+            const b = bandOf.get(c.pn);
+            const q = Number(c.counted_qty) || 0;
+            m = !b ? 0 : (q < b.band_low ? q - b.band_low : (q > b.band_high ? q - b.band_high : 0));
+          }
+          return { pn: c.pn, counted: Number(c.counted_qty) || 0, verdict: c.verdict, miss: m, by: c.counted_by };
+        });
+        const biggest = withMiss
+          .filter(c => c.miss !== 0)
+          .sort((a, b) => Math.abs(b.miss) - Math.abs(a.miss))
+          .slice(0, 15);
+        const summary = { ...tally, biggestMisses: biggest, finishedBy };
+        const { data, error } = await supa.from("count_sessions")
+          .update({ finished_at: new Date().toISOString(), finished_by: finishedBy, summary })
+          .eq("id", sessionId).is("finished_at", null)
+          .select("id, started_at, finished_at").single();
+        if (error) return { index: i, ok: false, error: "finishCountSession: update failed: " + error.message };
+        return {
+          index: i, ok: true, kind: "finishCountSession",
+          id: sessionId, startedAt: data && data.started_at,
+          finishedAt: data && data.finished_at, summary,
+        };
+      }
+
+      case "confirmShelfCount": {
+        // "Confirmed after recount" on a SHORT or OVER row. This is the
+        // difference between "the number looked wrong once" and "a human
+        // walked back, recounted, and the variance is real" -- and only
+        // the second kind belongs on the chronic-leak punch list.
+        //
+        // Recording ONLY. Adjusting Acumatica is Dylan's action at
+        // WHI900/RMSTOR-LM; nothing here touches it.
+        const countId = String(w.count_id || "").trim();
+        const confirmedBy = String(w.confirmed_by || "").trim();
+        if (!countId) return { index: i, ok: false, error: "confirmShelfCount: count_id required" };
+        if (!confirmedBy) return { index: i, ok: false, error: "confirmShelfCount: confirmed_by required" };
+        const on = w.confirmed === undefined ? true : !!w.confirmed;
+        const patch = on
+          ? { confirmed: true, confirmed_by: confirmedBy, confirmed_at: new Date().toISOString() }
+          : { confirmed: false, confirmed_by: null, confirmed_at: null };
+        const { data, error } = await supa.from("shelf_counts")
+          .update(patch).eq("id", countId)
+          .select("id, pn, verdict, confirmed, confirmed_at").single();
+        if (error) {
+          if (/column .* does not exist|schema cache/i.test(String(error.message || ""))) {
+            return { index: i, ok: false, error: "confirmShelfCount: shelf_counts has no confirmed columns yet — run the r2 migration in line-float-compute.js" };
+          }
+          return { index: i, ok: false, error: "confirmShelfCount: update failed: " + error.message };
+        }
+        return {
+          index: i, ok: true, kind: "confirmShelfCount",
+          id: countId, pn: data && data.pn, confirmed: data && data.confirmed,
+          confirmedAt: data && data.confirmed_at,
         };
       }
 

@@ -300,9 +300,9 @@ exports.handler = async (event) => {
 
   /* ------------------------------------------------------------------
      LINE-COUNT VALIDATION BLOCK — v-line-count.
-     "On the line" is status 'Released' EXACTLY (Dylan's call,
-     2026-09-16), compared case-insensitively. Units per FG model =
-     SUM(qty_remaining) over Released orders.
+     "On the line" is status 'Released' OR 'In Process' (Dylan,
+     2026-09-16), compared case- and separator-insensitively. Units per
+     FG model = SUM(qty_remaining) over those orders.
 
      Two things get logged every run so a silent break is loud:
        1. DISTINCT STATUS COUNTS. If Acumatica renames 'Released' the
@@ -513,10 +513,70 @@ exports.handler = async (event) => {
     },
   ]);
 
+  /* ------------------------------------------------------------------
+     CHAINED LINE-FLOAT RECOMPUTE — v-line-count-r2.
+
+     WHY. The Line Count tab does not read production_orders; it reads
+     line_float / line_float_meta, which only exist because
+     line-float-compute wrote them. Left on its own 06:30 UTC cron, that
+     compute meant a perfectly fresh hourly order sync still showed the
+     tab a band up to 24 hours old — orders moved, the band did not.
+     Syncing orders and recomputing the band are one logical operation,
+     so they run as one.
+
+     SHAPE. Same in-process require the PO-receipts pair uses: one
+     runner, several callers. No HTTP hop, so there is no 403 (this
+     function is scheduled and therefore not routable itself) and no
+     token to manage.
+
+     GUARDS.
+       - Skipped when nothing changed. An hourly no-op sync should not
+         rewrite 816 band rows for no reason.
+       - Skipped when any chunk failed. Recomputing a band from a
+         half-written order table would publish numbers nobody can
+         trust; better to keep yesterday's honest band and let the next
+         clean run advance it.
+       - Wrapped. A compute failure is logged and reported but NEVER
+         fails the sync — the orders are already safely upserted, and
+         taking the sync down because a downstream recompute threw
+         would be strictly worse than a stale band.
+     ------------------------------------------------------------------ */
+  let chained = { ran: false, reason: "", ok: null, durationMs: 0 };
+  if (anyChunkFailed) {
+    chained.reason = "skipped — order upsert/delete had failures; refusing to recompute the band from a partial table";
+    log(`[CHAIN] ${chained.reason}`);
+  } else if (totalUpserted === 0 && totalDeleted === 0) {
+    chained.reason = "skipped — no order changed, existing band still current";
+    log(`[CHAIN] ${chained.reason}`);
+  } else {
+    const c0 = Date.now();
+    try {
+      const { runLineFloat } = require("./line-float-compute.js");
+      // No `dry` flag => write mode. The cron path needs no token.
+      const res = await runLineFloat({ queryStringParameters: { chained: "1" } });
+      chained.ran = true;
+      chained.ok = res && res.statusCode === 200;
+      chained.durationMs = Date.now() - c0;
+      let bandRows = null;
+      try { bandRows = JSON.parse(res && res.body || "{}").rows; } catch (_) {}
+      chained.reason = chained.ok
+        ? `recomputed line_float${bandRows != null ? ` (${bandRows} part band(s))` : ""} in ${chained.durationMs}ms`
+        : `line-float-compute returned ${res && res.statusCode}`;
+      log(`[CHAIN] ${chained.reason}`);
+    } catch (err) {
+      chained.ran = true;
+      chained.ok = false;
+      chained.durationMs = Date.now() - c0;
+      chained.reason = `line-float-compute threw: ${(err && err.message) || err}`;
+      log(`[CHAIN] ${chained.reason} — orders are synced; the band keeps its previous values`);
+    }
+  }
+
   log(
     `Done. ${totalUpserted} upserted, ${totalDeleted} removed across ${feedById.size} orders in ${Date.now() - t0}ms` +
       (anyChunkFailed ? ` (skipped ${upsertFailed} upsert / ${deleteFailed} delete ids)` : "") +
-      (missingField.size > 0 ? ` — WARNING: unmapped fields: ${[...missingField].join(",")}` : "")
+      (missingField.size > 0 ? ` — WARNING: unmapped fields: ${[...missingField].join(",")}` : "") +
+      ` — line-float: ${chained.reason}`
   );
 
   return {
@@ -534,6 +594,7 @@ exports.handler = async (event) => {
       skippedNoOrderNbr: rowsMissingOrderNbr,
       detectedFieldMapping: detectedField,
       unmappedFields: [...missingField],
+      lineFloat: chained,
     }),
   };
 };
