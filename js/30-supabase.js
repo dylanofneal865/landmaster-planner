@@ -1980,10 +1980,40 @@ async function _fetchAllDeletedParts() {
 
 const CLOUD_HYDRATION_FAILURES = [];
 
+// Per-table timeout. A fetch that never settles (dropped connection,
+// a PostgREST worker wedged on a sort) used to park cloudInit forever:
+// every table after it never loaded and nothing ever said so. The
+// underlying request is not cancelled -- supabase-js has no handle for
+// that -- but boot stops WAITING for it, records the failure, and moves
+// on. 20s is generous for any single table here; parts is the largest
+// and pages in well under that.
+const HYDRATE_TIMEOUT_MS = 20000;
+
 async function _hydrate(label, fn, fallback) {
+  const t0 = Date.now();
+  _bootLog(`hydrating ${label}`);
+  let timer = null;
   try {
-    return await fn();
+    const result = await Promise.race([
+      fn(),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`timed out after ${HYDRATE_TIMEOUT_MS / 1000}s`)), HYDRATE_TIMEOUT_MS); }),
+    ]);
+    const size = Array.isArray(result) ? result.length + " row(s)" : (result === null ? "null (fetch reported failure)" : "ok");
+    _bootLog(`${label}: ${size} in ${Date.now() - t0}ms`);
+    // The fetch helpers report failure by RETURNING null (after their own
+    // console.error) rather than throwing. That is the right contract for
+    // the callers, but it must reach the user the same way a throw does:
+    // a table that quietly came back null is still a table that did not
+    // load, and the planner is still incomplete.
+    if (result === null) {
+      if (!CLOUD_HYDRATION_FAILURES.some(f => f.label === label)) {
+        CLOUD_HYDRATION_FAILURES.push({ label, msg: "fetch failed (details in the console)" });
+      }
+      _renderHydrationBanner();
+    }
+    return result;
   } catch (err) {
+    _bootLog(`${label}: FAILED after ${Date.now() - t0}ms -- ${(err && err.message) || err}`);
     const msg = (err && err.message) || String(err);
     console.error(`[cloud] hydration failed for ${label}:`, err);
     if (!CLOUD_HYDRATION_FAILURES.some(f => f.label === label)) {
@@ -1991,6 +2021,8 @@ async function _hydrate(label, fn, fallback) {
     }
     _renderHydrationBanner();
     return fallback === undefined ? null : fallback;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -2019,6 +2051,8 @@ function _renderHydrationBanner() {
 }
 
 async function cloudInit() {
+  const cloudT0 = Date.now();
+  _bootLog("cloudInit start");
   const ok = await _waitForDB();
   if (!ok) {
     console.error("[cloud] DB never became ready");
@@ -2032,6 +2066,7 @@ async function cloudInit() {
   }
 
   _supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  _bootLog("supabase client created");
 
   // Tombstones FIRST — populated before the parts fetch so the
   // filter below can drop any tombstoned pn coming back from cloud.
@@ -2040,7 +2075,7 @@ async function cloudInit() {
   // before that init (e.g. tests, hot-reload).
   if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
   else DB.deletedParts.clear();
-  const cloudTombstones = await _fetchAllDeletedParts();
+  const cloudTombstones = await _hydrate("deleted_parts", _fetchAllDeletedParts);
   if (cloudTombstones !== null) {
     for (const row of cloudTombstones) {
       DB.deletedParts.set(String(row.id), row.data || {});
@@ -2051,7 +2086,7 @@ async function cloudInit() {
   }
 
   // Pull current cloud parts (paginated to handle >1000 rows)
-  const data = await _fetchAllParts();
+  const data = await _hydrate("parts", _fetchAllParts);
   if (data === null) {
     showToast("Cloud sync failed during initial fetch", "crit");
     return;
@@ -2094,7 +2129,7 @@ async function cloudInit() {
   if (!(DB.queueEntries instanceof Map)) DB.queueEntries = new Map();
   else DB.queueEntries.clear();
   _stampedPns.clear();
-  const cloudQE = await _fetchAllQueueEntries();
+  const cloudQE = await _hydrate("queue_entries", _fetchAllQueueEntries);
   if (cloudQE !== null) {
     for (const row of cloudQE) {
       if (!row || !row.pn) continue;
@@ -2107,7 +2142,7 @@ async function cloudInit() {
   }
 
   // ---- POs ----
-  const cloudPos = await _fetchAllPos();
+  const cloudPos = await _hydrate("pos", _fetchAllPos);
   if (cloudPos !== null) {
     if (cloudPos.length === 0 && DB.pos && DB.pos.length > 0) {
       showToast(`Pushing ${DB.pos.length} POs to cloud (one-time)…`, "info", "Cloud sync");
@@ -2150,7 +2185,7 @@ async function cloudInit() {
   // ---- Audit Log ----
   // Cloud-wins strategy (NOT merge): cloud is source of truth.
   // Local rows missing from cloud are treated as "deleted in cloud" and removed.
-  const cloudAudit = await _fetchAllAudit();
+  const cloudAudit = await _hydrate("audit", _fetchAllAudit);
   if (cloudAudit !== null) {
     if (cloudAudit.length === 0 && DB.audit && DB.audit.length > 0) {
       // Cloud is empty for the first time — push local up
@@ -2180,7 +2215,7 @@ async function cloudInit() {
   // ---- Usage ----
   // Cloud-wins strategy (NOT merge): cloud is source of truth.
   // Local rows missing from cloud are treated as "deleted in cloud" and removed.
-  const cloudUsage = await _fetchAllUsage();
+  const cloudUsage = await _hydrate("usage", _fetchAllUsage);
   if (cloudUsage !== null) {
     if (cloudUsage.length === 0 && DB.usage && DB.usage.length > 0) {
       // Cloud is empty for the first time — push local up
@@ -2201,7 +2236,7 @@ async function cloudInit() {
 
   // ---- Kit BOMs ----
   // Cloud-wins strategy. In-place mutation of DB.kitBoms.
-  const cloudKitBoms = await _fetchAllKitBoms();
+  const cloudKitBoms = await _hydrate("kit_boms", _fetchAllKitBoms);
   if (cloudKitBoms !== null) {
     if (!DB.kitBoms || typeof DB.kitBoms !== "object") DB.kitBoms = {};
     if (cloudKitBoms.length === 0 && Object.keys(DB.kitBoms).length > 0) {
@@ -2225,7 +2260,7 @@ async function cloudInit() {
   // browser. Stored as a flat array of { bomId, parent, child, qty, uom }.
   // NOT persisted via saveDB — re-fetched from cloud each session — and NOT
   // included in the realtime subscription set below.
-  const cloudBomLinks = await _fetchAllBomLinks();
+  const cloudBomLinks = await _hydrate("bom_links", _fetchAllBomLinks);
   if (cloudBomLinks !== null) {
     DB.bomLinks = cloudBomLinks.map(r => ({ id: r.id, ...r.data }));
     console.log(`[cloud] loaded ${DB.bomLinks.length} bom_links rows`);
@@ -2248,7 +2283,7 @@ async function cloudInit() {
   // in the realtime publication — poll-only via this fetch + reconnect
   // catchup. Isolation contract: nothing else in the app reads or
   // writes DB.productionOrders.
-  const cloudProductionOrders = await _fetchAllProductionOrders();
+  const cloudProductionOrders = await _hydrate("production_orders", _fetchAllProductionOrders);
   if (cloudProductionOrders !== null) {
     DB.productionOrders = cloudProductionOrders.map(r => ({ id: r.id, ...r.data }));
     console.log(`[cloud] loaded ${DB.productionOrders.length} production_orders rows`);
@@ -2264,7 +2299,7 @@ async function cloudInit() {
   // Poll-only. NOT in the realtime publication; a reconnect catchup
   // re-fetches so a concurrent edit from another session lands on the
   // next reconnect.
-  const cloudBuildPlanTargets = await _fetchAllBuildPlanTargets();
+  const cloudBuildPlanTargets = await _hydrate("build_plan_targets", _fetchAllBuildPlanTargets);
   if (cloudBuildPlanTargets !== null) {
     _populateBuildPlanTargetsFromRows(cloudBuildPlanTargets);
     const s = DB.buildPlanTargets.settings;
@@ -2279,7 +2314,7 @@ async function cloudInit() {
   // ---- Frame Schedule (MOR-RYDE weekly cap + qty grid) ----
   // Sidecar table, poll-only like build_plan_targets. Rows keyed by
   // ISO Monday date in fg_sku; data jsonb carries {caps, qty}.
-  const cloudFrameSchedule = await _fetchAllFrameSchedule();
+  const cloudFrameSchedule = await _hydrate("frame_schedule", _fetchAllFrameSchedule);
   if (cloudFrameSchedule !== null) {
     _populateFrameScheduleFromRows(cloudFrameSchedule);
     console.log(`[cloud] loaded frame_schedule: ${DB.frameSchedule.weeks.size} week(s)`);
@@ -2333,7 +2368,7 @@ async function cloudInit() {
   // user action. Feeds the Frame Schedule tab's "got N" received-vs-
   // scheduled overlay and NOTHING else. Not in the realtime
   // publication — poll-only via this fetch + reconnect catchup.
-  const cloudPoReceipts = await _fetchAllPoReceipts();
+  const cloudPoReceipts = await _hydrate("po_receipts", _fetchAllPoReceipts);
   if (cloudPoReceipts !== null) {
     if (!Array.isArray(DB.poReceipts)) DB.poReceipts = [];
     DB.poReceipts.length = 0;
@@ -2360,7 +2395,7 @@ async function cloudInit() {
   // Mutate IN PLACE so any earlier consumer holding the map ref stays
   // valid (the page may have rendered an empty list before this fetch).
   if (!window.followMarks) window.followMarks = new Map();
-  const fmRows = await _fetchAllFollowMarks();
+  const fmRows = await _hydrate("follow_marks", _fetchAllFollowMarks);
   if (Array.isArray(fmRows)) {
     window.followMarks.clear();
     for (const r of fmRows) {
@@ -2410,6 +2445,8 @@ async function cloudInit() {
   if (typeof tagKitsFromKitBoms === "function") {
     try { tagKitsFromKitBoms(); } catch (e) { console.warn("[kits] tag migration failed", e); }
   }
+  _bootLog(`cloudInit complete in ${Date.now() - cloudT0}ms` +
+    (CLOUD_HYDRATION_FAILURES.length ? ` — ${CLOUD_HYDRATION_FAILURES.length} table(s) failed: ${CLOUD_HYDRATION_FAILURES.map(f => f.label).join(", ")}` : " — all tables loaded"));
 }
 
 let _realtimeChannel = null;

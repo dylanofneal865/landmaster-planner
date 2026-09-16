@@ -119,8 +119,13 @@ async function initApp() {
     const initialRoute = (typeof savedRoute === "string" && Object.prototype.hasOwnProperty.call(ROUTES, savedRoute))
       ? savedRoute
       : "dashboard";
+    // The router is NOT gated on cloud hydration: this renders from the
+    // local DB immediately, and cloudInit re-renders when data arrives.
+    // A dead cloud must mean stale numbers, never a blank screen.
+    if (typeof _bootLog === "function") _bootLog(`rendering route "${initialRoute}" (local data, before cloud hydration)`);
     navigate(initialRoute);
     refresh();
+    if (typeof _bootLog === "function") _bootLog("initial render complete");
 
     // Critical notifications
     setTimeout(showCriticalNotification, 700);

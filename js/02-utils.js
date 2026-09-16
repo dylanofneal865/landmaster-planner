@@ -6,6 +6,20 @@
 /* ============================================================
    UTILITIES
    ============================================================ */
+// BOOT LOG -- v-boot-guard. One line per boot stage, stamped with ms
+// since this file ran. Lives here (second script loaded) so every later
+// file, including initApp in js/17, can use it. When the planner comes
+// up blank the first question is "how far did boot get?" -- an empty
+// console used to mean the answer was unknowable. Filter the console
+// on "[boot]" to read the sequence.
+const _BOOT_T0 = Date.now();
+function _bootLog(stage, extra) {
+  const ms = String(Date.now() - _BOOT_T0).padStart(6, " ");
+  if (extra === undefined) console.log(`[boot] +${ms}ms ${stage}`);
+  else console.log(`[boot] +${ms}ms ${stage}`, extra);
+}
+_bootLog("scripts loading");
+
 const $ = (sel, ctx=document) => ctx.querySelector(sel);
 const $$ = (sel, ctx=document) => Array.from(ctx.querySelectorAll(sel));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));

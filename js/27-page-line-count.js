@@ -134,10 +134,22 @@ async function _lcLoad() {
   if (typeof _supa === "undefined" || !_supa) { LC_STATE.rows = []; _lcTouch(); return; }
   LC_STATE.loading = true;
   try {
+    // at_line is an r3 column. Selecting a column the table does not
+    // have is a 400 from PostgREST, and on 3958344 that 400 emptied the
+    // tab -- which, combined with the paint/refresh recursion, froze the
+    // planner. Try the full select; if it fails on the column, fall back
+    // to the pre-r3 shape rather than showing nothing.
+    const LF_COLS = "pn, band_low, band_high, onhand_at_line, avail_at_line, allocated_at_line, released_float, check_delta, check_flag, avail_known, computed_at";
+    const fetchLineFloat = async () => {
+      const r = await _supa.from("line_float").select(LF_COLS + ", at_line").limit(5000);
+      if (r.error && /at_line|does not exist|schema cache/i.test(String(r.error.message || ""))) {
+        console.warn("[line-count] line_float has no at_line column yet — reading the pre-r3 shape. Run the r3 migration in line-float-compute.js to split 'no line row' from 'no availability'.");
+        return _supa.from("line_float").select(LF_COLS).limit(5000);
+      }
+      return r;
+    };
     const [rowsRes, metaRes, countsRes, sessRes] = await Promise.all([
-      _supa.from("line_float")
-        .select("pn, band_low, band_high, onhand_at_line, avail_at_line, allocated_at_line, released_float, check_delta, check_flag, avail_known, at_line, computed_at")
-        .limit(5000),
+      fetchLineFloat(),
       _supa.from("line_float_meta").select("data").eq("id", "current").maybeSingle(),
       // Newest 2000 counts. Reduced to latest-per-pn for the rows and
       // kept whole for the chronic-leak tally. Small table; one query
@@ -882,7 +894,14 @@ function _lcRowHtml(r) {
 // filter / sort / toggle goes through.
 function _lcPaintTable() {
   const host = document.getElementById("lc-tbody");
-  if (!host) { refresh(); return; }   // shell not up yet
+  // No tbody means the shell is showing "Loading..." or "No line data",
+  // neither of which has a table to paint. Just return. This line used
+  // to call refresh() -- and refresh() re-enters renderLineCount, which
+  // took the fast path straight back here, synchronously, forever. That
+  // froze the tab on boot with an empty console (b7a21e2 .. 0cab112).
+  // The next data change bumps _dataVersion and the shell rebuilds on
+  // its own; nothing here needs to force it.
+  if (!host) return;
   const rows = _lcVisibleRows();
   const capped = !LC_STATE.showAll && rows.length > LC_ROW_CAP;
   const painted = capped ? rows.slice(0, LC_ROW_CAP) : rows;

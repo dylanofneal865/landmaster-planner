@@ -56,21 +56,84 @@ let CURRENT_ROUTE = null;
 
 function registerRoute(name, renderer) { ROUTES[name] = renderer; }
 
+/* ------------------------------------------------------------------
+   RENDER RE-ENTRANCY GUARD -- v-boot-guard.
+
+   Twice now a route renderer has called refresh() from INSIDE its own
+   render (d949eed: a microtask loop; b7a21e2: _lcPaintTable calling
+   refresh() when its tbody was absent). refresh() calls navigate(),
+   navigate() calls the renderer, the renderer calls refresh() -- a
+   synchronous cycle that never yields. Each level also runs
+   bumpStatusCache() and the badge updates over every part, so the tab
+   pegs the CPU and freezes long before a stack overflow could reach
+   the console. What the user sees: shell and sidebar drawn, counters
+   at 0, no page content, and an EMPTY console -- nothing ever threw.
+
+   The fix at the call site is one line. The fix here is for the
+   class: while a render is on the stack, refresh() no longer recurses.
+   It coalesces into ONE deferred refresh on a macrotask, so the
+   current render completes, the event loop runs, and the re-render
+   happens once. A renderer can still be wrong, but it can no longer
+   take the planner down with it -- and the deferral is logged, so the
+   wrong call site is named rather than hidden.
+   ------------------------------------------------------------------ */
+let _renderDepth = 0;
+let _refreshDeferred = false;
+let _refreshDeferrals = 0;
+let _refreshBurstStart = 0;
+const REFRESH_DEFER_LIMIT = 25;
+
 function navigate(route, params = {}) {
   CURRENT_ROUTE = route;
   // Update active nav
-  $$(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.route === route));
+  $(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.route === route));
   const main = $("#main");
   main.scrollTop = 0;
-  if (ROUTES[route]) {
-    ROUTES[route](params);
-    localStorage.setItem("landmaster.lastRoute", route);
-  } else {
-    main.innerHTML = `<div class="page"><div class="empty"><div class="empty-title">Not found</div></div></div>`;
+  _renderDepth++;
+  try {
+    if (ROUTES[route]) {
+      ROUTES[route](params);
+      localStorage.setItem("landmaster.lastRoute", route);
+    } else {
+      main.innerHTML = `<div class="page"><div class="empty"><div class="empty-title">Not found</div></div></div>`;
+    }
+  } finally {
+    _renderDepth--;
   }
 }
 
 function refresh() {
+  // Called from inside a render? Do NOT recurse. Coalesce into one
+  // deferred refresh so the current render finishes and the event loop
+  // gets a turn. See the re-entrancy note above navigate().
+  if (_renderDepth > 0) {
+    // Circuit breaker. Deferring turns a synchronous freeze into an
+    // async loop; a renderer that calls refresh() on EVERY render would
+    // then re-render once per tick forever -- responsive, but burning
+    // CPU. After a burst of deferrals the breaker stops re-scheduling:
+    // the page stays as last rendered, and the console says which
+    // route to fix. Resets on the next clean (non-deferred) refresh.
+    const now = Date.now();
+    if (now - _refreshBurstStart > 2000) { _refreshBurstStart = now; _refreshDeferrals = 0; }
+    _refreshDeferrals++;
+    if (_refreshDeferrals > REFRESH_DEFER_LIMIT) {
+      if (_refreshDeferrals === REFRESH_DEFER_LIMIT + 1) {
+        console.error(`[render] route "${CURRENT_ROUTE}" calls refresh() on every render — ${REFRESH_DEFER_LIMIT} deferrals in 2s, breaker tripped. Page left as last rendered. Fix the renderer.`);
+      }
+      return;
+    }
+    if (!_refreshDeferred) {
+      _refreshDeferred = true;
+      if (_refreshDeferrals === 1) {
+        console.warn(`[render] refresh() called during render of "${CURRENT_ROUTE}" — deferred instead of recursing (fix the renderer; this would have frozen the tab)`);
+      }
+      setTimeout(() => { _refreshDeferred = false; refresh(); }, 0);
+    }
+    return;
+  }
+  // (No counter reset here on purpose: the deferred re-render IS a clean
+  // refresh, and resetting on it would let an every-render caller dodge
+  // the breaker forever. The 2s window above is the reset.)
   bumpStatusCache();
   // Queue-entry stamp detector — one pass per refresh cycle, right after
   // the status cache is invalidated so queueParts() reflects fresh
