@@ -267,6 +267,15 @@ exports.handler = async (event) => {
   // reads as a bin list.
   const physicalByPn = new Map();
   const locByPn = new Map();
+  // Sentinel location label for the per-pn warehouse-aggregate row.
+  // DECLARED HERE, ahead of every consumer. It previously sat ~35 lines
+  // BELOW the [LOC] diagnostics block that reads it, so `const` put it in
+  // the temporal dead zone and the whole sync threw
+  // "Cannot access 'WAREHOUSE_SENTINEL' before initialization" on every
+  // run — taking inventory updates down with it. Keep this above the
+  // location-collection loop; nothing between here and the sentinel
+  // emit may reference it before this line.
+  const WAREHOUSE_SENTINEL = "__warehouse__";
   // Which of AVAIL_LOC_CANDIDATES actually matched, reported once per run
   // so the working field name is recorded rather than re-guessed.
   let availFieldUsed = null;
@@ -644,7 +653,7 @@ exports.handler = async (event) => {
   // touchedPnsForLocs (via the location loop OR nothing -- if
   // an aggregate-only pn has no location rows, we still need to
   // schedule its delete so the sentinel refreshes). Handle both.
-  const WAREHOUSE_SENTINEL = "__warehouse__";
+  // (WAREHOUSE_SENTINEL is declared above the location-collection loop.)
   let sentinelRows = 0;
   let physicalDisagreePns = 0;
   let physicalWidestGap = 0;
