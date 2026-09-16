@@ -298,6 +298,51 @@ exports.handler = async (event) => {
   }
   log(`Parsed ${feedById.size} unique production order(s) (raw entries: ${entries.length})`);
 
+  /* ------------------------------------------------------------------
+     LINE-COUNT VALIDATION BLOCK — v-line-count.
+     "On the line" is status 'Released' EXACTLY (Dylan's call,
+     2026-09-16), compared case-insensitively. Units per FG model =
+     SUM(qty_remaining) over Released orders.
+
+     Two things get logged every run so a silent break is loud:
+       1. DISTINCT STATUS COUNTS. If Acumatica renames 'Released' the
+          RELEASED_STATUS match silently goes to zero and every band
+          collapses to band_low == band_high. Seeing the distinct list
+          each run makes that rename obvious instead of invisible.
+       2. RELEASED UNITS BY MODEL. Dylan expects ~20-25 units on the
+          line; this is the number to sanity-check that against before
+          trusting any band.
+     Logging only — this function's stored rows are unchanged, and the
+     Released filter itself is applied downstream in line-float-compute.
+     ------------------------------------------------------------------ */
+  const RELEASED_STATUS = "released";
+  const statusCounts = Object.create(null);
+  const releasedByModel = new Map();   // fg_sku -> { units, orders, desc }
+  let releasedOrders = 0, releasedUnits = 0;
+  for (const { data: d } of feedById.values()) {
+    const st = String(d.status || "").trim();
+    statusCounts[st || "<empty>"] = (statusCounts[st || "<empty>"] || 0) + 1;
+    if (st.toLowerCase() !== RELEASED_STATUS) continue;
+    const sku = String(d.fgSku || "").trim();
+    if (!sku) continue;
+    const rem = Number(d.qtyRemaining);
+    const units = Number.isFinite(rem) ? rem : 0;
+    let rec = releasedByModel.get(sku);
+    if (!rec) { rec = { units: 0, orders: 0, desc: d.fgDesc || "" }; releasedByModel.set(sku, rec); }
+    rec.units += units;
+    rec.orders += 1;
+    releasedOrders++;
+    releasedUnits += units;
+  }
+  log(`[LINE] distinct Status values seen:`, statusCounts);
+  if (!Object.keys(statusCounts).some(s => s.toLowerCase() === RELEASED_STATUS)) {
+    log(`[LINE] WARNING: no order carries status '${RELEASED_STATUS}'. Either nothing is on the line right now, or Acumatica renamed the status — check the distinct list above. Every count band collapses to a single number while this holds.`);
+  }
+  log(`[LINE] ON THE LINE (status '${RELEASED_STATUS}'): ${releasedOrders} order(s), ${Math.round(releasedUnits * 100) / 100} unit(s) total across ${releasedByModel.size} model(s). Expected roughly 20-25 units.`);
+  for (const [sku, rec] of [...releasedByModel.entries()].sort((a, b) => b[1].units - a[1].units)) {
+    log(`[LINE]   ${sku}  ${rec.units} unit(s) over ${rec.orders} order(s)${rec.desc ? "  — " + rec.desc : ""}`);
+  }
+
   // Zero-row bailout — matches acumatica-bom-sync.js. A schema/auth
   // glitch that returns zero rows must NOT wipe the table.
   if (feedById.size === 0) {
