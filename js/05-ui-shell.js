@@ -86,7 +86,7 @@ const REFRESH_DEFER_LIMIT = 25;
 function navigate(route, params = {}) {
   CURRENT_ROUTE = route;
   // Update active nav
-  $(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.route === route));
+  $$(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.route === route));
   const main = $("#main");
   main.scrollTop = 0;
   _renderDepth++;
