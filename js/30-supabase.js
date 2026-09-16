@@ -1169,33 +1169,57 @@ async function _fsPostFrameScheduleWrite(body) {
 // by the client. Feeds the cycle-count mobile card + the part
 // drawer's "current locations" block. Byte-order matters: shape is
 //   DB.partLocations = Map<pn, Array<{location, location_desc, qty, synced_at}>>
+// ORDERING, and why it is attempted rather than demanded.
+//
+// Each .range() call is a separate query with its own snapshot, and
+// acumatica-sync rebuilds this whole table by delete+insert every 2
+// minutes. Without a total order the pages overlap and skip arbitrarily
+// -- some bins arrive twice, others never. So ordering is correct.
+//
+// But it is NOT worth the app for. There is no index on (pn, location)
+// -- the only index is (warehouse, location_raw) -- so an ORDER BY makes
+// PostgREST sort the table on every page, which on a large table can hit
+// the statement timeout and turn a slow read into a failed one. This
+// function therefore tries ordered, falls back to unordered on ANY
+// error, and never throws: a possibly-imperfect location list is worth
+// far more than a dead planner. The band the Line Count tab shows does
+// not come from here -- it is computed server-side, where the ordering
+// is enforced strictly.
+//
+// To make the ordered path cheap, add the covering index:
+//   CREATE INDEX IF NOT EXISTS part_locations_pn_loc_idx
+//     ON public.part_locations (pn, location);
 async function _fetchAllPartLocations() {
   if (!_supa) return null;
-  const all = [];
   const PAGE = 1000;
-  let from = 0;
-  while (true) {
-    const { data, error } = await _supa
-      .from("part_locations")
-      // ORDER BY IS LOAD-BEARING, not cosmetic. Each .range() call is a
-      // separate query with its own snapshot, and acumatica-sync rebuilds
-      // this whole table by delete+insert every 2 minutes, so without a
-      // total order the pages overlap and skip arbitrarily -- some bins
-      // arrive twice, others never. (pn, location) is unique per row.
-      .select("pn, location, location_desc, qty, synced_at")
-      .order("pn", { ascending: true })
-      .order("location", { ascending: true })
-      .range(from, from + PAGE - 1);
-    if (error) {
-      console.error("[cloud] part_locations fetch failed:", error);
-      return null;
+
+  const readPages = async (ordered) => {
+    const all = [];
+    for (let from = 0; ; from += PAGE) {
+      let q = _supa.from("part_locations").select("pn, location, location_desc, qty, synced_at");
+      if (ordered) q = q.order("pn", { ascending: true }).order("location", { ascending: true });
+      const { data, error } = await q.range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message || String(error));
+      if (!data || data.length === 0) break;
+      all.push(...data);
+      if (data.length < PAGE) break;
     }
-    if (!data || data.length === 0) break;
-    all.push(...data);
-    if (data.length < PAGE) break;
-    from += PAGE;
+    return all;
+  };
+
+  try {
+    return await readPages(true);
+  } catch (errOrdered) {
+    console.warn(
+      "[cloud] part_locations ordered read failed (" + (errOrdered && errOrdered.message) +
+      ") — retrying unordered. Pages may overlap; add part_locations_pn_loc_idx to fix properly.");
+    try {
+      return await readPages(false);
+    } catch (errPlain) {
+      console.error("[cloud] part_locations fetch failed:", errPlain);
+      return null;   // callers already treat null as "degrade, keep booting"
+    }
   }
-  return all;
 }
 // v-cc-loc-4 -- the __warehouse__ sentinel (per-pn physical
 // on-hand from QtyOnHandinWarehouse) is split OUT of
@@ -1933,6 +1957,67 @@ async function _fetchAllDeletedParts() {
   return all;
 }
 
+/* ============================================================
+   HYDRATION RESILIENCE -- v-boot-guard.
+
+   cloudInit is one long run of sequential awaits. Every fetch helper
+   is written to RETURN null on failure, and every consumer handles
+   null. But nothing stopped a helper from THROWING, and a throw
+   anywhere rejected the whole function: the remaining tables never
+   loaded, DB stayed half-populated, and the only trace was one
+   console.error behind a `.catch`. What the user saw was a shell with
+   a sidebar, every counter at 0, and no page content -- an app that
+   looks broken rather than an app that says what is missing.
+
+   Two changes:
+     * _hydrate() isolates a single table. A throw becomes a null,
+       which every consumer below already handles, so one bad table
+       degrades to one missing feature instead of a dead planner.
+     * Failures are collected and shown in a banner. A silent partial
+       boot is worse than a loud one: it looks like a data problem and
+       sends you hunting in the wrong place.
+   ============================================================ */
+
+const CLOUD_HYDRATION_FAILURES = [];
+
+async function _hydrate(label, fn, fallback) {
+  try {
+    return await fn();
+  } catch (err) {
+    const msg = (err && err.message) || String(err);
+    console.error(`[cloud] hydration failed for ${label}:`, err);
+    if (!CLOUD_HYDRATION_FAILURES.some(f => f.label === label)) {
+      CLOUD_HYDRATION_FAILURES.push({ label, msg });
+    }
+    _renderHydrationBanner();
+    return fallback === undefined ? null : fallback;
+  }
+}
+
+// Lives on <body>, deliberately NOT inside #main -- every route render
+// replaces main.innerHTML, and a warning about missing data must not
+// disappear the moment you navigate.
+function _renderHydrationBanner() {
+  if (typeof document === "undefined" || !document.body) return;
+  let el = document.getElementById("cloud-hydration-banner");
+  if (CLOUD_HYDRATION_FAILURES.length === 0) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "cloud-hydration-banner";
+    el.style.cssText =
+      "position:fixed;left:0;right:0;bottom:0;z-index:9999;padding:8px 14px;" +
+      "font:12px/1.5 system-ui,sans-serif;background:#7f1d1d;color:#fff;" +
+      "box-shadow:0 -2px 8px rgba(0,0,0,.3)";
+    document.body.appendChild(el);
+  }
+  const rows = CLOUD_HYDRATION_FAILURES
+    .map(f => `<strong>${f.label}</strong>: ${String(f.msg).slice(0, 160)}`).join(" &middot; ");
+  el.innerHTML =
+    `<span style="float:right;cursor:pointer;padding:0 6px" onclick="this.parentNode.remove()">&times;</span>` +
+    `Some data did not load, so parts of the planner are incomplete this session. ` +
+    `Reload to retry. &mdash; ${rows}`;
+}
+
 async function cloudInit() {
   const ok = await _waitForDB();
   if (!ok) {
@@ -2211,11 +2296,14 @@ async function cloudInit() {
   // acumatica-sync's per-location pass; read-only for the client).
   // Poll-only. js/26 refetches after every write via
   // _refetchCycleCounts.
+  // Each isolated: a throw in any one becomes null, which the branches
+  // below already handle, instead of rejecting cloudInit and leaving
+  // every table after this point unloaded.
   const [ccItems, ccLog, ccItemLocs, partLocs] = await Promise.all([
-    _fetchAllCycleCountItems(),
-    _fetchAllCycleCountLog(),
-    _fetchAllCycleCountItemLocations(),
-    _fetchAllPartLocations(),
+    _hydrate("cycle_count_items", _fetchAllCycleCountItems),
+    _hydrate("cycle_count_log", _fetchAllCycleCountLog),
+    _hydrate("cycle_count_item_locations", _fetchAllCycleCountItemLocations),
+    _hydrate("part_locations", _fetchAllPartLocations),
   ]);
   if (ccItems !== null || ccLog !== null) {
     _populateCycleCountsFromRows(ccItems || [], ccLog || []);
@@ -4615,14 +4703,31 @@ window.cloudForcePullKitBoms = async function () {
 // with no visible cause. Catching the rejection here surfaces the
 // error with a stable prefix so the actual throw point is visible in
 // the console filter next time it happens.
+// A rejection here means DB is HALF-populated: every table after the
+// throw point never loaded. Console-only reporting made that look like
+// an empty database rather than a failed boot, which is what sent the
+// last investigation to the wrong place. Say it on screen.
+function _cloudInitFatal(err) {
+  console.error("[cloud] cloudInit fatal:", err);
+  try {
+    if (!CLOUD_HYDRATION_FAILURES.some(f => f.label === "startup")) {
+      CLOUD_HYDRATION_FAILURES.push({
+        label: "startup",
+        msg: ((err && err.message) || String(err)) + " — loading stopped here, so tables after this point are empty",
+      });
+    }
+    _renderHydrationBanner();
+    if (typeof showToast === "function") showToast("Cloud data failed to finish loading — see the banner at the bottom", "crit");
+  } catch (_) { /* reporting must never throw */ }
+}
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => setTimeout(
-    () => cloudInit().catch(err => console.error("[cloud] cloudInit fatal:", err)),
+    () => cloudInit().catch(_cloudInitFatal),
     200,
   ));
 } else {
   setTimeout(
-    () => cloudInit().catch(err => console.error("[cloud] cloudInit fatal:", err)),
+    () => cloudInit().catch(_cloudInitFatal),
     200,
   );
 }
