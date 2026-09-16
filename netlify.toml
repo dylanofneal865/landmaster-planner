@@ -103,6 +103,17 @@
 [functions."parts-onhand-snapshot"]
   schedule = "50 5 * * *"
 
+# Line float -- 06:30 UTC daily, 30 minutes after acumatica-bom-sync so it
+# always explodes the freshest BOM pull. Reads bom_links + units_on_line,
+# walks the tree, writes per-purchased-part line_float. Manual re-trigger at
+# GET /.netlify/functions/line-float-compute; ?dry=1 previews without
+# writing; ?explain=PN1,PN2 prints the full explosion path (FG -> sub -> ...
+# -> part with qty at each level) for those parts -- the "check math" output.
+# Read-only against bom_links / units_on_line / audit; NEVER writes to
+# Acumatica, parts, or on-hand. See the function header for CREATE TABLE SQL.
+[functions."line-float-compute"]
+  schedule = "30 6 * * *"
+
 # INCREMENTAL sweep -- every 30 minutes. Adds a "Date ge datetime'...'"
 # filter with a 5-day lookback (v7.4 -- Edm.DateTime literal, falls back
 # to datetimeoffset and then to a full sweep if the tenant rejects
