@@ -2,9 +2,29 @@
 // Acumatica OData generic inquiry "LM Planner Production Orders" and
 // reconciles the Supabase `production_orders` table.
 //
-// Schedule: weekly, Monday 11:00 UTC (~ 6 AM EST / 7 AM EDT). Production
-// orders are slow-moving reference data for a read-only reporting tab —
-// they don't need the 2-minute on-hand cadence.
+// Schedule: HOURLY (0 * * * *). Raised from weekly when the Line Count
+// band started deriving from open orders — see netlify.toml.
+//
+// TWO DOORS, ONE RUNNER. Netlify does not route HTTP to a function that
+// carries a `schedule` in netlify.toml; it answers 403 "Access denied".
+// So this file exports runProductionOrdersSync and
+// acumatica-production-orders-run.js is an unscheduled wrapper around
+// it — the same shape acumatica-po-receipts-sync.js and
+// line-float-compute.js already use. Without that door there is no way
+// to force a sync or to see why one failed.
+//
+// WHY A RUN LEAVES A TRACE, ALWAYS. The audit row near the end of this
+// function is UNCONDITIONAL: a run that changes nothing still writes
+// one, and line-float-compute reads the newest such row as
+// prod_orders_synced_at. That makes the stamp a reliable liveness
+// signal — if it has not moved, no run REACHED the audit write. The
+// early returns above it (missing env, Acumatica non-OK, fetch threw,
+// zero rows parsed, existing-row select failed) used to leave no trace
+// at all, so a persistently failing sync was indistinguishable from one
+// that was never invoked. They now write an `...-sync-failed` audit row
+// instead: visible in the audit table, and deliberately a DIFFERENT
+// type so a failure can never masquerade as a successful sync and
+// advance the stamp.
 //
 // ISOLATION CONTRACT — read-only reporting feature:
 //   - Writes ONLY to public.production_orders (and one row to public.audit
@@ -138,9 +158,16 @@ function _prodOrderFingerprint(data) {
   return JSON.stringify(_canonicalize(data));
 }
 
-exports.handler = async (event) => {
+async function runProductionOrdersSync(event) {
   const t0 = Date.now();
-  const log = (msg, data) => console.log(`[acumatica-production-orders-sync] ${msg}`, data || "");
+  // Every line is kept as well as printed, so the HTTP wrapper can hand
+  // the whole trace back in its response. That is the diagnostic path
+  // when the Netlify log console is not available.
+  const trace = [];
+  const log = (msg, data) => {
+    console.log(`[acumatica-production-orders-sync] ${msg}`, data || "");
+    trace.push(data === undefined || data === "" ? String(msg) : `${msg} ${typeof data === "string" ? data : JSON.stringify(data)}`);
+  };
 
   const {
     ACUMATICA_BASE_URL,
@@ -152,9 +179,43 @@ exports.handler = async (event) => {
     SUPABASE_SERVICE_KEY,
   } = process.env;
 
-  if (!ACUMATICA_BASE_URL || !ACUMATICA_USERNAME || !ACUMATICA_PASSWORD || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    log("Missing required environment variables");
-    return { statusCode: 500, body: JSON.stringify({ error: "Missing env vars" }) };
+  // Failure breadcrumb. A bail that writes NOTHING is the reason a dead
+  // sync looked identical to one that was never scheduled. This records
+  // the bail under a distinct audit type, so it shows up in the audit
+  // table without ever being mistaken for a successful sync.
+  const failAudit = async (stage, detail) => {
+    try {
+      if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return;
+      const c = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      });
+      const id = `audit_acumatica_production_orders_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      await c.from("audit").upsert([{
+        id,
+        data: {
+          id, ts: new Date().toISOString(),
+          type: "acumatica-production-orders-sync-failed",
+          msg: `Production-orders sync BAILED at ${stage}: ${detail}`,
+          detail: { stage, detail, durationMs: Date.now() - t0, trace: trace.slice(-40) },
+        },
+      }]);
+    } catch (e) {
+      console.log(`[acumatica-production-orders-sync] could not record the failure audit row: ${e && e.message}`);
+    }
+  };
+  const bail = async (statusCode, stage, payload) => {
+    await failAudit(stage, payload.error + (payload.detail ? ` — ${payload.detail}` : ""));
+    return { statusCode, body: JSON.stringify({ ...payload, stage, trace }) };
+  };
+
+  const missingEnv = [
+    ["ACUMATICA_BASE_URL", ACUMATICA_BASE_URL], ["ACUMATICA_USERNAME", ACUMATICA_USERNAME],
+    ["ACUMATICA_PASSWORD", ACUMATICA_PASSWORD], ["SUPABASE_URL", SUPABASE_URL],
+    ["SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY],
+  ].filter(([, v]) => !v).map(([k]) => k);
+  if (missingEnv.length > 0) {
+    log("Missing required environment variables", missingEnv.join(", "));
+    return bail(500, "env", { error: "Missing env vars", detail: missingEnv.join(", ") });
   }
 
   const giEncoded = encodeURIComponent(ACUMATICA_PRODUCTION_ORDERS_GI_NAME || "LM Planner Production Orders");
@@ -185,7 +246,7 @@ exports.handler = async (event) => {
       if (!resp.ok) {
         const body = await resp.text();
         log("Acumatica returned non-OK status", { status: resp.status, page, skip, body: body.slice(0, 200) });
-        return { statusCode: 502, body: JSON.stringify({ error: "Acumatica auth/fetch failed", status: resp.status, page }) };
+        return bail(502, "acumatica-fetch", { error: "Acumatica auth/fetch failed", status: resp.status, page, detail: body.slice(0, 300) });
       }
       const pageXml = await resp.text();
       const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
@@ -199,7 +260,7 @@ exports.handler = async (event) => {
     }
   } catch (err) {
     log("Fetch threw", err.message);
-    return { statusCode: 502, body: JSON.stringify({ error: "Acumatica fetch error", detail: err.message }) };
+    return bail(502, "acumatica-fetch-threw", { error: "Acumatica fetch error", detail: err.message });
   }
 
   log(`Fetched ${entries.length} <entry> element(s) across ${pageCount} page(s)`);
@@ -322,7 +383,12 @@ exports.handler = async (event) => {
   const statusCounts = Object.create(null);
   const releasedByModel = new Map();   // fg_sku -> { units, orders, desc }
   let releasedOrders = 0, releasedUnits = 0;
-  for (const { data: d } of feedById.values()) {
+  try {
+  // feedById.set(data.id, data) stores the row DIRECTLY — there is no
+  // { data } wrapper to destructure. Getting that wrong here threw
+  // TypeError on the first iteration of every run, above the upsert, so
+  // the sync died before writing anything. See the try/catch note below.
+  for (const d of feedById.values()) {
     const st = String(d.status || "").trim();
     statusCounts[st || "<empty>"] = (statusCounts[st || "<empty>"] || 0) + 1;
     if (!ON_LINE_STATUSES.has(normStatus(st))) continue;
@@ -350,12 +416,24 @@ exports.handler = async (event) => {
   for (const [sku, rec] of [...releasedByModel.entries()].sort((a, b) => b[1].units - a[1].units)) {
     log(`[LINE]   ${sku}  ${rec.units} unit(s) over ${rec.orders} order(s)${rec.desc ? "  — " + rec.desc : ""}`);
   }
+  } catch (err) {
+    // THIS BLOCK IS PURE DIAGNOSTICS. It must never be able to stop the
+    // sync that feeds it — which is exactly what happened when a bad
+    // destructure here threw above the upsert and froze
+    // production_orders for two days while the cron dutifully fired.
+    // Logging is allowed to be wrong; it is not allowed to be fatal.
+    log(`[LINE] WARNING: validation block failed (${(err && err.message) || err}) — continuing with the sync, which is unaffected`);
+  }
 
   // Zero-row bailout — matches acumatica-bom-sync.js. A schema/auth
   // glitch that returns zero rows must NOT wipe the table.
   if (feedById.size === 0) {
     log("No production orders parsed from feed — possible schema change or empty GI; bailing without touching the table");
-    return { statusCode: 200, body: JSON.stringify({ upserted: 0, removed: 0, note: "No rows parsed" }) };
+    // A GI that suddenly returns nothing is a FAILURE, not a quiet
+    // success: it means the inquiry, its conditions or its permissions
+    // changed underneath us. 200 kept so the cron does not retry-storm,
+    // but it now leaves a failure breadcrumb instead of vanishing.
+    return bail(200, "empty-feed", { error: "No rows parsed from the GI", upserted: 0, removed: 0, detail: `fetched ${entries.length} entry element(s) across ${pageCount} page(s) but none carried a production-order number` });
   }
 
   const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
@@ -372,7 +450,7 @@ exports.handler = async (event) => {
     const { data, error } = await supa.from("production_orders").select("id, data").range(from, from + PAGE - 1);
     if (error) {
       log("production_orders select error", error);
-      return { statusCode: 500, body: JSON.stringify({ error: "production_orders select failed", detail: error.message }) };
+      return bail(500, "existing-select", { error: "production_orders select failed", detail: error.message });
     }
     if (!data || data.length === 0) break;
     existing.push(...data);
@@ -595,6 +673,16 @@ exports.handler = async (event) => {
       detectedFieldMapping: detectedField,
       unmappedFields: [...missingField],
       lineFloat: chained,
+      // Carried on the SUCCESS path too, not just the bails: the HTTP
+      // door exists so a run can be inspected without the Netlify log
+      // console, and "it worked, here is exactly what it saw" is the
+      // most useful version of that.
+      trace,
     }),
   };
-};
+}
+
+exports.handler = async (event) => runProductionOrdersSync(event);
+// Shared runner for the unscheduled HTTP door and for any caller that
+// wants a sync inline. See acumatica-production-orders-run.js.
+exports.runProductionOrdersSync = runProductionOrdersSync;
