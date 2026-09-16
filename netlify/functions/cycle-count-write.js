@@ -151,6 +151,58 @@ async function _applyOp(supa, w, i, log) {
         return { index: i, ok: true, kind: "flag", itemId: inserted.id };
       }
 
+      case "recordShelfCount": {
+        // v-line-count: a physical count of the LINE LOCATION
+        // (WHI900/RMSTOR-LM), judged against the band the Line Count tab
+        // shows. Writes to shelf_counts ONLY. Nothing here ever reaches
+        // Acumatica — Acumatica stays the system of record for on-hand,
+        // and this table is our own record of what was physically found.
+        //
+        // The verdict is computed HERE, from the band passed in, so the
+        // stored row carries the numbers it was judged against. A later
+        // sync moving on-hand must not silently re-grade a past count.
+        const pn = String(w.pn || "").trim();
+        const counter = String(w.counted_by || "").trim();
+        const countedRaw = Number(w.counted_qty);
+        if (!pn) return { index: i, ok: false, error: "recordShelfCount: pn required" };
+        if (!counter) return { index: i, ok: false, error: "recordShelfCount: counted_by required" };
+        if (!Number.isFinite(countedRaw) || countedRaw < 0) {
+          return { index: i, ok: false, error: "recordShelfCount: counted_qty must be a non-negative number" };
+        }
+        const bandLow = Number(w.band_low);
+        const bandHigh = Number(w.band_high);
+        if (!Number.isFinite(bandLow) || !Number.isFinite(bandHigh)) {
+          return { index: i, ok: false, error: "recordShelfCount: band_low and band_high required" };
+        }
+        if (bandLow > bandHigh) {
+          return { index: i, ok: false, error: `recordShelfCount: band_low ${bandLow} exceeds band_high ${bandHigh}` };
+        }
+        const counted = Math.round(countedRaw * 10000) / 10000;
+        const verdict = counted < bandLow ? "short" : (counted > bandHigh ? "over" : "ok");
+        const floatAt = Number.isFinite(Number(w.line_float_at_count)) ? Number(w.line_float_at_count) : null;
+        const { data, error } = await supa
+          .from("shelf_counts")
+          .insert({
+            pn,
+            counted_qty: counted,
+            counted_by: counter,
+            // band_high is the on-hand book figure the count was judged
+            // against; the column predates the band and keeps its name.
+            on_hand_at_count: bandHigh,
+            line_float_at_count: floatAt,
+            verdict,
+          })
+          .select("id, counted_at")
+          .single();
+        if (error) return { index: i, ok: false, error: "recordShelfCount: insert failed: " + error.message };
+        return {
+          index: i, ok: true, kind: "recordShelfCount",
+          id: data && data.id, pn, counted, verdict,
+          bandLow, bandHigh,
+          countedAt: data && data.counted_at,
+        };
+      }
+
       case "resolveListItem": {
         // v-ir-list: [Done] / [Not needed] on the Inventory
         // Reconciliation count list. Writes an audit row to
