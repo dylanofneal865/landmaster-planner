@@ -44,14 +44,14 @@
 # tab -- the client mirror DB.productionOrders is READ ONLY and never
 # influences partStatus, queueParts, daily rates, or any existing math.
 # Poll-only downstream: production_orders is NOT in the realtime publication.
-# v-line-count: cadence raised from weekly (Mon 11:00 UTC) to every 30
-# minutes. The Line Count band is derived from Released orders, and the
-# line turns over through the day -- a week-old unit count would put the
-# band badly out of date. Same GI, same stored shape; the existing
-# read-only "BOM Usage Weekly" tab just sees fresher rows. Note this is
-# ~48 pulls/day against the Production Orders GI where it used to be 1.
+# v-line-count: cadence raised from weekly (Mon 11:00 UTC) to HOURLY.
+# The Line Count band is derived from Released orders and the line turns
+# over through the day, so a week-old unit count would put the band badly
+# out of date. Hourly keeps it current at ~24 pulls/day (the first pass
+# used */30 -- halved per Dylan, 2026-09-16). Same GI, same stored shape;
+# the existing read-only "BOM Usage Weekly" tab just sees fresher rows.
 [functions."acumatica-production-orders-sync"]
-  schedule = "*/30 * * * *"
+  schedule = "0 * * * *"
 
 # PO-Receipts sync -- split into two cadences that share the same
 # runReceiptsSync(mode) in acumatica-po-receipts-sync.js.

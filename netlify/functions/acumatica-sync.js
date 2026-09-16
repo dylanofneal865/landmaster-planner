@@ -299,16 +299,29 @@ exports.handler = async (event) => {
     if (locQtyStr === null) continue;
     const locQty = parseFloat(locQtyStr);
     if (!isFinite(locQty)) continue;
+    // v-line-count: per-location AVAILABLE, alongside the existing
+    // per-location ON HAND. The Line Count band uses Available as
+    // band_high (allocations at the line location are not countable
+    // stock); On Hand is kept so the UI can show the two side by side
+    // whenever they disagree at RMSTOR-LM. Null-tolerant: a GI that
+    // hasn't got the column yet leaves qty_available null and every
+    // consumer falls back to qty (On Hand) rather than reading 0.
+    const locAvailStr = isNull("QtyAvailableinLocation") ? null : get("QtyAvailableinLocation");
+    const locAvailRaw = locAvailStr === null ? null : parseFloat(locAvailStr);
+    const locAvail = (locAvailRaw !== null && isFinite(locAvailRaw)) ? locAvailRaw : null;
     const key = warehouse + "|" + location;
     let byLoc = locByPn.get(pn);
     if (!byLoc) { byLoc = new Map(); locByPn.set(pn, byLoc); }
     const prev = byLoc.get(key);
     if (prev) {
       prev.qty += locQty;
+      // Available sums the same way On Hand does across LotSerialNbr
+      // rows. Stays null only if EVERY contributing row lacked it.
+      if (locAvail !== null) prev.qtyAvailable = (prev.qtyAvailable || 0) + locAvail;
       // Prefer a non-empty description if we see one later.
       if (!prev.location_desc && locDesc) prev.location_desc = locDesc;
     } else {
-      byLoc.set(key, { warehouse, location, location_desc: locDesc, qty: locQty });
+      byLoc.set(key, { warehouse, location, location_desc: locDesc, qty: locQty, qtyAvailable: locAvail });
     }
   }
 
@@ -441,6 +454,26 @@ exports.handler = async (event) => {
 
   // v-cc-loc-1 phase 1 -- part_locations upsert.
   //
+  // v-line-count SCHEMA ADDITION. Three nullable columns; run once in
+  // the Supabase SQL editor BEFORE this deploy (inserts naming a column
+  // that does not exist fail the whole batch):
+  //
+  //   ALTER TABLE public.part_locations
+  //     ADD COLUMN IF NOT EXISTS warehouse     text,
+  //     ADD COLUMN IF NOT EXISTS location_raw  text,
+  //     ADD COLUMN IF NOT EXISTS qty_available numeric;
+  //
+  //   -- Line Count reads this slice every render.
+  //   CREATE INDEX IF NOT EXISTS part_locations_wh_loc_idx
+  //     ON public.part_locations (warehouse, location_raw);
+  //
+  // qty_available is QtyAvailableinLocation (what is countable at the
+  // location, net of allocations) and is what the Line Count band uses
+  // for band_high. qty stays QtyOnHandinLocation so the UI can show both
+  // whenever they disagree. Both nullable: a GI missing the column
+  // leaves qty_available null and consumers fall back to qty rather
+  // than silently reading 0.
+  //
   // Emit rows: per pn, use the wh+loc dedupe map. Label:
   //   * pn touches > 1 warehouse -> location = "WAREHOUSE/LOC"
   //   * pn touches 1 warehouse (or an empty warehouse column) ->
@@ -505,12 +538,61 @@ exports.handler = async (event) => {
         location: displayLoc,
         location_desc: r.location_desc || null,
         qty: r.qty,
+        // v-line-count: warehouse is now STORED, not just used for the
+        // display-prefix decision. Without it "RMSTOR-LM" can only be
+        // matched by name; the Line Count band has to scope to
+        // WHI900/RMSTOR-LM specifically.
+        warehouse: r.warehouse || null,
+        // Raw (unprefixed) location so a consumer can match on the real
+        // Acumatica location id regardless of the multi-warehouse
+        // display prefix applied above.
+        location_raw: r.location || null,
+        qty_available: (r.qtyAvailable === null || r.qtyAvailable === undefined) ? null : r.qtyAvailable,
         synced_at: nowIsoLoc,
       });
     }
     touchedPnsForLocs.push(pn);
   }
   log(`[LOC] collected ${partLocationRows.length} location row(s) across ${touchedPnsForLocs.length} pn(s); ${agreePns} agree / ${disagreePns} disagree vs aggregate (worst ${widestDeltaPn ? widestDeltaPn + " delta=" + widestDelta.toFixed(1) : "n/a"})`);
+
+  /* ------------------------------------------------------------------
+     v-line-count LOCATION DIAGNOSTICS. Three things the Line Count band
+     depends on, logged every sync so a GI regression is visible:
+       1. Does QtyAvailableinLocation actually parse? If coverage is 0,
+          the column is absent/misnamed and every band_high would fall
+          back to On Hand -- say so loudly rather than shipping a band
+          built on the wrong number.
+       2. Distinct locations seen, so it is obvious whether the feed
+          carries more than RMSTOR-LM.
+       3. RMSTOR-LM specifically: row count, and how often Available
+          differs from On Hand there (the allocations the band must
+          exclude).
+     ------------------------------------------------------------------ */
+  {
+    const LINE_LOCATION = "RMSTOR-LM";
+    const LINE_WAREHOUSE = "WHI900";
+    const real = partLocationRows.filter(r => r.location !== WAREHOUSE_SENTINEL);
+    const withAvail = real.filter(r => r.qty_available !== null).length;
+    const locSet = new Set(real.map(r => r.location_raw || r.location).filter(Boolean));
+    const lineRows = real.filter(r =>
+      String(r.location_raw || "").toUpperCase() === LINE_LOCATION &&
+      (!r.warehouse || String(r.warehouse).toUpperCase() === LINE_WAREHOUSE));
+    let lineDiffer = 0, lineWidest = 0, lineWidestPn = null;
+    for (const r of lineRows) {
+      if (r.qty_available === null) continue;
+      const gap = Math.abs(Number(r.qty_available) - Number(r.qty));
+      if (gap > 0.5) {
+        lineDiffer++;
+        if (gap > lineWidest) { lineWidest = gap; lineWidestPn = r.pn; }
+      }
+    }
+    log(`[LOC] QtyAvailableinLocation coverage: ${withAvail}/${real.length} location row(s) parsed a value`);
+    if (real.length > 0 && withAvail === 0) {
+      log(`[LOC] WARNING: QtyAvailableinLocation parsed on ZERO rows. The column is missing or renamed on the LM Planner Inventory GI — qty_available is null everywhere and any Line Count band built on it would be wrong. Check the first-entry tag list above for the real column name.`);
+    }
+    log(`[LOC] distinct locations seen: ${locSet.size}${locSet.size > 1 && locSet.size <= 25 ? " — " + [...locSet].sort().join(", ") : ""}`);
+    log(`[LOC] ${LINE_WAREHOUSE}/${LINE_LOCATION}: ${lineRows.length} part row(s); Available differs from OnHand on ${lineDiffer}${lineWidest ? `, widest gap ${lineWidest.toFixed(1)} on ${lineWidestPn}` : ""}`);
+  }
   if (disagreePns > agreePns && disagreePns > 20) {
     log(`[LOC] WARN: disagreement widespread (${disagreePns} vs ${agreePns}). Available-vs-OnHand normally explains a gap; if this ratio persists after Reserved qty is checked, suspect LotSerialNbr rows still double-counting despite the wh+loc collapse.`);
   }
@@ -538,6 +620,12 @@ exports.handler = async (event) => {
       location: WAREHOUSE_SENTINEL,
       location_desc: null,
       qty: physQty,
+      // Sentinel is warehouse-aggregate by construction — no single
+      // warehouse/location applies, and warehouse-level Available is
+      // already stored as parts.data.onHand.
+      warehouse: null,
+      location_raw: null,
+      qty_available: null,
       synced_at: nowIsoLoc,
     });
     sentinelRows++;
