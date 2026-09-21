@@ -5582,12 +5582,24 @@ window._fsDebugSim = function () {
     // Placements (mirror the sim exactly — NO PO credits).
     // v3.3: split slots run frame A in week-1, frame B in week-2.
     // runPn is chosen per-week based on slot.weekIsos[1] === iso.
-    // v5: verbatim persisted-qty replay is restricted to the
-    // CURRENT week only (see _fsSimulate for the full rationale).
-    // Every future week — locked or not — sizes from current caps
-    // so cap edits reprice the whole grid, not just the tail.
+    // v5: verbatim persisted-qty replay for auto/seed rows is
+    // restricted to the CURRENT week, so cap edits reprice the grid.
+    // v6: MANUAL pins (source "manual", locked, stored qty map) replay
+    // verbatim at ANY horizon distance -- a manual pin is an agreement
+    // with the supplier and its numbers are part of the pin.
+    // This is an inline mirror of the gate in lib/frame-scheduler.js
+    // (slots path AND weekly path) -- change all three together.
     const wk = _fsWeekData(iso);
-    const isLockedWithPersistedQty = slot && slot.locked && c.current && wk.qty && Object.keys(wk.qty).length > 0;
+    const hasStoredQty = !!(wk.qty && Object.keys(wk.qty).length > 0);
+    const isManualPin = !!(slot && slot.locked && slot.source === "manual");
+    // Warn-once per week-iso; the Set hangs off window so it survives
+    // across _fsDebugSim invocations without a new top-level global.
+    const warned = (window._fsDebugWarnedNoQty = window._fsDebugWarnedNoQty || new Set());
+    if (isManualPin && !hasStoredQty && !warned.has(iso)) {
+      warned.add(iso);
+      console.warn(`[frame-schedule] manual pin at ${iso} has no stored qty map — live-sizing it; re-pin to store the agreed quantities`);
+    }
+    const isLockedWithPersistedQty = !!slot && slot.locked && hasStoredQty && (c.current || isManualPin);
     const isWeek2 = !!(slot && slot.weekIsos && slot.weekIsos[1] === iso);
     const runPn = slot && slot.resolvedPn
       ? (isWeek2 && slot.resolvedPn2 ? slot.resolvedPn2 : slot.resolvedPn)
