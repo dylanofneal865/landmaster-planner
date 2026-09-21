@@ -149,6 +149,9 @@ const FRAMESCHED_STATE = {
   // restores don't accumulate as permanent pins. Session flag
   // prevents the render from re-scanning the mirror every tick.
   _expiredManualPinsScanned: false,
+  // v8 one-time pin-map reconcile (see _fsReconcileManualPinMaps).
+  _mapReconciled: false,
+  _mapReconcileTouched: null,   // count of rows rewritten this browser, for the deploy report
   // v7.6 Banner visibility set by _fsCheckWriteBlockedAndBanner;
   // read by nothing else -- the DOM element is idempotent so
   // repeated calls are cheap.
@@ -1226,6 +1229,63 @@ function _fsBuildWeekPayload(iso, scheduledRuns, slot, isSlotStart) {
 // field matches after coercion (nullish -> ""; qty/qty2 -> 0).
 // Kept intentionally boring so a subtle field-drift diff always
 // counts as "differs".
+// ONE SOURCE OF TRUTH for a pinned week's numbers -- v8.
+//
+// A pinned week's quantities live in two places: the slot DESCRIPTOR
+// (slot.qty / slot.qty2 -- what the operator typed) and the row's
+// data.qty MAP (what replay reads). For months nothing read future
+// maps, so they drifted apart silently; dc658ff made maps load-bearing
+// without reconciling them and stale numbers surfaced on restored pins.
+//
+// Rule from here: the map is DERIVED from the descriptor, never typed
+// independently. Every writer of a manual weekly pin writes descriptor
+// and map together through this one function; replay reads the map;
+// and the render checks the two agree. Zero / absent entries are
+// omitted so the map never carries a phantom frame.
+function _fsMapFromDescriptor(slot) {
+  const map = {};
+  if (!slot || !slot.pn) return map;
+  const q  = Math.floor(Number(slot.qty));
+  const q2 = Math.floor(Number(slot.qty2));
+  if (Number.isFinite(q)  && q  > 0) map[slot.pn] = q;
+  if (slot.pn2 && slot.pn2 !== slot.pn && Number.isFinite(q2) && q2 > 0) map[slot.pn2] = q2;
+  return map;
+}
+
+// Canonical string of a qty map for comparison (sorted keys, zero /
+// non-numeric entries dropped -- the same normalisation the derivation
+// applies, so a legacy map with a stray 0 compares equal to a clean
+// one and does not trip a needless rewrite).
+function _fsQtyMapKey(map) {
+  const out = {};
+  for (const k of Object.keys(map || {}).sort()) {
+    const n = Math.floor(Number(map[k]));
+    if (Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return JSON.stringify(out);
+}
+
+// Render-time invariant: a manual weekly row whose map disagrees with
+// its descriptor is exactly the class of bug this exists to make
+// impossible. Warn once per iso, both values shown, so a regression is
+// loud without spamming every render.
+function _fsCheckPinMapInvariant(iso, wk) {
+  const slot = wk && wk.slot;
+  if (!slot || slot.mode !== "weekly" || slot.source !== "manual") return true;
+  // A descriptor with no typed qty has nothing to derive; that is the
+  // legacy pn-only pin, not a mismatch.
+  if (!(Number(slot.qty) > 0)) return true;
+  const want = _fsQtyMapKey(_fsMapFromDescriptor(slot));
+  const have = _fsQtyMapKey(wk.qty || {});
+  if (want === have) return true;
+  const warned = (window._fsPinMapWarned = window._fsPinMapWarned || new Set());
+  if (!warned.has(iso)) {
+    warned.add(iso);
+    console.warn(`[frame-schedule] PIN/MAP MISMATCH at ${iso}: descriptor says ${want}, stored map says ${have}. Replay reads the map. Run the map-repair SQL or re-save the pin.`);
+  }
+  return false;
+}
+
 function _fsSlotsEqual(a, b) {
   if (a == null && b == null) return true;
   if (a == null || b == null) return false;
@@ -2030,6 +2090,7 @@ function renderFrameSchedule() {
   // stop misleading and don't resist a future Replan horizon.
   // Idempotent -- guarded by a session flag inside.
   _fsExpirePastManualPins();
+  _fsReconcileManualPinMaps();   // v8: one-time, current+future manual pins, descriptor wins
   // v7.6 Also re-check the write-blocked banner so a tab that
   // becomes stale mid-session (a fresher deploy hydrates via
   // realtime) sees the banner without waiting for a write.
@@ -2188,6 +2249,9 @@ function renderFrameSchedule() {
     }
     for (let wi = 0; wi < cols.length; wi++) {
       const c = cols[wi];
+      // v8 invariant: a manual pin's map must equal its descriptor.
+      // Warns once per iso with both values; never alters the render.
+      if (!c.past) _fsCheckPinMapInvariant(c.iso, _fsWeekData(c.iso));
       // Collect placements for this week: primary "run" pn (or
       // the largest crew placement) + any "filler" or override
       // std placement.
@@ -4634,6 +4698,54 @@ function _fsHandleQtyOverride(pn, iso, evt) {
 // them if data structures ever need cleanup. Current + future
 // manual pins are LEFT ALONE. Guarded by _fsWriteBlocked so a
 // stale tab doesn't run the sweep.
+// v8 ONE-TIME RECONCILE -- current + future weeks only.
+//
+// On first render after hydration, once per browser behind a versioned
+// flag, every manual weekly pin whose stored map disagrees with the
+// map derived from its descriptor gets the map rewritten from the
+// descriptor through the normal guarded write path. Descriptor wins:
+// it is what the operator typed. Audit-logged per row so the deploy
+// report can say how many live rows were touched (should be zero if
+// the map-repair SQL ran first). Payload carries NO `slot` key, so
+// pn / source / locked are preserved and the manual-pin guard never
+// engages. Idempotent: a matching row is never written.
+const FS_MAP_RECONCILE_FLAG = "landmaster.fsMapReconcile.v1";
+function _fsReconcileManualPinMaps() {
+  if (FRAMESCHED_STATE._mapReconciled) return;
+  if (!(DB && DB.frameSchedule && DB.frameSchedule.loaded)) return;
+  if (!(DB.frameSchedule.weeks instanceof Map)) return;
+  FRAMESCHED_STATE._mapReconciled = true;
+  try { if (localStorage.getItem(FS_MAP_RECONCILE_FLAG) === "done") { FRAMESCHED_STATE._mapReconcileTouched = 0; return; } } catch (_) {}
+  if (_fsWriteBlocked()) { FRAMESCHED_STATE._mapReconciled = false; return; }   // retry next render once unblocked
+
+  const cols = _fsColumns();
+  const currentCol = cols.find(c => c.current) || null;
+  const currentIso = currentCol ? currentCol.iso : _fsIsoMonday(new Date());
+  let touched = 0;
+  const touchedIsos = [];
+  for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
+    if (iso === "__settings__" || iso < currentIso) continue;
+    const s = wk && wk.slot;
+    if (!s || s.mode !== "weekly" || s.source !== "manual") continue;
+    if (!(Number(s.qty) > 0)) continue;                    // pn-only legacy pin: nothing to derive
+    const derived = _fsMapFromDescriptor(s);
+    if (_fsQtyMapKey(derived) === _fsQtyMapKey(wk.qty || {})) continue;
+    const before = wk.qty || {};
+    _fsCommitWeek(iso, { qty: derived });
+    touched++;
+    touchedIsos.push(iso);
+    if (typeof logAudit === "function") {
+      logAudit("frame-sched-map-reconcile",
+        `Frame schedule: map reconciled from pin descriptor for ${iso}`,
+        { weekIso: iso, pn: s.pn, before, after: derived });
+    }
+    console.log(`[frame-schedule] v8 reconcile ${iso}: map ${JSON.stringify(before)} -> ${JSON.stringify(derived)} (descriptor wins)`);
+  }
+  FRAMESCHED_STATE._mapReconcileTouched = touched;
+  try { localStorage.setItem(FS_MAP_RECONCILE_FLAG, "done"); } catch (_) {}
+  console.log(`[frame-schedule] v8 pin-map reconcile: ${touched} row(s) rewritten from descriptor${touched ? " -- " + touchedIsos.join(", ") : ""}`);
+}
+
 function _fsExpirePastManualPins() {
   if (FRAMESCHED_STATE._expiredManualPinsScanned) return;
   if (_fsWriteBlocked()) { _fsCheckWriteBlockedAndBanner(); return; }
@@ -4749,7 +4861,10 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
     // manuallyPinned first (via confirm), so this line only
     // runs when the current row is not manually pinned; the
     // flag is a belt-and-suspenders no-op in that case.
-    _fsCommitWeek(iso, { slot: slotDesc, allowManualSlotChange: true });
+    // v8 ONE SOURCE OF TRUTH: descriptor AND map in the same payload,
+    // the map derived from what was just typed. Writing the descriptor
+    // alone here is how the two drifted apart for months.
+    _fsCommitWeek(iso, { slot: slotDesc, qty: _fsMapFromDescriptor(slotDesc), allowManualSlotChange: true });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       const desc = slotDesc.pn2
