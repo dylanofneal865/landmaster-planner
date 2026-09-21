@@ -1593,19 +1593,31 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
   // pass builds includes a slot descriptor (from _fsBuildWeekPayload
   // when isStart is true), so writing it would still stamp a
   // legacy slot over a weekly row.
+  // v7 BACKFILL extends this from the current week to EVERY visible,
+  // non-past week of a locked slot whose stored map is empty. Under
+  // v5 the sim never read stored qty on future weeks, so a crossing
+  // could leave locked weeks with pn but no numbers; now that a
+  // locked week's map IS the schedule, such a week would live-size
+  // forever. Persist its live sizing ONCE, qty-only (isSlotStart is
+  // passed false so no slot descriptor rides along and the manual-pin
+  // guard is never in play). Idempotent: once the map is non-empty
+  // the `continue` below skips it on every later render.
   const currentCol = cols.find(c => c.current);
-  if (currentCol) {
-    for (const s of slots) {
-      if (!s.locked || !s.resolvedPn) continue;
-      const idx = s.weekIsos.indexOf(currentCol.iso);
-      if (idx < 0) continue;
-      if (slotOverlapsWeeklyPin(s)) continue;
-      const wk = _fsWeekData(currentCol.iso);
+  const pastIsos = new Set(cols.filter(c => c.past).map(c => c.iso));
+  for (const s of slots) {
+    if (!s.locked || !s.resolvedPn) continue;
+    if (slotOverlapsWeeklyPin(s)) continue;
+    for (const iso of s.weekIsos) {
+      if (!visibleIsos.has(iso) || pastIsos.has(iso)) continue;
+      const wk = _fsWeekData(iso);
       if (wk.qty && Object.keys(wk.qty).length > 0) continue;
-      const payload = _fsBuildWeekPayload(currentCol.iso, scheduledRuns, s, idx === 0);
+      const payload = _fsBuildWeekPayload(iso, scheduledRuns, s, false);
       if (payload.qty && Object.keys(payload.qty).length > 0) {
         // v7.11 Queue instead of firing per-iso.
-        _fsPersistLockedCrossings_batchPending.push({ iso: currentCol.iso, payload });
+        _fsPersistLockedCrossings_batchPending.push({ iso, payload });
+        if (!currentCol || iso !== currentCol.iso) {
+          console.log(`[frame-schedule] v7 backfill: locked slot week ${iso} (${s.resolvedPn}) had no stored qty — persisting its live sizing once:`, payload.qty);
+        }
       }
     }
   }
@@ -1715,8 +1727,31 @@ function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visible
       if (existing.source === "manual" || existing.source === "seed") continue;
       if (existing.mode !== "weekly" && existing.locked) continue;
       if (existing.mode === "weekly") {
-        // Weekly pin already present -- respected verbatim.
-        // Mark the session set so we don't scan this iso again.
+        // Weekly pin already present -- respected verbatim, EXCEPT:
+        // v7 BACKFILL. Under v5 the sim never read stored qty on
+        // future weeks, so a crossing could leave a weekly-auto row
+        // with pn but an EMPTY qty map. Now that a pinned row's map
+        // IS the schedule, such a row would live-size forever and
+        // never freeze. Size it live ONCE, persist qty only (no
+        // `slot` key, so _fsCommitWeek preserves pn/source/locked
+        // and the manual-pin guard is never in play), and mark the
+        // session set. From then on it replays; nothing automatic
+        // touches it again.
+        const mapEmpty = !(wk.qty && Object.keys(wk.qty).length > 0);
+        if (mapEmpty) {
+          const backfill = {};
+          for (const r of rows) {
+            for (const rn of (scheduledRuns.get(r.pn) || [])) {
+              if (rn.weekIso === c.iso && rn.qty > 0) backfill[r.pn] = (backfill[r.pn] || 0) + rn.qty;
+            }
+          }
+          if (Object.keys(backfill).length > 0) {
+            _fsPersistWeeklyNearTerm_batchPending.push({ iso: c.iso, payload: { qty: backfill } });
+            console.log(`[frame-schedule] v7 backfill: pinned week ${c.iso} (${existing.pn}) had no stored qty — persisting its live sizing once:`, backfill);
+          }
+          // Idle (nothing placed) stays empty and is re-checked next
+          // render; an empty map is not a schedule to freeze.
+        }
         FRAMESCHED_STATE._autoPersistedWeeklyIsos.add(c.iso);
         continue;
       }
@@ -5582,24 +5617,23 @@ window._fsDebugSim = function () {
     // Placements (mirror the sim exactly — NO PO credits).
     // v3.3: split slots run frame A in week-1, frame B in week-2.
     // runPn is chosen per-week based on slot.weekIsos[1] === iso.
-    // v5: verbatim persisted-qty replay for auto/seed rows is
-    // restricted to the CURRENT week, so cap edits reprice the grid.
-    // v6: MANUAL pins (source "manual", locked, stored qty map) replay
-    // verbatim at ANY horizon distance -- a manual pin is an agreement
-    // with the supplier and its numbers are part of the pin.
+    // v7: LOCKS FREEZE THE NUMBERS. Any locked row -- manual,
+    // weekly-auto, seed -- with a non-empty stored qty map replays it
+    // verbatim at ANY horizon distance. Cap edits, on-hand moves, burn
+    // and catch-up shape only unlocked / proposed weeks. (v5 had
+    // restricted replay to the current week; v6 exempted manual pins.)
     // This is an inline mirror of the gate in lib/frame-scheduler.js
     // (slots path AND weekly path) -- change all three together.
     const wk = _fsWeekData(iso);
     const hasStoredQty = !!(wk.qty && Object.keys(wk.qty).length > 0);
-    const isManualPin = !!(slot && slot.locked && slot.source === "manual");
     // Warn-once per week-iso; the Set hangs off window so it survives
     // across _fsDebugSim invocations without a new top-level global.
     const warned = (window._fsDebugWarnedNoQty = window._fsDebugWarnedNoQty || new Set());
-    if (isManualPin && !hasStoredQty && !warned.has(iso)) {
+    if (slot && slot.locked && !hasStoredQty && !warned.has(iso)) {
       warned.add(iso);
-      console.warn(`[frame-schedule] manual pin at ${iso} has no stored qty map — live-sizing it; re-pin to store the agreed quantities`);
+      console.warn(`[frame-schedule] locked week ${iso} has no stored qty map — live-sizing it this pass; render backfills the persist once`);
     }
-    const isLockedWithPersistedQty = !!slot && slot.locked && hasStoredQty && (c.current || isManualPin);
+    const isLockedWithPersistedQty = !!slot && slot.locked && hasStoredQty;
     const isWeek2 = !!(slot && slot.weekIsos && slot.weekIsos[1] === iso);
     const runPn = slot && slot.resolvedPn
       ? (isWeek2 && slot.resolvedPn2 ? slot.resolvedPn2 : slot.resolvedPn)
