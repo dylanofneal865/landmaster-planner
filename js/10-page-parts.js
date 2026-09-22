@@ -285,35 +285,79 @@ function renderPartDetail(part) {
     }
   }
 
-  // PO receipt dots + labels. Two crowding rules:
-  //   (a) if a dot is within 55px of the left gutter, anchor the label start
-  //       at dot.x+6 so it can't land on the y-axis numbers or today line;
-  //   (b) if two dots are within 45px of each other, label only the LATER
-  //       one with the COMBINED "+N" (sum across the cluster). All dots are
-  //       drawn — only labels are merged.
+  // PO receipt dots + labels. LABELS ONLY -- the dots, the line and every
+  // number behind them are per-day dated and untouched here.
+  //
+  // Crowding rules:
+  //   (a) LEFT GUTTER: a dot within 55px of the left gutter anchors its
+  //       label start at dot.x+6 so it can't land on the y-axis numbers or
+  //       the today line. Unchanged.
+  //   (b) MERGE: dots within 45px of the previous dot merge into one
+  //       label -- but a cluster is CAPPED AT 7 CALENDAR DAYS of span. The
+  //       old rule chained without a cap, so any weekly PO schedule (7d is
+  //       ~44px) folded into a single "+total" at the last drop:
+  //       CP00591-2's six weekly 50s read as "+300" at 12/11. A merged
+  //       label anchors at the cluster's FIRST dot and says how many drops
+  //       it stands for: "+N (k drops)".
+  //   (c) STAGGER: receipts further apart than 7d keep their own labels
+  //       even when pixel-close; a label whose predecessor is within 45px
+  //       flips to the other side of the dot (above / below alternate), and
+  //       any label sharing a 45px window with 2+ others drops to 8px.
+  const RECV_MERGE_PX = 45;
+  const RECV_MERGE_MAX_SPAN_DAYS = 7;
   const _recvHits = [];
   series.forEach((s, i) => {
     if (!s.recv || s.recv <= 0) return;
-    _recvHits.push({ cx: xS(i), cy: yS(Math.max(0, s.oh)), recv: s.recv });
+    _recvHits.push({ cx: xS(i), cy: yS(Math.max(0, s.oh)), recv: s.recv, day: i });
   });
   const _recvLabels = [];
   for (const h of _recvHits) {
     const last = _recvLabels.length > 0 ? _recvLabels[_recvLabels.length - 1] : null;
-    if (last && h.cx - last.cx < 45) {
-      last.cx = h.cx;
-      last.cy = h.cy;
+    const pixelClose = !!last && (h.cx - last.lastCx) < RECV_MERGE_PX;
+    // Strictly LESS than the cap: consecutive weekly drops are exactly 7
+    // days apart, and a weekly cadence is the one thing that must never
+    // merge. 3-day pairs still do.
+    const withinSpan = !!last && (h.day - last.firstDay) < RECV_MERGE_MAX_SPAN_DAYS;
+    if (pixelClose && withinSpan) {
+      // Join the cluster: the label stays anchored at the FIRST dot.
+      last.lastCx = h.cx;
       last.recv += h.recv;
+      last.drops += 1;
     } else {
-      _recvLabels.push({ cx: h.cx, cy: h.cy, recv: h.recv });
+      _recvLabels.push({ cx: h.cx, cy: h.cy, lastCx: h.cx, firstDay: h.day, recv: h.recv, drops: 1 });
     }
   }
+  // Stagger pass. Labels chain into RUNS -- each label within 45px of the
+  // one before it joins the run (the same chaining the merge rule uses).
+  // Within a run, sides alternate above / below. A run of 3+ labels is
+  // crowded as a whole, so the WHOLE run drops to 8px -- sizing the ends
+  // 9px and the middle 8px (a per-label neighbour count does that) reads
+  // as a mistake, not a rule.
+  let prevBelow = false;
+  let runStart = 0;
+  const closeRun = (li) => {
+    const runLen = li - runStart + 1;
+    for (let k = runStart; k <= li; k++) _recvLabels[k].small = runLen >= 3;
+  };
+  for (let li = 0; li < _recvLabels.length; li++) {
+    const L = _recvLabels[li];
+    const prev = li > 0 ? _recvLabels[li - 1] : null;
+    const chained = !!prev && (L.cx - prev.cx) < RECV_MERGE_PX;
+    if (!chained && li > 0) { closeRun(li - 1); runStart = li; }
+    L.below = chained ? !prevBelow : false;
+    prevBelow = L.below;
+  }
+  if (_recvLabels.length > 0) closeRun(_recvLabels.length - 1);
   const recvMarkers = [
     _recvHits.map(h => `<circle cx="${h.cx}" cy="${h.cy}" r="3" fill="#4aa3f2"/>`).join(""),
     _recvLabels.map(h => {
       const closeToLeft = h.cx - PL < 55;
       const lx = closeToLeft ? h.cx + 6 : h.cx;
       const anchor = closeToLeft ? "start" : "middle";
-      return `<text x="${lx}" y="${h.cy - 8}" text-anchor="${anchor}" fill="#4aa3f2" font-size="9" font-family="var(--f-mono)">+${fmtNum(h.recv)}</text>`;
+      const ly = h.below ? h.cy + 14 : h.cy - 8;
+      const fs = h.small ? 8 : 9;
+      const text = h.drops > 1 ? `+${fmtNum(h.recv)} (${h.drops} drops)` : `+${fmtNum(h.recv)}`;
+      return `<text x="${lx}" y="${ly}" text-anchor="${anchor}" fill="#4aa3f2" font-size="${fs}" font-family="var(--f-mono)">${text}</text>`;
     }).join(""),
   ].join("");
 
