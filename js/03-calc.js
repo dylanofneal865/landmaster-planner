@@ -220,6 +220,36 @@ function leadTimeDays(part) {
   return Math.round((part.ltWeeks || 0) * 7);
 }
 
+// PRE-LAUNCH FORCE-ADMIT: the BRIDGE test (replaces the PO-presence test).
+//
+// The old admission gate required onPO === 0 -- "a PO exists, so the part
+// is handled". Two live parts disproved that: JP00038 (5 on PO = 1.3 days
+// at 3.91/day, order-by passed Jul 18) and CP00591-2 (345 on PO across
+// weekly drops, projected runout 12/22 against a 12-week lead -- its next
+// buy window opened Sep 9). A PO's presence says nothing about whether it
+// BRIDGES to the next order.
+//
+// Bridge test: admit when the projected runout -- PO-inclusive, cut-in-
+// aware, the same number the drawer banner prints -- lands BEFORE
+// today + leadTimeDays + safetyDays. No finite runout inside the horizon
+// means the part is covered: stay silent. onPO === 0 is kept as an
+// alternative so the zero-PO path behaves exactly as before.
+//
+// Pure: every input is a number or boolean, so the six live shapes can be
+// asserted directly.
+function preLaunchBridgeAdmit(runoutDays, leadDays, safetyDays) {
+  const r = Number(runoutDays);
+  if (!Number.isFinite(r)) return false;                       // beyond horizon = covered
+  return r < (Number(leadDays) || 0) + (Number(safetyDays) || 0);
+}
+function preLaunchForceAdmitEligible(f) {
+  if (!f || !f.preLaunch) return false;
+  if (String(f.itemType || "").toLowerCase().trim() !== "base_bom") return false;
+  if (f.hasBlanket) return false;                              // RELEASE tier owns it
+  if (!f.orderByPassed) return false;
+  return f.onPO === 0 || preLaunchBridgeAdmit(f.runoutDays, f.leadDays, f.safetyDays);
+}
+
 /* ------------------------------------------------------------------
    WORKDAY ⇄ CALENDAR conversion (shared, single source of truth)
 
@@ -3930,11 +3960,23 @@ function partsWithStatus() {
     let _forceAdmitAsPreLaunchOrder = false;
     let _preLaunchOrderByDaysPast = null;
     let _preLaunchForceOrderByDate = null;
-    if (preLaunch
-        && String(p.itemType || "").toLowerCase().trim() === "base_bom"
-        && onPO === 0
-        && !(typeof findOpenBlanketForPart === "function" && findOpenBlanketForPart(p.pn))
-        && preLaunchOB && preLaunchOB.orderByPassed) {
+    // Condition 3 is now the BRIDGE test (see preLaunchBridgeAdmit): a
+    // PO that does not carry the part to today + lead + safety is not
+    // coverage. runoutDays is status.daysOfCover -- partStatus over the
+    // chain-aware effective view WITH open lines, i.e. the PO-inclusive,
+    // cut-in-aware runout the drawer banner prints. onPO === 0 remains
+    // an admit on its own, so the zero-PO path is unchanged.
+    const _plSafety = (typeof DB !== "undefined" && DB && DB.settings && Number(DB.settings.safetyDays)) || 0;
+    if (preLaunchForceAdmitEligible({
+          preLaunch,
+          itemType: p.itemType,
+          onPO,
+          hasBlanket: !!(typeof findOpenBlanketForPart === "function" && findOpenBlanketForPart(p.pn)),
+          orderByPassed: !!(preLaunchOB && preLaunchOB.orderByPassed),
+          runoutDays: status ? status.daysOfCover : Infinity,
+          leadDays: leadTimeDays(p),
+          safetyDays: _plSafety,
+        })) {
       _forceAdmitAsPreLaunchOrder = true;
       _preLaunchForceOrderByDate = preLaunchOB.orderByDate;
       _preLaunchOrderByDaysPast = Math.floor((TODAY.getTime() - preLaunchOB.orderByDate.getTime()) / 86400000);
