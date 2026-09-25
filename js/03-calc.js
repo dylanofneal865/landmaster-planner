@@ -2115,6 +2115,54 @@ function chainDisplayDaily(part) {
        }
      }
    ============================================================ */
+// CHAIN REORDER-BY -- coverage-aware. Pure; every input is a number or
+// boolean so the live shapes can be asserted directly.
+//
+// Two candidate anchors for the successor's last-order day:
+//   byRunout = chainRunoutDays - lead - safety     (coverage-anchored;
+//              chainRunoutDays is PO-inclusive and already lands at a
+//              coverage gap's start when one exists)
+//   byCutin  = cutinFromToday  - lead - safety     (launch-anchored; only
+//              when C1 applies -- the successor has no bridge stock at
+//              cut-in)
+//
+// The old rule took min(byRunout, byCutin) unconditionally. Live case:
+// CP00936/937/938/939 -- launch-anchored order-by Jul 7 PASSED, but
+// 1,200 on PO with the first 1,000 landing Oct 2, before the Nov 2
+// cut-in, chain covered to Aug '27 -- all four CRITICAL suggesting
+// qty 0 / $0. That is the pre-launch branch's own bug in chain form:
+// "passed" must mean "passed AND no covering supply in flight".
+//
+// Rule: the cut-in anchor applies only when the chain does NOT run past
+// cut-in (nothing in flight bridges it). A chain whose PO-inclusive
+// runout extends beyond cut-in is covered through launch, so its next
+// reorder-by is coverage-anchored (byRunout) and status follows from
+// there. A chain whose runout lands at or before cut-in keeps the old
+// min() -- including the successor with NOTHING ordered, whose runout
+// lands exactly at cut-in, so it goes critical exactly as before.
+// Chain runout inside today + lead + safety is critical regardless:
+// byRunout <= 0 wins the min either way.
+function chainReorderByFromBasis(b) {
+  const lead = Number(b.leadDays) || 0, safety = Number(b.safety) || 0;
+  const warnDays = Number(b.warnDays) || 14;
+  const runout = Number(b.chainRunoutDays);
+  const byRunoutDays = Number.isFinite(runout) ? runout - lead - safety : Infinity;
+  const cutin = Number(b.cutinFromToday);
+  const hasCutin = Number.isFinite(cutin) && !!b.c1Applicable;
+  // Covered through cut-in: runout strictly beyond the cut-in day, or no
+  // runout inside the horizon at all.
+  const coveredThroughCutin = !hasCutin ? null : (!Number.isFinite(runout) || runout > cutin);
+  const byCutinDays = (hasCutin && !coveredThroughCutin) ? cutin - lead - safety : Infinity;
+  const chainReorderByDays = Math.min(byRunoutDays, byCutinDays);
+  const anchor = chainReorderByDays === Infinity ? "none"
+    : (byCutinDays < byRunoutDays ? "cut-in" : "coverage");
+  let chainStatus = "ok";
+  if (chainReorderByDays === Infinity) chainStatus = "ok";
+  else if (chainReorderByDays <= 0) chainStatus = "critical";
+  else if (chainReorderByDays <= warnDays) chainStatus = "warning";
+  return { byRunoutDays, byCutinDays, coveredThroughCutin, chainReorderByDays, chainStatus, anchor };
+}
+
 function getChainInfo(pn) {
   if (!pn) return null;
   const target = String(pn).trim();
@@ -2284,12 +2332,13 @@ function getChainInfo(pn) {
   // future OR when ownStock is 0 (no bridge stock at cutin — need supply on
   // that day). Matches the pattern in preLaunchOrderBy so behavior is
   // consistent across chain and standalone pre-launch surfaces.
-  const byRunoutDays = (chainRunoutDays === Infinity)
-    ? Infinity
-    : chainRunoutDays - leadDays - safety;
-  let byCutinDays = Infinity;
+  // The derivation itself lives in chainReorderByFromBasis (pure, tested).
+  // This block only resolves the inputs: cut-in distance and C1
+  // applicability.
+  let cutinFromToday = null;
+  let c1Applicable = false;
   if (hardCutin && hardCutin.hardCutinDate) {
-    const cutinFromToday = Math.round(
+    cutinFromToday = Math.round(
       (hardCutin.hardCutinDate.getTime() - TODAY.getTime()) / DAY_MS
     );
     // C1 applicability — Sensourcing-scoped rewrite.
@@ -2302,39 +2351,26 @@ function getChainInfo(pn) {
     //     short-circuit stays (documented as a separate ticket; scope-
     //     preserved this pass).
     const _finalCycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(finalMember.supplier) : null;
-    let c1Applicable;
     if (_finalCycle) {
       c1Applicable = (Number(hardCutin.ownStockAtCutinBlanketOnly) || 0) <= 0;
     } else {
       c1Applicable = cutinFromToday >= 0 || hardCutin.ownStock <= 0;
     }
-    if (c1Applicable) byCutinDays = cutinFromToday - leadDays - safety;
   }
-  const chainReorderByDays = Math.min(byRunoutDays, byCutinDays);
+  // Coverage-aware reorder-by + status ladder (OK / WARNING within
+  // warnDays / CRITICAL at or past reorder-by). See chainReorderByFromBasis
+  // for the rule and the CP00936 case it fixes.
+  const _rb = chainReorderByFromBasis({
+    chainRunoutDays, cutinFromToday, c1Applicable, leadDays, safety, warnDays,
+  });
+  const byRunoutDays = _rb.byRunoutDays;
+  const byCutinDays = _rb.byCutinDays;
+  const chainReorderByDays = _rb.chainReorderByDays;
   const chainReorderByDate = (chainReorderByDays !== Infinity)
     ? addDays(TODAY, chainReorderByDays)
     : null;
   const chainReorderByPassed = chainReorderByDays !== Infinity && chainReorderByDays <= 0;
-
-  // Chain status ladder — expressed directly against chainReorderByDays
-  // so the code matches the mental model: escalate as the last-order
-  // moment approaches, hit CRITICAL when it passes.
-  //   OK       reorder-by is comfortably future     (days > warnDays)
-  //   WARNING  reorder-by is within warn window     (0 < days ≤ warnDays)
-  //   CRITICAL reorder-by has arrived or passed     (days ≤ 0)
-  // Algebraically identical to the older `chainRunoutDays <= leadDays+safety`
-  // test — same output for every input — but the naming makes intent
-  // grep-legible and one-to-one with partStatus's ladder.
-  let chainStatus = "ok";
-  if (chainReorderByDays === Infinity) {
-    chainStatus = "ok";
-  } else if (chainReorderByDays <= 0) {
-    chainStatus = "critical";
-  } else if (chainReorderByDays <= warnDays) {
-    chainStatus = "warning";
-  } else {
-    chainStatus = "ok";
-  }
+  const chainStatus = _rb.chainStatus;
 
   // Want-by — 18 days before chain runout, matching Coverage Gaps'
   // targetArrivalDate convention. If runout is < 18 days out (or
@@ -2392,6 +2428,15 @@ function getChainInfo(pn) {
     chainReorderByDate,
     chainReorderByDays,
     chainReorderByPassed,
+    // Which anchor produced chainReorderByDays ("coverage" | "cut-in" |
+    // "none") plus the two candidates and the cut-in distance, so the
+    // drawer, the queue and the audit print all read the same basis --
+    // no separate display logic.
+    chainReorderByAnchor: _rb.anchor,
+    byRunoutDays,
+    byCutinDays,
+    coveredThroughCutin: _rb.coveredThroughCutin,
+    cutinFromToday,
     chainStatus,
     chainStatusDetail: {
       leadDays,
@@ -3380,6 +3425,52 @@ function _printQueueFlagAudit() {
   return [`[queue-flag audit]`, columns, sep, body, summary].join("\n");
 }
 window._printQueueFlagAudit = _printQueueFlagAudit;
+
+// CHAIN REORDER-BY AUDIT -- before/after for every live chain successor.
+// "before" = the old unconditional min(byRunout, byCutin); "after" = the
+// coverage-aware rule (chainReorderByFromBasis). Prints every successor
+// with the numbers that justify its row, then only the rows whose status
+// or admission changed. Read-only; console only.
+function _printChainReorderByAudit() {
+  const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
+  const queued = new Set(((typeof queueParts === "function") ? queueParts("base_bom") : []).map(p => p && p.pn));
+  const rows = [];
+  for (const p of stats) {
+    const ci = p && p._chainInfo;
+    if (!ci || !p._isChainFinal) continue;
+    const d = ci.chainStatusDetail || {};
+    const lead = Number(d.leadDays) || 0, safety = Math.max(0, (Number(d.reorderBy) || 0) - lead), warnDays = Number(d.warnDays) || 14;
+    const c1 = ci.byCutinDays !== Infinity || ci.coveredThroughCutin === true;   // C1 applied when a cut-in candidate existed
+    const oldByCutin = (c1 && Number.isFinite(ci.cutinFromToday)) ? ci.cutinFromToday - lead - safety : Infinity;
+    const oldDays = Math.min(ci.byRunoutDays, oldByCutin);
+    const oldStatus = oldDays === Infinity ? "ok" : oldDays <= 0 ? "critical" : oldDays <= warnDays ? "warning" : "ok";
+    const newStatus = ci.chainStatus;
+    const oldAdmit = (oldStatus === "critical" || oldStatus === "warning") && !p._brokenHandoff;
+    const newAdmit = queued.has(p.pn);
+    rows.push({
+      pn: p.pn, supplier: p.supplier || "-",
+      chainRunoutDays: ci.chainRunoutDays === Infinity ? "∞" : ci.chainRunoutDays,
+      cutinFromToday: ci.cutinFromToday == null ? "-" : ci.cutinFromToday,
+      coveredThroughCutin: ci.coveredThroughCutin == null ? "-" : ci.coveredThroughCutin,
+      byRunout: ci.byRunoutDays === Infinity ? "∞" : ci.byRunoutDays,
+      byCutin_old: oldByCutin === Infinity ? "∞" : oldByCutin,
+      reorderBy_before: oldDays === Infinity ? "∞" : oldDays,
+      reorderBy_after: ci.chainReorderByDays === Infinity ? "∞" : ci.chainReorderByDays,
+      anchor: ci.chainReorderByAnchor,
+      status_before: oldStatus, status_after: newStatus,
+      admitted_before: oldAdmit, admitted_after: newAdmit,
+      brokenHandoff: !!p._brokenHandoff,
+      changed: (oldStatus !== newStatus || oldAdmit !== newAdmit) ? "CHANGED" : "",
+    });
+  }
+  console.info(`[chain-reorder-by] ${rows.length} chain successor(s); rule: cut-in anchor applies only when the chain does not run past cut-in`);
+  if (rows.length) console.table(rows);
+  const changed = rows.filter(r => r.changed);
+  console.info(`[chain-reorder-by] ${changed.length} row(s) change status or admission:`);
+  if (changed.length) console.table(changed.map(r => ({ pn: r.pn, chainRunoutDays: r.chainRunoutDays, cutinFromToday: r.cutinFromToday, reorderBy_before: r.reorderBy_before, reorderBy_after: r.reorderBy_after, status: `${r.status_before} -> ${r.status_after}`, admitted: `${r.admitted_before} -> ${r.admitted_after}` })));
+  return rows;
+}
+window._printChainReorderByAudit = _printChainReorderByAudit;
 
 // MISSING-CUTIN AUDIT — every part that is a chain successor (some other
 // part points at it via supersededBy AND that predecessor has phasingOut
