@@ -184,9 +184,13 @@ async function _fetchAllPos() {
   const PAGE = 1000;
   let from = 0;
   while (true) {
+    // Ordered by the primary key so .range() paging is stable under the
+    // 2-minute PO sync's upserts. (The table currently holds exactly 1,000
+    // rows -- the card's "1000 POs" is the real count, not a page cap.)
     const { data, error } = await _supa
       .from("pos")
       .select("id, data")
+      .order("id", { ascending: true })
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] pos page fetch failed:", error);
@@ -498,12 +502,22 @@ async function _fetchAllAudit() {
   const PAGE = 1000;
   let from = 0;
   while (true) {
+    // ORDER BY is load-bearing: audit holds 31,000+ rows and sync
+    // functions insert every two minutes. Unordered .range() paging under
+    // concurrent inserts returns an unstable subset -- which is exactly
+    // how the Settings "Last sync" labels froze at Sep 16-17 while the
+    // syncs kept writing. Newest-first also means a short read keeps the
+    // freshest rows, not an arbitrary slice.
     const { data, error } = await _supa
       .from("audit")
       .select("id, data")
+      .order("created_at", { ascending: false })
       .range(from, from + PAGE - 1);
     if (error) {
       console.error("[cloud] audit page fetch failed:", error);
+      // Say so on screen. Silently keeping the stale local copy is what
+      // made a dead-looking label indistinguishable from a healthy one.
+      if (typeof showToast === "function") showToast(`Audit log fetch failed — showing the last copy this browser had (${(error && error.message) || "error"})`, "warn", "Cloud sync");
       return null;
     }
     if (!data || data.length === 0) break;

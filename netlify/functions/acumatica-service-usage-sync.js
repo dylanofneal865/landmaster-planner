@@ -54,6 +54,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
 // The browser client's landmaster-broadcast channel listens for
 // { event: "data-changed", payload: { tables: [...] } } and delta-
@@ -782,7 +783,7 @@ exports.handler = async () => {
   }
 
   try {
-    await supa.from("audit").insert({
+    const { error: _auditErr } = await supa.from("audit").insert({
       ts: new Date().toISOString(),
       type: "service-usage-sync",
       msg: `usage_txns rebuilt: ${totalUpserted} row(s) (${directRows} direct + ${explodedRows} exploded from ${kitSales} kit sales) — service daily refreshed on ${dailyUpserted}/${dailyServiceConsidered} in ${elapsedMs}ms`,
@@ -829,11 +830,14 @@ exports.handler = async () => {
         note: "Kit sales exploded recursively to leaves; row shape mirrors Excel importer's. Service-part daily rates computed from FULL usage table and written back to parts.data.daily — service parts only.",
       },
     });
+    if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-service-usage-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
   } catch (e) {
     log("Audit insert threw (non-fatal)", e.message);
   }
 
-  return { statusCode: 200, body: JSON.stringify({
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-service-usage-sync", "service usage rates written", log);
+return { statusCode: 200, body: JSON.stringify({
     upserted: totalUpserted,
     directRows,
     explodedRows,

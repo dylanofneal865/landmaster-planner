@@ -187,6 +187,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 const MAX_DEPTH = 64;   // hard stop; real trees are <10 deep
 
 // Paged read of an entire table.
@@ -601,7 +602,7 @@ async function runLineFloat(event) {
   let dupeRows = 0;
   for (const r of (locRows || [])) {
     if (!r || !r.pn) continue;
-    const rowKey = r.pn + " " + String(r.location || "");
+    const rowKey = r.pn + "\u0000" + String(r.location || "");
     if (seenRowKeys.has(rowKey)) { dupeRows++; continue; }
     seenRowKeys.add(rowKey);
     const rawLoc = String(r.location_raw || r.location || "").trim();
@@ -831,7 +832,9 @@ async function runLineFloat(event) {
   if (metaErr) log("line_float_meta upsert failed (non-fatal): " + metaErr.message);
 
   log(`done: wrote ${written} line_float rows in ${Date.now() - t0}ms`);
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "line-float-compute", "line_float written", log);
+return {
     statusCode: 200,
     body: JSON.stringify({ ok: true, written, meta, explain, elapsedMs: Date.now() - t0 }, null, 2),
   };

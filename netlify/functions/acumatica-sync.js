@@ -14,6 +14,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
 // The browser client's landmaster-broadcast channel listens for
 // { event: "data-changed", payload: { tables: [...] } } and delta-
@@ -718,7 +719,7 @@ exports.handler = async (event) => {
 
   if (rows.length > 0) {
     const auditId = `audit_acumatica_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await supa.from("audit").upsert([
+    const { error: _auditErr } = await supa.from("audit").upsert([
       {
         id: auditId,
         data: {
@@ -737,6 +738,7 @@ exports.handler = async (event) => {
         },
       },
     ]);
+    if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
   }
 
   log(`Done. ${totalUpserted} parts updated in ${Date.now() - t0}ms`);
@@ -773,7 +775,9 @@ exports.handler = async (event) => {
     serviceKey: SUPABASE_SERVICE_KEY,
   });
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-sync", "on-hand + part_locations pass", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,
@@ -1290,7 +1294,7 @@ async function runPOSync(ctx) {
 
   // Audit.
   const auditId = `audit_acumatica_pos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await supa.from("audit").upsert([
+  const { error: _auditErr } = await supa.from("audit").upsert([
     {
       id: auditId,
       data: {
@@ -1318,9 +1322,12 @@ async function runPOSync(ctx) {
       },
     },
   ]);
+  if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
 
   log(`POs: ${upserted} upserted, ${unchanged} unchanged (skipped), ${reconciled} reconciled`);
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-po-sync", "pos reconciled", log);
+return {
     posInFeed: byOrder.size,
     linesInFeed: entries.length,
     upserted,

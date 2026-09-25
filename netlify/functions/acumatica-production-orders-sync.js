@@ -57,6 +57,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). Verbatim from acumatica-bom-sync.js — kept
 // inline so this function stays self-contained for esbuild bundling.
@@ -190,7 +191,7 @@ async function runProductionOrdersSync(event) {
         auth: { autoRefreshToken: false, persistSession: false },
       });
       const id = `audit_acumatica_production_orders_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      await c.from("audit").upsert([{
+      const { error: _auditErr } = await c.from("audit").upsert([{
         id,
         data: {
           id, ts: new Date().toISOString(),
@@ -199,6 +200,7 @@ async function runProductionOrdersSync(event) {
           detail: { stage, detail, durationMs: Date.now() - t0, trace: trace.slice(-40) },
         },
       }]);
+      if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-production-orders-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
     } catch (e) {
       console.log(`[acumatica-production-orders-sync] could not record the failure audit row: ${e && e.message}`);
     }
@@ -559,7 +561,7 @@ async function runProductionOrdersSync(event) {
   // ── Audit row ─────────────────────────────────────────────────────
   // Same shape and conventions as the on-hand / BOM passes.
   const auditId = `audit_acumatica_production_orders_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await supa.from("audit").upsert([
+  const { error: _auditErr } = await supa.from("audit").upsert([
     {
       id: auditId,
       data: {
@@ -590,6 +592,7 @@ async function runProductionOrdersSync(event) {
       },
     },
   ]);
+  if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-production-orders-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
 
   /* ------------------------------------------------------------------
      CHAINED LINE-FLOAT RECOMPUTE — v-line-count-r2.
@@ -657,7 +660,9 @@ async function runProductionOrdersSync(event) {
       ` — line-float: ${chained.reason}`
   );
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-production-orders-sync", "production_orders reconciled (+ chained line-float)", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,

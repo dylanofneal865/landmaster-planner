@@ -39,6 +39,7 @@
 // browser-vs-shadow diff tool.
 
 const { createClient } = require("@supabase/supabase-js");
+const { beat: _beat } = require("./_heartbeat.js");
 const crypto = require("crypto");
 const FrameScheduler = require("../../lib/frame-scheduler.js");
 // v-cc-loc-2 -- moved the chain helpers to lib/supersession-server.js
@@ -607,7 +608,9 @@ exports.handler = async (event) => {
   }
 
   log("shadow updated", summary);
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "frame-schedule-compute", "shadow plan written", log);
+return {
     statusCode: 200,
     headers: { "content-type": "application/json" },
     body: JSON.stringify(summary),

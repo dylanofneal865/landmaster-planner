@@ -54,6 +54,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 const RETENTION_DAYS = 60;
 
 exports.handler = async () => {
@@ -146,7 +147,9 @@ exports.handler = async () => {
   const durMs = Date.now() - t0;
   log(`done in ${durMs}ms (snapshot_date=${snapshotDate}, rowsWritten=${written})`);
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "frame-schedule-snapshot", "nightly snapshot", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       ok: true,

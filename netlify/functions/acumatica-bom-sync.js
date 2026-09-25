@@ -17,6 +17,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). WITHOUT this, a supplier / desc containing
 // "&" arrives as "&amp;", gets stored that way in Supabase, and every
@@ -361,7 +362,7 @@ exports.handler = async (event) => {
 
   // Audit row — same shape and conventions as the on-hand / PO passes.
   const auditId = `audit_acumatica_bom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await supa.from("audit").upsert([
+  const { error: _auditErr } = await supa.from("audit").upsert([
     {
       id: auditId,
       data: {
@@ -392,13 +393,16 @@ exports.handler = async (event) => {
       },
     },
   ]);
+  if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-bom-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
 
   log(
     `Done. ${totalUpserted} upserted, ${totalDeleted} removed across ${parentBoms.size} parent BOMs in ${Date.now() - t0}ms` +
       (anyChunkFailed ? ` (skipped ${upsertFailed} upsert / ${deleteFailed} delete ids)` : "")
   );
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-bom-sync", "bom_links reconciled", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,

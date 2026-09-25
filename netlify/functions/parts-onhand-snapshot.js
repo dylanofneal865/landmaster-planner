@@ -25,6 +25,7 @@
 // comment header for the CREATE TABLE SQL.
 
 const { createClient } = require("@supabase/supabase-js");
+const { beat: _beat } = require("./_heartbeat.js");
 const { classifyChainRole } = require("../../lib/supersession-server.js");
 
 const WAREHOUSE_SENTINEL = "__warehouse__";
@@ -350,7 +351,9 @@ exports.handler = async (event) => {
   }
 
   log(`done: wrote ${written} rows in ${Date.now() - t0}ms`);
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "parts-onhand-snapshot", "nightly on-hand ledger", log);
+return {
     statusCode: 200,
     body: JSON.stringify({ ok: true, today, written, stats, elapsedMs: Date.now() - t0 }),
   };

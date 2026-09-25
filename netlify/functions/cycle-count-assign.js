@@ -39,6 +39,7 @@
 // po_receipts, or frame_schedule.
 
 const { createClient } = require("@supabase/supabase-js");
+const { beat: _beat } = require("./_heartbeat.js");
 const { classifyChainRole } = require("../../lib/supersession-server.js");
 
 // Frames get forced onto a 30-day rotation cycle -- keeps the six
@@ -835,7 +836,9 @@ exports.handler = async (event) => {
   log(`plan: hot=${summary.hot} runway=${summary.runway} rotation=${summary.rotation} (frames forced=${summary.framesForced})`);
 
   if (plans.length === 0) {
-    return { statusCode: 200, body: JSON.stringify({ ok: true, today, isMonday, summary, inserted: 0 }) };
+        // Heartbeat: real completion only (bail-outs above do not beat).
+    await _beat(supa, "cycle-count-assign", "nothing to assign today", log);
+return { statusCode: 200, body: JSON.stringify({ ok: true, today, isMonday, summary, inserted: 0 }) };
   }
 
   if (dryRun) {

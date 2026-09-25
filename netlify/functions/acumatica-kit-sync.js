@@ -29,6 +29,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
 // The browser client's landmaster-broadcast channel listens for
 // { event: "data-changed", payload: { tables: [...] } } and delta-
@@ -520,7 +521,7 @@ exports.handler = async (event) => {
 
   // Audit row — same shape and conventions as bom-sync's audit.
   const auditId = `audit_acumatica_kit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  await supa.from("audit").upsert([
+  const { error: _auditErr } = await supa.from("audit").upsert([
     {
       id: auditId,
       data: {
@@ -553,13 +554,16 @@ exports.handler = async (event) => {
       },
     },
   ]);
+  if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-kit-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
 
   log(
     `Done. ${totalUpserted} kits upserted, ${totalDeleted} removed in ${Date.now() - t0}ms` +
       (anyChunkFailed ? ` (skipped ${upsertFailed} upsert / ${deleteFailed} delete pns)` : "")
   );
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-kit-sync", "kit_boms reconciled", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,

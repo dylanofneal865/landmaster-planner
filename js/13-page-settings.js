@@ -6,13 +6,87 @@
 /* ============================================================
    PAGE: SETTINGS
    ============================================================ */
+/* ------------------------------------------------------------------
+   SYNC FRESHNESS -- from sync_heartbeats, not DB.audit.
+
+   The cards used to take "Last sync" from the newest DB.audit row of
+   each type. DB.audit is the browser's mirror of a 31,000-row table
+   paged 1,000 at a time; under the 2-minute sync's inserts that mirror
+   went stale (labels frozen at Sep 16-17 while every sync was writing
+   fine). A label that cannot tell dead from healthy is worse than none.
+
+   sync_heartbeats is one row per sync, upserted by the function on a
+   REAL completion (netlify/functions/_heartbeat.js). One tiny fetch on
+   render; the card shows last_ok and turns red with "stale" once
+   now - last_ok exceeds STALE_FACTOR x that sync's cadence. That is an
+   honest dead-sync alarm.
+   ------------------------------------------------------------------ */
+const SYNC_STALE_FACTOR = 2;
+// Cadence in minutes, from netlify.toml. Kept here (not derived) so the
+// card's threshold is legible next to its use.
+const SYNC_CADENCE_MIN = {
+  "acumatica-sync": 2,
+  "acumatica-po-sync": 2,                    // runs inside acumatica-sync
+  "acumatica-bom-sync": 1440,
+  "acumatica-kit-sync": 1440,
+  "acumatica-service-usage-sync": 1440,
+  "acumatica-production-orders-sync": 60,
+  "acumatica-po-receipts-incremental": 30,
+  "acumatica-po-receipts-full": 1440,
+  "line-float-compute": 1440,
+  "frame-schedule-compute": 15,
+  "frame-schedule-snapshot": 1440,
+  "cycle-count-assign": 1440,
+  "parts-onhand-snapshot": 1440,
+};
+const _syncHeartbeats = { rows: null, fetchedAt: 0, inFlight: false, error: null };
+
+// Pure: { text, stale, cls } for a heartbeat row. `now` injectable for tests.
+function _settingsSyncLabel(name, row, now) {
+  const nowMs = Number.isFinite(now) ? now : Date.now();
+  const cadence = SYNC_CADENCE_MIN[name];
+  if (!row || !row.last_ok) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny" };
+  const t = new Date(row.last_ok).getTime();
+  if (!Number.isFinite(t)) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny" };
+  const ageMin = (nowMs - t) / 60000;
+  const stale = Number.isFinite(cadence) ? ageMin > cadence * SYNC_STALE_FACTOR : false;
+  const when = (typeof fmtDate === "function") ? fmtDate(row.last_ok) : String(row.last_ok);
+  const clock = new Date(t);
+  const hm = String(clock.getHours()).padStart(2, "0") + ":" + String(clock.getMinutes()).padStart(2, "0");
+  const text = stale
+    ? `stale — last OK ${when} ${hm} (${ageMin >= 120 ? Math.round(ageMin / 60) + "h" : Math.round(ageMin) + "m"} ago, expected every ${cadence >= 60 ? (cadence / 60) + "h" : cadence + "m"})`
+    : `Last OK ${when} ${hm}`;
+  return { text, stale, cls: stale ? "tiny text-crit bold" : "muted tiny" };
+}
+function _settingsSyncLabelHtml(name) {
+  const rows = _syncHeartbeats.rows;
+  const row = rows ? rows.find(r => r.name === name) : null;
+  if (!rows) return `<span class="muted tiny">${_syncHeartbeats.error ? "heartbeats unavailable" : "checking…"}</span>`;
+  const l = _settingsSyncLabel(name, row);
+  return `<span class="${l.cls}" title="${esc(name)}${l.stale ? " — no successful run inside " + SYNC_STALE_FACTOR + "× its cadence" : ""}">${esc(l.text)}</span>`;
+}
+// One tiny fetch per render (throttled to 30s); re-renders the page when it lands.
+function _settingsFetchHeartbeats() {
+  if (typeof _supa === "undefined" || !_supa) return;
+  if (_syncHeartbeats.inFlight) return;
+  if (Date.now() - _syncHeartbeats.fetchedAt < 30000) return;
+  _syncHeartbeats.inFlight = true;
+  _supa.from("sync_heartbeats").select("name, last_ok, note").then(({ data, error }) => {
+    _syncHeartbeats.inFlight = false;
+    _syncHeartbeats.fetchedAt = Date.now();
+    if (error) { _syncHeartbeats.error = error.message || String(error); _syncHeartbeats.rows = _syncHeartbeats.rows || null; console.warn("[settings] sync_heartbeats fetch failed:", error); }
+    else { _syncHeartbeats.error = null; _syncHeartbeats.rows = data || []; }
+    if (typeof CURRENT_ROUTE !== "undefined" && CURRENT_ROUTE === "settings" && typeof refresh === "function") refresh();
+  }).catch(err => { _syncHeartbeats.inFlight = false; _syncHeartbeats.error = (err && err.message) || String(err); });
+}
+
 registerRoute("settings", () => {
   const s = DB.settings;
+  _settingsFetchHeartbeats();
   const poLineCount = (DB.pos || []).reduce((sum, po) => sum + (po.lines?.length || 0), 0);
-  const lastPoSync = (DB.audit || []).find(a => a.type === "acumatica-po-sync")?.ts || null;
-  const lastOnHandSync = (DB.audit || []).find(a => a.type === "acumatica-sync")?.ts || null;
-  const lastBomSync = (DB.audit || []).find(a => a.type === "acumatica-bom-sync")?.ts || null;
-  const lastSvcUsageSync = (DB.audit || []).find(a => a.type === "service-usage-sync")?.ts || null;
+  // Retained for the Usage card further down; now heartbeat-backed too.
+  const _hb = (n) => { const r = _syncHeartbeats.rows ? _syncHeartbeats.rows.find(x => x.name === n) : null; return r ? r.last_ok : null; };
+  const lastSvcUsageSync = _hb("acumatica-service-usage-sync");
   const servicePartsCount = (DB.parts || []).filter(p => String(p.itemType || "").toLowerCase().trim() === "service").length;
   // BOM links load asynchronously after first paint; distinguish "not yet
   // arrived" (undefined) from "loaded but empty" (0) so the card doesn't
@@ -90,7 +164,7 @@ registerRoute("settings", () => {
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${DB.pos.length} POs · ${poLineCount} lines</span>
             <div class="grow"></div>
-            <span class="muted tiny">${lastPoSync ? 'Last sync ' + fmtDate(lastPoSync) : 'Awaiting first sync'}</span>
+            ${_settingsSyncLabelHtml("acumatica-po-sync")}
           </div>
         </div>
       </div>
@@ -105,7 +179,7 @@ registerRoute("settings", () => {
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${DB.parts.length} parts</span>
             <div class="grow"></div>
-            <span class="muted tiny">${lastOnHandSync ? 'Last sync ' + fmtDate(lastOnHandSync) : 'Awaiting first sync'}</span>
+            ${_settingsSyncLabelHtml("acumatica-sync")}
           </div>
         </div>
       </div>
@@ -120,7 +194,7 @@ registerRoute("settings", () => {
             <span class="pill ok">● Acumatica · live</span>
             <span class="mono dim" style="font-size:11px">${bomLinksLoaded ? `${fmtNum(bomLinksCount)} links · ${fgCount} finished goods` : 'loading…'}</span>
             <div class="grow"></div>
-            <span class="muted tiny">Syncs daily 6:00 AM${lastBomSync ? ' · last ' + fmtDate(lastBomSync) : ''}</span>
+            <span class="muted tiny">Syncs daily 6:00 AM ·</span> ${_settingsSyncLabelHtml("acumatica-bom-sync")}
           </div>
         </div>
       </div>

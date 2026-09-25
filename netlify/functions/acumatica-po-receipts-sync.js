@@ -55,6 +55,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+const { beat: _beat } = require("./_heartbeat.js");
 // Decode the five XML entities Acumatica emits in OData text fields
 // (plus numeric char refs). Verbatim from acumatica-bom-sync.js.
 // ORDER MATTERS: &amp; MUST be replaced LAST. See bom-sync for detail.
@@ -447,7 +448,9 @@ async function runReceiptsSync(mode) {
     } else {
       log("No released receipts in the last 5 days — nothing to reconcile (quiet, no audit row).");
     }
-    return {
+        // Heartbeat: real completion only (bail-outs above do not beat).
+    await _beat(supa, "acumatica-po-receipts-" + runMode, "nothing new to reconcile", log);
+return {
       statusCode: 200,
       body: JSON.stringify({ mode: runMode, upserted: 0, unchanged: 0, pages: pageCount, note: "No rows parsed" }),
     };
@@ -526,7 +529,7 @@ async function runReceiptsSync(mode) {
   // daily reconcile ran.
   if (totalUpserted > 0 || runMode === "full") {
     const auditId = `audit_acumatica_po_receipts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await supa.from("audit").upsert([
+    const { error: _auditErr } = await supa.from("audit").upsert([
       {
         id: auditId,
         data: {
@@ -561,6 +564,7 @@ async function runReceiptsSync(mode) {
         },
       },
     ]);
+    if (_auditErr) log(`AUDIT WRITE FAILED (acumatica-po-receipts-sync): ${_auditErr.message}${_auditErr.code ? " (" + _auditErr.code + ")" : ""} — the run completed but left no audit row`);
   }
 
   // ── Broadcast hook ───────────────────────────────────────────────
