@@ -46,7 +46,8 @@
    ===================================================== */
 
 const BB_STATE = {
-  filter: "disagree",       // "disagree" | "all"
+  view: "simple",           // "simple" (default) | "full" -- presentation only, remembered
+  filter: "disagree",       // "disagree" | "all"   (Full view)
   search: "",
   ready: false,             // snapshots + band loaded at least once
   loading: false,
@@ -57,9 +58,12 @@ const BB_STATE = {
 const BB_MIN_WINDOW_DAYS = 90;   // the recon ledger's default window is 30d; a baseline older than the window would truncate the model
 const BB_THRESHOLD_KEY = "landmaster.backupBuy.thresholds";
 
+const BB_VIEW_KEY = "landmaster.backupBuy.view";
 try {
   const t = JSON.parse(localStorage.getItem(BB_THRESHOLD_KEY) || "null");
   if (t && Number.isFinite(t.units) && Number.isFinite(t.usd)) BB_STATE.thresholds = { units: Math.max(0, t.units), usd: Math.max(0, t.usd) };
+  const v = localStorage.getItem(BB_VIEW_KEY);
+  if (v === "full" || v === "simple") BB_STATE.view = v;
 } catch (_) {}
 
 /* ---------------- pure helpers (tested by slice) ---------------- */
@@ -109,6 +113,90 @@ function _bbReorderByDays(statusRow) {
   const cover = Number(statusRow.daysOfCover);
   const rb = Number(statusRow.reorderBy) || 0;
   return Number.isFinite(cover) ? cover - rb : Infinity;
+}
+
+/* ---------------- SIMPLE view: pure derivation over the SAME rows ----------------
+   Takes the output of _bbBuildRows and nothing else. No status, no queue,
+   no model call happens here -- that is the fixture's invariant. */
+function _bbSimpleSections(rows) {
+  const orderNow = rows.filter(r => r.modelAdmits).slice().sort((a, b) => {
+    const ra = a.modelReorderByDays, rb = b.modelReorderByDays;
+    if (ra !== rb) return (ra === Infinity ? 1e9 : ra) - (rb === Infinity ? 1e9 : rb);
+    return Math.abs(b.deltaUsd) - Math.abs(a.deltaUsd);
+  });
+  const countFirst = rows.filter(r => r.cls.flag).slice().sort((a, b) => Math.abs(b.deltaUsd) - Math.abs(a.deltaUsd));
+  const notModeled = rows.filter(r => !r.hasAnchor).length;
+  const totalUsd = orderNow.reduce((s, r) => s + (Number(r.sqUsd) || 0), 0);
+  return { orderNow, countFirst, notModeled, totalUsd, toOrder: orderNow.length, needCount: countFirst.length };
+}
+// The one chip on an ORDER NOW row. Placeholder badge is the same rule as Full view.
+function _bbChip(r) {
+  if (r.placeholder) return { kind: "placeholder", text: "PLACEHOLDER RATE" };
+  if (r.cls.flag) return { kind: "count", text: `COUNT FIRST — off by ${Math.abs(Math.round(Number(r.delta) || 0))} ($${Math.abs(Math.round(Number(r.deltaUsd) || 0))})` };
+  return { kind: "good", text: "good" };
+}
+// One plain sentence per COUNT FIRST row, from the row's own fields.
+function _bbSentence(r, fmtDay) {
+  const off = Math.abs(Math.round(Number(r.delta) || 0));
+  const by = typeof fmtDay === "function" ? fmtDay(r.modelReorderByDays) : String(r.modelReorderByDays);
+  if (r.cls.kind === "model-orders") return `model says order ${r.sq} by ${by} — live says fine; books off by ${off}, count it`;
+  if (r.cls.kind === "live-orders") return `live wants to order — model says covered; books off by ${off}, count before spending`;
+  return r.cls.label || "";
+}
+function _bbSetView(v) {
+  BB_STATE.view = v === "full" ? "full" : "simple";      // search / filter untouched
+  try { localStorage.setItem(BB_VIEW_KEY, BB_STATE.view); } catch (_) {}
+  refresh();
+}
+
+function _bbSimpleHtml(rows) {
+  const s = _bbSimpleSections(rows);
+  const q = String(BB_STATE.search || "").toLowerCase().trim();
+  const match = (r) => !q || (r.pn + " " + r.desc + " " + r.supplier).toLowerCase().includes(q);
+  const orderNow = s.orderNow.filter(match), countFirst = s.countFirst.filter(match);
+  const dayTxt = (d) => (d === Infinity || !Number.isFinite(d)) ? "—"
+    : ((typeof addDays === "function" && typeof fmtDate === "function" && typeof TODAY !== "undefined") ? fmtDate(addDays(TODAY, Math.round(d))) : `${Math.round(d)}d`);
+  const orderRows = orderNow.map(r => {
+    const chip = _bbChip(r);
+    const chipCls = chip.kind === "good" ? "ok" : (chip.kind === "count" ? "crit" : "warn");
+    const passed = r.modelReorderByDays <= 0;
+    const liveDiffers = r.hasAnchor && Math.round(r.live) !== Math.round(r.modeled);
+    return `
+      <tr>
+        <td class="mono"><a href="#" onclick="openPartDetail('${esc(r.pn)}');return false;">${esc(r.pn)}</a></td>
+        <td class="dim" title="${esc(r.desc)}">${esc(r.desc)}</td>
+        <td class="right num bold text-accent">${fmtNum(r.sq)}</td>
+        <td class="right num">${fmtMoney(r.sqUsd)}</td>
+        <td class="${passed ? "text-crit bold" : ""}">${passed ? "passed " : ""}${dayTxt(r.modelReorderByDays)}</td>
+        <td class="right num">${r.hasAnchor ? fmtNum(r.modeled) : fmtNum(r.live)}${liveDiffers ? ` <span class="dim tiny">live ${fmtNum(r.live)}</span>` : ""}</td>
+        <td><span class="pill ${chipCls}" style="font-size:9px">${esc(chip.text)}</span></td>
+      </tr>`;
+  }).join("");
+  const countRows = countFirst.map(r => `
+      <tr>
+        <td class="mono"><a href="#" onclick="openPartDetail('${esc(r.pn)}');return false;">${esc(r.pn)}</a></td>
+        <td class="dim" title="${esc(r.desc)}">${esc(r.desc)}</td>
+        <td>${esc(_bbSentence(r, dayTxt))}</td>
+        <td>${typeof flagForCountButton === "function" ? flagForCountButton(r.pn, { size: "xs" }) : ""}</td>
+      </tr>`).join("");
+  return `
+    <div class="muted" style="margin:6px 0 4px">From your last trusted count, plus receipts, minus daily usage — this is what to order.</div>
+    <div class="row gap-md" style="margin-bottom:12px">
+      <span class="bold">${fmtNum(s.toOrder)} part${s.toOrder === 1 ? "" : "s"} to order · ${fmtMoney(s.totalUsd)} total</span>
+      <span class="dim">·</span>
+      <span class="${s.needCount ? "text-crit bold" : "dim"}">${fmtNum(s.needCount)} need a count first</span>
+      <span class="flex-1"></span>
+      <input class="input" placeholder="Filter" value="${esc(BB_STATE.search)}" onchange="_bbSetSearch(this.value)" style="max-width:200px">
+    </div>
+    <div class="section-head" style="font-size:13px;font-weight:600;margin:10px 0 6px">ORDER NOW</div>
+    ${orderNow.length === 0
+      ? `<div class="empty tiny muted">Nothing to order on the modeled numbers${q ? " (matching the filter)" : ""}.</div>`
+      : `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Part</th><th>Description</th><th class="right">Order</th><th class="right">$</th><th>By</th><th class="right">On hand</th><th></th></tr></thead><tbody>${orderRows}</tbody></table></div>`}
+    <div class="section-head" style="font-size:13px;font-weight:600;margin:16px 0 6px">COUNT FIRST</div>
+    ${countFirst.length === 0
+      ? `<div class="empty tiny muted">Model and live agree within your thresholds on every modeled part${q ? " (matching the filter)" : ""}.</div>`
+      : `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Part</th><th>Description</th><th>What the books say</th><th></th></tr></thead><tbody>${countRows}</tbody></table></div>`}
+    <div class="dim tiny" style="margin-top:12px">${fmtNum(s.notModeled)} part${s.notModeled === 1 ? "" : "s"} not modeled yet (no count or baseline — pre-launch / VMI / new) — see Full.</div>`;
 }
 
 function _bbSuggestedQty(sp) {
@@ -271,7 +359,7 @@ function _bbSetThreshold(k, v) {
 function _bbReload() { BB_STATE.ready = false; if (typeof IR_STATE !== "undefined") IR_STATE.snapsLoadedFor = null; if (typeof LC_STATE !== "undefined") LC_STATE.rows = null; _bbRouteEnter(); refresh(); }
 
 if (typeof window !== "undefined") {
-  Object.assign(window, { _bbSetBaseline, _bbSetBaselineAll, _bbSetFilter, _bbSetSearch, _bbSetThreshold, _bbReload });
+  Object.assign(window, { _bbSetBaseline, _bbSetBaselineAll, _bbSetFilter, _bbSetSearch, _bbSetThreshold, _bbReload, _bbSetView });
 }
 
 /* ---------------- render ---------------- */
@@ -347,12 +435,16 @@ function renderBackupBuy() {
           <div class="page-sub">The Base BOM reorder math, run on <strong>modeled</strong> on-hand (anchor + receipts − usage, from the recon ledger) instead of live. Where the two queues disagree, the live number is the suspect — count before you act on it.</div>
         </div>
         <div class="page-actions">
+          <span class="row" style="gap:0;border:1px solid var(--line,#cbd5e1);border-radius:6px;overflow:hidden" title="Simple: what to order and what to count. Full: every modeled row with anchor, band, delta and thresholds.">
+            <button class="btn sm ${BB_STATE.view !== "full" ? "primary" : "ghost"}" style="border:0;border-radius:0" onclick="_bbSetView('simple')">Simple</button>
+            <button class="btn sm ${BB_STATE.view === "full" ? "primary" : "ghost"}" style="border:0;border-radius:0" onclick="_bbSetView('full')">Full</button>
+          </span>
           <button class="btn" onclick="_bbReload()">Reload</button>
-          <button class="btn" onclick="_bbSetBaselineAll()">Set baseline = today (all)</button>
+          ${BB_STATE.view === "full" ? `<button class="btn" onclick="_bbSetBaselineAll()">Set baseline = today (all)</button>` : ""}
         </div>
       </div>
 
-      ${!ready ? `<div class="empty tiny muted">Loading ledger snapshots and line-float band…</div>` : `
+      ${!ready ? `<div class="empty tiny muted">Loading ledger snapshots and line-float band…</div>` : (BB_STATE.view !== "full" ? _bbSimpleHtml(rows) : `
       <div class="bb-strip">
         <div class="bb-stat"><div class="bb-stat-label">Modeled parts</div><div class="bb-stat-value">${anchored}</div><div class="dim tiny">${noAnchor} with no anchor</div></div>
         <div class="bb-stat"><div class="bb-stat-label">Disagree</div><div class="bb-stat-value">${disagree}</div><div class="dim tiny">material, outside band, not placeholder</div></div>
@@ -381,7 +473,7 @@ function renderBackupBuy() {
             <tbody>${body}</tbody>
           </table></div>
           <div class="dim tiny" style="margin-top:6px">${visible.length} of ${rows.length} base BOM parts shown. Sort: modeled reorder-by, then |Δ $|. Count band: RMSTOR-LM low = Available, high = On Hand. This page never writes on-hand.</div>`}
-      `}
+      `)}
     </div>`;
 }
 
