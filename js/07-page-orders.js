@@ -216,13 +216,15 @@ function oqSortHeader(key, dir) {
 // they naturally cluster at the top under ascending sort.
 // Missing cover/reorderBy → +Infinity → sorts to the bottom.
 function oqUrgencyMargin(p) {
-  // Force-admitted RELEASE rows sit at status ok / daysOfCover Infinity —
-  // by cover math they'd sort to the bottom. Rank them by
-  // _forceAdmitDaysToTrigger instead: smaller trigger = more urgent
-  // release. Puts an "in 3 days" RELEASE ahead of a "cover 45d" critical.
-  if (p && p._forceAdmitAsRelease && Number.isFinite(p._forceAdmitDaysToTrigger)) {
+  // Blanket RELEASE rows sit at status ok / daysOfCover Infinity under the
+  // blanket-aware projection — by cover math they'd sort to the bottom.
+  // Rank them by the release trigger's daysToTrigger instead: smaller =
+  // more urgent release. Puts an "in 3 days" RELEASE ahead of a "cover
+  // 45d" critical. _blanketQueue is the one decision (blanketReleaseDecision).
+  const _bqSort = p && p._blanketQueue;
+  if (_bqSort && _bqSort.kind === "release" && Number.isFinite(_bqSort.daysToTrigger)) {
     const reorderBy = Number(p?.reorderBy);
-    return Number(p._forceAdmitDaysToTrigger) - (Number.isFinite(reorderBy) ? reorderBy : 0);
+    return Number(_bqSort.daysToTrigger) - (Number.isFinite(reorderBy) ? reorderBy : 0);
   }
   const cover = Number(p?.daysOfCover);
   const reorderBy = Number(p?.reorderBy);
@@ -622,12 +624,15 @@ function renderOrderQueueFor(itemType) {
                     // (chainInfo.chainRunoutDays for chain members, per-
                     // part daysOfCover for standalone parts).
                     // triggerDate = the EARLIER of (runout, transitionStartDate).
-                    // For force-admitted RELEASE rows the OPEN-index runout
-                    // (p._openDaysOfCover) is the correct "runout" input —
-                    // p.daysOfCover on those rows is Infinity under the
-                    // blanket-aware projection and would suppress the RELEASE
-                    // badge. Non-Sensourcing rows keep reading p.daysOfCover.
-                    const _runoutBasisDays = (p._forceAdmitAsRelease && Number.isFinite(p._openDaysOfCover))
+                    // For blanket RELEASE rows (p._blanketQueue.kind ===
+                    // "release") the OPEN-index runout (p._openDaysOfCover)
+                    // is the correct "runout" input — p.daysOfCover on those
+                    // rows is Infinity under the blanket-aware projection.
+                    // Non-Sensourcing rows keep reading p.daysOfCover.
+                    // _bq is declared here, ahead of every reader below.
+                    const _bq = p._blanketQueue || null;
+                    const _bqRelease = !!(_bq && _bq.kind === "release");
+                    const _runoutBasisDays = (_bqRelease && Number.isFinite(p._openDaysOfCover))
                       ? p._openDaysOfCover
                       : p.daysOfCover;
                     let runoutDate = null;
@@ -649,7 +654,8 @@ function renderOrderQueueFor(itemType) {
                     }
                     const daysToTrigger = triggerDate
                       ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
-                    const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
+                    const _releaseWindowDays = (typeof BLANKET_RELEASE_WINDOW_DAYS === "number") ? BLANKET_RELEASE_WINDOW_DAYS : 50;
+                    const inWindow = daysToTrigger !== null && daysToTrigger <= _releaseWindowDays;
                     // Open blanket lookup (any-scope) — used to decide
                     // whether to hang a "BLKT" pill on the pn cell for
                     // rows without escalation, and to escalate to RELEASE
@@ -660,7 +666,7 @@ function renderOrderQueueFor(itemType) {
                     // base_bom so options / service queue rows never get
                     // decorated with a base_bom-scoped affordance:
                     //   RELEASE — base_bom + open blanket + no normal PO
-                    //     + inside the 21-day trigger window. ANY supplier
+                    //     + inside the BLANKET_RELEASE_WINDOW_DAYS trigger window. ANY supplier
                     //     (broadened from Sensourcing-only so a non-cycled
                     //     base_bom part with a blanket still gets the CTA).
                     //   NO PO — base_bom + Sensourcing (isCycledScope) +
@@ -673,11 +679,12 @@ function renderOrderQueueFor(itemType) {
                     //     23-8006 correctly fall through to "none".
                     const itemTypeNorm = String(p.itemType || "").toLowerCase().trim();
                     const isBaseBomScope = itemTypeNorm === "base_bom";
-                    // Flag decision — RELEASE reads _forceAdmitAsRelease
-                    // from partsWithStatus (single source of truth). NO PO
-                    // stays row-local (needs live triggerDate).
+                    // Flag decision — RELEASE reads p._blanketQueue from
+                    // partsWithStatus (blanketReleaseDecision: the single
+                    // source of truth). NO PO stays row-local (needs live
+                    // triggerDate).
                     let flag = "none";
-                    if (p._forceAdmitAsRelease) {
+                    if (_bqRelease) {
                       flag = "RELEASE";
                     } else if (isBaseBomScope && isCycledScope && !blk && openPO === 0 && triggerDate) {
                       flag = "NO PO";
@@ -712,8 +719,8 @@ function renderOrderQueueFor(itemType) {
                     // the computed action text + which trigger fired so the
                     // buyer sees the need-by date without opening the drawer.
                     // Suppresses the older RELEASE pill so rows never double up.
-                    const _bq = p._blanketQueue || null;
-                    const blanketReleasePill = (_bq && _bq.kind === "release")
+                    // (_bq is declared above, next to _runoutBasisDays.)
+                    const blanketReleasePill = _bqRelease
                       ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(_bq.action + (_bq.triggerReason ? ` · trigger: ${_bq.triggerReason}` : "") + (_bq.daysToTrigger != null ? ` (${_bq.daysToTrigger}d)` : "") + ` · ${fmtNum(_bq.blanketOpen || 0)} open on the blanket`)}">BLANKET RELEASE</span>`
                       : "";
                     const flagPillFinal = blanketReleasePill ? "" : flagPill;
@@ -723,14 +730,14 @@ function renderOrderQueueFor(itemType) {
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {
-                        if (p._forceAdmitAsRelease) return ` title="Blanket-covered but inside the 21-day release trigger — release from blanket now."`;
+                        if (_bqRelease) return ` title="Blanket-covered but inside the ${_releaseWindowDays}-day release trigger (${_bq.triggerReason || "trigger"}) — release from blanket now."`;
                         const s = stockoutDateStr(p.daysOfCover);
                         return s ? ` title="Projected stockout: ${s}"` : '';
                       })()}>
-                        ${p._forceAdmitAsRelease ? `
+                        ${_bqRelease ? `
                         <span class="meter" style="opacity:1">
                           <span class="meter-bar" style="background:var(--info-soft,#e0eaff);border-color:var(--info,#4a7cff)"><i style="background:var(--info,#4a7cff);width:100%"></i></span>
-                          <span class="num bold" style="color:var(--info-d,var(--info,#2f5edb))">release in ${Number.isFinite(p._forceAdmitDaysToTrigger) ? p._forceAdmitDaysToTrigger + 'd' : '—'}</span>
+                          <span class="num bold" style="color:var(--info-d,var(--info,#2f5edb))">release in ${Number.isFinite(_bq.daysToTrigger) ? _bq.daysToTrigger + 'd' : '—'}</span>
                         </span>
                         ` : `
                         <span class="meter">

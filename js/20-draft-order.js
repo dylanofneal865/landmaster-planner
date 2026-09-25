@@ -319,8 +319,9 @@ function quickAddToDraft(pn) {
   // RELEASE PATH — Sensourcing full-blanket release.
   //
   // When a Sensourcing part enters the release trigger window
-  // (partsWithStatus flips _forceAdmitAsRelease at ≤15 days from
-  // consumption of the blanket balance), cycleAwareSuggestedQty
+  // (blanketReleaseDecision returns kind "release" -- projected runout
+  // or blanket expiry within BLANKET_RELEASE_WINDOW_DAYS; carried on
+  // the row as _blanketQueue), cycleAwareSuggestedQty
   // returns 0 because blanketIncomingQty nets the demand fully
   // into `have` — the blanket already covers everything. But the
   // business rule is that a release converts the FULL remaining

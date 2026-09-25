@@ -1343,37 +1343,10 @@ function partStatusBlanketAware(part, supplyLines) {
   return { status, urgency, stockoutDay, leadDays: lt, reorderBy, daysOfCover: stockoutDay };
 }
 
-// Shared min-triggerDate helper. Extracted from the row-map so
-// partsWithStatus (force-admit predicate) and renderOrderQueueFor
-// (RELEASE badge decision) resolve triggerDate the same way, and any
-// future consumer inherits it. Returns { triggerDate, daysToTrigger,
-// inWindow } given a runoutDaysOfCover (any calendar-days number,
-// finite = a valid runout, Infinity or non-finite = no runout) and
-// an optional transitionStartDate string. inWindow uses the 15-day
-// calendar threshold.
-function _computeTriggerFromRunoutAndTransition(runoutDaysOfCover, transitionStartDate) {
-  let runoutDate = null;
-  if (Number.isFinite(runoutDaysOfCover) && typeof addDays === "function") {
-    runoutDate = addDays(TODAY, runoutDaysOfCover);
-  }
-  let transitionDate = null;
-  if (transitionStartDate && typeof parseDateLocal === "function") {
-    const parsed = parseDateLocal(transitionStartDate);
-    if (parsed && !isNaN(parsed.getTime())) transitionDate = parsed;
-  }
-  let triggerDate = null;
-  if (runoutDate && transitionDate) {
-    triggerDate = runoutDate.getTime() <= transitionDate.getTime() ? runoutDate : transitionDate;
-  } else if (runoutDate) {
-    triggerDate = runoutDate;
-  } else if (transitionDate) {
-    triggerDate = transitionDate;
-  }
-  const daysToTrigger = triggerDate
-    ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
-  const inWindow = daysToTrigger !== null && daysToTrigger <= 15;
-  return { triggerDate, daysToTrigger, inWindow };
-}
+// (_computeTriggerFromRunoutAndTransition -- the 15-day min(runout,
+// transition) helper -- was deleted with the force-admit predicate. The
+// blanket release trigger is blanketReleaseDecision, cover-based, one
+// window: BLANKET_RELEASE_WINDOW_DAYS.)
 
 // Shared window→demand conversion. Given a CALENDAR-day window and a
 // PER-WORKDAY consumption rate, returns the units demanded across the
@@ -3751,10 +3724,11 @@ function toggleSupplierMute(name) {
         Fires on whichever comes first:
           (a) blanket authorization ages out within
               BLANKET_RELEASE_WINDOW_DAYS, or
-          (b) the part's runout lands within the same window —
-              substituting transitionStartDate for runout on a
-              part that hasn't cut in yet, since that's the date
-              stock actually has to be there.
+          (b) the part's projected runout -- ctx.daysOfCover, which
+              is already chain-aware (chainRunoutDays ?? daysOfCover)
+              and for an unstocked successor lands at cut-in --
+              falls within the same window. One cover-based rule;
+              there is no separate transition-date branch.
         Action: "Release N against blanket <PO> — need by <date>".
 
      3. ACTIVE BLANKET, NEITHER TRIGGER → SILENT.
@@ -3792,6 +3766,10 @@ function blanketReleaseDecision(part, ctx) {
       isBlanketSupplier: true, hasActiveBlanket: false, blanket: null,
       kind: "order", admitOverride: null, supplier: supplierName, qty,
       triggerDate: null, daysToTrigger: null, triggerReason: null,
+      // Same basis fields as the blanket branches so the audit print
+      // shows one uniform population.
+      cover: Number.isFinite(Number(ctx.daysOfCover)) ? Math.round(Number(ctx.daysOfCover)) : null,
+      daysToExpiry: null,
       action: `Order ${qty} from ${supplierName}`,
     };
   }
@@ -3807,21 +3785,24 @@ function blanketReleaseDecision(part, ctx) {
   const daysToExpiry = expiryDate
     ? Math.round((expiryDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
 
-  // (b) runout, or transitionStartDate for a part that hasn't cut in.
-  let needDate = null;
-  if (part.transitionStartDate && typeof parseDateLocal === "function") {
-    const t = parseDateLocal(part.transitionStartDate);
-    if (t && !isNaN(t.getTime()) && t.getTime() > TODAY.getTime()) needDate = t;
-  }
-  if (!needDate) {
-    const cover = Number(ctx.daysOfCover);
-    if (Number.isFinite(cover) && typeof addDays === "function") needDate = addDays(TODAY, cover);
-  }
-  const daysToNeed = needDate
-    ? Math.round((needDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
+  // (b) ONE cover-based rule. ctx.daysOfCover is already chain-aware
+  // (chainRunoutDays ?? status.daysOfCover), and for an unstocked
+  // successor that cover lands exactly at cut-in -- so the old
+  // "substitute transitionStartDate" branch could only ever fire EARLY,
+  // never usefully. Live noise case: JP00021, chain cover 171d, cut-in
+  // ~6 weeks out, admitted at 47d via the transition branch. Deleted.
+  // No finite cover inside the horizon = no need date = does not fire.
+  const cover = Number(ctx.daysOfCover);
+  const needDate = (Number.isFinite(cover) && typeof addDays === "function") ? addDays(TODAY, cover) : null;
+  const daysToNeed = needDate ? Math.round(cover) : null;
 
   const expiryFires = daysToExpiry !== null && daysToExpiry <= BLANKET_RELEASE_WINDOW_DAYS;
   const needFires = daysToNeed !== null && daysToNeed <= BLANKET_RELEASE_WINDOW_DAYS;
+
+  // Every branch below carries the two numbers the decision was made
+  // from, so the audit can assert the inverse (a part inside the window
+  // MUST be admitted) and the operator print can show the population.
+  const basis = { cover: Number.isFinite(cover) ? Math.round(cover) : null, daysToExpiry };
 
   if (!expiryFires && !needFires) {
     return {
@@ -3829,6 +3810,7 @@ function blanketReleaseDecision(part, ctx) {
       kind: "silent", admitOverride: false, supplier: supplierName, qty,
       triggerDate: null, daysToTrigger: null, triggerReason: null,
       blanketPo: blk.po ? blk.po.num : null, blanketOpen: blk.open,
+      ...basis,
       action: "",
       why: `blanket ${blk.po ? blk.po.num : "?"} covers it — ${daysToExpiry === null ? "no expiry recorded" : daysToExpiry + "d to expiry"}, ${daysToNeed === null ? "no runout in horizon" : daysToNeed + "d to need"}; both beyond the ${BLANKET_RELEASE_WINDOW_DAYS}d window`,
     };
@@ -3841,7 +3823,7 @@ function blanketReleaseDecision(part, ctx) {
     if (triggerDate === null || n < daysToTrigger) { triggerDate = d; daysToTrigger = n; triggerReason = why; }
   };
   if (expiryFires) pick(expiryDate, daysToExpiry, "blanket authorization expires");
-  if (needFires) pick(needDate, daysToNeed, part.transitionStartDate && daysToNeed !== null ? "transition cut-in" : "projected runout");
+  if (needFires) pick(needDate, daysToNeed, "projected runout");
 
   const poNum = blk.po ? blk.po.num : "?";
   const dateTxt = (typeof fmtDate === "function" && triggerDate) ? fmtDate(triggerDate) : "?";
@@ -3850,6 +3832,7 @@ function blanketReleaseDecision(part, ctx) {
     kind: "release", admitOverride: true, supplier: supplierName, qty,
     triggerDate, daysToTrigger, triggerReason,
     blanketPo: poNum, blanketOpen: blk.open,
+    ...basis,
     action: `Release ${qty} against blanket ${poNum} — need by ${dateTxt}`,
   };
 }
@@ -3896,29 +3879,11 @@ function partsWithStatus() {
       ? partStatusBlanketAware(effectiveForStatus, _supplySlice)
       : partStatus(effectiveForStatus, lines);
 
-    // Force-admit predicate: Sensourcing base_bom parts with an open
-    // blanket and no normal PO. Fires within 21d of min(cut-in,
-    // blanket-aware runout). Trigger basis for chain parts is
-    // chainRunoutDays (blanket-aware post commit acc3321), not
-    // _openDaysOfCover (which for a chain successor reads predecessor
-    // stock and misrepresents the buyer's actual coverage horizon).
-    let _forceAdmitAsRelease = false;
-    let _forceAdmitDaysToTrigger = null;
-    if (_cycleForStatus
-        && String(p.itemType || "").toLowerCase().trim() === "base_bom"
-        && status.status === "ok"
-        && onPO === 0
-        && (typeof findOpenBlanketForPart === "function") && findOpenBlanketForPart(p.pn)) {
-      const _chainInfoForForceAdmit = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
-      const runoutBasis = (_chainInfoForForceAdmit && Number.isFinite(_chainInfoForForceAdmit.chainRunoutDays))
-        ? _chainInfoForForceAdmit.chainRunoutDays
-        : (_openStatus ? _openStatus.daysOfCover : Infinity);
-      const trig = _computeTriggerFromRunoutAndTransition(runoutBasis, p.transitionStartDate);
-      if (trig.inWindow) {
-        _forceAdmitAsRelease = true;
-        _forceAdmitDaysToTrigger = trig.daysToTrigger;
-      }
-    }
+    // (The old 15-day "force-admit as release" predicate lived here. It
+    // was a second, narrower copy of the blanket release trigger --
+    // min(cut-in, runout) within 15d, onPO === 0 only -- and every
+    // consumer now reads the single decision in _blanketQueue instead.
+    // See blanketReleaseDecision.)
 
     const muted = isSupplierMuted(p.supplier);
     // Pre-launch superseding parts are gated the same way muted-supplier parts
@@ -3940,7 +3905,7 @@ function partsWithStatus() {
     // existing pre-launch override silences it (status="ok") which
     // hides it through its entire ordering window. This flag re-admits
     // it. Blanket-covered parts stay on the RELEASE tier
-    // (_forceAdmitAsRelease handles them). PO-covered parts are
+    // (_blanketQueue kind "release" handles them). PO-covered parts are
     // already ordered — no signal needed.
     //
     // Trigger conditions (all required):
@@ -4019,13 +3984,11 @@ function partsWithStatus() {
       onPO,
       isKit: isKitVal,
       ...status,
-      // Sensourcing force-admit: written for every cycled Sensourcing
-      // part (default false). Read by queueParts to force-admit an OK
-      // row as a RELEASE call-to-action, and by the order-queue row map
-      // to pick the release-styled visual + daysToTrigger display.
+      // Sensourcing: pre-blanket (open-lines-only) runout, kept for the
+      // order-queue runout-date display. The release call-to-action
+      // itself is _blanketQueue (below) -- the one decision every
+      // consumer reads.
       ...(_cycleForStatus ? {
-        _forceAdmitAsRelease,
-        _forceAdmitDaysToTrigger,
         _openDaysOfCover: _openStatus ? _openStatus.daysOfCover : null,
       } : {}),
       // MUTED-supplier override.
@@ -4798,7 +4761,7 @@ function queueParts(itemType) {
     if (bq && bq.admitOverride === true) return true;
     if (bq && bq.admitOverride === false) return false;
     return (p.status === "critical" || p.status === "warning"
-            || p._forceAdmitAsRelease || p._forceAdmitAsPreLaunchOrder);
+            || p._forceAdmitAsPreLaunchOrder);
   });
 }
 
@@ -4809,23 +4772,69 @@ function queueParts(itemType) {
    on every badge refresh; console-callable as _printSensourcingQueue().
    ------------------------------------------------------------------ */
 let _sensourcingQueueReported = false;
+// The OLD rule, reproduced from row fields, so the operator print can
+// show before/after per part. Two pieces made up "before":
+//   (1) blanketReleaseDecision's transition-date branch: need date =
+//       transitionStartDate when it is in the future, else runout.
+//   (2) the deleted 15-day force-admit: min(runout, transition) <= 15d,
+//       onPO === 0, status ok, blanket present.
+// Either admitting = "release" before. Read-only; diagnostics only.
+function _sensourcingOldRuleBranch(p, bq) {
+  if (!bq) return null;
+  if (bq.kind === "order") return "order";
+  const window = BLANKET_RELEASE_WINDOW_DAYS;
+  let transDays = null;
+  if (p.transitionStartDate && typeof parseDateLocal === "function") {
+    const t = parseDateLocal(p.transitionStartDate);
+    if (t && !isNaN(t.getTime()) && t.getTime() > TODAY.getTime()) transDays = Math.round((t.getTime() - TODAY.getTime()) / DAY_MS);
+  }
+  const cover = Number.isFinite(bq.cover) ? bq.cover : null;
+  const oldNeed = transDays !== null ? transDays : cover;
+  const oldNeedFires = oldNeed !== null && oldNeed <= window;
+  const expiryFires = bq.daysToExpiry !== null && bq.daysToExpiry !== undefined && bq.daysToExpiry <= window;
+  if (oldNeedFires || expiryFires) return "release";
+  // (2) the 15-day force-admit
+  const openCover = Number.isFinite(p._openDaysOfCover) ? p._openDaysOfCover : (cover === null ? Infinity : cover);
+  const minTrig = Math.min(Number.isFinite(openCover) ? openCover : Infinity, transDays === null ? Infinity : transDays);
+  if ((p.onPO || 0) === 0 && p.status === "ok" && Number.isFinite(minTrig) && minTrig <= 15) return "release";
+  return "silent";
+}
+
+// v-blanket-queue audit, both directions:
+//   FORWARD  no blanket-supplier part reaches the queue without a fired
+//            trigger (or the no-blanket ORDER path).
+//   INVERSE  every blanket-supplier part with an active blanket whose
+//            finite cover <= window OR daysToExpiry <= window IS admitted.
+// A miss in either direction is a console.error naming the pn.
 function sensourcingQueueAudit() {
   const stats = (typeof partsWithStatus === "function") ? partsWithStatus() : [];
   const queued = new Set(((typeof queueParts === "function") ? queueParts("base_bom") : []).map(p => p && p.pn));
+  const window = BLANKET_RELEASE_WINDOW_DAYS;
   let scanned = 0, release = 0, order = 0, silent = 0;
   const violations = [];
-  const rows = [];
+  const inverseMisses = [];
+  const rows = [];          // queued rows (as before)
+  const population = [];    // EVERY Sensourcing part, for the operator print
   for (const p of stats) {
     const bq = p && p._blanketQueue;
     if (!bq) continue;
     scanned++;
     const inQueue = queued.has(p.pn);
-    // "admitted" counts are what actually reached the queue. A no-blanket
-    // ORDER part still has to pass normal reorder rules, so it can be
-    // scanned-but-not-admitted; SILENT is suppression by definition.
     if (bq.kind === "silent") silent++;
     else if (inQueue && bq.kind === "release") release++;
     else if (inQueue && bq.kind === "order") order++;
+
+    const coverTxt = bq.cover == null ? "∞" : bq.cover;
+    const expTxt = bq.daysToExpiry == null ? "-" : bq.daysToExpiry;
+    const oldBranch = _sensourcingOldRuleBranch(p, bq);
+    population.push({
+      pn: p.pn, supplier: p.supplier || "-", cover: coverTxt, daysToExpiry: expTxt,
+      branch: bq.kind, reason: bq.triggerReason || (bq.kind === "silent" ? "covered" : "-"),
+      daysToTrigger: bq.daysToTrigger == null ? "-" : bq.daysToTrigger,
+      inQueue, blanket: bq.blanketPo || "-", open: bq.blanketOpen || 0,
+      before: oldBranch, changed: oldBranch !== bq.kind ? (bq.kind === "release" ? "APPEARS" : "DISAPPEARS") : "",
+    });
+
     if (inQueue) {
       rows.push({
         pn: p.pn, kind: bq.kind, qty: bq.qty,
@@ -4834,25 +4843,50 @@ function sensourcingQueueAudit() {
         daysToTrigger: bq.daysToTrigger == null ? "-" : bq.daysToTrigger,
         action: bq.action,
       });
-      // A blanket part may sit in the queue ONLY via a fired release
-      // trigger or via the no-blanket ordinary-buy branch.
       if (bq.kind === "silent") {
         violations.push(`${p.pn}: in Base BOM Queue but decision is SILENT (${bq.why || "no trigger"})`);
       } else if (bq.kind === "release" && bq.daysToTrigger == null) {
         violations.push(`${p.pn}: admitted as RELEASE but no trigger date resolved`);
       }
     }
+
+    // INVERSE: inside the window on either number => must be admitted.
+    if (bq.hasActiveBlanket) {
+      const coverIn = Number.isFinite(bq.cover) && bq.cover <= window;
+      const expiryIn = bq.daysToExpiry != null && bq.daysToExpiry <= window;
+      if ((coverIn || expiryIn) && !inQueue) {
+        inverseMisses.push(`${p.pn}: cover ${coverTxt}d / expiry ${expTxt}d inside the ${window}d window but NOT admitted (decision ${bq.kind}${bq.why ? " — " + bq.why : ""})`);
+      }
+    }
   }
-  return { scanned, release, order, silent, violations, rows };
+  for (const m of inverseMisses) console.error(`[sensourcing-queue] INVERSE MISS ${m}`);
+  return { scanned, release, order, silent, violations, inverseMisses, rows, population };
 }
+
+// Operator print: the WHOLE Sensourcing population -- pn, cover,
+// daysToExpiry, branch, reason -- plus what the old rule would have
+// done, so every row that appears or disappears carries the number
+// that justifies it.
 function _printSensourcingQueue() {
   const a = sensourcingQueueAudit();
-  console.info(`[sensourcing-queue] ${a.scanned} Sensourcing parts scanned · ${a.release} admitted (release), ${a.order} admitted (order — no blanket), ${a.silent} silent`);
-  if (a.rows.length) console.table(a.rows);
-  if (a.violations.length) {
-    console.warn(`[sensourcing-queue] violations: ${a.violations.length}\n  ` + a.violations.join("\n  "));
+  console.info(`[sensourcing-queue] ${a.scanned} Sensourcing parts scanned · ${a.release} admitted (release), ${a.order} admitted (order — no blanket), ${a.silent} silent (blanket covers) · window ${BLANKET_RELEASE_WINDOW_DAYS}d`);
+  if (a.population.length) console.table(a.population);
+  const changed = a.population.filter(r => r.changed);
+  if (changed.length) {
+    console.info(`[sensourcing-queue] ${changed.length} row(s) differ from the old rule:`);
+    console.table(changed.map(r => ({ pn: r.pn, before: r.before, after: r.branch, change: r.changed, cover: r.cover, daysToExpiry: r.daysToExpiry, reason: r.reason })));
   } else {
-    console.info("[sensourcing-queue] violations: none — every queued Sensourcing part has a fired trigger or no blanket");
+    console.info("[sensourcing-queue] no row differs from the old rule");
+  }
+  if (a.violations.length) {
+    console.error(`[sensourcing-queue] FORWARD violations: ${a.violations.length}\n  ` + a.violations.join("\n  "));
+  } else {
+    console.info("[sensourcing-queue] forward: none — every queued Sensourcing part has a fired trigger or no blanket");
+  }
+  if (a.inverseMisses.length) {
+    console.error(`[sensourcing-queue] INVERSE misses: ${a.inverseMisses.length}\n  ` + a.inverseMisses.join("\n  "));
+  } else {
+    console.info(`[sensourcing-queue] inverse: none — every part inside the ${BLANKET_RELEASE_WINDOW_DAYS}d window on cover or expiry is admitted`);
   }
   return a;
 }
