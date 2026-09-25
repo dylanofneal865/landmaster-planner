@@ -1471,7 +1471,7 @@ function supersessionChain(pn) {
   const visited = new Set([start]);
   let cur = start;
   while (true) {
-    const p = (DB.parts || []).find(x => x.pn === cur);
+    const p = _allParts().find(x => x.pn === cur);
     const next = (p && p.supersededBy) ? String(p.supersededBy).trim() : "";
     if (!next) break;
     if (visited.has(next)) {
@@ -1504,7 +1504,7 @@ function supersessionLineage(pn) {
   const seen = new Set([start]);
   let cur = start;
   while (true) {
-    const pred = (DB.parts || []).find(x => x.supersededBy && String(x.supersededBy).trim() === cur);
+    const pred = _allParts().find(x => x.supersededBy && String(x.supersededBy).trim() === cur);
     if (!pred) break;
     if (seen.has(pred.pn)) {
       console.warn(`[supersession] backward cycle hitting ${pred.pn} from ${start}`);
@@ -1849,7 +1849,7 @@ function chainSequentialView(part) {
   const lineage = supersessionLineage(part.pn);
   if (lineage.length < 2) return null;
 
-  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const partsByPn = new Map(_allParts().map(p => [p.pn, p]));
   const members = lineage.map(pn => partsByPn.get(pn)).filter(Boolean);
   if (members.length < 2) return null;
 
@@ -2008,7 +2008,7 @@ function chainDisplayDailySource(part) {
   const lineage = supersessionLineage(part.pn);
   if (lineage.length < 2) return own;
 
-  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const partsByPn = new Map(_allParts().map(p => [p.pn, p]));
   const transitioning = lineage.some(pn => {
     const p = partsByPn.get(pn);
     return !!(p && p.phasingOut);
@@ -2163,11 +2163,20 @@ function chainReorderByFromBasis(b) {
   return { byRunoutDays, byCutinDays, coveredThroughCutin, chainReorderByDays, chainStatus, anchor };
 }
 
-function getChainInfo(pn) {
+// `parts` is OPTIONAL and defaults to DB.parts (via _allParts): every
+// existing caller is byte-identical. The Backup Buy Queue passes its
+// shadow set so chain lineage, rates and runout are resolved against
+// modeled on-hand. Scoped: set for this call only, restored in finally.
+function getChainInfo(pn, parts) {
+  if (Array.isArray(parts) && _partsOverride !== parts) {
+    const prev = _partsOverride;
+    _partsOverride = parts;
+    try { return getChainInfo(pn); } finally { _partsOverride = prev; }
+  }
   if (!pn) return null;
   const target = String(pn).trim();
   if (!target) return null;
-  const partsByPn = new Map((DB.parts || []).map(p => [p.pn, p]));
+  const partsByPn = new Map(_allParts().map(p => [p.pn, p]));
   const part = partsByPn.get(target);
   if (!part) return null;
 
@@ -2189,7 +2198,7 @@ function getChainInfo(pn) {
   {
     let cur = target;
     while (true) {
-      const pred = (DB.parts || []).find(x =>
+      const pred = _allParts().find(x =>
         x && x.supersededBy && String(x.supersededBy).trim() === cur
       );
       if (!pred) break;
@@ -3480,7 +3489,7 @@ window._printChainReorderByAudit = _printChainReorderByAudit;
 // chain falls back to the pre-fix combined runout. Returns ONE string.
 function _printMissingCutins() {
   const rows = [];
-  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const partsByPn = new Map(_allParts().map(p => [p && p.pn, p]));
   for (const p of (DB.parts || [])) {
     if (!p || !p.pn) continue;
     // Find any predecessor pointing at THIS part via supersededBy AND
@@ -3745,6 +3754,23 @@ let _statusCache = null;
 let _statusCacheVer = 0;
 function bumpStatusCache() { _statusCacheVer++; _statusCache = null; }
 
+// PARTS OVERRIDE -- v-backup-buy.
+//
+// The Backup Buy Queue runs the EXACT reorder math against shadow parts
+// (clones with onHand := modeled on-hand). Every helper that used to
+// read DB.parts internally now reads _allParts(), which returns DB.parts
+// unless an override is set. With no override every existing caller is
+// byte-identical. The override is set only for the synchronous span of
+// partsWithStatus({ parts }) / getChainInfo(pn, parts) and restored in a
+// finally, so no async work can observe it and nothing persists.
+//
+// Helpers switched to _allParts(): supersessionChain, supersessionLineage,
+// chainSequentialView, chainDisplayDailySource, getChainInfo (map + pred
+// lookup), chainActiveMemberInfo, evaluateChainHandoff, partsWithStatus,
+// and the _printMissingCutins diagnostic (same string, harmless).
+let _partsOverride = null;
+function _allParts() { return _partsOverride || DB.parts || []; }
+
 // Supplier mute — independent from itemType="do_not_order". A muted
 // supplier's parts keep their TRUE computed status in _rawStatus, but their
 // public-facing status is forced to "ok" so they fall out of every alert
@@ -3937,7 +3963,24 @@ function blanketReleaseDecision(part, ctx) {
   };
 }
 
-function partsWithStatus() {
+// opts.parts (OPTIONAL): run the whole status pipeline against a shadow
+// parts array instead of DB.parts. Bypasses the live cache in both
+// directions -- the live cache is neither read nor overwritten -- and the
+// override is restored in finally. With no opts every caller is
+// byte-identical. Used by the Backup Buy Queue.
+function partsWithStatus(opts) {
+  if (opts && Array.isArray(opts.parts)) {
+    const prevOverride = _partsOverride;
+    const savedCache = _statusCache;
+    _partsOverride = opts.parts;
+    _statusCache = null;
+    try {
+      return partsWithStatus();          // computes fresh over _allParts()
+    } finally {
+      _statusCache = savedCache;         // shadow result never becomes the live cache
+      _partsOverride = prevOverride;
+    }
+  }
   if (_statusCache) return _statusCache;
   // Build the per-PN open-PO-line index ONCE and reuse it so we don't
   // rescan DB.pos for every part during the .map below.
@@ -3946,7 +3989,7 @@ function partsWithStatus() {
   // lines that pass isLineIncomingSupply. Only Sensourcing parts route
   // through this; non-Sensourcing parts continue to read lineIndex.
   const supplyIndex = (typeof _buildSupplyLineIndex === "function") ? _buildSupplyLineIndex() : new Map();
-  const out = DB.parts.map(p => {
+  const out = _allParts().map(p => {
     const lines = lineIndex.get(p.pn);
     const onPO = lines ? openPOQty(p.pn, lines) : 0;
     const isKitVal = typeof isKit === "function" ? isKit(p) : false;
@@ -4247,7 +4290,7 @@ function isBlanketSupplierPart(part) { return _supplierMatchesTokens(part, BLANK
 function chainActiveMemberInfo(ci) {
   const lineage = (ci && Array.isArray(ci.chainParts)) ? ci.chainParts.slice() : [];
   if (lineage.length === 0) return { lineage, activeIdx: -1, activePn: null, terminalActive: false, queued: new Set() };
-  const byPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const byPn = new Map(_allParts().map(p => [p && p.pn, p]));
   const today = new Date(TODAY.getTime()); today.setHours(0, 0, 0, 0);
   const queued = new Set();
   for (const pn of lineage) {
@@ -4332,7 +4375,7 @@ function evaluateChainHandoff(ci) {
   const cutinOffset = cutinDate ? Math.max(0, cutinDays) : null;
   const leadDays = (succ && typeof leadTimeDays === "function") ? leadTimeDays(succ) : 0;
   const safetyDays = (typeof DB !== "undefined" && DB && DB.settings && Number(DB.settings.safetyDays)) || 0;
-  const partsByPn = new Map((DB.parts || []).map(p => [p && p.pn, p]));
+  const partsByPn = new Map(_allParts().map(p => [p && p.pn, p]));
   const predStock0 = predPns.reduce((s, pn) => { const p = partsByPn.get(pn); return s + Math.max(0, Number(p && p.onHand) || 0); }, 0);
   const succStock0 = Math.max(0, Number(succ && succ.onHand) || 0);
   const roleInfo = chainActiveMemberInfo(ci);
@@ -4819,8 +4862,10 @@ function preLaunchOrderBy(part) {
 //
 // queueParts() (no arg) === union of queueParts("base_bom"), queueParts("options"),
 // queueParts("service") — same predicate, no untagged leakage.
-function queueParts(itemType) {
-  let stats = partsWithStatus();
+// opts.parts (OPTIONAL) -> shadow admission via partsWithStatus({ parts }).
+// Same filters, same gates; only the parts array differs.
+function queueParts(itemType, opts) {
+  let stats = partsWithStatus(opts);
   // Route-param compare normalized on both sides so case/whitespace variants
   // (e.g. a part tagged "Service") still route to the intended queue.
   const _wantType = String(itemType || "").toLowerCase().trim();

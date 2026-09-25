@@ -1786,6 +1786,31 @@ function _irAggregate() {
     const prev = anchorByPn.get(r.pn);
     if (!prev || String(r.counted_at) > String(prev.counted_at)) anchorByPn.set(r.pn, r);
   }
+  // v-backup-buy: an operator BASELINE is a second kind of anchor. "Set
+  // baseline = today" says "trust live as of now; model forward from
+  // here" without claiming a count happened. It is distinct from a count
+  // (its own audit row, no counted_qty) and it never writes on-hand. The
+  // ledger simply stops accumulating before the later of {last count,
+  // baseline}. Per-part baselines live in DB.settings.backupBaselines
+  // {pn: iso}; a tab-level one in DB.settings.backupBaselineAll.
+  const _bl = (DB && DB.settings) ? DB.settings : {};
+  const _blAll = typeof _bl.backupBaselineAll === "string" ? _bl.backupBaselineAll : null;
+  const _blByPn = (_bl.backupBaselines && typeof _bl.backupBaselines === "object") ? _bl.backupBaselines : {};
+  const baselineIsoFor = (pn) => {
+    const own = typeof _blByPn[pn] === "string" ? _blByPn[pn] : null;
+    if (own && _blAll) return own > _blAll ? own : _blAll;
+    return own || _blAll;
+  };
+  const pnsWithBaseline = new Set(Object.keys(_blByPn));
+  if (_blAll) for (const s of snaps) pnsWithBaseline.add(s.pn);
+  for (const pn of pnsWithBaseline) {
+    const iso = baselineIsoFor(pn);
+    if (!iso) continue;
+    const cur = anchorByPn.get(pn);
+    if (!cur || String(iso) > String(cur.counted_at).slice(0, 10)) {
+      anchorByPn.set(pn, { pn, counted_at: iso, counted_by: null, outcome: "baseline", isBaseline: true });
+    }
+  }
   for (const s of snaps) {
     if (++iterations > IR_AGG_MAX_ITERATIONS) {
       console.error("[ir] aggregation hit iteration cap in snap pass -- bailing (snaps=" + snaps.length + " partsSeen=" + agg.size + ")");
@@ -1807,6 +1832,7 @@ function _irAggregate() {
         receiptsSum: 0,
         lastCountedAt: anchor ? anchor.counted_at : null,
         lastCounter: anchor ? anchor.counted_by : null,
+        anchorKind: anchor ? (anchor.isBaseline ? "baseline" : "count") : null,   // v-backup-buy
         adjustmentsExcluded: 0,
         driftRun: 0,
         driftLastSign: 0,
