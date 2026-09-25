@@ -927,7 +927,9 @@ return { statusCode: 200, body: JSON.stringify({ ok: true, today, isMonday, summ
   }
 
   log(`inserted ${plans.length} items (+ ${locSnapshotCount} location snapshots) in ${Date.now() - t0}ms`);
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "cycle-count-assign", "items assigned", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       ok: true,

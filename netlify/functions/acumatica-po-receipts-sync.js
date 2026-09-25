@@ -587,7 +587,9 @@ return {
       (missingField.size > 0 ? ` — WARNING: unmapped fields: ${[...missingField].join(",")}` : "")
   );
 
-  return {
+    // Heartbeat: real completion only (bail-outs above do not beat).
+  await _beat(supa, "acumatica-po-receipts-" + runMode, "po_receipts reconciled", log);
+return {
     statusCode: 200,
     body: JSON.stringify({
       mode: runMode,
