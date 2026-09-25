@@ -3290,18 +3290,24 @@ function _printDraftQtyAudit() {
 }
 window._printDraftQtyAudit = _printDraftQtyAudit;
 
-// QUEUE FLAG AUDIT — reproduces the RELEASE / NO PO decision the queue row
+// QUEUE FLAG AUDIT — prints the RELEASE / NO PO decision the queue row
 // renderer applies at js/07-page-orders.js, per part. Sensourcing scope
 // only (getSupplierCycle non-null). Returns ONE string.
 // Columns: pn | supplier | hasBlanket | blanketCount | openPOQty |
 //   cutinDate | runoutDate | triggerDate | daysToTrigger | flag
-// Trigger date sourcing matches the queue: transitionStartDate wins (past
-// or future); else chain-aware runout via getChainInfo, else per-part
-// runout via partStatus daysOfCover.
+// RELEASE is READ from the row's _blanketQueue (blanketReleaseDecision:
+// cover-based, one window) -- this printer no longer recomputes it with
+// its own min(cut-in, runout) / 21-day rule, which had drifted from the
+// queue. NO PO stays row-local (needs a demand signal: cut-in or runout).
 function _printQueueFlagAudit() {
   const iso = d => (d && d.toISOString) ? d.toISOString().slice(0, 10) : "-";
   const rows = [];
   let relCount = 0, noPoCount = 0;
+  // One decision per part, read from partsWithStatus (cached), not recomputed here.
+  const _bqByPn = new Map();
+  for (const s of ((typeof partsWithStatus === "function") ? partsWithStatus() : [])) {
+    if (s && s.pn) _bqByPn.set(s.pn, s._blanketQueue || null);
+  }
   for (const p of (DB.parts || [])) {
     if (!p || !p.pn) continue;
     const cycle = (typeof getSupplierCycle === "function") ? getSupplierCycle(p.supplier) : null;
@@ -3328,17 +3334,20 @@ function _printQueueFlagAudit() {
         runoutDate = addDays(TODAY, stat.daysOfCover);
       }
     }
-    const triggerDate = cutinDate || runoutDate;
-    const daysToTrigger = triggerDate
-      ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null;
-    const inWindow = daysToTrigger !== null && daysToTrigger <= 21;
+    // RELEASE: the one decision (blanketReleaseDecision via partsWithStatus).
+    // Its need-by / daysToTrigger are the numbers the queue shows.
+    const _bq = _bqByPn.get(p.pn) || null;
+    const _isRelease = !!(_bq && _bq.kind === "release");
+    // NO PO: row-local demand signal, as in js/07 -- a Sensourcing part
+    // with no runout and no cut-in has nothing to be late for.
+    const signalDate = cutinDate || runoutDate;
+    const triggerDate = _isRelease ? (_bq.triggerDate || signalDate) : signalDate;
+    const daysToTrigger = _isRelease && Number.isFinite(_bq.daysToTrigger)
+      ? _bq.daysToTrigger
+      : (triggerDate ? Math.round((triggerDate.getTime() - TODAY.getTime()) / DAY_MS) : null);
     let flag = "none";
-    // Both flags require a valid triggerDate — a Sensourcing part with no
-    // runout and no cutin has no demand signal, so surfacing NO PO on it
-    // is a false positive. Matches the queue row's gate at
-    // js/07-page-orders.js.
-    if (blk && openPO === 0 && inWindow) flag = "RELEASE";
-    else if (!blk && openPO === 0 && triggerDate) flag = "NO PO";
+    if (_isRelease) flag = "RELEASE";
+    else if (!blk && openPO === 0 && signalDate) flag = "NO PO";
     if (flag === "RELEASE") relCount++;
     else if (flag === "NO PO") noPoCount++;
     rows.push({
@@ -3869,9 +3878,11 @@ function partsWithStatus() {
     // slice, so a blanket landing that keeps oh > 0 through the horizon
     // yields status OK. Non-Sensourcing branch: partStatus with the OPEN
     // slice — byte-identical to production. _openStatus is retained on
-    // Sensourcing parts as the pre-blanket runout, used by the force-admit
-    // predicate (a covered part still needs a RELEASE CTA when its raw
-    // runout falls inside the 21-day trigger window).
+    // Sensourcing parts as the pre-blanket runout (_openDaysOfCover on
+    // the row), which the order queue shows as the runout date on
+    // blanket RELEASE rows. The release decision itself is
+    // blanketReleaseDecision -> _blanketQueue, one window
+    // (BLANKET_RELEASE_WINDOW_DAYS).
     const _openStatus = _cycleForStatus
       ? partStatus(effectiveForStatus, lines)
       : null;
