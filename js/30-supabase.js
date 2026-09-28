@@ -1720,6 +1720,11 @@ async function setFrameScheduleSettingsCloud(caps) {
   const bufferWeeks = Number.isFinite(bwArg) && bwArg >= 0
     ? bwArg
     : (prev && Number.isFinite(prev.bufferWeeks) ? prev.bufferWeeks : null);
+  // v8 maxCoverWeeks: preserve-on-omit, same shape as bufferWeeks.
+  const mcArg = Number(caps && caps.maxCoverWeeks);
+  const maxCoverWeeks = Number.isFinite(mcArg) && mcArg > 0
+    ? mcArg
+    : (prev && Number.isFinite(prev.maxCoverWeeks) && prev.maxCoverWeeks > 0 ? prev.maxCoverWeeks : null);
   // v5 publishToken: same preservation shape as bufferWeeks. When
   // caller passes a valid token (client mints "fs-<uuid>" via
   // crypto.randomUUID), persist it. When caller omits, keep
@@ -1761,6 +1766,7 @@ async function setFrameScheduleSettingsCloud(caps) {
   const nowIso = new Date().toISOString();
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
+  if (maxCoverWeeks !== null) dataOut.maxCoverWeeks = maxCoverWeeks;
   if (publishToken !== null) dataOut.publishToken = publishToken;
   if (lastPublishedAt !== null) dataOut.lastPublishedAt = lastPublishedAt;
   // Persist scheduleMode unconditionally so a legacy row upgrades
@@ -1768,7 +1774,7 @@ async function setFrameScheduleSettingsCloud(caps) {
   // installation still lands on the new scheduler.
   dataOut.scheduleMode = scheduleMode;
   if (minWriteBuild > 0) dataOut.minWriteBuild = minWriteBuild;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, maxCoverWeeks, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
   // v7.11 Route the settings write through the frame-schedule-write
   // Netlify function (service key + token + build guard). The
   // function re-sanitizes the settings payload against the CURRENT
@@ -1776,6 +1782,7 @@ async function setFrameScheduleSettingsCloud(caps) {
   // this client's mirror is stale.
   const settingsForFn = { crewhd, std, appBuild: (typeof APP_BUILD === "number" ? APP_BUILD : 0) };
   if (bufferWeeks !== null) settingsForFn.bufferWeeks = bufferWeeks;
+  if (maxCoverWeeks !== null) settingsForFn.maxCoverWeeks = maxCoverWeeks;
   if (publishToken !== null) settingsForFn.publishToken = publishToken;
   if (lastPublishedAt !== null) settingsForFn.lastPublishedAt = lastPublishedAt;
   settingsForFn.scheduleMode = scheduleMode;

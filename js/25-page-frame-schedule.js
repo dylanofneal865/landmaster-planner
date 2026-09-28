@@ -183,6 +183,7 @@ const FRAMESCHED_STATE = {
   // trip lands; the reader (_fsSettingsBufferWeeks) prefers the
   // cloud value.
   _bufferWeeks: null,
+  _maxCoverWeeks: null,      // v8: session-local fallback for the max-cover ceiling
   // v5 AUTO-PUBLISH state. renderFrameSchedule computes a grid
   // key from every scheduled cell (pn|iso|qty) and asks
   // _fsAutoPublish to republish when the key changes vs the last
@@ -321,6 +322,7 @@ function _fsSchedFor() {
   return FrameScheduler.forContext({
     weekDataByIso: map,
     bufferWeeks: _fsSettingsBufferWeeks(),
+    maxCoverWeeks: _fsSettingsMaxCoverWeeks(),   // v8 ceiling; the server passes the same value
     scheduleMode: _fsSettingsScheduleMode(),
     today: t,
     parseDateLocal: (typeof parseDateLocal === "function") ? parseDateLocal : undefined,
@@ -567,6 +569,24 @@ function _fsWeekEnvelopeStatus(crewhdSum, stdSum, caps) {
 // went silent, runs under-sized. Same null-gate pattern as the
 // cloud path.
 const _FS_BUFFER_WEEKS_DEFAULT = 1.0;
+// v8 MAX COVER (weeks) -- the ceiling that matches the min-cover floor.
+// Same read order as bufferWeeks: cloud __settings__ row, then the
+// session-local value from an in-flight edit, then the default. Passed
+// to the shared scheduler as ctx.maxCoverWeeks; frame-schedule-compute
+// passes the same value, so browser and server apply one rule.
+const _FS_MAX_COVER_WEEKS_DEFAULT = 8;
+function _fsSettingsMaxCoverWeeks() {
+  const s = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
+  const raw = s ? s.maxCoverWeeks : null;
+  const cloudVal = (raw != null && Number.isFinite(Number(raw)) && Number(raw) > 0) ? Number(raw) : null;
+  if (cloudVal !== null) return cloudVal;
+  const localRaw = FRAMESCHED_STATE._maxCoverWeeks;
+  if (localRaw != null) {
+    const localVal = Number(localRaw);
+    if (Number.isFinite(localVal) && localVal > 0) return localVal;
+  }
+  return _FS_MAX_COVER_WEEKS_DEFAULT;
+}
 function _fsSettingsBufferWeeks() {
   const s = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
   const raw = s ? s.bufferWeeks : null;
@@ -1991,9 +2011,17 @@ function _fsFindStaleLocks(slots, rows, cols, globalCaps, currentSimResult, rate
    allows a mix week explicitly.
    ============================================================ */
 
-function _fsBuildTrueDemandPanel(rows, globalCaps) {
+// `band` (optional, v8): { minCover, maxCover, timeline } where timeline is
+// the sim's onHandTimeline (Map pn -> [{ iso, endOh, burn }]). When given,
+// each frame row gets a chip naming any scheduled week whose end-of-week
+// cover leaves the [min, max] band -- the board-level view of the
+// ceiling rule, so a slug or a starve is visible without reading cells.
+function _fsBuildTrueDemandPanel(rows, globalCaps, band) {
   const crewhdCap = Number(globalCaps && globalCaps.crewhd) || 0;
   const stdCap    = Number(globalCaps && globalCaps.std)    || 0;
+  const bandMin = band && Number.isFinite(Number(band.minCover)) ? Number(band.minCover) : null;
+  const bandMax = band && Number.isFinite(Number(band.maxCover)) ? Number(band.maxCover) : null;
+  const timeline = (band && band.timeline instanceof Map) ? band.timeline : null;
 
   // Per-frame burn + cover. Uses _fsDaily so chained frames report
   // their true chain rate (e.g. UT101002 = 0.61 chain vs 0.162
@@ -2004,7 +2032,16 @@ function _fsBuildTrueDemandPanel(rows, globalCaps) {
     const burn  = daily * FS_WORKDAYS_PER_WEEK;
     const oh    = Number(r.onHand) || 0;
     const cover = burn > 0 ? (oh / burn) : Infinity;
-    return { pn: r.pn, pool: r.pool, short: FRAME_SHORT[r.pn] || "", burn, cover, oh };
+    // v8 band violations across the scheduled horizon.
+    const violations = [];
+    if (timeline && burn > 0) {
+      for (const e of (timeline.get(r.pn) || [])) {
+        const c = (Number(e.endOh) || 0) / burn;
+        if (bandMax !== null && c > bandMax) violations.push({ iso: e.iso, cover: c, kind: "over" });
+        else if (bandMin !== null && bandMin > 0 && c < bandMin) violations.push({ iso: e.iso, cover: c, kind: "under" });
+      }
+    }
+    return { pn: r.pn, pool: r.pool, short: FRAME_SHORT[r.pn] || "", burn, cover, oh, violations };
   });
 
   // Pool subtotals.
@@ -2033,6 +2070,17 @@ function _fsBuildTrueDemandPanel(rows, globalCaps) {
       <td class="mono tiny"><strong>${esc(f.pn)}</strong>${f.short ? `<span class="muted"> &middot; ${esc(f.short)}</span>` : ""}${poolPill}</td>
       <td class="right mono tiny">${f.burn.toFixed(1)}/wk</td>
       <td class="right mono tiny muted">${coverTxt}</td>
+      <td class="tiny">${(() => {
+        // v8 band chip: name the first violating week; count the rest.
+        const v = f.violations || [];
+        if (!v.length) return (bandMax !== null || (bandMin !== null && bandMin > 0)) ? `<span class="pill ok" style="font-size:9px">in band</span>` : "";
+        const first = v[0];
+        const more = v.length > 1 ? ` +${v.length - 1}` : "";
+        const label = first.kind === "over"
+          ? `over ${bandMax} wk: ${first.cover.toFixed(1)} wk @ ${_fsMdFromIso(first.iso)}${more}`
+          : `under ${bandMin} wk: ${first.cover.toFixed(1)} wk @ ${_fsMdFromIso(first.iso)}${more}`;
+        return `<span class="pill ${first.kind === "over" ? "warn" : "crit"}" style="font-size:9px" title="${esc(v.map(x => `${x.kind} ${x.cover.toFixed(1)} wk @ ${x.iso}`).join(", "))}">${esc(label)}</span>`;
+      })()}</td>
     </tr>`;
   }).join("");
 
@@ -3504,6 +3552,13 @@ function renderFrameSchedule() {
                ${capKeyHandler}
                onchange="_fsHandleSettingsBufferWeeks(this.value)">
       </label>
+      <label class="fs-caps-label" title="Ceiling to the min-cover floor. A run or filler is BLOCKED when it would push a frame's cover past this AND the frame holds min cover through its next placeable week without it. If skipping would breach the floor first, the placement stands (coverage outranks the lid). Manual pins are never blocked. Persisted in the __settings__ row; the server compute reads the same value.">
+        <span class="muted tiny">Max cover (weeks)</span>
+        <input id="fs-cap-max-cover-weeks" type="number" step="0.5" min="0.5" value="${_fsSettingsMaxCoverWeeks()}"
+               class="input mono fs-caps-input"
+               ${capKeyHandler}
+               onchange="_fsHandleSettingsMaxCoverWeeks(this.value)">
+      </label>
       <label class="fs-caps-label" title="Scheduler mode. Weekly: greedy per-week cover-driven picks (default). Slots: legacy 2-week enumerator kept for fallback.">
         <span class="muted tiny">Mode</span>
         <select id="fs-cap-schedule-mode" class="input mono fs-caps-input"
@@ -3769,7 +3824,11 @@ function renderFrameSchedule() {
         </div>
       </div>
 
-      ${_fsBuildTrueDemandPanel(rows, globalCaps)}
+      ${_fsBuildTrueDemandPanel(rows, globalCaps, {
+        minCover: _fsSettingsBufferWeeks(),
+        maxCover: _fsSettingsMaxCoverWeeks(),
+        timeline: (typeof simResult !== "undefined" && simResult && simResult.onHandTimeline instanceof Map) ? simResult.onHandTimeline : null,
+      })}
 
       <div class="fs-warnings-panel">
         <div class="fs-warn-title">Coverage warnings</div>
@@ -3897,6 +3956,60 @@ function _fsHandleHistoryRange(val) {
 // rounds down. Optimistic mirror (via the writer) + immediate
 // re-render so the optimizer picks up the new target on the same
 // tick.
+// v8 PIN DIALOG cover readout. Approximate on purpose: today's on-hand
+// plus the qty being pinned, over the frame's weekly burn -- enough to
+// show the operator where the pin lands against the band. Pins are
+// never blocked; past the ceiling they save and warn red.
+function _fsPinCoverInfo(pn, curQty) {
+  const part = (DB.parts || []).find(p => p && p.pn === pn);
+  if (!part) return null;
+  const daily = (typeof _fsDaily === "function") ? Number(_fsDaily(part)) : Number(part.daily);
+  const wpw = (typeof FS_WORKDAYS_PER_WEEK === "number") ? FS_WORKDAYS_PER_WEEK : 5;
+  const burn = (Number.isFinite(daily) ? daily : 0) * wpw;
+  if (!(burn > 0)) return null;
+  const oh = Number(part.onHand) || 0;
+  return { burn, oh, coverNow: oh / burn, maxCover: _fsSettingsMaxCoverWeeks(), minCover: _fsSettingsBufferWeeks(), curQty: Number(curQty) || 0 };
+}
+function _fsWarnPinPastCeiling(pn, raw, info) {
+  if (!info) return;
+  const q = Math.max(0, Math.floor(Number(raw) || 0));
+  if (q <= 0) return;
+  const coverAfter = (info.oh + q) / info.burn;
+  if (coverAfter > info.maxCover && typeof showToast === "function") {
+    showToast(`${pn}: pin saved — cover after ≈ ${coverAfter.toFixed(1)} wk, past the ${info.maxCover} wk ceiling`, "crit", "Max cover");
+  }
+}
+
+// v8 Max cover (weeks). Snapped to 0.5; must sit above min cover (a
+// ceiling at or below the floor would block every placement that the
+// floor demands, so the floor always wins -- refuse the edit instead).
+function _fsHandleSettingsMaxCoverWeeks(raw) {
+  if (typeof gateEdit === "function" && !gateEdit()) return;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return;
+  const maxCoverWeeks = Math.max(0.5, Math.round(parsed * 2) / 2);
+  const minCover = _fsSettingsBufferWeeks();
+  if (maxCoverWeeks <= minCover) {
+    if (typeof showToast === "function") showToast(`Max cover must be above min cover (${minCover} wk)`, "warn");
+    if (typeof refresh === "function") refresh();
+    return;
+  }
+  FRAMESCHED_STATE._maxCoverWeeks = maxCoverWeeks;
+  const cur = _fsSettingsCaps();
+  if (typeof setFrameScheduleSettingsCloud === "function") {
+    setFrameScheduleSettingsCloud({ crewhd: cur.crewhd, std: cur.std, bufferWeeks: _fsSettingsBufferWeeks(), maxCoverWeeks })
+      .then(res => {
+        if (res && res.ok) {
+          if (typeof logAudit === "function") logAudit("frame-sched-edit", `Frame schedule: max cover = ${maxCoverWeeks} wk`, { maxCoverWeeks });
+          if (typeof showToast === "function") showToast(`Max cover set to ${maxCoverWeeks} wk`, "ok");
+        } else if (typeof showToast === "function") {
+          showToast("Max cover save failed — check connection", "warn");
+        }
+      });
+  }
+  if (typeof refresh === "function") refresh();
+}
+
 function _fsHandleSettingsBufferWeeks(raw) {
   if (typeof gateEdit === "function" && !gateEdit()) return;
   const parsed = Number(raw);
@@ -4032,13 +4145,19 @@ function _fsBackfillSched(pn, iso, evt) {
   const curVal = Number(curQty[pn]) || 0;
   const promptDefault = curVal > 0 ? String(curVal) : "";
   const weekLabel = _fsMdLongFromIso(iso);
+  // v8: show projected cover after the pin (approximate: current on-hand
+  // plus this qty over the frame's weekly burn) and the ceiling, so the
+  // operator sees the band before committing. Pins are never blocked.
+  const _pinCoverInfo = _fsPinCoverInfo(pn, curVal);
   const raw = (typeof window !== "undefined" && typeof window.prompt === "function")
     ? window.prompt(
-        `Scheduled qty for ${pn} · ${weekLabel}\n\nEnter a non-negative integer.\nBlank or 0 removes.`,
+        `Scheduled qty for ${pn} · ${weekLabel}\n\nEnter a non-negative integer.\nBlank or 0 removes.` +
+        (_pinCoverInfo ? `\n\nCover now ≈ ${_pinCoverInfo.coverNow.toFixed(1)} wk · ceiling ${_pinCoverInfo.maxCover} wk · floor ${_pinCoverInfo.minCover} wk` : ""),
         promptDefault
       )
     : null;
   if (raw === null) return;   // operator hit Cancel
+  _fsWarnPinPastCeiling(pn, raw, _pinCoverInfo);
   const trimmed = String(raw).trim();
   let newVal;
   if (trimmed === "") {
@@ -4577,11 +4696,15 @@ function _fsHandleQtyOverride(pn, iso, evt) {
         `Manual qty override for ${pn} · ${_fsMdLongFromIso(iso)}\n\n` +
         `Enter a non-negative integer to fix this week's build (0 = build nothing).\n` +
         `Blank clears the override back to the optimizer.\n` +
-        `Cancel aborts.`,
+        `Cancel aborts.` +
+        ((typeof _fsPinCoverInfo === "function" && _fsPinCoverInfo(pn, curPlaced))
+          ? (function (ci) { return `\n\nCover now ≈ ${ci.coverNow.toFixed(1)} wk · ceiling ${ci.maxCover} wk · floor ${ci.minCover} wk`; })(_fsPinCoverInfo(pn, curPlaced))
+          : ""),
         promptDefault
       )
     : null;
   if (raw === null) return;
+  if (typeof _fsWarnPinPastCeiling === "function") _fsWarnPinPastCeiling(pn, raw, _fsPinCoverInfo(pn, curPlaced));
   const trimmed = String(raw).trim();
   let newVal = null;
   let clearing = false;
@@ -5439,6 +5562,7 @@ window.fsCompareShadow = async function (opts) {
     scheduleMode: srvIn.scheduleMode,
     caps: srvIn.caps,
     bufferWeeks: srvIn.bufferWeeks,
+    maxCoverWeeks: srvIn.maxCoverWeeks,
     anchorIso: srvIn.anchorIso,
     todayIso: srvIn.todayIso,
   } : "(no settings row in shadow)");

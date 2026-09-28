@@ -158,6 +158,11 @@ function _sanitizeSettingsPayload(payload, prevData) {
   const bufferWeeks = (Number.isFinite(bwArg) && bwArg >= 0)
     ? bwArg
     : (prevData && Number.isFinite(prevData.bufferWeeks) ? prevData.bufferWeeks : null);
+  // v8 maxCoverWeeks: preserve-on-omit, bufferWeeks pattern.
+  const mcArg = Number(payload && payload.maxCoverWeeks);
+  const maxCoverWeeks = (Number.isFinite(mcArg) && mcArg > 0)
+    ? mcArg
+    : (prevData && Number.isFinite(prevData.maxCoverWeeks) && prevData.maxCoverWeeks > 0 ? prevData.maxCoverWeeks : null);
   const ptArg = payload && payload.publishToken;
   const publishToken = (typeof ptArg === "string" && /^[A-Za-z0-9._-]{24,128}$/.test(ptArg))
     ? ptArg
@@ -176,6 +181,7 @@ function _sanitizeSettingsPayload(payload, prevData) {
   const minWriteBuild = Math.max(prevBuild, clientBuild);
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
+  if (maxCoverWeeks !== null) dataOut.maxCoverWeeks = maxCoverWeeks;
   if (publishToken !== null) dataOut.publishToken = publishToken;
   if (lastPublishedAt !== null) dataOut.lastPublishedAt = lastPublishedAt;
   dataOut.scheduleMode = scheduleMode;

@@ -102,12 +102,14 @@ function ingestFrameSchedule(rows) {
     const d = row.data || {};
     if (key === "__settings__") {
       const bw = Number(d.bufferWeeks);
+      const mc = Number(d.maxCoverWeeks);   // v8 max-cover ceiling, bufferWeeks pattern
       settings = {
         caps: {
           crewhd: Number(d.caps && d.caps.crewhd) || 0,
           std:    Number(d.caps && d.caps.std)    || 0,
         },
         bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
+        maxCoverWeeks: (Number.isFinite(mc) && mc > 0) ? mc : null,
         scheduleMode: (d.scheduleMode === "slots") ? "slots" : "weekly",
         publishToken: (typeof d.publishToken === "string") ? d.publishToken : null,
         lastPublishedAt: (typeof d.lastPublishedAt === "string") ? d.lastPublishedAt : null,
@@ -338,6 +340,9 @@ exports.handler = async (event) => {
   const ctx = {
     weekDataByIso,
     bufferWeeks,
+    // v8: pass the ceiling only when set; the lib defaults to 8 otherwise,
+    // exactly as the browser does, so both sides apply one rule.
+    maxCoverWeeks: (typeof settings.maxCoverWeeks === "number" && settings.maxCoverWeeks > 0) ? settings.maxCoverWeeks : undefined,
     scheduleMode: settings.scheduleMode || "weekly",
     today,
     parseDateLocal,
