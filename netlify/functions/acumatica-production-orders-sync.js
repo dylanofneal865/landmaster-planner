@@ -691,3 +691,8 @@ exports.handler = async (event) => runProductionOrdersSync(event);
 // Shared runner for the unscheduled HTTP door and for any caller that
 // wants a sync inline. See acumatica-production-orders-run.js.
 exports.runProductionOrdersSync = runProductionOrdersSync;
+
+// Failure note (Sep 28 2026): a thrown exception or a 5xx return writes
+// sync_heartbeats.note = "ERROR <ts>: <reason>" under this name (last_ok
+// untouched) so the Settings card shows WHY, not just "stale".
+exports.handler = require("./_heartbeat.js").guard("acumatica-production-orders-sync", exports.handler);

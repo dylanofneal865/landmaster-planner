@@ -14,7 +14,7 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
-const { beat: _beat } = require("./_heartbeat.js");
+const { beat: _beat, fail: _fail, guard: _guard, remainingMs: _remainingMs } = require("./_heartbeat.js");
 // Broadcast a data-changed ping via Supabase Realtime's HTTP endpoint.
 // The browser client's landmaster-broadcast channel listens for
 // { event: "data-changed", payload: { tables: [...] } } and delta-
@@ -107,7 +107,33 @@ function makeFieldGetters(raw) {
   return { get, isNull };
 }
 
-exports.handler = async (event) => {
+// ── TWO PASSES, ALTERNATING TICKS (Sep 28 2026 stall) ──────────────
+// This function used to run the on-hand pass AND the PO pass in one
+// invocation. Every completed run on record took 68–108 s (PO pass p50
+// 56 s / max 97 s on Fri Sep 25; on-hand 9–15 s). On Sep 28 the on-hand
+// pass drifted to 15–29 s and the PO pass past 73 s, and from 17:29Z no
+// invocation reached the end: the platform killed it after the on-hand
+// audit and before the PO audit / heartbeat — no error anywhere the
+// page could see, absent-PO reconciliation frozen for hours.
+//
+// Fix: each 2-minute tick runs ONE pass, alternating by tick parity, so
+// each pass gets the whole invocation budget. Per-pass cadence becomes
+// 4 minutes. ?phase=onhand|po|both overrides for a manual run. Both
+// heartbeat names keep their own row: "acumatica-sync" beats on an
+// on-hand completion, "acumatica-po-sync" on a PO completion, and any
+// failure writes its reason to that pass's note (never its last_ok).
+const TICK_MS = 120000;
+function pickPhase(override, nowMs) {
+  const o = String(override || "").toLowerCase();
+  if (o === "onhand" || o === "po" || o === "both") return o;
+  const n = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return Math.floor(n / TICK_MS) % 2 === 0 ? "onhand" : "po";
+}
+// Stop the PO pass this many ms before the platform would kill the
+// invocation, so the failure is written as a note instead of vanishing.
+const DEADLINE_MARGIN_MS = 8000;
+
+exports.handler = _guard("acumatica-sync", async (event, context) => {
   const t0 = Date.now();
   const log = (msg, data) => console.log(`[acumatica-sync] ${msg}`, data || "");
 
@@ -124,6 +150,32 @@ exports.handler = async (event) => {
   if (!ACUMATICA_BASE_URL || !ACUMATICA_USERNAME || !ACUMATICA_PASSWORD || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     log("Missing required environment variables");
     return { statusCode: 500, body: JSON.stringify({ error: "Missing env vars" }) };
+  }
+
+  const qs = (event && event.queryStringParameters) || {};
+  const phase = pickPhase(qs.phase, t0);
+  const deadlineAt = t0 + _remainingMs(context, t0) - DEADLINE_MARGIN_MS;
+  log(`phase=${phase} (tick ${Math.floor(t0 / TICK_MS)}), ${Math.round((deadlineAt - t0) / 1000)}s budget before the deadline margin`);
+
+  if (phase === "po") {
+    const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const poSummary = await runPOSync({
+      supa,
+      log,
+      baseUrl: ACUMATICA_BASE_URL,
+      company: ACUMATICA_COMPANY || "LIVE",
+      username: ACUMATICA_USERNAME,
+      password: ACUMATICA_PASSWORD,
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SUPABASE_SERVICE_KEY,
+      deadlineAt,
+    });
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ durationMs: Date.now() - t0, phase, pos: poSummary }),
+    };
   }
 
   const giEncoded = encodeURIComponent(ACUMATICA_GI_NAME || "LM Planner Inventory");
@@ -143,7 +195,9 @@ exports.handler = async (event) => {
     if (!resp.ok) {
       const body = await resp.text();
       log("Acumatica returned non-OK status", { status: resp.status, body: body.slice(0, 200) });
-      return { statusCode: 502, body: JSON.stringify({ error: "Acumatica auth/fetch failed", status: resp.status }) };
+      // The 502 lands in the guard, which writes the note with this detail
+      // (a 401 = credentials, a 404 body names a renamed GI).
+      return { statusCode: 502, body: JSON.stringify({ error: "Acumatica auth/fetch failed", status: resp.status, detail: `GI "${ACUMATICA_GI_NAME || "LM Planner Inventory"}" HTTP ${resp.status}: ${body.slice(0, 200)}` }) };
     }
     xml = await resp.text();
   } catch (err) {
@@ -762,30 +816,39 @@ exports.handler = async (event) => {
     unchanged,
   };
 
-  // ===== PO SYNC PASS (LMInventoryPlannerPOLines) =====
-  // Runs every cycle, after the on-hand pass, sharing auth + Supabase client.
-  const poSummary = await runPOSync({
-    supa,
-    log,
-    baseUrl: ACUMATICA_BASE_URL,
-    company,
-    username: ACUMATICA_USERNAME,
-    password: ACUMATICA_PASSWORD,
-    supabaseUrl: SUPABASE_URL,
-    serviceKey: SUPABASE_SERVICE_KEY,
-  });
-
-    // Heartbeat: real completion only (bail-outs above do not beat).
+  // Heartbeat: real completion only (bail-outs above do not beat).
   await _beat(supa, "acumatica-sync", "on-hand + part_locations pass", log);
-return {
+
+  // ===== PO SYNC PASS (LMInventoryPlannerPOLines) =====
+  // Alternate ticks own this pass (see pickPhase); only ?phase=both
+  // runs it here after the on-hand pass, sharing auth + Supabase client.
+  let poSummary = { skipped: "alternate tick owns the PO pass" };
+  if (phase === "both") {
+    poSummary = await runPOSync({
+      supa,
+      log,
+      baseUrl: ACUMATICA_BASE_URL,
+      company,
+      username: ACUMATICA_USERNAME,
+      password: ACUMATICA_PASSWORD,
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SUPABASE_SERVICE_KEY,
+      deadlineAt,
+    });
+  }
+
+  return {
     statusCode: 200,
     body: JSON.stringify({
       durationMs: Date.now() - t0,
+      phase,
       onHand: onHandSummary,
       pos: poSummary,
     }),
   };
-};
+});
+exports._pickPhase = pickPhase;
+exports._runPOSync = (ctx) => runPOSync(ctx);
 
 // ---- PO status derivation (ported verbatim from the app's Excel PO parser) ----
 function normalizeAcumaticaStatus(raw) {
@@ -837,6 +900,19 @@ async function runPOSync(ctx) {
   const { supa, log, baseUrl, company, username, password, supabaseUrl, serviceKey } = ctx;
   const PO_GI = "LMInventoryPlannerPOLines";
   const url = `${baseUrl}/OData/${company}/${encodeURIComponent(PO_GI)}`;
+  const HB = "acumatica-po-sync";
+  const tStart = Date.now();
+  // Deadline (ms epoch) after which no further Acumatica page may start;
+  // default = a 100 s budget from now (see _heartbeat.remainingMs).
+  const deadlineAt = Number.isFinite(ctx.deadlineAt) ? ctx.deadlineAt : tStart + 100000;
+  const fetchImpl = typeof ctx.fetch === "function" ? ctx.fetch : fetch;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // A failed run writes its reason to the heartbeat note (last_ok untouched)
+  // and returns the same { error } shape the caller already handles.
+  const failed = async (reason, extra) => {
+    await _fail(supa, HB, reason, log);
+    return Object.assign({ error: reason }, extra || {});
+  };
   // Paginated fetch — Acumatica OData caps a single response at ~1000 rows
   // by default. The GI has grown past that (blanket lines were sitting past
   // the cap, invisible to a single-shot fetch), so walk pages via $top/$skip
@@ -850,24 +926,82 @@ async function runPOSync(ctx) {
   const MAX_PAGES = 20;
   log("PO sync: fetching (paginated)", url);
 
+  // Per-page resilience (Sep 28 stall):
+  //   * every page runs under an AbortController so a hung Acumatica
+  //     response cannot silently eat the whole invocation;
+  //   * a 5xx or a thrown fetch retries up to PAGE_RETRIES times with
+  //     bounded backoff, but only while the deadline still allows it;
+  //   * before each page the deadline is checked; past it the pass
+  //     STOPS and writes the note ("aborted before page N ...") so the
+  //     stall announces itself on the Settings card instead of dying
+  //     between the on-hand audit and the heartbeat with no trace.
+  // Basic auth is per request (no session), so there is nothing to
+  // re-login; a 401 is a credential problem and is reported as such.
+  const PAGE_TIMEOUT_MS = 30000;
+  const PAGE_RETRIES = 2;
+  const BACKOFF_MS = [1000, 3000];
   let entries = [];
   let pageCount = 0;
+  const spent = () => Math.round((Date.now() - tStart) / 1000);
   try {
     const auth = Buffer.from(`${username}:${password}`).toString("base64");
     for (let page = 0, skip = 0; page < MAX_PAGES; page++, skip += PAGE_SIZE) {
       const pageUrl = `${url}?$top=${PAGE_SIZE}&$skip=${skip}`;
-      const resp = await fetch(pageUrl, {
-        headers: { Authorization: `Basic ${auth}`, Accept: "application/atom+xml" },
-      });
+      let resp = null;
+      for (let attempt = 0; ; attempt++) {
+        const left = deadlineAt - Date.now();
+        if (left < 2000) {
+          const reason = `deadline: PO pass aborted before page ${page + 1} after ${spent()}s (${entries.length} lines in ${pageCount} page(s) fetched; feed needs more time than one invocation allows)`;
+          log("PO fetch " + reason);
+          return failed(reason, { page, pagesFetched: pageCount, linesFetched: entries.length });
+        }
+        const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+        const pageBudget = Math.min(PAGE_TIMEOUT_MS, left);
+        const cappedByDeadline = left < PAGE_TIMEOUT_MS;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), pageBudget) : null;
+        let threw = null;
+        try {
+          resp = await fetchImpl(pageUrl, {
+            headers: { Authorization: `Basic ${auth}`, Accept: "application/atom+xml" },
+            signal: ctrl ? ctrl.signal : undefined,
+          });
+        } catch (err) {
+          threw = err;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+        const aborted = !!(threw && threw.name === "AbortError");
+        if (aborted && cappedByDeadline) {
+          // The invocation's deadline, not Acumatica, cut this page short.
+          const reason = `deadline: PO pass aborted during page ${page + 1} after ${spent()}s (${entries.length} lines in ${pageCount} page(s) fetched; feed needs more time than one invocation allows)`;
+          log("PO fetch " + reason);
+          return failed(reason, { page, pagesFetched: pageCount, linesFetched: entries.length });
+        }
+        const retryable = threw ? true : (resp.status >= 500);
+        if (!retryable) break;
+        const why = threw ? `threw: ${aborted ? "timed out after " + pageBudget + "ms" : (threw && threw.message) || threw}` : `HTTP ${resp.status}`;
+        if (attempt < PAGE_RETRIES && Date.now() + BACKOFF_MS[attempt] + 2000 < deadlineAt) {
+          log(`PO GI page ${page + 1} ${why} — retry ${attempt + 1}/${PAGE_RETRIES} in ${BACKOFF_MS[attempt]}ms`);
+          await sleep(BACKOFF_MS[attempt]);
+          continue;
+        }
+        if (threw) {
+          const reason = `PO fetch error on page ${page + 1} (skip=${skip}) after ${attempt + 1} attempt(s): ${why} [${spent()}s spent]`;
+          log(reason);
+          return failed(reason, { page, detail: (threw && threw.message) || String(threw) });
+        }
+        break; // 5xx with retries exhausted: fall through to the non-OK report
+      }
       if (!resp.ok) {
         const body = await resp.text();
         log("PO GI non-OK status", { status: resp.status, page, skip, body: body.slice(0, 200) });
-        return { error: "PO fetch failed", status: resp.status, page };
+        const reason = `GI ${PO_GI} page ${page + 1} HTTP ${resp.status}: ${body.slice(0, 200)}`;
+        return failed(reason, { status: resp.status, page });
       }
       const pageXml = await resp.text();
       const pageEntries = pageXml.split(/<entry[^>]*>/i).slice(1);
       pageCount++;
-      log(`PO sync: page ${pageCount} (skip=${skip}) returned ${pageEntries.length} entries`);
+      log(`PO sync: page ${pageCount} (skip=${skip}) returned ${pageEntries.length} entries [${spent()}s]`);
       entries.push(...pageEntries);
       // A page shorter than PAGE_SIZE is the last page — stop before
       // firing a wasted round-trip for an empty page.
@@ -878,10 +1012,10 @@ async function runPOSync(ctx) {
     }
   } catch (err) {
     log("PO fetch threw", err.message);
-    return { error: "PO fetch error", detail: err.message };
+    return failed(`PO fetch error: ${err.message}`, { detail: err.message });
   }
 
-  log(`PO sync: fetched ${entries.length} entries across ${pageCount} pages`);
+  log(`PO sync: fetched ${entries.length} entries across ${pageCount} pages in ${spent()}s`);
 
   const toNum = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
   // Acumatica returns date fields as midnight in an unspecified timezone
@@ -1147,6 +1281,9 @@ async function runPOSync(ctx) {
   if (blanketExpiresSamples.length) log("Blanket Expires samples:", blanketExpiresSamples);
 
   if (byOrder.size === 0) {
+    // Not a completion (no beat) and not silent either: an empty feed
+    // is either a renamed/emptied GI or a parse break — say so.
+    await _fail(supa, HB, `No PO entries parsed (${entries.length} raw <entry> element(s) across ${pageCount} page(s)) — GI ${PO_GI} empty or shape changed`, log);
     return { posInFeed: 0, linesInFeed: entries.length, upserted: 0, reconciled: 0, note: "No PO entries parsed" };
   }
 
@@ -1155,7 +1292,7 @@ async function runPOSync(ctx) {
   const PAGE = 1000;
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supa.from("pos").select("id, data").range(from, from + PAGE - 1);
-    if (error) { log("pos select error", error); return { error: "pos select failed", detail: error.message }; }
+    if (error) { log("pos select error", error); return failed(`pos select failed: ${error.message}${error.code ? " (" + error.code + ")" : ""}`, { detail: error.message }); }
     if (!data || data.length === 0) break;
     existing.push(...data);
     if (data.length < PAGE) break;
@@ -1280,7 +1417,7 @@ async function runPOSync(ctx) {
   for (let i = 0; i < rows.length; i += BATCH) {
     const batch = rows.slice(i, i + BATCH);
     const { error } = await supa.from("pos").upsert(batch);
-    if (error) { log("pos upsert error", error); return { error: "pos upsert failed", detail: error.message, partial: upserted }; }
+    if (error) { log("pos upsert error", error); return failed(`pos upsert failed after ${upserted} row(s): ${error.message}${error.code ? " (" + error.code + ")" : ""}`, { detail: error.message, partial: upserted }); }
     upserted += batch.length;
   }
 

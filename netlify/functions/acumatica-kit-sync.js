@@ -583,3 +583,8 @@ return {
     }),
   };
 };
+
+// Failure note (Sep 28 2026): a thrown exception or a 5xx return writes
+// sync_heartbeats.note = "ERROR <ts>: <reason>" under this name (last_ok
+// untouched) so the Settings card shows WHY, not just "stale".
+exports.handler = require("./_heartbeat.js").guard("acumatica-kit-sync", exports.handler);

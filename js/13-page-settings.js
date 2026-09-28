@@ -41,13 +41,25 @@ const SYNC_CADENCE_MIN = {
 };
 const _syncHeartbeats = { rows: null, fetchedAt: 0, inFlight: false, error: null };
 
-// Pure: { text, stale, cls } for a heartbeat row. `now` injectable for tests.
+// A failed run writes note = "ERROR <iso ts>: <reason>" (last_ok untouched,
+// see netlify/functions/_heartbeat.js fail()). The next success replaces
+// the note, so an ERROR note is always "the latest run failed, here is why".
+function _settingsSyncErrorNote(row) {
+  const n = row && typeof row.note === "string" ? row.note : "";
+  const m = /^ERROR\s+(\S+):\s*([\s\S]*)$/.exec(n);
+  if (!m) return null;
+  const t = new Date(m[1]).getTime();
+  const hm = Number.isFinite(t) ? String(new Date(t).getHours()).padStart(2, "0") + ":" + String(new Date(t).getMinutes()).padStart(2, "0") : "";
+  return { at: m[1], atHm: hm, reason: m[2].trim() };
+}
+// Pure: { text, stale, cls, error } for a heartbeat row. `now` injectable for tests.
 function _settingsSyncLabel(name, row, now) {
   const nowMs = Number.isFinite(now) ? now : Date.now();
   const cadence = SYNC_CADENCE_MIN[name];
-  if (!row || !row.last_ok) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny" };
+  const error = _settingsSyncErrorNote(row);
+  if (!row || !row.last_ok) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny", error };
   const t = new Date(row.last_ok).getTime();
-  if (!Number.isFinite(t)) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny" };
+  if (!Number.isFinite(t)) return { text: "Awaiting first heartbeat", stale: null, cls: "muted tiny", error };
   const ageMin = (nowMs - t) / 60000;
   const stale = Number.isFinite(cadence) ? ageMin > cadence * SYNC_STALE_FACTOR : false;
   const when = (typeof fmtDate === "function") ? fmtDate(row.last_ok) : String(row.last_ok);
@@ -56,14 +68,18 @@ function _settingsSyncLabel(name, row, now) {
   const text = stale
     ? `stale — last OK ${when} ${hm} (${ageMin >= 120 ? Math.round(ageMin / 60) + "h" : Math.round(ageMin) + "m"} ago, expected every ${cadence >= 60 ? (cadence / 60) + "h" : cadence + "m"})`
     : `Last OK ${when} ${hm}`;
-  return { text, stale, cls: stale ? "tiny text-crit bold" : "muted tiny" };
+  return { text, stale, cls: stale ? "tiny text-crit bold" : "muted tiny", error };
 }
 function _settingsSyncLabelHtml(name) {
   const rows = _syncHeartbeats.rows;
   const row = rows ? rows.find(r => r.name === name) : null;
   if (!rows) return `<span class="muted tiny">${_syncHeartbeats.error ? "heartbeats unavailable" : "checking…"}</span>`;
   const l = _settingsSyncLabel(name, row);
-  return `<span class="${l.cls}" title="${esc(name)}${l.stale ? " — no successful run inside " + SYNC_STALE_FACTOR + "× its cadence" : ""}">${esc(l.text)}</span>`;
+  const label = `<span class="${l.cls}" title="${esc(name)}${l.stale ? " — no successful run inside " + SYNC_STALE_FACTOR + "× its cadence" : ""}">${esc(l.text)}</span>`;
+  if (!l.error) return label;
+  // The reason line sits under the stale/OK line, right-aligned like it.
+  const noteLine = `<span class="tiny text-crit" style="max-width:520px;text-align:right;white-space:normal;word-break:break-word" title="${esc(l.error.at)}">last run failed${l.error.atHm ? " " + esc(l.error.atHm) : ""}: ${esc(l.error.reason)}</span>`;
+  return `<span style="display:inline-flex;flex-direction:column;align-items:flex-end;gap:2px">${label}${noteLine}</span>`;
 }
 // One tiny fetch per render (throttled to 30s); re-renders the page when it lands.
 function _settingsFetchHeartbeats() {
