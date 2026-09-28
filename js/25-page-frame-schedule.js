@@ -2012,10 +2012,14 @@ function _fsFindStaleLocks(slots, rows, cols, globalCaps, currentSimResult, rate
    ============================================================ */
 
 // `band` (optional, v8): { minCover, maxCover, timeline } where timeline is
-// the sim's onHandTimeline (Map pn -> [{ iso, endOh, burn }]). When given,
-// each frame row gets a chip naming any scheduled week whose end-of-week
+// the sim's onHandTimeline (Map pn -> [{ iso, endOh, troughOh, burn }]).
+// When given, each frame row gets a chip naming any scheduled week whose
 // cover leaves the [min, max] band -- the board-level view of the
 // ceiling rule, so a slug or a starve is visible without reading cells.
+// v9: OVER is judged on end-of-week stock (post-credit), UNDER on the
+// intra-week TROUGH (post-burn, pre-credit) -- a delivery week burns old
+// stock before the build lands, so the trough is the real starve. The
+// chip may name a locked week: it reports, it never resizes.
 function _fsBuildTrueDemandPanel(rows, globalCaps, band) {
   const crewhdCap = Number(globalCaps && globalCaps.crewhd) || 0;
   const stdCap    = Number(globalCaps && globalCaps.std)    || 0;
@@ -2036,9 +2040,10 @@ function _fsBuildTrueDemandPanel(rows, globalCaps, band) {
     const violations = [];
     if (timeline && burn > 0) {
       for (const e of (timeline.get(r.pn) || [])) {
-        const c = (Number(e.endOh) || 0) / burn;
-        if (bandMax !== null && c > bandMax) violations.push({ iso: e.iso, cover: c, kind: "over" });
-        else if (bandMin !== null && bandMin > 0 && c < bandMin) violations.push({ iso: e.iso, cover: c, kind: "under" });
+        const cEnd = (Number(e.endOh) || 0) / burn;
+        const cTrough = ((e.troughOh === undefined ? Number(e.endOh) : Number(e.troughOh)) || 0) / burn;
+        if (bandMax !== null && cEnd > bandMax) violations.push({ iso: e.iso, cover: cEnd, kind: "over" });
+        else if (bandMin !== null && bandMin > 0 && cTrough < bandMin) violations.push({ iso: e.iso, cover: cTrough, kind: "under" });
       }
     }
     return { pn: r.pn, pool: r.pool, short: FRAME_SHORT[r.pn] || "", burn, cover, oh, violations };
@@ -5853,6 +5858,34 @@ window._fsDebugSim = function () {
     const startOh = new Map();
     for (const r of rows) startOh.set(r.pn, onHand.get(r.pn) || 0);
 
+    // v9 END-OF-WEEK CREDIT (mirrors both lib walks): a PROPOSED week
+    // burns workweek demand BEFORE placements are sized or credited,
+    // so every decision reads the intra-week trough; a LOCKED slot
+    // week keeps the v8 burn-after order so its live sizing is
+    // byte-identical. Flat rate — same value every week (_fsDaily
+    // × 5). Chain-aware; rate steps intentionally ignored. Track raw
+    // part.daily alongside so the debug output shows both numbers
+    // and the gap is visible for chained frames.
+    const weekLocked = !!(slot && slot.locked);
+    const burnThisWeek = new Map();
+    const rateThisWeek = new Map();
+    const rateRawThisWeek = new Map();
+    const troughOhThisWeek = new Map();
+    for (const r of rows) {
+      // PERF: rate lookup goes through the memoized rateByPn (see
+      // renderFrameSchedule) so the per-week debug walk doesn't
+      // chain-walk again.
+      const rate = Number(rateByPn[r.pn]) || 0;
+      const rateRaw = Number(r.daily) || 0;
+      const b = rate * FS_WORKDAYS_PER_WEEK;
+      troughOhThisWeek.set(r.pn, (onHand.get(r.pn) || 0) - b);
+      burnThisWeek.set(r.pn, b);
+      rateThisWeek.set(r.pn, rate);
+      rateRawThisWeek.set(r.pn, rateRaw);
+    }
+    const burnNow = () => { for (const r of rows) onHand.set(r.pn, (onHand.get(r.pn) || 0) - (burnThisWeek.get(r.pn) || 0)); };
+    if (!weekLocked) burnNow();
+
     // Placements (mirror the sim exactly — NO PO credits).
     // v3.3: split slots run frame A in week-1, frame B in week-2.
     // runPn is chosen per-week based on slot.weekIsos[1] === iso.
@@ -5976,26 +6009,8 @@ window._fsDebugSim = function () {
       }
     }
 
-    // Burn workweek demand. Flat rate — same value every week
-    // (_fsDaily × 5). Chain-aware; rate steps intentionally
-    // ignored; schedule drives production toward the current rate.
-    // Track raw part.daily alongside so the debug output shows
-    // both numbers and the gap is visible for chained frames.
-    const burnThisWeek = new Map();
-    const rateThisWeek = new Map();
-    const rateRawThisWeek = new Map();
-    for (const r of rows) {
-      // PERF: rate lookup goes through the memoized rateByPn (see
-      // renderFrameSchedule) so the per-week debug walk doesn't
-      // chain-walk again.
-      const rate = Number(rateByPn[r.pn]) || 0;
-      const rateRaw = Number(r.daily) || 0;
-      const b = rate * FS_WORKDAYS_PER_WEEK;
-      onHand.set(r.pn, (onHand.get(r.pn) || 0) - b);
-      burnThisWeek.set(r.pn, b);
-      rateThisWeek.set(r.pn, rate);
-      rateRawThisWeek.set(r.pn, rateRaw);
-    }
+    // v9: a proposed week burned above; a locked week burns here (v8 order).
+    if (weekLocked) burnNow();
 
     // Record per-frame snapshot for this week (no poCredits
     // column — inbound POs live in the separate info table
@@ -6038,6 +6053,7 @@ window._fsDebugSim = function () {
           return `+${x.qty}(${x.kind}${modeTag})${detail}`;
         }).join(" ") : "",
         burn: Number(burn.toFixed(3)),
+        troughOh: Number((troughOhThisWeek.get(r.pn) || 0).toFixed(3)),
         endOh: Number(endOh.toFixed(3)),
         targetUnits: bufferWeeks > 0 ? Number(targetUnits.toFixed(3)) : "",
         coverWk: coverWk === Infinity ? "inf" : Number(coverWk.toFixed(2)),
