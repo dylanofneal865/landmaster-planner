@@ -313,6 +313,22 @@ function mlbSetSearch(q) {
    _statusCacheVer on every DB.parts mutation, and the BOM index
    auto-invalidates when DB.bomLinks is replaced by cloud sync.
    ============================================================ */
+/* Sibling YELLOW badge: exploded components that DO exist in DB.parts
+   but whose itemType !== "base_bom" (do_not_order / service / kit /
+   options / blank). Disjoint from red by construction — one classifier,
+   _mlbClassifyLeaf, decides both, and the cache + row pills read it, so
+   the two surfaces can never disagree. Display only; nothing here writes. */
+function _mlbTypeLabel(itemType) {
+  const t = String(itemType == null ? "" : itemType).trim();
+  return t ? t.replace(/_/g, " ").toUpperCase() : "NO TYPE";
+}
+// → { kind: "missing" } | { kind: "typed", label } | { kind: null }
+function _mlbClassifyLeaf(pn, partByPn) {
+  const cat = partByPn.get(pn);
+  if (!cat) return { kind: "missing" };
+  if (cat.itemType !== "base_bom") return { kind: "typed", label: _mlbTypeLabel(cat.itemType) };
+  return { kind: null };
+}
 let _mlbMissingCache = null;
 let _mlbMissingCacheKey = null;
 function _mlbMissingKeyNow() {
@@ -322,10 +338,10 @@ function _mlbMissingKeyNow() {
   };
 }
 function _mlbBuildMissingCache() {
-  const partsSet = new Set(
+  const partByPn = new Map(
     ((typeof DB !== "undefined" && Array.isArray(DB.parts)) ? DB.parts : [])
-      .map(p => p && p.pn)
-      .filter(Boolean)
+      .filter(p => p && p.pn)
+      .map(p => [p.pn, p])
   );
   const fgs = (typeof FINISHED_GOODS === "object" && Array.isArray(FINISHED_GOODS)) ? FINISHED_GOODS : [];
   const cache = new Map();
@@ -334,6 +350,7 @@ function _mlbBuildMissingCache() {
     if (!pn) continue;
     const seenLeafPns = new Set();
     let missing = 0;
+    let typed = 0;
     try {
       const result = (typeof explodeBOM === "function") ? explodeBOM(pn) : null;
       const leaves = (result && Array.isArray(result.leaves)) ? result.leaves : [];
@@ -341,18 +358,20 @@ function _mlbBuildMissingCache() {
         if (!l || !l.pn) continue;
         if (seenLeafPns.has(l.pn)) continue;
         seenLeafPns.add(l.pn);
-        if (!partsSet.has(l.pn)) missing++;
+        const k = _mlbClassifyLeaf(l.pn, partByPn).kind;
+        if (k === "missing") missing++;
+        else if (k === "typed") typed++;
       }
     } catch (e) {
       console.warn(`[mlb-missing] explodeBOM failed for ${pn}`, e);
     }
-    cache.set(pn, missing);
+    cache.set(pn, { missing, typed });
   }
   _mlbMissingCache = cache;
   _mlbMissingCacheKey = _mlbMissingKeyNow();
   // One summary log per cache rebuild — user can sanity-check totals
   // against reality without opening 91 rows individually.
-  const withMissing = [...cache.entries()].filter(([, n]) => n > 0);
+  const withMissing = [...cache.entries()].map(([pn, c]) => [pn, c.missing]).filter(([, n]) => n > 0);
   if (withMissing.length) {
     const top3 = withMissing.sort((a, b) => b[1] - a[1]).slice(0, 3);
     console.info(
@@ -363,8 +382,8 @@ function _mlbBuildMissingCache() {
     console.info(`[mlb-missing] All ${cache.size} finished good(s) have every component in DB.parts`);
   }
 }
-function missingComponentCount(fgPn) {
-  if (!fgPn) return 0;
+function _mlbComponentCounts(fgPn) {
+  if (!fgPn) return null;
   const key = _mlbMissingKeyNow();
   if (!_mlbMissingCache
       || !_mlbMissingCacheKey
@@ -372,7 +391,16 @@ function missingComponentCount(fgPn) {
       || _mlbMissingCacheKey.partsVer !== key.partsVer) {
     _mlbBuildMissingCache();
   }
-  return _mlbMissingCache.get(fgPn) || 0;
+  return _mlbMissingCache.get(fgPn) || null;
+}
+function missingComponentCount(fgPn) {
+  const c = _mlbComponentCounts(fgPn);
+  return c ? c.missing : 0;
+}
+// Yellow sibling: components present in DB.parts but not typed base_bom.
+function nonBaseBomComponentCount(fgPn) {
+  const c = _mlbComponentCounts(fgPn);
+  return c ? c.typed : 0;
 }
 
 function renderMultiLevelBom() {
@@ -519,11 +547,17 @@ function _mlbListHtml(filteredFgs, sel) {
             const missingBadge = missing > 0
               ? ` <span class="pill crit mono" style="font-size:10px; padding:1px 5px; margin-left:4px; border-width:0" title="${missing} component${missing === 1 ? '' : 's'} not in parts catalog">${missing}</span>`
               : "";
+            // Yellow sibling: same mechanics, `.pill.warn` (Helix warn
+            // token) — components in the planner but not typed Base BOM.
+            const typed = (typeof nonBaseBomComponentCount === "function") ? nonBaseBomComponentCount(fg.pn) : 0;
+            const typedBadge = typed > 0
+              ? ` <span class="pill warn mono" style="font-size:10px; padding:1px 5px; margin-left:4px; border-width:0" title="${typed} part${typed === 1 ? '' : 's'} in the planner but not typed Base BOM">${typed}</span>`
+              : "";
             return `
               <tr class="clickable" onclick="mlbSelectFg('${esc(fg.pn)}')"
                   style="${isSel ? 'background:var(--bg-3);' : ''}">
                 <td>
-                  <div class="pn">${esc(fg.pn)}${missingBadge}</div>
+                  <div class="pn">${esc(fg.pn)}${missingBadge}${typedBadge}</div>
                   <div class="muted tiny">${esc(fg.desc || '—')}</div>
                 </td>
               </tr>
@@ -629,11 +663,16 @@ function _mlbExplodedPanel(fgPn, expl, partByPn) {
               const cat = partByPn.get(l.pn);
               const desc = cat?.desc || "";
               const supplier = cat?.supplier || "";
-              const noCat = !cat;
+              const cls = _mlbClassifyLeaf(l.pn, partByPn);
+              const pill = cls.kind === "missing"
+                ? ' <span class="pill warn" style="margin-left:6px">NOT IN CATALOG</span>'
+                : cls.kind === "typed"
+                  ? ` <span class="pill warn" style="margin-left:6px">${esc(cls.label)}</span>`
+                  : '';
               const qtyDisplay = Number.isInteger(l.qtyPerUnit) ? fmtNum(l.qtyPerUnit) : fmtNum(l.qtyPerUnit, 3);
               return `
                 <tr ${cat ? `class="clickable" onclick="openPartDetail('${esc(l.pn)}')"` : ''}>
-                  <td class="pn">${esc(l.pn)}${noCat ? ' <span class="pill warn" style="margin-left:6px">NOT IN CATALOG</span>' : ''}</td>
+                  <td class="pn">${esc(l.pn)}${pill}</td>
                   <td>${esc(desc)}</td>
                   <td class="dim">${esc(supplier)}</td>
                   <td class="right num bold">${qtyDisplay}</td>
