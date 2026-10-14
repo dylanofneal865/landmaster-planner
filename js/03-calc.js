@@ -4907,8 +4907,17 @@ function queueParts(itemType, opts) {
     const bq = p._blanketQueue;
     if (bq && bq.admitOverride === true) return true;
     if (bq && bq.admitOverride === false) return false;
-    return (p.status === "critical" || p.status === "warning"
-            || p._forceAdmitAsPreLaunchOrder);
+    // Order queue = parts with something to BUY. A critical/warning part
+    // whose suggested qty is 0 is covered by QUANTITY (enough on hand +
+    // on PO) and is only short on TIMING — a PO lands after a brief
+    // runout. There is nothing to order, so it does not belong here as a
+    // $0 line; the arrival-vs-runout gap is surfaced by Coverage Gaps
+    // (computeCoverageGaps / projectOnHand). Pre-launch force-admit keeps
+    // its own admission (it is specifically a BUY signal); blanket
+    // overrides already returned above and are unaffected.
+    const _hasQtyToOrder = (Number(p._suggestedQty) || 0) > 0;
+    return ((p.status === "critical" || p.status === "warning") && _hasQtyToOrder)
+            || p._forceAdmitAsPreLaunchOrder;
   });
 }
 
