@@ -39,6 +39,17 @@ const RETENTION_DAYS = 180;
 // count still shows up.
 const ADJUSTMENT_WINDOW_DAYS = 3;
 const ADJUSTMENT_MAGNITUDE_TOLERANCE = 0.25;   // within 25% of variance
+// Self-healing receipt reconcile window. The old per-interval window
+// (receipts dated strictly after prevDate) silently DROPPED any receipt
+// that posted to po_receipts after that morning's snapshot ran: it was
+// too late for its own day and excluded from the next day's window
+// (r.date <= prevDate), so the on-hand jump showed up with no receipt
+// and read as a huge false "unexplained" residual. Instead, each run
+// attributes every receipt through today that prior snapshots in this
+// window have NOT already counted (cumulative - already-attributed), so
+// a late receipt is swept up on the next run and the running residual
+// self-corrects. 90d covers any realistic sync lag or snapshot outage.
+const RECEIPT_RECONCILE_DAYS = 90;
 
 function _todayIsoUtc() {
   const d = new Date();
@@ -87,6 +98,27 @@ function _workdaysBetween(prevIso, curIso) {
   const endDow = end.getDay();
   if (endDow !== 0 && endDow !== 6) count++;
   return count;
+}
+// Self-healing receipt attribution for one part.
+//   receiptsList        : [{date:"YYYY-MM-DD", qty}] within the reconcile window
+//   priorAttributedQty  : sum of receipts_qty from THIS part's prior snapshots
+//                         in the same window (today's row excluded)
+//   today / prevDate     : ISO date strings
+// Returns the qty to attribute to today's snapshot = every receipt through
+// today MINUS what prior snapshots already counted, floored at 0. A receipt
+// the previous run missed (posted late) is therefore swept up now instead of
+// being lost between two interval windows. receipts_count stays informational:
+// the number of receipts newly dated in the strict (prevDate, today] interval.
+function _reconcileReceipts(receiptsList, priorAttributedQty, today, prevDate) {
+  let cumThroughToday = 0;
+  let intervalCount = 0;
+  for (const r of (receiptsList || [])) {
+    if (!r || !r.date || r.date > today) continue;
+    cumThroughToday += Number(r.qty) || 0;
+    if (!prevDate || r.date > prevDate) intervalCount++;
+  }
+  const qty = Math.max(0, Math.round((cumThroughToday - (Number(priorAttributedQty) || 0)) * 100) / 100);
+  return { receiptsQty: qty, receiptsCount: intervalCount };
 }
 async function _fetchAll(supa, table, cols, filter) {
   const all = [];
@@ -140,17 +172,16 @@ exports.handler = async (event) => {
       _fetchAll(supa, "parts", "pn, data"),
       _fetchAll(supa, "part_locations", "pn, location, qty"),
       _fetchAll(supa, "pos", "id, data"),
-      _fetchAll(supa, "parts_onhand_snapshots", "snapshot_date, pn, on_hand", q =>
-        q.gte("snapshot_date", new Date(todayDate.getTime() - 45 * 24 * 3600 * 1000).toISOString().slice(0, 10))),
+      _fetchAll(supa, "parts_onhand_snapshots", "snapshot_date, pn, on_hand, receipts_qty", q =>
+        q.gte("snapshot_date", new Date(todayDate.getTime() - RECEIPT_RECONCILE_DAYS * 24 * 3600 * 1000).toISOString().slice(0, 10))),
       _fetchAll(supa, "cycle_count_log", "pn, counted_at, counted_by, counted_qty, variance, outcome", q =>
         q.gte("counted_at", new Date(todayDate.getTime() - 45 * 24 * 3600 * 1000).toISOString())),
     ]);
-    // Small window of po_receipts covering the freshest snapshot
-    // interval + a paranoia buffer -- we filter per-pn by prev
-    // snapshot date below, so a 45d window covers every plausible
-    // gap between snapshots (a two-week outage plus slop).
+    // po_receipts over the reconcile window. Must match the snapshot
+    // window above so "cumulative receipts" and "already attributed by
+    // prior snapshots" cover the same span (see _reconcileReceipts).
     priorRecents = await _fetchAll(supa, "po_receipts", "id, data", q =>
-      q.gte("data->>receiptDate", new Date(todayDate.getTime() - 45 * 24 * 3600 * 1000).toISOString().slice(0, 10))
+      q.gte("data->>receiptDate", new Date(todayDate.getTime() - RECEIPT_RECONCILE_DAYS * 24 * 3600 * 1000).toISOString().slice(0, 10))
        .lte("data->>receiptDate", today));
   } catch (err) {
     log("input fetch failed: " + err.message);
@@ -179,13 +210,18 @@ exports.handler = async (event) => {
   }
   const allEntries = [...allPartsData.entries()];
 
-  // Latest snapshot per pn from priorSnaps (newest wins).
+  // Latest snapshot per pn from priorSnaps (newest wins), and the sum of
+  // receipts already attributed by this part's prior snapshots in the
+  // reconcile window -- the baseline _reconcileReceipts subtracts so a
+  // receipt is counted exactly once across runs.
   const latestPrevByPn = new Map();
+  const priorReceiptsSumByPn = new Map();
   for (const s of (priorSnaps || [])) {
     if (!s || !s.pn) continue;
     if (s.snapshot_date === today) continue;   // ignore any same-day overwrite scenario
     const prev = latestPrevByPn.get(s.pn);
     if (!prev || s.snapshot_date > prev.snapshot_date) latestPrevByPn.set(s.pn, s);
+    priorReceiptsSumByPn.set(s.pn, (priorReceiptsSumByPn.get(s.pn) || 0) + (Number(s.receipts_qty) || 0));
   }
 
   // Group po_receipts by pn -> list of { date, qty }.
@@ -254,18 +290,11 @@ exports.handler = async (event) => {
     const prev = forceAnchor ? null : latestPrevByPn.get(pn);
     const prevDate = prev ? prev.snapshot_date : null;
 
-    // Receipts in the interval (prev exclusive, today inclusive).
-    let receiptsQty = 0;
-    let receiptsCount = 0;
-    const receipts = receiptsByPn.get(pn) || [];
-    for (const r of receipts) {
-      if (prevDate) {
-        if (r.date <= prevDate) continue;
-      }
-      if (r.date > today) continue;
-      receiptsQty += r.qty;
-      receiptsCount++;
-    }
+    // Receipts: self-healing attribution (catch-up over the reconcile
+    // window), so a receipt that posted after its own day's snapshot ran
+    // is swept up on a later run instead of being dropped between windows.
+    const { receiptsQty, receiptsCount } = _reconcileReceipts(
+      receiptsByPn.get(pn) || [], priorReceiptsSumByPn.get(pn) || 0, today, prevDate);
 
     // Workday-aware usage estimate.
     const workdays = prevDate ? _workdaysBetween(prevDate, today) : 0;
