@@ -290,6 +290,8 @@ registerRoute("settings", () => {
         </div>
       </div>
 
+      ${_supplierCyclesPanelHtml()}
+
       <div class="panel">
         <div class="panel-head">
           <div class="panel-title">Data</div>
@@ -730,4 +732,163 @@ function showSalesOrderImportResult(result) {
       <button class="btn primary" data-close>Done</button>
     </div>
   `);
+}
+
+/* ============================================================
+   SUPPLIER ORDER CYCLES — editor for DB.settings.supplierCycles.
+   Pure UI over the existing cycle model (js/03-calc.js). Writing a
+   cycle here is read by cycleAwareSuggestedQty / the order queue — no
+   engine change. Keyed by supplierKey() so it survives capitalization
+   and legal-suffix drift across feeds, exactly like getSupplierCycle().
+   ============================================================ */
+
+// Pure validate + normalize. Returns { ok, key, cfg } or { ok:false, error }.
+// `existingKeys` (optional Set) blocks adding a duplicate; omit when saving
+// an existing row (the key is expected to already be present).
+function _normalizeSupplierCycleInput(supplierName, weeks, anchor, leadInDays, existingKeys) {
+  const name = String(supplierName || "").trim();
+  if (!name) return { ok: false, error: "Pick a supplier." };
+  const key = (typeof supplierKey === "function") ? supplierKey(name) : name.toLowerCase().trim();
+  if (!key) return { ok: false, error: "Pick a supplier." };
+  if (existingKeys && existingKeys.has && existingKeys.has(key)) {
+    return { ok: false, error: `${name} already has a cycle.` };
+  }
+  const wk = Math.round(Number(weeks));
+  if (!Number.isFinite(wk) || wk < 1 || wk > 52) return { ok: false, error: "Weeks must be 1–52." };
+  const a = String(anchor || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(a)) return { ok: false, error: "Pick a first-order date." };
+  const parsed = (typeof parseDateLocal === "function") ? parseDateLocal(a) : new Date(a);
+  if (!parsed || isNaN(parsed.getTime())) return { ok: false, error: "First-order date is invalid." };
+  // Reject a rolled-over calendar date (e.g. 2026-13-40 → Date silently
+  // normalizes). A <input type="date"> never emits one, but the guard keeps
+  // a pasted/typed value honest.
+  const [_cy, _cm, _cd] = a.split("-").map(Number);
+  if (parsed.getFullYear() !== _cy || parsed.getMonth() + 1 !== _cm || parsed.getDate() !== _cd) {
+    return { ok: false, error: "First-order date is invalid." };
+  }
+  let lead = Math.round(Number(leadInDays));
+  if (!Number.isFinite(lead) || lead < 0) lead = 0;
+  if (lead > 365) lead = 365;
+  return { ok: true, key, cfg: { anchor: a, intervalDays: wk * 7, leadInDays: lead, displayName: name } };
+}
+
+// Ordered keys of the configured cycles — the single source the panel and
+// the index-based row handlers both read, so a row index is stable between
+// render and click (any mutation re-renders).
+function _supplierCycleKeys() {
+  const cycles = (DB.settings && DB.settings.supplierCycles) || {};
+  return Object.keys(cycles).sort((a, b) =>
+    String(cycles[a].displayName || a).localeCompare(String(cycles[b].displayName || b)));
+}
+
+function _cycleNextOrderLabel(cfg) {
+  try {
+    const anchor = (typeof parseDateLocal === "function") ? parseDateLocal(cfg.anchor) : new Date(cfg.anchor);
+    const interval = Math.round(Number(cfg.intervalDays));
+    if (!anchor || isNaN(anchor.getTime()) || !(interval > 0)) return "—";
+    const today = new Date(TODAY.getTime()); today.setHours(0, 0, 0, 0);
+    const d = nextCycleDates({ anchor, intervalDays: interval }, today, 1)[0];
+    return d ? fmtDate(d) : "—";
+  } catch (_) { return "—"; }
+}
+
+function _supplierCyclesPanelHtml() {
+  const cycles = (DB.settings && DB.settings.supplierCycles) || {};
+  const keys = _supplierCycleKeys();
+  const partsFor = (k) => (DB.parts || []).filter(p =>
+    ((typeof supplierKey === "function") ? supplierKey(p.supplier) : "") === k && !p.phasingOut).length;
+
+  const rows = keys.map((k, i) => {
+    const c = cycles[k];
+    const wk = Math.max(1, Math.round(Number(c.intervalDays) / 7));
+    return `<tr>
+      <td>${esc(c.displayName || k)}<div class="muted tiny">${partsFor(k)} parts · next order ${_cycleNextOrderLabel(c)}</div></td>
+      <td><input class="input num" type="number" min="1" max="52" id="cyc-wk-${i}" value="${wk}" style="width:70px"></td>
+      <td><input class="input" type="date" id="cyc-anchor-${i}" value="${esc(c.anchor || "")}"></td>
+      <td><input class="input num" type="number" min="0" max="365" id="cyc-leadin-${i}" value="${Number(c.leadInDays) || 0}" style="width:70px"></td>
+      <td><div class="row gap-sm"><button class="btn sm" onclick="saveSupplierCycle(${i})">Save</button><button class="btn sm ghost" onclick="removeSupplierCycle(${i})">Remove</button></div></td>
+    </tr>`;
+  }).join("");
+
+  const cycled = new Set(keys);
+  const suppliers = [...new Set((DB.parts || []).map(p => p.supplier).filter(Boolean))]
+    .filter(name => !cycled.has((typeof supplierKey === "function") ? supplierKey(name) : name.toLowerCase().trim()))
+    .sort((a, b) => a.localeCompare(b));
+  const options = suppliers.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+
+  return `<div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">Supplier Order Cycles</div>
+      <div class="panel-sub">Suppliers that only take orders on a fixed cadence. The order queue sizes each cycled part to cover lead time + safety + one cycle, and surfaces it ahead of its next order date.</div>
+    </div>
+    <div class="panel-body col">
+      ${keys.length ? `<table class="tbl">
+        <thead><tr><th>Supplier</th><th>Every (weeks)</th><th>First order</th><th>Lead-in (days)</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : `<p class="muted tiny">No supplier cycles yet. Add one below.</p>`}
+      <div class="row gap-md mt-sm" style="align-items:flex-end;flex-wrap:wrap">
+        <div><div class="muted tiny">Supplier</div><select class="input" id="cyc-add-supplier" style="min-width:220px">${options || '<option value="">— all suppliers already cycled —</option>'}</select></div>
+        <div><div class="muted tiny">Every (weeks)</div><input class="input num" type="number" min="1" max="52" id="cyc-add-weeks" value="8" style="width:90px"></div>
+        <div><div class="muted tiny">First order</div><input class="input" type="date" id="cyc-add-anchor"></div>
+        <div><div class="muted tiny">Lead-in (days)</div><input class="input num" type="number" min="0" max="365" id="cyc-add-leadin" value="14" style="width:90px"></div>
+        <button class="btn primary" onclick="addSupplierCycle()">+ Add cycle</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function addSupplierCycle() {
+  if (!DB.settings.supplierCycles) DB.settings.supplierCycles = {};
+  const existing = new Set(Object.keys(DB.settings.supplierCycles));
+  const res = _normalizeSupplierCycleInput(
+    $("#cyc-add-supplier") && $("#cyc-add-supplier").value,
+    $("#cyc-add-weeks") && $("#cyc-add-weeks").value,
+    $("#cyc-add-anchor") && $("#cyc-add-anchor").value,
+    $("#cyc-add-leadin") && $("#cyc-add-leadin").value,
+    existing);
+  if (!res.ok) { showToast(res.error, "warn"); return; }
+  DB.settings.supplierCycles[res.key] = res.cfg;
+  logAudit("settings", `Supplier cycle added: ${res.cfg.displayName} every ${res.cfg.intervalDays / 7}w (first ${res.cfg.anchor})`);
+  saveDB();
+  bumpStatusCache();
+  showToast(`Cycle added for ${res.cfg.displayName}`, "ok");
+  refresh();
+}
+
+function saveSupplierCycle(i) {
+  const keys = _supplierCycleKeys();
+  const key = keys[i];
+  if (!key || !DB.settings.supplierCycles || !DB.settings.supplierCycles[key]) {
+    showToast("Cycle not found — reloading.", "warn"); refresh(); return;
+  }
+  const cur = DB.settings.supplierCycles[key];
+  const res = _normalizeSupplierCycleInput(
+    cur.displayName || key,
+    $(`#cyc-wk-${i}`) && $(`#cyc-wk-${i}`).value,
+    $(`#cyc-anchor-${i}`) && $(`#cyc-anchor-${i}`).value,
+    $(`#cyc-leadin-${i}`) && $(`#cyc-leadin-${i}`).value,
+    null);
+  if (!res.ok) { showToast(res.error, "warn"); return; }
+  // Keep the row under its ORIGINAL key — displayName is unchanged on an
+  // edit, so res.key === key, but assign by `key` to be explicit.
+  DB.settings.supplierCycles[key] = { ...cur, anchor: res.cfg.anchor, intervalDays: res.cfg.intervalDays, leadInDays: res.cfg.leadInDays };
+  logAudit("settings", `Supplier cycle updated: ${cur.displayName || key} every ${res.cfg.intervalDays / 7}w (first ${res.cfg.anchor})`);
+  saveDB();
+  bumpStatusCache();
+  showToast(`Cycle saved for ${cur.displayName || key}`, "ok");
+  refresh();
+}
+
+function removeSupplierCycle(i) {
+  const keys = _supplierCycleKeys();
+  const key = keys[i];
+  if (!key || !DB.settings.supplierCycles || !DB.settings.supplierCycles[key]) { refresh(); return; }
+  const name = DB.settings.supplierCycles[key].displayName || key;
+  if (typeof confirm === "function" && !confirm(`Remove the order cycle for ${name}? Its parts go back to standard reorder sizing.`)) return;
+  delete DB.settings.supplierCycles[key];
+  logAudit("settings", `Supplier cycle removed: ${name}`);
+  saveDB();
+  bumpStatusCache();
+  showToast(`Cycle removed for ${name}`, "ok");
+  refresh();
 }
