@@ -2570,18 +2570,26 @@ function nextCycleDates(cycle, fromDate, n) {
   if (!cycle || !cycle.anchor || !cycle.intervalDays || !fromDate) return [];
   const count = Math.max(0, Math.floor(Number(n) || 0));
   if (count === 0) return [];
-  const anchorMs = cycle.anchor.getTime();
-  const fromMs = fromDate.getTime();
-  const intervalMs = cycle.intervalDays * DAY_MS;
+  // CALENDAR-DAY arithmetic, not milliseconds. anchor + k×intervalDays×
+  // DAY_MS drifts by an hour across a DST change (10/15 + 56 days in
+  // ms = Dec 9 23:00, not Dec 10 00:00), so on the cycle date itself
+  // the "first date ≥ today" test skipped to the FOLLOWING cycle and
+  // every cycle-driven signal (lead-in, snap, admission, the Settings
+  // "next order" label) went dark for that day. Build each candidate
+  // with setDate so it lands on local midnight of the right day, and
+  // compare at day resolution.
+  const anchorDay = new Date(cycle.anchor.getTime()); anchorDay.setHours(0, 0, 0, 0);
+  const fromDay = new Date(fromDate.getTime()); fromDay.setHours(0, 0, 0, 0);
+  const interval = Math.max(1, Math.round(Number(cycle.intervalDays)));
+  const at = (k) => { const d = new Date(anchorDay.getTime()); d.setDate(d.getDate() + k * interval); d.setHours(0, 0, 0, 0); return d; };
   let k = 0;
-  if (fromMs > anchorMs) {
-    k = Math.ceil((fromMs - anchorMs) / intervalMs);
-    // Correct for float drift — walk forward until the computed date is
-    // genuinely ≥ fromMs.
-    while ((anchorMs + k * intervalMs) < fromMs) k++;
+  if (fromDay.getTime() > anchorDay.getTime()) {
+    // ms estimate is within ±1 of the right k; the walk below settles it.
+    k = Math.max(0, Math.floor((fromDay.getTime() - anchorDay.getTime()) / (interval * DAY_MS)) - 1);
+    while (at(k).getTime() < fromDay.getTime()) k++;
   }
   const out = [];
-  for (let i = 0; i < count; i++) out.push(new Date(anchorMs + (k + i) * intervalMs));
+  for (let i = 0; i < count; i++) out.push(at(k + i));
   return out;
 }
 
@@ -2710,14 +2718,19 @@ function cycleSnapOrderBy(naturalOrderByDate, cycle) {
   if (nextCycleDate && naturalMs >= nextCycleDate.getTime()) {
     // Walk forward from nextCycleDate as long as the NEXT hop still lands
     // on-or-before naturalOrderBy; the last valid cursor is the snap point.
-    const intervalMs = cycle.intervalDays * DAY_MS;
-    let cursor = nextCycleDate.getTime();
+    // Calendar-day hops (setDate), for the same DST reason as
+    // nextCycleDates: an ms hop lands an hour early after November and
+    // a natural order-by that falls exactly ON a cycle date would then
+    // snap one cycle too late.
+    const interval = Math.max(1, Math.round(Number(cycle.intervalDays)));
+    const hop = (d) => { const x = new Date(d.getTime()); x.setDate(x.getDate() + interval); x.setHours(0, 0, 0, 0); return x; };
+    let cursor = new Date(nextCycleDate.getTime());
     let last = cursor;
-    while ((cursor + intervalMs) <= naturalMs) {
-      cursor += intervalMs;
+    while (hop(cursor).getTime() <= naturalMs) {
+      cursor = hop(cursor);
       last = cursor;
     }
-    snappedDate = new Date(last);
+    snappedDate = new Date(last.getTime());
   } else if (missedWindow && nextCycleDate) {
     // Gate-A fix: a natural order-by that's ALREADY PAST the next cycle
     // date doesn't disqualify the part — it makes ordering MORE urgent,
@@ -2762,6 +2775,14 @@ function cycleAwareSuggestedQty(part, onPO) {
   const lt = leadTimeDays(part);
   const safety = (DB.settings && Number(DB.settings.safetyDays)) || 0;
   const horizon = cycle.intervalDays; // ← the only real difference vs suggestedQty
+  // The PO goes out ON the cycle date, not today. Demand between today
+  // and that date still has to come out of what we have, so the window
+  // starts at today and runs to (cycle date + lead + one cycle + safety).
+  // Without this the order is short by (days until cycle date × daily)
+  // — up to a full lead-in window of consumption. 0 on the cycle date
+  // itself, so a same-day order is sized exactly as before.
+  const _li = (typeof cycleLeadIn === "function") ? cycleLeadIn(cycle, TODAY) : null;
+  const daysToCycle = (_li && Number.isFinite(_li.daysUntil)) ? Math.max(0, _li.daysUntil) : 0;
   const dailyRate = boost
     ? Math.max(Number(part.daily) || 0, boost.dailyRate)
     : (Number(part.daily) || 0);
@@ -2769,7 +2790,7 @@ function cycleAwareSuggestedQty(part, onPO) {
   // Same fix as suggestedQty — the previous formula multiplied calendar
   // days × per-workday rate directly, over-ordering by ~7/wpw.
   // Passes `part` so a future-dated rateStep splits the window at eff.
-  const target = _windowDemandUnits(lt + safety + horizon, dailyRate, TODAY, part);
+  const target = _windowDemandUnits(daysToCycle + lt + safety + horizon, dailyRate, TODAY, part);
   const onPOQty = (typeof onPO === "number")
     ? onPO
     : ((typeof openPOQty === "function") ? openPOQty(part.pn) : 0);
@@ -4107,6 +4128,41 @@ function partsWithStatus(opts) {
     // pre-launch parts (no phasing-out predecessor) return null from
     // getChainInfo and fall through to preLaunch logic unchanged.
     const chainInfo = (typeof getChainInfo === "function") ? getChainInfo(p.pn) : null;
+    // v-cycle-admit: SUPPLIER-CYCLE ADMISSION. A cycled supplier only
+    // takes a PO on its cycle dates, so "do I need to act" is not
+    // answered by lead-time status alone: a part can be comfortably OK
+    // on cover today and still have to go on the UPCOMING cycle order,
+    // because the cycle after that lands too late. cycleSnapOrderBy
+    // already answers this (mustOrderThisCycle = the upcoming cycle is
+    // the last one that still meets the part's natural order-by date);
+    // until now nothing in the queue read it, so OK-status parts fell
+    // through the cycle. Computed only for cycled suppliers (null for
+    // everyone else — their rows stay byte-identical). Gated the same
+    // way the other admissions are: mute wins, phasing-out predecessors
+    // never order, and a standalone pre-launch part keeps its own
+    // launch-anchored admission (preLaunchForceAdmitEligible) so the
+    // two signals cannot fight over one row.
+    //   _cycleDue      → true only inside the lead-in window AND the
+    //                    upcoming cycle is this part's last chance.
+    //                    queueParts admits on it when the cycle qty > 0.
+    //   _cycleOrderBy  → the cycle date the PO must go out on.
+    //   _cycleMissed   → natural order-by is already behind the cycle
+    //                    date (order on it anyway; urgency modifier).
+    //   _cycleNaturalOrderBy → the pre-cycle deadline, for the pill.
+    let _cycleDue = false, _cycleOrderBy = null, _cycleMissed = false, _cycleNaturalOrderBy = null;
+    if (_cycleForStatus && !muted && !p.phasingOut && !(preLaunch && !chainInfo)
+        && typeof cycleLeadIn === "function" && typeof cycleSnapOrderBy === "function"
+        && typeof naturalOrderByForPart === "function") {
+      const _cli = cycleLeadIn(_cycleForStatus, TODAY);
+      const _natural = naturalOrderByForPart(p);
+      const _snap = _natural ? cycleSnapOrderBy(_natural, _cycleForStatus) : null;
+      _cycleNaturalOrderBy = _natural || null;
+      if (_cli.inLeadIn && _snap && _snap.mustOrderThisCycle) {
+        _cycleDue = true;
+        _cycleOrderBy = _snap.nextCycleDate;
+        _cycleMissed = !!_snap.missedWindow;
+      }
+    }
     // v-handoff: evaluated once per chain member per pass (cheap — reads
     // only fields getChainInfo already computed). Muted chains skip it
     // like every other chain override.
@@ -4135,6 +4191,11 @@ function partsWithStatus(opts) {
       // consumer reads.
       ...(_cycleForStatus ? {
         _openDaysOfCover: _openStatus ? _openStatus.daysOfCover : null,
+        // v-cycle-admit (see above). Only cycled rows carry these.
+        _cycleDue,
+        _cycleOrderBy,
+        _cycleMissed,
+        _cycleNaturalOrderBy,
       } : {}),
       // MUTED-supplier override.
       ...(muted ? { _muted: true, _rawStatus: status.status, status: "ok", urgency: 9999 } : {}),
@@ -4916,6 +4977,16 @@ function queueParts(itemType, opts) {
     // its own admission (it is specifically a BUY signal); blanket
     // overrides already returned above and are unaffected.
     const _hasQtyToOrder = (Number(p._suggestedQty) || 0) > 0;
+    // v-cycle-admit: a cycled-supplier part that must go on the UPCOMING
+    // cycle order (inside the lead-in window, and the cycle after this
+    // one lands too late) is admitted even at status OK — it has
+    // something to buy and one date to buy it on. Still a BUY signal, so
+    // the qty gate applies: cycle qty 0 means the cycle order needs
+    // nothing for this part. Blanket decisions above keep authority
+    // (a blanket-covered cycled part stays on the release path); mute,
+    // phasing-out and broken handoffs were excluded above. Non-cycled
+    // parts never carry _cycleDue, so their admission is unchanged.
+    if (p._cycleDue && _hasQtyToOrder) return true;
     return ((p.status === "critical" || p.status === "warning") && _hasQtyToOrder)
             || p._forceAdmitAsPreLaunchOrder;
   });

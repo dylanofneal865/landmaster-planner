@@ -683,10 +683,21 @@ function renderOrderQueueFor(itemType) {
                     // partsWithStatus (blanketReleaseDecision: the single
                     // source of truth). NO PO stays row-local (needs live
                     // triggerDate).
+                    // v-cycle-admit: row is on the queue because it belongs
+                    // on the UPCOMING cycle order (partsWithStatus wrote
+                    // _cycleDue / _cycleOrderBy / _cycleMissed / _cycleNatural-
+                    // OrderBy; queueParts admits on it). Only cycled rows
+                    // ever carry the flag. An OK-status row admitted this
+                    // way is not "late" — NO PO would read as a false alarm
+                    // on it, so the CYCLE pill replaces NO PO there.
+                    // Critical/warning cycle rows keep NO PO as before and
+                    // get the CYCLE pill beside it.
+                    const _cycleDueRow = isCycledScope && p._cycleDue === true;
+                    const _cycleOkRow = _cycleDueRow && p.status === "ok";
                     let flag = "none";
                     if (_bqRelease) {
                       flag = "RELEASE";
-                    } else if (isBaseBomScope && isCycledScope && !blk && openPO === 0 && triggerDate) {
+                    } else if (isBaseBomScope && isCycledScope && !blk && openPO === 0 && triggerDate && !_cycleOkRow) {
                       flag = "NO PO";
                     }
                     // Enumerate ALL open blankets for the RELEASE tooltip so
@@ -724,9 +735,30 @@ function renderOrderQueueFor(itemType) {
                       ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(_bq.action + (_bq.triggerReason ? ` · trigger: ${_bq.triggerReason}` : "") + (_bq.daysToTrigger != null ? ` (${_bq.daysToTrigger}d)` : "") + ` · ${fmtNum(_bq.blanketOpen || 0)} open on the blanket`)}">BLANKET RELEASE</span>`
                       : "";
                     const flagPillFinal = blanketReleasePill ? "" : flagPill;
+                    // v-cycle-admit: CYCLE pill. Shows the cycle date the PO
+                    // has to go out on and, in the tooltip, why the part
+                    // cannot wait for the cycle after it. Red when the
+                    // part's own order-by is already behind the cycle date
+                    // (order on this cycle anyway, expect a gap); lime when
+                    // the cycle simply comes first.
+                    let cyclePill = "";
+                    if (_cycleDueRow && p._cycleOrderBy) {
+                      const _cyc = supplierCycle;
+                      const _following = (typeof addDays === "function" && _cyc && _cyc.intervalDays)
+                        ? addDays(p._cycleOrderBy, _cyc.intervalDays) : null;
+                      const _natStr = p._cycleNaturalOrderBy ? fmtDate(p._cycleNaturalOrderBy) : "n/a";
+                      const _cycleTip = p._cycleMissed
+                        ? `Supplier cycle — order by ${fmtDate(p._cycleOrderBy)}. This part's own order-by (${_natStr}) is already behind the cycle date; this cycle is the earliest ship, expect a gap.`
+                        : `Supplier cycle — order by ${fmtDate(p._cycleOrderBy)}. This part's own order-by is ${_natStr}; the following cycle${_following ? ` (${fmtDate(_following)})` : ""} would be too late.`;
+                      const _cycleCls = p._cycleMissed ? "pill crit" : "pill";
+                      const _cycleStyle = p._cycleMissed
+                        ? "font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px"
+                        : "font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px;background:var(--accent-soft);color:var(--accent);border-color:var(--accent)";
+                      cyclePill = ` <span class="${_cycleCls}" style="${_cycleStyle}" title="${esc(_cycleTip)}">CYCLE ${esc(fmtDate(p._cycleOrderBy))}</span>`;
+                    }
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPillFinal}${blanketReleasePill}${blkPill}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPillFinal}${blanketReleasePill}${cyclePill}${blkPill}</td>
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {
@@ -741,8 +773,8 @@ function renderOrderQueueFor(itemType) {
                         </span>
                         ` : `
                         <span class="meter">
-                          <span class="meter-bar ${p.status==='critical'?'crit':'warn'}"><i style="width:${clamp((p.daysOfCover/Math.max(p.leadDays+30,30))*100,5,100)}%"></i></span>
-                          <span class="num bold ${p.status==='critical'?'text-crit':'text-warn'}">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
+                          <span class="meter-bar ${p.status==='critical'?'crit':(_cycleOkRow?'':'warn')}"><i style="width:${clamp((p.daysOfCover/Math.max(p.leadDays+30,30))*100,5,100)}%"></i></span>
+                          <span class="num bold ${p.status==='critical'?'text-crit':(_cycleOkRow?'':'text-warn')}">${p.daysOfCover === Infinity ? "∞" : p.daysOfCover + "d"}</span>
                         </span>
                         `}
                       </td>
