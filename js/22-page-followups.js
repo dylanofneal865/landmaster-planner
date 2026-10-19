@@ -245,15 +245,26 @@ function computeCoverageGap(part, lines) {
     return _chainCoverageGap(part);
   }
 
-  // PRE-LAUNCH GATE (defense-in-depth). A pre-launch chain successor
-  // (transitionStartDate in the FUTURE) has no live consumption — its
-  // stored `daily` is a placeholder that misleads the projection into
-  // depleting phantom stock. The aggregator's own gate at
-  // computeCoverageGaps handles the primary suppression + rollup to the
-  // demand-carrying predecessor; this guard catches any direct caller
-  // (a future part-drawer hint, an audit) so no code path can surface a
-  // pre-launch part as its own gap row.
-  if (typeof isPreLaunch === "function" && isPreLaunch(part)) return null;
+  // PRE-LAUNCH (v-gap-routing). A standalone pre-launch part
+  // (transitionStartDate in the FUTURE, no active chain — chains were
+  // routed above) used to return null here, and the aggregator skipped
+  // it too. That made sense when the projection depleted phantom stock
+  // from day 0; projectOnHand has held flat until the cut-in date since
+  // CASE-A, so the series after the start date is real. What is NOT a
+  // gap is the flat-zero stretch BEFORE the start date on a part with
+  // nothing on the shelf yet — no demand exists there. So: scan for
+  // zeros from the start date onward, not from today. Without this a
+  // pre-launch part whose first PO lands after its stock runs dry
+  // (CP00552: dry 12/14, the 430 on PO dated 2/5) showed up nowhere
+  // once the order queue stopped mis-grading it as a buy.
+  let _scanFrom = 0;
+  if (typeof isPreLaunch === "function" && isPreLaunch(part)
+      && part.transitionStartDate && typeof parseDateLocal === "function") {
+    const _start = parseDateLocal(part.transitionStartDate);
+    if (_start && !isNaN(_start.getTime())) {
+      _scanFrom = Math.max(0, Math.round((_start.getTime() - TODAY.getTime()) / DAY_MS));
+    }
+  }
 
   const daily = Number(part.daily) || 0;
   if (daily <= 0) return null;
@@ -267,7 +278,7 @@ function computeCoverageGap(part, lines) {
   // ── Normal-gap detection ────────────────────────────────────────────────
   // First day balance hits <= 0 (can be today if on-hand is already <= 0).
   let zeroIdx = -1;
-  for (let i = 0; i < series.length; i++) {
+  for (let i = _scanFrom; i < series.length; i++) {
     if (series[i].oh <= 0) { zeroIdx = i; break; }
   }
 
@@ -373,7 +384,7 @@ function computeCoverageGap(part, lines) {
     const odSeries = projectOnHand(part, 365, lines, { ignoreOverdue: true });
     if (odSeries && odSeries.length) {
       let odZeroIdx = -1;
-      for (let i = 0; i < odSeries.length; i++) {
+      for (let i = _scanFrom; i < odSeries.length; i++) {
         if (odSeries[i].oh <= 0) { odZeroIdx = i; break; }
       }
       if (odZeroIdx !== -1) {
@@ -563,7 +574,14 @@ function computeCoverageGaps() {
           daysPastDue: 0, action: "no overdue lines",
         });
       }
-      continue;
+      // v-gap-routing: the rollup still runs (overdue lines on a pre-
+      // launch part are rolled to its demand-carrying predecessor), but
+      // the part no longer skips the gap check. computeCoverageGap now
+      // scans a pre-launch part from its start date, so a post-launch
+      // stockout that an already-placed PO ends (CP00552: dry 12/14,
+      // PO dated 2/5) gets its own row here instead of nowhere. Chain
+      // successors are unaffected: they carry _chainInfo and route to
+      // _chainCoverageGap inside computeCoverageGap as before.
     }
     const gap = computeCoverageGap(p);
     if (!gap) continue;
@@ -802,6 +820,20 @@ function computeCoverageGaps() {
   }
   // Stash actions for the audit helper. Reset each aggregator pass.
   if (typeof window !== "undefined") window._preLaunchRollupActions = rollupActions;
+  // v-gap-routing: a pre-launch part can now produce BOTH a real gap row
+  // (computeCoverageGap, scanned from its start date) and the synthetic
+  // overdue row the rollup makes when it has no demand-carrying
+  // predecessor. The real row carries the projected runout and the
+  // covering POs; the synthetic one only carries the overdue lines. Keep
+  // the real one. Parts with no real gap keep their synthetic row exactly
+  // as before.
+  {
+    const _realPns = new Set(out.filter(r => !r._syntheticFromRollup && r.part && r.part.pn).map(r => r.part.pn));
+    for (let i = out.length - 1; i >= 0; i--) {
+      const r = out[i];
+      if (r && r._syntheticFromRollup && r.part && _realPns.has(r.part.pn)) out.splice(i, 1);
+    }
+  }
   // Sort by gapStart when present, else overdueRisk.runoutDate — so
   // overdue-only rows interleave with normal gaps by their soonest-dry
   // date. Tiebreak by widest gap (null gapDays → 0 for overdue-only, so

@@ -4041,7 +4041,27 @@ function partsWithStatus(opts) {
     const _openStatus = _cycleForStatus
       ? partStatus(effectiveForStatus, lines)
       : null;
-    const status = _cycleForStatus
+    // v-gap-routing: WHICH runout grades the part for the order queue.
+    //   partStatus            -> daysUntilStockout = the LAST day with
+    //                            stock (final runout). A stockout that a
+    //     scheduled receipt already ends is a timing gap, not a buy —
+    //     Coverage Gaps owns it (computeCoverageGap / projectOnHand).
+    //     This is how every non-cycled part has always been graded.
+    //   partStatusBlanketAware -> daysUntilFirstZero = the FIRST day at
+    //     zero. Right for a part whose gap is bridged by BLANKET supply,
+    //     because the fix for that gap IS a queue action (release from
+    //     the blanket), and blanketReleaseDecision's trigger reads this
+    //     cover.
+    // The cycle work routed EVERY cycled supplier through the blanket-
+    // aware branch, so a Schafer part with 278 on hand + 378 on PO and a
+    // 5-week gap in February before the PO lands (19440) went red in the
+    // buy queue with a qty that lands in May — an expedite wearing a
+    // buy's urgency. Blanket-aware grading now applies only when the
+    // part's supply slice actually carries blanket lines; otherwise a
+    // cycled part is graded on its final runout like everyone else.
+    // Non-cycled parts: byte-identical (the else branch is unchanged).
+    const _hasBlanketSupply = !!(_supplySlice && _supplySlice.some(s => s && s.ln && typeof isBlanketLine === "function" && isBlanketLine(s.ln)));
+    const status = (_cycleForStatus && _hasBlanketSupply)
       ? partStatusBlanketAware(effectiveForStatus, _supplySlice)
       : partStatus(effectiveForStatus, lines);
 
