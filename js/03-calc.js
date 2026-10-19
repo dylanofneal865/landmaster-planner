@@ -4138,10 +4138,18 @@ function partsWithStatus(opts) {
     // until now nothing in the queue read it, so OK-status parts fell
     // through the cycle. Computed only for cycled suppliers (null for
     // everyone else — their rows stay byte-identical). Gated the same
-    // way the other admissions are: mute wins, phasing-out predecessors
-    // never order, and a standalone pre-launch part keeps its own
-    // launch-anchored admission (preLaunchForceAdmitEligible) so the
-    // two signals cannot fight over one row.
+    // way the other admissions are: mute wins and phasing-out
+    // predecessors never order. Pre-launch parts are NOT excluded:
+    // naturalOrderByForPart already routes them through
+    // preLaunchOrderBy (launch-anchored, on-hand-aware), so the cycle
+    // snap reads the right deadline. The pre-launch force-admit
+    // (preLaunchForceAdmitEligible) is a separate, later signal — it
+    // fires once the order-by has PASSED; this fires while the cycle
+    // can still be made. Both may land on one row (CP00576-style:
+    // force-admit critical + CYCLE pill) and that is correct. The first
+    // cut of this excluded standalone pre-launch parts and silently
+    // dropped the MY27 F1 shocks (CP00575/77/78) from a cycle their
+    // own order-by required.
     //   _cycleDue      → true only inside the lead-in window AND the
     //                    upcoming cycle is this part's last chance.
     //                    queueParts admits on it when the cycle qty > 0.
@@ -4150,11 +4158,26 @@ function partsWithStatus(opts) {
     //                    date (order on it anyway; urgency modifier).
     //   _cycleNaturalOrderBy → the pre-cycle deadline, for the pill.
     let _cycleDue = false, _cycleOrderBy = null, _cycleMissed = false, _cycleNaturalOrderBy = null;
-    if (_cycleForStatus && !muted && !p.phasingOut && !(preLaunch && !chainInfo)
+    if (_cycleForStatus && !muted && !p.phasingOut
         && typeof cycleLeadIn === "function" && typeof cycleSnapOrderBy === "function"
         && typeof naturalOrderByForPart === "function") {
       const _cli = cycleLeadIn(_cycleForStatus, TODAY);
-      const _natural = naturalOrderByForPart(p);
+      let _natural = naturalOrderByForPart(p);
+      // Standalone pre-launch: naturalOrderByForPart routes through
+      // preLaunchOrderBy, which is on-hand-only (blind to open POs) and
+      // called a part with 200 on PO "overdue since September". For the
+      // cycle decision use the open-lines runout instead (_openStatus:
+      // PO-inclusive, cut-in-aware — the same number the drawer banner
+      // and the pre-launch bridge test read) minus lead + safety. Same
+      // formula as the regular branch of naturalOrderByForPart. A
+      // runout beyond the horizon (Infinity) means no deadline.
+      // naturalOrderByForPart itself is untouched (the Cycle Counts
+      // "verify this week" list reads it too).
+      if (preLaunch && !chainInfo && _openStatus) {
+        _natural = Number.isFinite(_openStatus.daysOfCover)
+          ? addDays(TODAY, _openStatus.daysOfCover - leadTimeDays(p) - _plSafety)
+          : null;
+      }
       const _snap = _natural ? cycleSnapOrderBy(_natural, _cycleForStatus) : null;
       _cycleNaturalOrderBy = _natural || null;
       if (_cli.inLeadIn && _snap && _snap.mustOrderThisCycle) {
