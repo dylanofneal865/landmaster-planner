@@ -25,8 +25,8 @@ const SYNC_STALE_FACTOR = 2;
 // Cadence in minutes, from netlify.toml. Kept here (not derived) so the
 // card's threshold is legible next to its use.
 const SYNC_CADENCE_MIN = {
-  "acumatica-sync": 2,
-  "acumatica-po-sync": 2,                    // runs inside acumatica-sync
+  "acumatica-sync": 4,                       // 2-min tick, on-hand owns every other one
+  "acumatica-po-sync": 4,                    // the other tick; runs in acumatica-po-sync-background
   "acumatica-bom-sync": 1440,
   "acumatica-kit-sync": 1440,
   "acumatica-service-usage-sync": 1440,

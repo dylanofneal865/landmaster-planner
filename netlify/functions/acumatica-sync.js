@@ -133,6 +133,57 @@ function pickPhase(override, nowMs) {
 // invocation, so the failure is written as a note instead of vanishing.
 const DEADLINE_MARGIN_MS = 8000;
 
+// ── PO PASS HAND-OFF (Oct 13 2026) ─────────────────────────────────
+// Netlify gives a SCHEDULED function 30 s. The PO pass needs ~50 s
+// (8,535 lines / 9 pages), so the platform re-ran it -- three attempts
+// per PO tick, all pulling the same GI at once -- and on a slow
+// Acumatica day the pass hit this invocation's ~52 s cut-off before
+// the last page (35% of business-hours PO ticks completed on Oct 8).
+//
+// Fix: on a PO tick this function only STARTS the pass, in the
+// background function acumatica-po-sync-background (15-minute limit),
+// and returns at once. Same runPOSync, same cadence, same heartbeat
+// name; it just runs somewhere it has room to finish.
+//
+// Fail-safe: anything but a 202 from the hand-off runs the pass inline
+// exactly as before. ?inline=1 or env PO_SYNC_INLINE=1 forces inline.
+const PO_BACKGROUND_FN = "acumatica-po-sync-background";
+const HANDOFF_TIMEOUT_MS = 8000;
+function siteOrigin(event) {
+  const env = process.env.URL;
+  if (env && /^https?:\/\//i.test(env)) return env.replace(/\/+$/, "");
+  try {
+    if (event && event.rawUrl) return new URL(event.rawUrl).origin;
+  } catch (_) { /* fall through to the host header */ }
+  const h = event && event.headers && (event.headers.host || event.headers.Host);
+  return h ? `https://${h}` : null;
+}
+async function handOffPOSync(event, fetchImpl) {
+  const origin = siteOrigin(event);
+  if (!origin) return { ok: false, why: "no site URL (env URL, event.rawUrl and host header all missing)" };
+  const url = `${origin}/.netlify/functions/${PO_BACKGROUND_FN}`;
+  const doFetch = typeof fetchImpl === "function" ? fetchImpl : fetch;
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), HANDOFF_TIMEOUT_MS) : null;
+  try {
+    const resp = await doFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "acumatica-sync" }),
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    // A background function answers 202 the moment it is queued. Any
+    // other status means it did not start as a background run.
+    if (resp.status === 202) return { ok: true, status: 202, url };
+    return { ok: false, why: `HTTP ${resp.status} from ${url} (expected 202)` };
+  } catch (err) {
+    const aborted = !!(err && err.name === "AbortError");
+    return { ok: false, why: aborted ? `no answer from ${url} in ${HANDOFF_TIMEOUT_MS}ms` : `${url} threw: ${(err && err.message) || err}` };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 exports.handler = _guard("acumatica-sync", async (event, context) => {
   const t0 = Date.now();
   const log = (msg, data) => console.log(`[acumatica-sync] ${msg}`, data || "");
@@ -158,6 +209,18 @@ exports.handler = _guard("acumatica-sync", async (event, context) => {
   log(`phase=${phase} (tick ${Math.floor(t0 / TICK_MS)}), ${Math.round((deadlineAt - t0) / 1000)}s budget before the deadline margin`);
 
   if (phase === "po") {
+    const forceInline = String(qs.inline || "") === "1" || process.env.PO_SYNC_INLINE === "1";
+    if (!forceInline) {
+      const handed = await handOffPOSync(event);
+      if (handed.ok) {
+        log(`PO pass handed to ${PO_BACKGROUND_FN} (HTTP ${handed.status}) in ${Date.now() - t0}ms`);
+        return {
+          statusCode: 200,
+          body: JSON.stringify({ durationMs: Date.now() - t0, phase, pos: { handedOff: true, to: PO_BACKGROUND_FN } }),
+        };
+      }
+      log(`PO hand-off FAILED (${handed.why}) -- running the pass inline as before`);
+    }
     const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
@@ -849,6 +912,8 @@ exports.handler = _guard("acumatica-sync", async (event, context) => {
 });
 exports._pickPhase = pickPhase;
 exports._runPOSync = (ctx) => runPOSync(ctx);
+exports._handOffPOSync = handOffPOSync;
+exports._siteOrigin = siteOrigin;
 
 // ---- PO status derivation (ported verbatim from the app's Excel PO parser) ----
 function normalizeAcumaticaStatus(raw) {
@@ -1441,6 +1506,9 @@ async function runPOSync(ctx) {
         msg: `Acumatica PO sync: ${upserted} upserted, ${unchanged} unchanged (skipped), ${reconciled} reconciled closed (${byOrder.size} POs / ${entries.length} lines in feed)`,
         detail: {
           source: "netlify-scheduled-function",
+          mode: ctx.mode || "inline",
+          durationMs: Date.now() - tStart,
+          pages: pageCount,
           posInFeed: byOrder.size,
           linesInFeed: entries.length,
           upserted,
