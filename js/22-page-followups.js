@@ -1472,7 +1472,9 @@ function draftFollowupEmailRow(idx) {
     multi: false,
     poBlocks: [_chasePOBlock(fu.po.num, [line])],
   });
-  _openMailDraft(subject, body);
+  // To/CC from supplier_contacts — vendor ID off the PO first, name
+  // match second (see _contactForDraft).
+  _openMailDraft(subject, body, _contactForDraft(fu.po && fu.po.vendor, fu.supplier));
 }
 
 function draftFollowupEmailSupplier(gidx) {
@@ -1509,7 +1511,10 @@ function draftFollowupEmailSupplier(gidx) {
     multi: pendingLines.length > 1,
     poBlocks,
   });
-  _openMailDraft(subject, body);
+  // Every line in a group shares one supplier; the first PO that
+  // carries a vendor ID identifies the contact.
+  const _vendorId = (pendingLines.find(fu => fu.po && fu.po.vendor) || { po: {} }).po.vendor || null;
+  _openMailDraft(subject, body, _contactForDraft(_vendorId, g.supplier));
 }
 
 // ── Expedite helpers (Coverage Gaps only) ───────────────────────
@@ -1732,7 +1737,9 @@ function draftCoverageExpediteRow(idx) {
     intro,
     poBlocks,
   });
-  _openMailDraft(subject, body);
+  // primarySupplier is a NAME; the vendor ID rides on the covering /
+  // overdue PO (see _cgVendorId), so the lookup is ID-first here too.
+  _openMailDraft(subject, body, _contactForDraft(_cgVendorId(g), g.primarySupplier || ""));
 }
 
 // Section-level "Draft all expedites": one email per supplier
@@ -1900,44 +1907,170 @@ function _draftCoverageExpeditesFor(supplierKeys) {
     const subject = _expediteSubjectBundle(allExpLines.length, anyOverdue, anyPullIn, earliestNeedBy);
     const intro = _expediteIntro({ multi: allExpLines.length > 1, anyOverdue, anyPullIn });
     const body = _assembleExpediteEmail({ supplier, intro, poBlocks });
-    _openMailDraft(subject, body);
+    // One contact per supplier email: the first gap in this supplier's
+    // list that resolves a vendor ID wins; name match is the fallback.
+    const _vendorId = list.map(_cgVendorId).find(Boolean) || null;
+    _openMailDraft(subject, body, _contactForDraft(_vendorId, supplier === "—" ? "" : supplier));
     opened++;
   }
   showToast(`Drafted ${opened} email${opened === 1 ? "" : "s"} (one per supplier)`, "ok", "Coverage expedites");
 }
 
-function _openMailDraft(subject, body) {
+/* ── Supplier contacts → To/CC for the draft buttons ──────────────
+   DB.supplierContacts (Map keyed by Acumatica vendor ID, mirrored
+   from the `supplier_contacts` table by js/30-supabase.js) holds
+   { vendorId, supplier, to[], cc[], aliases[], notes, review }.
+
+   Lookup order: vendor ID first (the PO carries it — po.vendor), then
+   a normalized NAME match against data.supplier and data.aliases.
+   The name key folds case, strips punctuation and drops a trailing
+   inc / llc / co / ltd / corp / company, so "MOR-RYDE INTERNATIONAL,
+   INC" (a part's supplier) and "Mor-Ryde International, Inc" (the
+   PO's) collapse to the same key. Nothing fuzzier — no match means
+   no contact, and the draft opens with To blank exactly as before.
+   An address is never guessed. */
+const _CONTACT_INTERNAL_DOMAINS = ["whisperusa.com", "whisperev.com", "lpiinc.com", "md-carts.com"];
+const _CONTACT_TRAILING_LEGAL = /\s+(inc|llc|co|ltd|corp|company)$/;
+
+function _contactNameKey(name) {
+  let s = String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  while (_CONTACT_TRAILING_LEGAL.test(s)) s = s.replace(_CONTACT_TRAILING_LEGAL, "");
+  return s;
+}
+
+function findSupplierContact({ vendorId, supplier } = {}) {
+  const map = (typeof DB !== "undefined" && DB && DB.supplierContacts instanceof Map) ? DB.supplierContacts : null;
+  if (!map || !map.size) return null;
+  const vid = String(vendorId || "").trim();
+  if (vid && map.has(vid)) return map.get(vid);
+  const key = _contactNameKey(supplier);
+  if (!key) return null;
+  for (const c of map.values()) {
+    if (!c) continue;
+    if (_contactNameKey(c.supplier) === key) return c;
+    if (Array.isArray(c.aliases) && c.aliases.some(a => _contactNameKey(a) === key)) return c;
+  }
+  return null;
+}
+
+// Coverage Gaps rows carry primarySupplier as a NAME. The vendor ID
+// lives on the PO: first covering PO (by poId), else the first overdue
+// line's PO (by number). Null when the row has no PO at all.
+function _cgVendorId(g) {
+  const pos = (typeof DB !== "undefined" && DB && DB.pos) || [];
+  const c0 = g && g.coveringPOs && g.coveringPOs[0];
+  if (c0 && c0.poId) {
+    const po = pos.find(x => x && x.id === c0.poId);
+    if (po && po.vendor) return po.vendor;
+  }
+  const ol = g && g.overdueRisk && g.overdueRisk.overdueLines && g.overdueRisk.overdueLines[0];
+  if (ol && ol.po) {
+    const po = pos.find(x => x && x.num === ol.po);
+    if (po && po.vendor) return po.vendor;
+  }
+  return null;
+}
+
+// Resolve the {to, cc} for one draft and raise the user-facing toasts:
+//   - no contact, or a contact with an empty To → To stays blank and
+//     "No email saved for <supplier>. Add it in Supplier contacts."
+//     (the link opens / creates that supplier's row on Settings)
+//   - review:true → fill it in anyway, plus "Check the To for <supplier>".
+function _contactForDraft(vendorId, supplierName) {
+  const c = findSupplierContact({ vendorId, supplier: supplierName });
+  const name = supplierName || (c && c.supplier) || vendorId || "this supplier";
+  const to = c ? (c.to || []).map(s => String(s || "").trim()).filter(Boolean) : [];
+  const cc = c ? (c.cc || []).map(s => String(s || "").trim()).filter(Boolean) : [];
+  if (!to.length) {
+    _contactMissingToast(name, vendorId || (c && c.vendorId) || null);
+    return { to: [], cc: [] };
+  }
+  if (c.review) showToast(`Check the To for ${name}`, "warn", "Supplier contact");
+  return { to, cc };
+}
+
+// showToast escapes its message, so the "Add it in Supplier contacts"
+// link is built by hand on the same toast markup. Clicking it jumps to
+// the Settings editor focused on (and if needed creating) the row.
+function _contactMissingToast(supplierName, vendorId) {
+  const msg = `No email saved for ${supplierName}. Add it in Supplier contacts.`;
+  const stack = (typeof $ === "function") ? $("#toast-stack") : null;
+  if (!stack) { showToast(msg, "warn", "Draft email"); return; }
+  const t = document.createElement("div");
+  t.className = "toast warn";
+  t.innerHTML = `<div class="ti">Draft email</div><div class="tm">No email saved for ${esc(supplierName)}. <a href="#" style="text-decoration:underline;font-weight:600">Add it in Supplier contacts.</a></div>`;
+  const link = t.querySelector("a");
+  if (link) link.onclick = (e) => {
+    e.preventDefault();
+    t.remove();
+    if (typeof openSupplierContactRow === "function") openSupplierContactRow(vendorId, supplierName);
+    else if (typeof navigate === "function") navigate("settings");
+  };
+  stack.appendChild(t);
+  setTimeout(() => {
+    t.style.transition = "opacity 0.25s ease, transform 0.25s ease";
+    t.style.opacity = 0; t.style.transform = "translateX(20px)";
+    setTimeout(() => t.remove(), 260);
+  }, 9000);
+}
+
+// Pure: the mailto: URL for a draft. Each address is percent-encoded
+// on its own so the commas BETWEEN addresses stay literal separators;
+// cc= is left out entirely when there is nobody to copy.
+function _buildMailtoUrl(subject, body, to, cc) {
+  const toList = (to || []).filter(Boolean);
+  const ccList = (cc || []).filter(Boolean);
+  const params = [];
+  if (ccList.length) params.push(`cc=${ccList.map(encodeURIComponent).join(",")}`);
+  params.push(`subject=${encodeURIComponent(subject)}`);
+  params.push(`body=${encodeURIComponent(body)}`);
+  return `mailto:${toList.map(encodeURIComponent).join(",")}?${params.join("&")}`;
+}
+
+function _openMailDraft(subject, body, { to = [], cc = [] } = {}) {
+  const toList = (to || []).filter(Boolean);
+  const ccList = (cc || []).filter(Boolean);
   let opened = false;
   try {
     const a = document.createElement("a");
-    a.href = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    a.href = _buildMailtoUrl(subject, body, toList, ccList);
     document.body.appendChild(a);
     a.click();
     a.remove();
     opened = true;
   } catch (e) { /* fall through to clipboard / modal */ }
 
-  const clip = `Subject: ${subject}\n\n${body}`;
+  const head = (toList.length ? `To: ${toList.join(", ")}\n` : "")
+             + (ccList.length ? `CC: ${ccList.join(", ")}\n` : "");
+  const clip = `${head}Subject: ${subject}\n\n${body}`;
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(clip).then(
       () => showToast(`Draft copied to clipboard${opened ? " · mail app opened" : ""}`, "ok", "Draft email"),
-      () => { if (!opened) _followupCopyModal(subject, body); else showToast("Mail app opened", "ok", "Draft email"); }
+      () => { if (!opened) _followupCopyModal(subject, body, toList, ccList); else showToast("Mail app opened", "ok", "Draft email"); }
     );
   } else if (!opened) {
-    _followupCopyModal(subject, body);
+    _followupCopyModal(subject, body, toList, ccList);
   } else {
     showToast("Mail app opened", "ok", "Draft email");
   }
 }
 
-function _followupCopyModal(subject, body) {
+function _followupCopyModal(subject, body, to = [], cc = []) {
+  const toList = (to || []).filter(Boolean);
+  const ccList = (cc || []).filter(Boolean);
   openModal(`
     <div class="modal-head">
       <div style="font-size:13px;font-weight:600">Draft email</div>
       <div class="muted tiny mt-xs">No mail handler / clipboard access — copy the text below into your email client.</div>
     </div>
     <div class="modal-body">
-      <div class="field"><label>Subject</label>
+      ${toList.length ? `<div class="field"><label>To</label>
+        <input class="input" readonly value="${esc(toList.join(", "))}" onclick="this.select()">
+      </div>` : ""}
+      ${ccList.length ? `<div class="field" style="margin-top:10px"><label>CC</label>
+        <input class="input" readonly value="${esc(ccList.join(", "))}" onclick="this.select()">
+      </div>` : ""}
+      <div class="field"${(toList.length || ccList.length) ? ' style="margin-top:10px"' : ""}><label>Subject</label>
         <input class="input" readonly value="${esc(subject)}" onclick="this.select()">
       </div>
       <div class="field" style="margin-top:10px"><label>Body</label>

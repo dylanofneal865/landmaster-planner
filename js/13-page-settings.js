@@ -290,6 +290,8 @@ registerRoute("settings", () => {
         </div>
       </div>
 
+      ${_supplierContactsPanelHtml()}
+
       ${_supplierCyclesPanelHtml()}
 
       <div class="panel">
@@ -891,4 +893,232 @@ function removeSupplierCycle(i) {
   bumpStatusCache();
   showToast(`Cycle removed for ${name}`, "ok");
   refresh();
+}
+
+/* ============================================================
+   SUPPLIER CONTACTS — editor for DB.supplierContacts, the mirror of
+   the `supplier_contacts` Supabase table (js/30-supabase.js). One row
+   per Acumatica vendor ID: { vendorId, supplier, to[], cc[], aliases[],
+   notes, review, updatedBy }. The Follow-Ups / Coverage Gaps "Draft
+   email" buttons read this to fill To/CC (js/22-page-followups.js,
+   findSupplierContact). Rows flagged review:true sort to the top;
+   saving a row clears the flag and stamps updatedBy. Writes go
+   through upsertSupplierContactCloud, which broadcasts so other open
+   tabs pick the edit up without a reload.
+   ============================================================ */
+const _SC_EMAIL_RE = /^[^\s@,;<>()]+@[^\s@,;<>()]+\.[^\s@,;<>()]+$/;
+// Internal domains are never a supplier's To. (CC is allowed — copying
+// a buyer is normal.) Also matched as a parent domain, so a mailbox on
+// mail.lpiinc.com is caught too.
+const _SC_INTERNAL_DOMAINS = ["whisperusa.com", "whisperev.com", "lpiinc.com", "md-carts.com"];
+
+function _scIsInternal(addr) {
+  const dom = String(addr || "").toLowerCase().split("@")[1] || "";
+  return _SC_INTERNAL_DOMAINS.some(d => dom === d || dom.endsWith("." + d));
+}
+
+// Comma / semicolon / newline separated → cleaned list. Returns
+// { ok:true, list } or { ok:false, error }.
+function _scParseAddresses(raw, opts) {
+  const blockInternal = !!(opts && opts.blockInternal);
+  const list = [];
+  const seen = new Set();
+  for (const piece of String(raw || "").split(/[,;\n]+/)) {
+    const a = piece.trim();
+    if (!a) continue;
+    if (!_SC_EMAIL_RE.test(a)) return { ok: false, error: `"${a}" is not a valid email address.` };
+    if (blockInternal && _scIsInternal(a)) return { ok: false, error: `${a} is an internal address — it can't be a supplier's To.` };
+    const k = a.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    list.push(a);
+  }
+  return { ok: true, list };
+}
+
+// Ordered keys — review rows first, then by supplier name. The panel
+// and the index-based row handlers both read this so a row index is
+// stable between render and click (every mutation re-renders).
+function _supplierContactKeys() {
+  const m = (DB.supplierContacts instanceof Map) ? DB.supplierContacts : new Map();
+  return [...m.keys()].sort((a, b) => {
+    const ca = m.get(a) || {}, cb = m.get(b) || {};
+    if (!!ca.review !== !!cb.review) return ca.review ? -1 : 1;
+    return String(ca.supplier || a).localeCompare(String(cb.supplier || b));
+  });
+}
+
+// Who saved it. No login in the planner, so the name is asked once
+// per browser and kept in localStorage.
+function _scUpdatedBy() {
+  let who = "";
+  try { who = localStorage.getItem("landmaster.userName") || ""; } catch (_) { /* private mode */ }
+  if (!who && typeof prompt === "function") {
+    const v = prompt("Your name (stamped as \"updated by\" on supplier contacts):");
+    if (v && v.trim()) {
+      who = v.trim();
+      try { localStorage.setItem("landmaster.userName", who); } catch (_) { /* ignore */ }
+    }
+  }
+  return who || "planner";
+}
+
+function _scFmtUpdated(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " "
+       + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function _supplierContactsPanelHtml() {
+  const m = (DB.supplierContacts instanceof Map) ? DB.supplierContacts : new Map();
+  const keys = _supplierContactKeys();
+  // Set by openSupplierContactRow (the "Add it in Supplier contacts"
+  // toast link): which row to highlight, or a supplier name to prefill
+  // in the add form when there was no vendor ID to key a row on.
+  const focus = window._supplierContactsFocus || null;
+  const focusId = focus && focus.vendorId ? String(focus.vendorId) : "";
+  const prefillName = focus && !focusId ? (focus.supplier || "") : "";
+  const reviewCount = keys.filter(k => (m.get(k) || {}).review).length;
+
+  const rows = keys.map((k, i) => {
+    const c = m.get(k) || {};
+    const hl = focusId && k === focusId;
+    return `<tr id="sc-row-${i}"${hl ? ' style="outline:2px solid var(--accent);outline-offset:-2px"' : ""}>
+      <td class="mono dim">${esc(k)}</td>
+      <td>${esc(c.supplier || "")}${c.review ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px" title="Contact not confirmed yet — drafts still use it, with a reminder toast">review</span>' : ""}${(c.aliases || []).length ? `<div class="muted tiny">aka ${esc((c.aliases || []).join(", "))}</div>` : ""}</td>
+      <td><input class="input" id="sc-to-${i}" value="${esc((c.to || []).join(", "))}" placeholder="name@supplier.com, …" style="min-width:220px"></td>
+      <td><input class="input" id="sc-cc-${i}" value="${esc((c.cc || []).join(", "))}" placeholder="optional" style="min-width:160px"></td>
+      <td><input class="input" id="sc-notes-${i}" value="${esc(c.notes || "")}" placeholder="who / when / quirks" style="min-width:180px"></td>
+      <td class="muted tiny" title="${esc(c.updatedBy ? "by " + c.updatedBy : "")}">${_scFmtUpdated(c._updatedAt)}${c.updatedBy ? `<div>${esc(c.updatedBy)}</div>` : ""}</td>
+      <td><button class="btn sm" onclick="saveSupplierContact(${i})">Save</button></td>
+    </tr>`;
+  }).join("");
+
+  return `<div class="panel" id="supplier-contacts-panel">
+    <div class="panel-head">
+      <div class="panel-title">Supplier contacts</div>
+      <div class="panel-sub">Who the Follow-Ups and Coverage Gaps "Draft email" buttons address. To and CC are comma-separated. Saving a row confirms it${reviewCount ? ` — <strong>${reviewCount}</strong> still to confirm` : ""}.</div>
+    </div>
+    <div class="panel-body col">
+      ${keys.length ? `<div style="overflow-x:auto"><table class="tbl">
+        <thead><tr><th>Vendor</th><th>Supplier</th><th>To</th><th>CC</th><th>Notes</th><th>Updated</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : `<p class="muted tiny">No supplier contacts loaded yet. Add one below.</p>`}
+      <div class="row gap-md mt-sm" style="align-items:flex-end;flex-wrap:wrap">
+        <div><div class="muted tiny">Vendor ID</div><input class="input mono" id="sc-add-vendor" placeholder="V002083" style="width:110px"></div>
+        <div><div class="muted tiny">Supplier</div><input class="input" id="sc-add-supplier" value="${esc(prefillName)}" placeholder="Name as it appears on POs" style="min-width:240px"></div>
+        <button class="btn primary" onclick="addSupplierContact()">+ Add contact</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// After the Settings page paints, bring the focused row into view. The
+// focus marker is kept for a few seconds rather than cleared at once:
+// the page's heartbeat fetch (_settingsFetchHeartbeats) re-renders
+// Settings shortly after first paint, and the row highlight should
+// survive that second paint.
+function _scAfterRender() {
+  const focus = window._supplierContactsFocus;
+  if (!focus) return;
+  setTimeout(() => { if (window._supplierContactsFocus === focus) window._supplierContactsFocus = null; }, 5000);
+  setTimeout(() => {
+    let el = null;
+    if (focus.vendorId) {
+      const i = _supplierContactKeys().indexOf(String(focus.vendorId));
+      if (i >= 0) el = document.getElementById(`sc-row-${i}`);
+      if (el) {
+        el.scrollIntoView({ block: "center" });
+        const inp = document.getElementById(`sc-to-${i}`);
+        if (inp) inp.focus();
+        return;
+      }
+    }
+    el = document.getElementById("sc-add-vendor");
+    if (el) { el.scrollIntoView({ block: "center" }); el.focus(); }
+  }, 50);
+}
+
+// Entry point for the "Add it in Supplier contacts" toast link
+// (js/22-page-followups.js). Creates the row — vendor ID + supplier
+// name, review:true, empty To — when it doesn't exist, then opens
+// Settings on it. No vendor ID → opens Settings with the add form
+// prefilled with the supplier name instead (a row needs an ID).
+function openSupplierContactRow(vendorId, supplier) {
+  if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
+  const vid = String(vendorId || "").trim();
+  if (vid && !DB.supplierContacts.has(vid)) {
+    const row = { vendorId: vid, supplier: String(supplier || "").trim(), to: [], cc: [], aliases: [], notes: "", review: true, updatedBy: "" };
+    DB.supplierContacts.set(vid, row);
+    if (typeof upsertSupplierContactCloud === "function") {
+      upsertSupplierContactCloud(vid, row).then(r => {
+        if (r && !r.ok) showToast(`Could not save the new contact row for ${row.supplier || vid}`, "crit", "Supplier contacts");
+      });
+    }
+  }
+  window._supplierContactsFocus = { vendorId: vid || null, supplier: supplier || "" };
+  navigate("settings");
+  _scAfterRender();
+}
+
+async function saveSupplierContact(i) {
+  const keys = _supplierContactKeys();
+  const key = keys[i];
+  const m = (DB.supplierContacts instanceof Map) ? DB.supplierContacts : null;
+  if (!key || !m || !m.has(key)) { showToast("Contact not found — reloading.", "warn"); refresh(); return; }
+  const cur = m.get(key);
+  const toRes = _scParseAddresses($(`#sc-to-${i}`) && $(`#sc-to-${i}`).value, { blockInternal: true });
+  if (!toRes.ok) { showToast(toRes.error, "warn", "Supplier contacts"); return; }
+  const ccRes = _scParseAddresses($(`#sc-cc-${i}`) && $(`#sc-cc-${i}`).value, { blockInternal: false });
+  if (!ccRes.ok) { showToast(ccRes.error, "warn", "Supplier contacts"); return; }
+  const notes = String(($(`#sc-notes-${i}`) && $(`#sc-notes-${i}`).value) || "").trim();
+  const next = Object.assign({}, cur, {
+    vendorId: cur.vendorId || key,
+    to: toRes.list,
+    cc: ccRes.list,
+    notes,
+    review: false,
+    updatedBy: _scUpdatedBy(),
+  });
+  m.set(key, next);
+  const res = (typeof upsertSupplierContactCloud === "function")
+    ? await upsertSupplierContactCloud(key, next)
+    : { ok: false, error: new Error("cloud not ready") };
+  if (!res.ok) {
+    m.set(key, cur);
+    showToast(`Save failed for ${cur.supplier || key}: ${(res.error && res.error.message) || "unknown error"}`, "crit", "Supplier contacts");
+    refresh();
+    return;
+  }
+  next._updatedAt = new Date().toISOString();
+  logAudit("settings", `Supplier contact saved: ${next.supplier || key} → ${next.to.join(", ") || "(no To)"}`);
+  showToast(`Saved contact for ${next.supplier || key}`, "ok", "Supplier contacts");
+  refresh();
+}
+
+async function addSupplierContact() {
+  if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
+  const vid = String(($("#sc-add-vendor") && $("#sc-add-vendor").value) || "").trim().toUpperCase();
+  const name = String(($("#sc-add-supplier") && $("#sc-add-supplier").value) || "").trim();
+  if (!vid) { showToast("Enter the Acumatica vendor ID (e.g. V002083).", "warn", "Supplier contacts"); return; }
+  if (!name) { showToast("Enter the supplier name.", "warn", "Supplier contacts"); return; }
+  if (DB.supplierContacts.has(vid)) { showToast(`${vid} already has a row.`, "warn", "Supplier contacts"); return; }
+  const row = { vendorId: vid, supplier: name, to: [], cc: [], aliases: [], notes: "", review: true, updatedBy: "" };
+  DB.supplierContacts.set(vid, row);
+  const res = (typeof upsertSupplierContactCloud === "function")
+    ? await upsertSupplierContactCloud(vid, row)
+    : { ok: false, error: new Error("cloud not ready") };
+  if (!res.ok) {
+    DB.supplierContacts.delete(vid);
+    showToast(`Could not add ${name}: ${(res.error && res.error.message) || "unknown error"}`, "crit", "Supplier contacts");
+    return;
+  }
+  row._updatedAt = new Date().toISOString();
+  logAudit("settings", `Supplier contact added: ${name} (${vid})`);
+  showToast(`Added ${name} — fill in the To and save.`, "ok", "Supplier contacts");
+  window._supplierContactsFocus = { vendorId: vid, supplier: name };
+  refresh();
+  _scAfterRender();
 }

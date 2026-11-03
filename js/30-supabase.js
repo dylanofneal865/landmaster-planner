@@ -84,6 +84,7 @@ const _lastRemoteApplyAt = {
   deleted_parts:  new Map(),
   audit:          new Map(),
   usage:          new Map(),
+  supplier_contacts: new Map(),
 };
 
 // ── Broadcast listener state (Phase 2 broadcast migration, Step 2) ────
@@ -142,6 +143,7 @@ const _lastSeenAt = {
   deleted_parts:  null,
   audit:          null,   // uses created_at (append-only)
   usage:          null,   // uses created_at (append-only)
+  supplier_contacts: null,
 };
 
 // Wait for the main app to finish booting (DB must exist with parts)
@@ -263,6 +265,7 @@ async function _fetchFollowMarksSince(sinceIso)  { return _fetchSince("follow_ma
 async function _fetchDeletedPartsSince(sinceIso) { return _fetchSince("deleted_parts", "id, data",     "updated_at", sinceIso); }
 async function _fetchAuditSince(sinceIso)        { return _fetchSince("audit",         "id, data",     "created_at", sinceIso); }
 async function _fetchUsageSince(sinceIso)        { return _fetchSince("usage",         "id, data",     "created_at", sinceIso); }
+async function _fetchSupplierContactsSince(sinceIso) { return _fetchSince("supplier_contacts", "id, data", "updated_at", sinceIso); }
 
 // ── Boot cursor seeder (Phase 2, Step 1) ────────────────────────────
 // One-shot: 8 parallel top-1-desc queries to capture the current max
@@ -360,6 +363,7 @@ async function _seedLastSeenCursors() {
       ["deleted_parts", "updated_at"],
       ["audit",         "created_at"],
       ["usage",         "created_at"],
+      ["supplier_contacts", "updated_at"],
     ];
     // allSettled instead of all — even if a per-table callback
     // somehow rejects (it shouldn't, since each has its own try/
@@ -600,6 +604,89 @@ async function deleteFollowMarkCloud(id) {
 
 window.upsertFollowMarkCloud = upsertFollowMarkCloud;
 window.deleteFollowMarkCloud = deleteFollowMarkCloud;
+
+// ------------------------------------------------------------------
+// supplier_contacts — who to email at each supplier. Table is
+// { id text PK (Acumatica vendor ID, e.g. V002083), data jsonb }
+// with data = { vendorId, supplier, to[], cc[], aliases[], notes,
+// review, updatedBy }. Mirrored as DB.supplierContacts (Map keyed by
+// vendor ID; value = data + _updatedAt from the row). Read by the
+// Follow-Ups / Coverage Gaps "Draft email" buttons, edited on the
+// Settings page.
+//
+// Loaded the same way follow_marks is: one paged fetch at boot
+// (cloudInit) and on reconnect (_catchupFetch); edits from other
+// tabs arrive through the broadcast delta path (_BROADCAST_FETCHERS).
+// NOT in the supabase_realtime publication, so there is deliberately
+// no postgres_changes subscription for it — adding one would close
+// the whole landmaster-sync channel (see _setupRealtimeSubscriptions).
+//
+// A failed fetch returns null and the caller KEEPS the existing map —
+// a stale contact list beats an empty one.
+// ------------------------------------------------------------------
+async function _fetchAllSupplierContacts() {
+  if (!_supa) return [];
+  const all = [];
+  const PAGE = 1000;
+  let from = 0;
+  while (true) {
+    const { data, error } = await _supa
+      .from("supplier_contacts")
+      .select("id, data, updated_at")
+      .range(from, from + PAGE - 1);
+    if (error) {
+      console.error("[cloud] supplier_contacts page fetch failed:", error);
+      return null;
+    }
+    if (!data || data.length === 0) break;
+    all.push(...data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return all;
+}
+
+// Row → mirror value. Keeps the row's updated_at on the value (as
+// _updatedAt) so the Settings table can show "last updated" without a
+// second fetch. Stripped again before any write (see the upsert).
+function _supplierContactFromRow(r) {
+  const d = Object.assign({}, r.data || {});
+  d.vendorId = d.vendorId || r.id;
+  d.to = Array.isArray(d.to) ? d.to : [];
+  d.cc = Array.isArray(d.cc) ? d.cc : [];
+  d.aliases = Array.isArray(d.aliases) ? d.aliases : [];
+  d._updatedAt = r.updated_at || null;
+  return d;
+}
+
+// Replace the mirror's contents IN PLACE (never reassign the Map —
+// consumers may hold the reference). Only called with a non-null
+// row list; a failed fetch never reaches here.
+function _populateSupplierContactsFromRows(rows) {
+  if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
+  DB.supplierContacts.clear();
+  for (const r of rows) {
+    if (r && r.id) DB.supplierContacts.set(String(r.id), _supplierContactFromRow(r));
+  }
+}
+
+// Optimistic write from the Settings editor: the caller has already
+// updated DB.supplierContacts. Broadcasts so other open tabs delta-
+// fetch the row; our own echo is dropped by the content-equality
+// check in _handleRealtimeSupplierContact.
+async function upsertSupplierContactCloud(id, data) {
+  if (!_supa) return { ok: false, error: new Error("not ready") };
+  const clean = Object.assign({}, data || {});
+  delete clean._updatedAt;
+  const { error } = await _supa.from("supplier_contacts").upsert({ id, data: clean });
+  if (error) {
+    console.error("[cloud] supplier_contacts upsert failed:", error);
+    return { ok: false, error };
+  }
+  _sendDataChanged(["supplier_contacts"]);
+  return { ok: true };
+}
+window.upsertSupplierContactCloud = upsertSupplierContactCloud;
 
 // ── deleted_parts tombstone helpers ─────────────────────────────────
 // Table schema: { id text PK, data jsonb } — matches follow_marks and
@@ -2425,6 +2512,17 @@ async function cloudInit() {
     console.log(`[cloud] loaded ${window.followMarks.size} follow_marks`);
   }
 
+  // supplier_contacts — same contract as follow_marks: one fetch,
+  // in-place populate. A failed fetch (null) keeps whatever the map
+  // already holds (the IDB-cached copy is {} after JSON, so usually
+  // empty — but never cleared by a failure).
+  if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
+  const scRows = await _hydrate("supplier_contacts", _fetchAllSupplierContacts);
+  if (Array.isArray(scRows)) {
+    _populateSupplierContactsFromRows(scRows);
+    console.log(`[cloud] loaded ${DB.supplierContacts.size} supplier_contacts`);
+  }
+
   // Phase 2 broadcast migration, Step 1 — seed the delta cursors after
   // every boot full-scan has adopted its cloud state. Nothing consumes
   // these yet; the delta fetchers exist but are unwired.
@@ -2765,6 +2863,7 @@ function _stampRemoteApplyAt(table, row) {
     case "deleted_parts": pk = row.id; break;
     case "audit":         pk = row.id; break;
     case "usage":         pk = row.id; break;
+    case "supplier_contacts": pk = row.id; break;
     default: return;
   }
   if (pk != null) m.set(pk, now);
@@ -2784,6 +2883,7 @@ function _broadcastRowPk(table, row) {
     case "deleted_parts": return row.id;
     case "audit":         return row.id;
     case "usage":         return row.id;
+    case "supplier_contacts": return row.id;
     default:              return null;
   }
 }
@@ -2836,6 +2936,7 @@ const _BROADCAST_FETCHERS = {
   deleted_parts:  _fetchDeletedPartsSince,
   audit:          _fetchAuditSince,
   usage:          _fetchUsageSince,
+  supplier_contacts: _fetchSupplierContactsSince,
 };
 
 // Dispatch a delta-fetched row through the SAME postgres_changes-handler
@@ -2858,6 +2959,7 @@ function _applyBroadcastRow(table, row) {
     case "deleted_parts": _handleRealtimeDeletedParts({ eventType: "UPDATE", new: row }); break;
     case "audit":         _handleRealtimeAudit({ eventType: "UPDATE", new: row }); break;
     case "usage":         _handleRealtimeUsage({ eventType: "UPDATE", new: row }); break;
+    case "supplier_contacts": _handleRealtimeSupplierContact({ eventType: "UPDATE", new: row }); break;
     default:              console.warn(`[cloud] broadcast: unknown table "${table}" — ignored`);
   }
 }
@@ -3247,6 +3349,10 @@ async function _catchupFetch() {
     window.followMarks.clear();
     for (const r of fmRows) if (r && r.id && r.data) window.followMarks.set(r.id, r.data);
   }
+
+  // Supplier contacts — in-place; a failed fetch keeps the current map.
+  const scRowsCatchup = await _fetchAllSupplierContacts();
+  if (Array.isArray(scRowsCatchup)) _populateSupplierContactsFromRows(scRowsCatchup);
 
   // Settings — merge (don't replace) so a client-local setting the
   // client already tweaked isn't clobbered by an older cloud snapshot.
@@ -4125,6 +4231,34 @@ function _handleRealtimeFollowMark(payload) {
       _followMarksRendering = false;
     }
   }, 150);
+}
+
+// supplier_contacts — reached only through the broadcast delta path
+// (_applyBroadcastRow); there is no postgres_changes subscription for
+// this table. Updates the mirror in place; the flush pass that called
+// us ends with ONE _applyAndRefresh(), which redraws the current route
+// — so an open Settings page picks up another tab's edit without a
+// reload. Content-equality skip drops the echo of our own upsert.
+function _handleRealtimeSupplierContact(payload) {
+  if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
+  const { eventType, new: row, old } = payload;
+  if (eventType === "DELETE") {
+    const id = old && old.id;
+    if (id) DB.supplierContacts.delete(String(id));
+    return;
+  }
+  if (!row || !row.id) return;
+  const next = _supplierContactFromRow(row);
+  const existing = DB.supplierContacts.get(String(row.id));
+  if (existing) {
+    const strip = (d) => { const c = Object.assign({}, d); delete c._updatedAt; return JSON.stringify(c); };
+    if (strip(existing) === strip(next)) {
+      // Same content — just adopt the newer server timestamp.
+      if (next._updatedAt) existing._updatedAt = next._updatedAt;
+      return;
+    }
+  }
+  DB.supplierContacts.set(String(row.id), next);
 }
 
 async function _pushAllParts() {

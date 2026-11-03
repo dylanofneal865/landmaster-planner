@@ -71,6 +71,9 @@ async function initApp() {
     // truth and cloudInit repopulates from it on every boot. This
     // shape-guard resets any object that came back as {} on load.
     if (!(DB.deletedParts instanceof Map)) DB.deletedParts = new Map();
+    // Supplier contacts mirror (Supabase `supplier_contacts`): same
+    // rules — a Map, mutated in place, repopulated by cloudInit.
+    if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
 
     ensureIds();
 
