@@ -32,6 +32,30 @@
 //   payload.qtyOverride      -- {pn: units} manual overrides
 //   payload.allowManualSlotChange -- true to override the DB-side
 //                                    manual-pin immutability guard
+//   payload.operatorEdit     -- true ONLY from operator actions (pin,
+//                               unpin, qty override, slot override).
+//                               Required to change slot or qty on a
+//                               week inside the 6-week lock window.
+//
+// v10 LOCK-HORIZON GUARD (enforced HERE against the DB row; the
+// fs_lock_horizon_guard trigger is the second line of defence):
+// when the CURRENT DB row has slot.pn, the week's Monday is inside
+// [current Monday, current Monday + 42 days] (America/New_York,
+// computed server-side), and the payload changes slot or qty
+// without operatorEdit === true, the write is SKIPPED with
+// { ok: true, skipped: true, reason: "lock-horizon" }. Writes that
+// only touch onHandAtClose / qtyOverride pass; the first fill of a
+// week with no slot passes; a qty-only fill of an empty map passes.
+//
+// v10 BUILD FLOOR: MIN_CLIENT_BUILD is a hard server-side floor on
+// x-app-build. Tabs running an older bundle get 409 (and the
+// write-blocked banner) regardless of __settings__.minWriteBuild.
+//
+// v10 PRESERVE-ON-OMIT for qty / slot: a payload that does not
+// carry the `qty` key keeps the prior row's qty; one that does not
+// carry `slot` keeps the prior slot. An explicit slot: null still
+// clears. (Earlier clients always sent both keys, so this is a
+// pure widening.)
 //
 // The DB-side manual-pin guard (v7.10 semantics, now enforced HERE
 // instead of only at the client): if the CURRENT DB row has
@@ -65,6 +89,41 @@
 
 const { createClient } = require("@supabase/supabase-js");
 
+// v10 Hard build floor. Keep equal to APP_BUILD in js/01-config.js
+// for the deploy that introduced the lock-horizon guard; bump both
+// together whenever the write contract changes again.
+const MIN_CLIENT_BUILD = 1793750400;   // 2026-11-04 00:00:00 UTC
+
+// v10 Lock window, computed server-side in America/New_York so a
+// client clock can't move the fence. Returns ISO "YYYY-MM-DD" for
+// the current Monday and for Monday + LOCK_HORIZON_DAYS.
+const LOCK_HORIZON_DAYS = 42;
+function _lockWindowIsos(now) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit", weekday: "short",
+  }).formatToParts(now || new Date());
+  const get = t => (parts.find(p => p.type === t) || {}).value;
+  const y = Number(get("year")), m = Number(get("month")), d = Number(get("day"));
+  const dowIdx = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[get("weekday")] || 0;
+  const back = (dowIdx + 6) % 7;   // days since Monday
+  const mondayUtc = Date.UTC(y, m - 1, d) - back * 86400000;
+  const iso = ms => new Date(ms).toISOString().slice(0, 10);
+  return { curMondayIso: iso(mondayUtc), horizonEndIso: iso(mondayUtc + LOCK_HORIZON_DAYS * 86400000) };
+}
+
+// Canonical key of a qty map: sorted pns, positive integers only, so
+// a stray 0 or key order never reads as a change.
+function _qtyKey(map) {
+  const out = {};
+  if (map && typeof map === "object") {
+    for (const k of Object.keys(map).sort()) {
+      const n = Math.floor(Number(map[k]));
+      if (Number.isFinite(n) && n > 0) out[k] = n;
+    }
+  }
+  return JSON.stringify(out);
+}
+
 // v7.10 slot equality helper, mirrored from js/25 + js/30.
 function _slotsEqual(a, b) {
   if (a == null && b == null) return true;
@@ -82,15 +141,22 @@ function _slotsEqual(a, b) {
 // used to. Duplicated here so this function is self-contained
 // (no shared module).
 function _sanitizeWeekPayload(payload, prevData) {
+  const has = k => !!payload && Object.prototype.hasOwnProperty.call(payload, k);
   const qty = {};
-  if (payload && payload.qty && typeof payload.qty === "object") {
-    for (const [k, v] of Object.entries(payload.qty)) {
+  // v10 preserve-on-omit: no `qty` key -> keep the prior map.
+  const qtySrc = has("qty") ? payload.qty : (prevData && prevData.qty);
+  if (qtySrc && typeof qtySrc === "object") {
+    for (const [k, v] of Object.entries(qtySrc)) {
       const n = Math.max(0, Number(v) || 0);
       if (n > 0) qty[k] = n;
     }
   }
   let slot = null;
-  if (payload && payload.slot && typeof payload.slot === "object" && payload.slot.pn) {
+  // v10 preserve-on-omit: no `slot` key -> keep the prior slot
+  // (already sanitized when it was stored). Explicit null clears.
+  if (!has("slot") && prevData && prevData.slot && typeof prevData.slot === "object" && prevData.slot.pn) {
+    slot = Object.assign({}, prevData.slot);
+  } else if (payload && payload.slot && typeof payload.slot === "object" && payload.slot.pn) {
     slot = {
       pn: String(payload.slot.pn),
       locked: !!payload.slot.locked,
@@ -179,6 +245,39 @@ function _sanitizeSettingsPayload(payload, prevData) {
   const clientBuild = payload && Number.isFinite(Number(payload.appBuild)) ? Math.floor(Number(payload.appBuild)) : 0;
   const prevBuild = (prevData && Number.isFinite(Number(prevData.minWriteBuild))) ? Math.floor(Number(prevData.minWriteBuild)) : 0;
   const minWriteBuild = Math.max(prevBuild, clientBuild);
+  // v10 closedWeeks: [{ weekIso, workdays }] -- validated, preserve-
+  // on-omit. An explicit array (even empty) replaces the prior list.
+  let closedWeeks = null;
+  const cwArg = payload && payload.closedWeeks;
+  if (Array.isArray(cwArg)) {
+    closedWeeks = [];
+    for (const e of cwArg) {
+      if (!e || typeof e.weekIso !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(e.weekIso)) continue;
+      const wd = Math.floor(Number(e.workdays));
+      if (!Number.isFinite(wd) || wd < 0 || wd > 5) continue;
+      closedWeeks.push({ weekIso: e.weekIso, workdays: wd });
+    }
+  } else if (prevData && Array.isArray(prevData.closedWeeks)) {
+    closedWeeks = prevData.closedWeeks;
+  }
+  // v10 lastPublishedQty: { iso: { pn: qty } } snapshot of the lock
+  // window as last published to the supplier. Preserve-on-omit.
+  let lastPublishedQty = null;
+  const lpqArg = payload && payload.lastPublishedQty;
+  if (lpqArg && typeof lpqArg === "object" && !Array.isArray(lpqArg)) {
+    lastPublishedQty = {};
+    for (const [iso, m] of Object.entries(lpqArg)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(iso) || !m || typeof m !== "object") continue;
+      const clean = {};
+      for (const [pn, v] of Object.entries(m)) {
+        const n = Math.floor(Number(v));
+        if (Number.isFinite(n) && n > 0) clean[pn] = n;
+      }
+      lastPublishedQty[iso] = clean;
+    }
+  } else if (prevData && prevData.lastPublishedQty && typeof prevData.lastPublishedQty === "object") {
+    lastPublishedQty = prevData.lastPublishedQty;
+  }
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
   if (maxCoverWeeks !== null) dataOut.maxCoverWeeks = maxCoverWeeks;
@@ -186,6 +285,8 @@ function _sanitizeSettingsPayload(payload, prevData) {
   if (lastPublishedAt !== null) dataOut.lastPublishedAt = lastPublishedAt;
   dataOut.scheduleMode = scheduleMode;
   if (minWriteBuild > 0) dataOut.minWriteBuild = minWriteBuild;
+  if (closedWeeks !== null) dataOut.closedWeeks = closedWeeks;
+  if (lastPublishedQty !== null) dataOut.lastPublishedQty = lastPublishedQty;
   return { dataOut };
 }
 
@@ -217,6 +318,17 @@ exports.handler = async (event) => {
   const clientBuild = Number(clientBuildRaw);
   if (!Number.isFinite(clientBuild) || clientBuild <= 0) {
     return { statusCode: 400, body: JSON.stringify({ error: "invalid or missing x-app-build" }) };
+  }
+  // v10 hard floor -- independent of the __settings__ row.
+  if (clientBuild < MIN_CLIENT_BUILD) {
+    return {
+      statusCode: 409,
+      body: JSON.stringify({
+        error: "app build is stale (server requires a newer planner build)",
+        minWriteBuild: MIN_CLIENT_BUILD,
+        clientBuild,
+      }),
+    };
   }
 
   // ---- Parse body ------------------------------------------------
@@ -252,7 +364,7 @@ exports.handler = async (event) => {
     return { statusCode: 500, body: JSON.stringify({ error: "settings read failed", detail: settingsErr.message }) };
   }
   const settingsData = (settingsRow && settingsRow.data) || {};
-  const minWriteBuild = Number(settingsData.minWriteBuild) || 0;
+  const minWriteBuild = Math.max(Number(settingsData.minWriteBuild) || 0, MIN_CLIENT_BUILD);
   if (minWriteBuild > 0 && clientBuild < minWriteBuild) {
     return {
       statusCode: 409,
@@ -318,6 +430,7 @@ exports.handler = async (event) => {
   const results = [];
   const rowsToUpsert = [];
   const nowIso = new Date().toISOString();
+  const { curMondayIso, horizonEndIso } = _lockWindowIsos(new Date());
 
   for (const w of writes) {
     if (!w || typeof w.iso !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(w.iso)) {
@@ -346,6 +459,28 @@ exports.handler = async (event) => {
         prevPn2: priorSlot.pn2 || null,
       });
       continue;
+    }
+    // v10 Lock-horizon guard against DB truth. A week inside the
+    // window that already has a frame keeps its slot + qty unless
+    // the write is an operator action.
+    const inWindow = w.iso >= curMondayIso && w.iso <= horizonEndIso;
+    if (inWindow && priorSlot && priorSlot.pn && payload.operatorEdit !== true) {
+      const slotChanged = payloadHasSlot && !_slotsEqual(payload.slot, priorSlot);
+      const priorQtyKey = _qtyKey(prior.qty);
+      const nextQtyKey = Object.prototype.hasOwnProperty.call(payload, "qty") ? _qtyKey(payload.qty) : priorQtyKey;
+      // First fill of an empty map is allowed (mirrors the DB guard).
+      const qtyChanged = nextQtyKey !== priorQtyKey && priorQtyKey !== "{}";
+      if (slotChanged || qtyChanged) {
+        results.push({
+          iso: w.iso,
+          ok: true,
+          skipped: true,
+          reason: "lock-horizon",
+          prevPn: priorSlot.pn || null,
+          prevPn2: priorSlot.pn2 || null,
+        });
+        continue;
+      }
     }
     const { dataOut } = _sanitizeWeekPayload(payload, prior);
     rowsToUpsert.push({
@@ -377,8 +512,9 @@ exports.handler = async (event) => {
   }
 
   const skipped = results.filter(r => r.skipped).length;
+  const lockSkipped = results.filter(r => r.skipped && r.reason === "lock-horizon").length;
   const wrote = results.filter(r => r.ok && !r.skipped).length;
-  log(`batch write OK: ${wrote} wrote, ${skipped} skipped(manual-pin) in ${Date.now() - t0}ms`);
+  log(`batch write OK: ${wrote} wrote, ${skipped - lockSkipped} skipped(manual-pin), ${lockSkipped} skipped(lock-horizon ${curMondayIso}..${horizonEndIso}) in ${Date.now() - t0}ms`);
   return {
     statusCode: 200,
     body: JSON.stringify({ ok: true, results }),

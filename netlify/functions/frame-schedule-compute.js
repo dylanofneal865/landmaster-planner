@@ -110,6 +110,9 @@ function ingestFrameSchedule(rows) {
         },
         bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
         maxCoverWeeks: (Number.isFinite(mc) && mc > 0) ? mc : null,
+        // v10 closed weeks: pass the stored list through verbatim (the
+        // lib validates); undefined -> lib seed, same as the browser.
+        closedWeeks: Array.isArray(d.closedWeeks) ? d.closedWeeks : undefined,
         scheduleMode: (d.scheduleMode === "slots") ? "slots" : "weekly",
         publishToken: (typeof d.publishToken === "string") ? d.publishToken : null,
         lastPublishedAt: (typeof d.lastPublishedAt === "string") ? d.lastPublishedAt : null,
@@ -343,6 +346,7 @@ exports.handler = async (event) => {
     // v8: pass the ceiling only when set; the lib defaults to 8 otherwise,
     // exactly as the browser does, so both sides apply one rule.
     maxCoverWeeks: (typeof settings.maxCoverWeeks === "number" && settings.maxCoverWeeks > 0) ? settings.maxCoverWeeks : undefined,
+    closedWeeks: settings.closedWeeks,   // v10: same list the browser reads
     scheduleMode: settings.scheduleMode || "weekly",
     today,
     parseDateLocal,
@@ -395,6 +399,7 @@ exports.handler = async (event) => {
     bufferWeeks,
     scheduleMode: settings.scheduleMode,
     minWriteBuild: settings.minWriteBuild,
+    closedWeeks: [...sched.closedWeeks.entries()],
   });
 
   const shadowRows = [];
@@ -562,6 +567,7 @@ exports.handler = async (event) => {
       framePns: FRAME_PNS,
       anchorIso: FrameScheduler.SLOT_ANCHOR_ISO,
       todayIso,
+      closedWeeks: [...sched.closedWeeks.entries()].map(([weekIso, workdays]) => ({ weekIso, workdays })),
       determinism: determinismLine,
       perFrameInputs,
       weeklyPins,

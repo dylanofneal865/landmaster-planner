@@ -201,6 +201,12 @@ const FRAMESCHED_STATE = {
   _autoPublishDirty: false,
   _lastRenderKey: null,
   _lastPublishedKey: null,
+  // v10 { iso: { pn: qty } } for every rendered column from the most
+  // recent render. Compared (inside the lock window only) against
+  // settings.lastPublishedQty to gate auto-publish and to list the
+  // changed weeks in the Publish confirm.
+  _lastWindowMap: null,
+  _autoPublishHeldKey: null,
   // v5.1 Supplier snapshot now embeds the FULL Frame Schedule tab,
   // read-only. The build path fetches css/styles.css once and
   // inlines it into every published document so the supplier page
@@ -323,6 +329,7 @@ function _fsSchedFor() {
     weekDataByIso: map,
     bufferWeeks: _fsSettingsBufferWeeks(),
     maxCoverWeeks: _fsSettingsMaxCoverWeeks(),   // v8 ceiling; the server passes the same value
+    closedWeeks: _fsSettingsClosedWeeks(),       // v10 Mor-Ryde closed weeks; undefined -> lib seed
     scheduleMode: _fsSettingsScheduleMode(),
     today: t,
     parseDateLocal: (typeof parseDateLocal === "function") ? parseDateLocal : undefined,
@@ -587,6 +594,29 @@ function _fsSettingsMaxCoverWeeks() {
   }
   return _FS_MAX_COVER_WEEKS_DEFAULT;
 }
+// v10 MOR-RYDE CLOSED WEEKS -- [{ weekIso, workdays }] from the
+// __settings__ row. Returns the stored array when the row has one
+// (even empty), else undefined so the shared scheduler applies its
+// seed list (FrameScheduler.FS_CLOSED_WEEKS_DEFAULT) -- the compute
+// function reads the same field, so both sides agree.
+function _fsSettingsClosedWeeks() {
+  const s = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
+  return (s && Array.isArray(s.closedWeeks)) ? s.closedWeeks : undefined;
+}
+function _fsWorkdaysFor(iso) {
+  try { return _fsSchedFor().workdaysFor(iso); } catch (_) { return FS_WORKDAYS_PER_WEEK; }
+}
+
+// v10 Last Monday inside the lock window: current Monday +
+// LOCK_HORIZON_DAYS. Weeks with iso <= this are locked.
+function _fsLockHorizonEndIso() {
+  const cur = _fsColumns()[0];
+  const end = (typeof addDays === "function")
+    ? addDays(cur.date, LOCK_HORIZON_DAYS)
+    : new Date(cur.date.getTime() + LOCK_HORIZON_DAYS * 86400000);
+  return _fsIsoMonday(end);
+}
+
 function _fsSettingsBufferWeeks() {
   const s = (DB && DB.frameSchedule && DB.frameSchedule.settings) || null;
   const raw = s ? s.bufferWeeks : null;
@@ -1364,19 +1394,24 @@ function _fsCommitWeek(iso, payload) {
   // The cloud writer applies the same preservation semantics —
   // send only the fields the caller populated so the write is
   // minimal + non-destructive.
+  // v10 Send ONLY the fields the caller populated. The write
+  // function preserves qty / slot / onHandAtClose / qtyOverride
+  // from the DB row when a key is absent, so a stale mirror can no
+  // longer ride its old qty or slot into the row on the back of an
+  // on-hand snapshot.
   const outPayload = {};
   if ("qty" in payload) outPayload.qty = payload.qty;
-  else outPayload.qty = cur.qty || {};
   if ("slot" in payload) outPayload.slot = payload.slot;
-  else if (cur.slot) outPayload.slot = cur.slot;
   if ("onHandAtClose" in payload) outPayload.onHandAtClose = payload.onHandAtClose;
-  else if (cur.onHandAtClose) outPayload.onHandAtClose = cur.onHandAtClose;
   if ("qtyOverride" in payload) outPayload.qtyOverride = payload.qtyOverride;
-  else if (cur.qtyOverride) outPayload.qtyOverride = cur.qtyOverride;
   // v7.10 Forward the allowManualSlotChange flag to the cloud
   // writer's own belt-and-suspenders guard so a manual-over-
   // manual write survives the second gate too.
   if (payload.allowManualSlotChange === true) outPayload.allowManualSlotChange = true;
+  // v10 operatorEdit: ONLY operator actions (pin, unpin, qty
+  // override, slot override) set this; it is what lets a write
+  // change slot or qty on a week inside the lock window.
+  if (payload.operatorEdit === true) outPayload.operatorEdit = true;
   _fsDebouncedWriteWeek(iso, outPayload);
   return { ok: true };
 }
@@ -1430,16 +1465,15 @@ function _fsCommitWeekBatch(writes) {
     });
     // Build the outbound payload (same preserve-on-omit rules
     // as the per-iso path).
+    // v10 Only the fields the caller populated (server preserves
+    // the rest from the DB row) -- see _fsCommitWeek.
     const out = {};
     if ("qty" in payload) out.qty = payload.qty;
-    else out.qty = cur.qty || {};
     if ("slot" in payload) out.slot = payload.slot;
-    else if (cur.slot) out.slot = cur.slot;
     if ("onHandAtClose" in payload) out.onHandAtClose = payload.onHandAtClose;
-    else if (cur.onHandAtClose) out.onHandAtClose = cur.onHandAtClose;
     if ("qtyOverride" in payload) out.qtyOverride = payload.qtyOverride;
-    else if (cur.qtyOverride) out.qtyOverride = cur.qtyOverride;
     if (payload.allowManualSlotChange === true) out.allowManualSlotChange = true;
+    if (payload.operatorEdit === true) out.operatorEdit = true;
     toSend.push({ iso, payload: out });
   }
   if (toSend.length === 0) {
@@ -1719,20 +1753,67 @@ function _fsPersistLockedCrossings(slots, cols, scheduledRuns, rows, globalCaps,
   }
 
   // v7.11 Flush the whole persister pass in one HTTP call.
+  // v10 ... after re-fetching frame_schedule; only weeks that are
+  // still empty in the fresh read are written.
   if (_fsPersistLockedCrossings_batchPending.length > 0) {
     const batch = _fsPersistLockedCrossings_batchPending;
     _fsPersistLockedCrossings_batchPending = [];
-    _fsCommitWeekBatch(batch).then(res => {
-      if (res && res.results && res.results.length > 0) {
-        const skippedIsos = res.results.filter(r => r.skipped).map(r => r.iso);
-        if (skippedIsos.length > 0) {
-          console.log(`[frame-schedule] slot-crossings persister: ${skippedIsos.length} week(s) skipped as manual pins:`, skippedIsos);
-        }
-      }
-    });
+    _fsFlushPersistBatch(batch, "slot-crossings persister");
   }
 }
 let _fsPersistLockedCrossings_batchPending = [];
+
+// v10 Shared flush for both persisters. Re-fetches frame_schedule
+// IMMEDIATELY before writing (so an open tab's stale mirror can't
+// refill weeks another tab or the DB already hold), drops every
+// queued write whose week is no longer empty in the fresh read,
+// then commits the rest in one batch. Never carries operatorEdit.
+//   * a slot write is dropped when the fresh row already has a frame
+//   * a qty-only backfill is dropped when the fresh row already has
+//     a qty map
+//   * onHandAtClose-only writes always go through
+// If the refetch changed the mirror, the tab redraws so the screen
+// shows the database's numbers.
+async function _fsFlushPersistBatch(batch, label) {
+  let changed = false;
+  if (typeof refetchFrameScheduleCloud === "function") {
+    try {
+      const r = await refetchFrameScheduleCloud({ silent: true });
+      changed = !!(r && r.changed);
+    } catch (err) {
+      console.warn(`[frame-schedule] ${label}: refetch before write failed`, err);
+    }
+  }
+  const kept = [];
+  const dropped = [];
+  for (const w of batch) {
+    if (!w || typeof w.iso !== "string") continue;
+    const p = w.payload || {};
+    const wk = _fsWeekData(w.iso);
+    const hasSlot = Object.prototype.hasOwnProperty.call(p, "slot") && !!p.slot;
+    const hasQty = Object.prototype.hasOwnProperty.call(p, "qty");
+    if (hasSlot && wk.slot && wk.slot.pn) { dropped.push(w.iso); continue; }
+    if (!hasSlot && hasQty && wk.qty && Object.keys(wk.qty).length > 0) { dropped.push(w.iso); continue; }
+    kept.push(w);
+  }
+  if (dropped.length > 0) {
+    console.log(`[frame-schedule] ${label}: ${dropped.length} week(s) already filled in the database -- not rewritten:`, dropped);
+  }
+  if (kept.length > 0) {
+    try {
+      const res = await _fsCommitWeekBatch(kept);
+      if (res && res.results && res.results.length > 0) {
+        const skippedIsos = res.results.filter(r => r.skipped).map(r => `${r.iso} (${r.reason || "server"})`);
+        if (skippedIsos.length > 0) {
+          console.log(`[frame-schedule] ${label}: ${skippedIsos.length} week(s) skipped by the server:`, skippedIsos);
+        }
+      }
+    } catch (err) {
+      console.warn(`[frame-schedule] ${label}: batch write failed`, err);
+    }
+  }
+  if (changed && typeof refresh === "function") refresh();
+}
 
 // v7.1 WEEKLY MODE near-term auto-persist. Mirrors the slot-mode
 // _fsPersistLockedCrossings guards: skip when the sim is
@@ -1908,17 +1989,11 @@ function _fsPersistWeeklyNearTerm(rows, cols, scheduledRuns, globalCaps, visible
   // (DB says the row is manually pinned) come back as
   // { skipped:true }; log them and continue -- a stale mirror
   // can no longer overwrite the DB's manual pins.
+  // v10 Re-fetch first; only still-empty weeks are written.
   if (_fsPersistWeeklyNearTerm_batchPending.length > 0) {
     const batch = _fsPersistWeeklyNearTerm_batchPending;
     _fsPersistWeeklyNearTerm_batchPending = [];
-    _fsCommitWeekBatch(batch).then(res => {
-      if (res && res.results && res.results.length > 0) {
-        const skippedIsos = res.results.filter(r => r.skipped).map(r => r.iso);
-        if (skippedIsos.length > 0) {
-          console.log(`[frame-schedule] weekly persister: ${skippedIsos.length} week(s) skipped as manual pins:`, skippedIsos);
-        }
-      }
-    });
+    _fsFlushPersistBatch(batch, "weekly persister");
   }
 }
 let _fsPersistWeeklyNearTerm_batchPending = [];
@@ -2578,9 +2653,14 @@ function renderFrameSchedule() {
   </tr>`;
 
   // ---- Week header (M/D + ISO title) ----
-  const headMD = cols.map(c =>
-    `<th class="right${c.past ? " dim" : ""}${c.current ? " bold" : ""}" title="${esc(c.iso)}">${esc(c.md)}</th>`
-  ).join("");
+  const headMD = cols.map(c => {
+    // v10 Mor-Ryde closed / short week marker.
+    const wd = _fsWorkdaysFor(c.iso);
+    const closedTag = (wd < FS_WORKDAYS_PER_WEEK)
+      ? `<div class="tiny crit" title="Mor-Ryde ${wd === 0 ? "closed" : wd + " workdays"} this week -- caps scaled by ${wd}/${FS_WORKDAYS_PER_WEEK}">${wd === 0 ? "CLOSED" : wd + "-DAY"}</div>`
+      : "";
+    return `<th class="right${c.past ? " dim" : ""}${c.current ? " bold" : ""}" title="${esc(c.iso)}">${esc(c.md)}${closedTag}</th>`;
+  }).join("");
 
   // ---- Frame rows (computed, read-only) ----
   //
@@ -3880,6 +3960,7 @@ function renderFrameSchedule() {
   // the try/catch above so a publish glitch never blocks the
   // planner render.
   FRAMESCHED_STATE._lastRenderKey = _fsGridKey(rows, renderCols, scheduledRuns);
+  FRAMESCHED_STATE._lastWindowMap = _fsWindowQtyMap(rows, renderCols, scheduledRuns);
   _fsAutoPublish();
 }
 
@@ -4779,7 +4860,7 @@ function _fsHandleQtyOverride(pn, iso, evt) {
   if (!clearing) nextMap[pn] = newVal;
   const payloadOverride = Object.keys(nextMap).length > 0 ? nextMap : null;
 
-  _fsCommitWeek(iso, { qtyOverride: payloadOverride });
+  _fsCommitWeek(iso, { qtyOverride: payloadOverride, operatorEdit: true });
   if (typeof logAudit === "function") {
     const desc = clearing
       ? `Frame schedule override cleared: ${pn} · ${iso}` + (hadOverride ? ` (was ${curOv})` : "")
@@ -4948,7 +5029,7 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
     }
     // v7.10 Sanctioned unpin -- carries the manual-slot override
     // flag so the write-layer guard lets it through.
-    _fsCommitWeek(iso, { slot: null, allowManualSlotChange: true });
+    _fsCommitWeek(iso, { slot: null, allowManualSlotChange: true, operatorEdit: true });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       logAudit("frame-sched-weekly-pin",
@@ -4992,7 +5073,7 @@ function _fsHandleWeeklyPin(iso, pn, qty, pn2, qty2, evt) {
     // v8 ONE SOURCE OF TRUTH: descriptor AND map in the same payload,
     // the map derived from what was just typed. Writing the descriptor
     // alone here is how the two drifted apart for months.
-    _fsCommitWeek(iso, { slot: slotDesc, qty: _fsMapFromDescriptor(slotDesc), allowManualSlotChange: true });
+    _fsCommitWeek(iso, { slot: slotDesc, qty: _fsMapFromDescriptor(slotDesc), allowManualSlotChange: true, operatorEdit: true });
     FRAMESCHED_STATE._autoPersistedWeeklyIsos.delete(iso);
     if (typeof logAudit === "function") {
       const desc = slotDesc.pn2
@@ -5040,8 +5121,12 @@ function _fsHandleReplanHorizon() {
   if (typeof gateEdit === "function" && !gateEdit()) return;
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) return;
 
+  // v10 Only weeks BEYOND the lock window are released. The current
+  // week + 42 days are frozen; nothing automatic (Replan included)
+  // changes them.
+  const horizonEndIso = _fsLockHorizonEndIso();
   if (typeof window !== "undefined" && typeof window.confirm === "function") {
-    const msg = "Release all auto-planned weeks (weekly-auto AND legacy 2-week auto slots) and replan from current data? Manually pinned weeks, seed runs, and manual qty overrides are kept.";
+    const msg = `Release auto-planned weeks BEYOND the 6-week lock window (weeks starting after ${_fsMdFromIso(horizonEndIso)}) and replan them from current data? Every week inside the lock window (through ${_fsMdFromIso(horizonEndIso)}), manually pinned weeks, seed runs, and manual qty overrides are kept.`;
     if (!window.confirm(msg)) return;
   }
 
@@ -5051,6 +5136,7 @@ function _fsHandleReplanHorizon() {
   const releasedLegacyAuto = [];
   for (const [iso, wk] of DB.frameSchedule.weeks.entries()) {
     if (iso === "__settings__") continue;
+    if (iso <= horizonEndIso) continue;                           // v10 inside the lock window: frozen
     const s = wk && wk.slot;
     if (!s || !s.pn) continue;
     if (s.source === "manual" || s.source === "seed") continue;   // preserve
@@ -5085,8 +5171,9 @@ function _fsHandleReplanHorizon() {
 
   if (typeof logAudit === "function") {
     logAudit("frame-sched-replan-horizon",
-      `Frame schedule replan: released ${releasedWeeklyAuto.length} weekly-auto + ${releasedLegacyAuto.length} legacy-auto week${targets.length === 1 ? "" : "s"}`,
+      `Frame schedule replan: released ${releasedWeeklyAuto.length} weekly-auto + ${releasedLegacyAuto.length} legacy-auto week${targets.length === 1 ? "" : "s"} beyond ${horizonEndIso}`,
       {
+        lockHorizonEndIso: horizonEndIso,
         releasedCount: targets.length,
         weeklyAutoCount: releasedWeeklyAuto.length,
         legacyAutoCount: releasedLegacyAuto.length,
@@ -5145,7 +5232,7 @@ function _fsHandleSlotOverride(startIso, pn, pn2) {
     if (slot) {
       for (const wkIso of slot.weekIsos) {
         if (!cols.some(c => c.iso === wkIso)) continue;
-        _fsCommitWeek(wkIso, { qty: {} });
+        _fsCommitWeek(wkIso, { qty: {}, operatorEdit: true });
       }
     }
     FRAMESCHED_STATE._autoPersistedSlots.delete(startIso);
@@ -5209,6 +5296,7 @@ function _fsHandleSlotOverride(startIso, pn, pn2) {
       // so a manual split's second week persists on pn2 without
       // any extra plumbing here.
       const payload = _fsBuildWeekPayload(wkIso, scheduledRuns, slot, isStart);
+      payload.operatorEdit = true;   // v10 operator action
       _fsCommitWeek(wkIso, payload);
     }
   }
@@ -6278,6 +6366,69 @@ function _fsGridKey(rows, cols, scheduledRuns) {
 //      and refresh the "Last published" stamp WITHOUT a toast.
 //      Auto-publish is background work; the operator shouldn't
 //      get a popup every few seconds.
+// v10 PUBLISH BASELINE. { iso: { pn: qty } } for every rendered
+// column (12 weeks) from scheduledRuns. Stored in
+// __settings__.data.lastPublishedQty on every successful publish
+// (manual or auto) so a later comparison is against what Mor-Ryde
+// actually saw, in any tab. Storing all rendered weeks (not just
+// the window) means a week that rolls INTO the window next Monday
+// already has a published value to compare against.
+function _fsWindowQtyMap(rows, cols, scheduledRuns) {
+  const map = {};
+  if (!Array.isArray(rows) || !Array.isArray(cols) || !scheduledRuns) return map;
+  for (const c of cols) {
+    if (c.past) continue;
+    const m = {};
+    for (const r of rows) {
+      let q = 0;
+      for (const rn of (scheduledRuns.get(r.pn) || [])) if (rn.weekIso === c.iso) q += Number(rn.qty) || 0;
+      if (q > 0) m[r.pn] = Math.round(q);
+    }
+    map[c.iso] = m;
+  }
+  return map;
+}
+// Weeks INSIDE the lock window whose frame set or quantities differ
+// between the published baseline and the current render. Weeks the
+// baseline never saw (legacy row / beyond its range) are skipped.
+function _fsWindowDiff(prevMap, curMap) {
+  const out = [];
+  if (!prevMap || !curMap) return out;
+  const curIso = _fsColumns()[0].iso;
+  const endIso = _fsLockHorizonEndIso();
+  for (const iso of Object.keys(curMap).sort()) {
+    if (iso < curIso || iso > endIso) continue;
+    if (!Object.prototype.hasOwnProperty.call(prevMap, iso)) continue;
+    const before = prevMap[iso] || {};
+    const after = curMap[iso] || {};
+    if (_fsQtyMapKey(before) !== _fsQtyMapKey(after)) out.push({ iso, before, after });
+  }
+  return out;
+}
+function _fsFmtQtyMap(m) {
+  const keys = Object.keys(m || {}).sort();
+  if (keys.length === 0) return "idle";
+  return keys.map(pn => `${(typeof FRAME_SHORT === "object" && FRAME_SHORT && FRAME_SHORT[pn]) || pn} ${m[pn]}`).join(" + ");
+}
+// true when nothing inside the lock window differs from the last
+// publish. With no baseline yet (first publish after this deploy)
+// it is false: only a manual Publish may send.
+function _fsWindowUnchangedSincePublish() {
+  const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
+  const pub = s && s.lastPublishedQty;
+  const cur = FRAMESCHED_STATE._lastWindowMap;
+  if (!pub || !cur) return false;
+  return _fsWindowDiff(pub, cur).length === 0;
+}
+function _fsAutoPublishHeld() {
+  const key = FRAMESCHED_STATE._lastRenderKey;
+  if (FRAMESCHED_STATE._autoPublishHeldKey === key) return;
+  FRAMESCHED_STATE._autoPublishHeldKey = key;
+  const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
+  const why = (s && s.lastPublishedQty) ? "a week inside the 6-week lock window differs from the last publish" : "no publish baseline yet";
+  console.log(`[frame-schedule] auto-publish held: ${why} -- click Publish for supplier to send it to Mor-Ryde`);
+}
+
 function _fsAutoPublish() {
   const s = DB && DB.frameSchedule && DB.frameSchedule.settings;
   const token = s && typeof s.publishToken === "string" && _FS_TOKEN_RE.test(s.publishToken)
@@ -6285,6 +6436,10 @@ function _fsAutoPublish() {
     : null;
   if (!token) return;
   if (FRAMESCHED_STATE._lastRenderKey === FRAMESCHED_STATE._lastPublishedKey) return;
+  // v10 Never auto-publish a change inside the lock window; those
+  // reach Mor-Ryde only through the Publish button. Beyond-window
+  // changes still auto-publish.
+  if (!_fsWindowUnchangedSincePublish()) { _fsAutoPublishHeld(); return; }
 
   // Debounce -- reset the timer on every call so a rapid edit
   // stream doesn't fire N POSTs.
@@ -6313,6 +6468,10 @@ async function _fsAutoPublishFire() {
 
   const targetKey = FRAMESCHED_STATE._lastRenderKey;
   if (targetKey === FRAMESCHED_STATE._lastPublishedKey) return;
+  // v10 Re-check at fire time (the debounce may have outlived a
+  // render that changed the window).
+  if (!_fsWindowUnchangedSincePublish()) { _fsAutoPublishHeld(); return; }
+  const targetWindowMap = FRAMESCHED_STATE._lastWindowMap;
 
   if (FRAMESCHED_STATE._autoPublishInFlight) {
     // A POST (or its build) is currently running. Mark that a
@@ -6370,6 +6529,7 @@ async function _fsAutoPublishFire() {
       lastPublishedAt,
     };
     if (typeof bw === "number") arg.bufferWeeks = bw;
+    if (targetWindowMap) arg.lastPublishedQty = targetWindowMap;   // v10 baseline follows what was sent
     setFrameScheduleSettingsCloud(arg).then(r => {
       if (!r || !r.ok) {
         console.warn("[frame-schedule] auto-publish failed to persist lastPublishedAt", r && r.error);
@@ -6657,6 +6817,24 @@ async function _fsPublishSupplier(evt) {
     mintedNew = true;
   }
 
+  // v10 PUBLISH CHECK. Compare the lock window against what Mor-Ryde
+  // last saw and list every changed week before sending. No changes
+  // inside the window = no extra step. No baseline yet (first
+  // publish after this deploy) = no extra step either.
+  const curWindowMap = FRAMESCHED_STATE._lastWindowMap || null;
+  const pubWindowMap = (settings && settings.lastPublishedQty) || null;
+  if (curWindowMap && pubWindowMap) {
+    const diff = _fsWindowDiff(pubWindowMap, curWindowMap);
+    if (diff.length > 0 && typeof window !== "undefined" && typeof window.confirm === "function") {
+      const lines = diff.map(d => `  ${_fsMdFromIso(d.iso)}:  ${_fsFmtQtyMap(d.before)}  ->  ${_fsFmtQtyMap(d.after)}`);
+      const msg = `${diff.length} week${diff.length === 1 ? "" : "s"} inside the 6-week lock window changed since the last publish:\n\n${lines.join("\n")}\n\nPublish these changes to Mor-Ryde?`;
+      if (!window.confirm(msg)) {
+        setStatus("Publish cancelled.", null);
+        return;
+      }
+    }
+  }
+
   if (btn) { btn.disabled = true; }
   setStatus("Publishing...", null);
 
@@ -6703,6 +6881,7 @@ async function _fsPublishSupplier(evt) {
     };
     if (mintedNew) arg.publishToken = token;
     if (typeof bw === "number") arg.bufferWeeks = bw;
+    if (curWindowMap) arg.lastPublishedQty = curWindowMap;   // v10 per-week baseline of what was sent
     setFrameScheduleSettingsCloud(arg).then(r => {
       if (!r || !r.ok) {
         console.warn("[frame-schedule] failed to persist publish settings", r && r.error);

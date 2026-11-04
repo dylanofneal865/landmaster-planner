@@ -44,7 +44,7 @@ const DAY_MS = 86400000;
 // scheduler-model swaps, guard adjustments) so any tab still
 // running yesterday's code goes read-only the moment a fresh
 // tab bumps the settings row.
-const APP_BUILD = 1789171200;   // 2026-09-08 04:00:00 UTC
+const APP_BUILD = 1793750400;   // 2026-11-04 00:00:00 UTC -- v10 lock-horizon guard; frame-schedule-write enforces this as a hard floor
 
 // v7.12 Frame-schedule edit token, sent on every call to the
 // frame-schedule-write / frame-schedule-publish Netlify functions

@@ -85,6 +85,7 @@ const _lastRemoteApplyAt = {
   audit:          new Map(),
   usage:          new Map(),
   supplier_contacts: new Map(),
+  frame_schedule: new Map(),
 };
 
 // ── Broadcast listener state (Phase 2 broadcast migration, Step 2) ────
@@ -144,6 +145,7 @@ const _lastSeenAt = {
   audit:          null,   // uses created_at (append-only)
   usage:          null,   // uses created_at (append-only)
   supplier_contacts: null,
+  frame_schedule: null,   // v10: broadcast delta so open tabs see pins / replans live
 };
 
 // Wait for the main app to finish booting (DB must exist with parts)
@@ -266,6 +268,7 @@ async function _fetchDeletedPartsSince(sinceIso) { return _fetchSince("deleted_p
 async function _fetchAuditSince(sinceIso)        { return _fetchSince("audit",         "id, data",     "created_at", sinceIso); }
 async function _fetchUsageSince(sinceIso)        { return _fetchSince("usage",         "id, data",     "created_at", sinceIso); }
 async function _fetchSupplierContactsSince(sinceIso) { return _fetchSince("supplier_contacts", "id, data", "updated_at", sinceIso); }
+async function _fetchFrameScheduleSince(sinceIso)    { return _fetchSince("frame_schedule", "fg_sku, data", "updated_at", sinceIso); }
 
 // ── Boot cursor seeder (Phase 2, Step 1) ────────────────────────────
 // One-shot: 8 parallel top-1-desc queries to capture the current max
@@ -364,6 +367,7 @@ async function _seedLastSeenCursors() {
       ["audit",         "created_at"],
       ["usage",         "created_at"],
       ["supplier_contacts", "updated_at"],
+      ["frame_schedule", "updated_at"],
     ];
     // allSettled instead of all — even if a per-table callback
     // somehow rejects (it shouldn't, since each has its own try/
@@ -1003,144 +1007,236 @@ async function _fetchAllFrameSchedule() {
 // only reassigned on shape mismatch. Mirrors
 // _populateBuildPlanTargetsFromRows exactly so any UI consumer holding
 // a reference to DB.frameSchedule stays valid across reloads.
+//
+// v10: a null / non-array argument (fetch failed) LEAVES THE EXISTING
+// MIRROR ALONE and does not flip `loaded` -- previously it wiped the
+// map and still marked it loaded, which let a persister see "every
+// week empty" and refill the lock window. Returns true when the
+// row set differs from the last one applied (signature compare), so
+// callers can decide whether a redraw is warranted.
+let _fsRowsSig = null;
+// v10 server-reported build floor (from a 409). Folded into the
+// mirror's minWriteBuild on every settings apply so the banner
+// can't flap back off when the DB row carries a lower value.
+let _fsServerMinBuild = 0;
+let _fsWritesInFlight = 0;      // frame-schedule-write POSTs currently running
+let _fsLastLocalWriteAt = 0;    // ms clock of the last POST start/end
+function _frameScheduleRowsSig(rows) {
+  try {
+    // onHandAtClose (rewritten by every render of every tab) and
+    // updated_at are excluded: only qty / slot / qtyOverride /
+    // settings changes count as "changed" for redraw purposes.
+    const strip = d => {
+      if (!d || typeof d !== "object") return d;
+      const c = Object.assign({}, d);
+      delete c.onHandAtClose;
+      return c;
+    };
+    return JSON.stringify(
+      rows.map(r => [String(r && r.fg_sku), strip(r && r.data)])
+          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    );
+  } catch (_) { return null; }
+}
 function _populateFrameScheduleFromRows(rows) {
+  if (!Array.isArray(rows)) {
+    console.warn("[cloud] frame_schedule: fetch returned no rows -- keeping the existing mirror");
+    return false;
+  }
   if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
     DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
   }
+  const sig = _frameScheduleRowsSig(rows);
+  const changed = sig !== _fsRowsSig;
+  _fsRowsSig = sig;
   DB.frameSchedule.settings = null;
   DB.frameSchedule.weeks.clear();
-  if (!Array.isArray(rows)) { DB.frameSchedule.loaded = true; return; }
-  for (const row of rows) {
-    if (!row || !row.fg_sku) continue;
-    const key = String(row.fg_sku);
-    const d = row.data || {};
-    if (key === "__settings__") {
-      // v2.1 global caps sentinel. Row's `data.caps` carries the
-      // whole-tab CREW/HD and STD per-week caps.
-      // v4.1: `data.bufferWeeks` (float, min-cover-in-weeks
-      // safety buffer) lifted alongside the caps. Legacy
-      // `data.buffer` (integer units) is intentionally IGNORED —
-      // the units-based term was superseded by the weeks-based
-      // formulation before it saw production use.
-      const bw = Number(d.bufferWeeks);
-      // v5 publishToken: lifted so the supplier-snapshot Publish
-      // button reuses the same URL across republishes. Shape:
-      // 24..128 URL-safe chars ("fs-<uuid>" from the client mint).
-      // Absent on legacy rows → null → client mints on first click.
-      const rawTok = d && d.publishToken;
-      const publishToken = (typeof rawTok === "string" && /^[A-Za-z0-9._-]{24,128}$/.test(rawTok))
-        ? rawTok : null;
-      // v5 lastPublishedAt: ISO timestamp of the most recent
-      // successful publish. Rendered next to the URL in the
-      // client's status area so the operator always knows how
-      // fresh the supplier's copy is. Null on legacy rows /
-      // before the first publish.
-      const rawLp = d && d.lastPublishedAt;
-      const lastPublishedAt = (typeof rawLp === "string" && rawLp.length > 0) ? rawLp : null;
-      // v7 scheduleMode: "weekly" or "slots". Default "weekly"
-      // per the v7 cover-driven scheduler ticket; legacy rows
-      // without the field also land on "weekly".
-      const rawSm = d && d.scheduleMode;
-      const scheduleMode = (rawSm === "slots") ? "slots" : "weekly";
-      // v7.6 minWriteBuild: highest APP_BUILD any client has
-      // ever pushed. Any newer settings writer raises this to
-      // its own APP_BUILD; clients running an older APP_BUILD
-      // refuse to write and show the write-blocked banner.
-      const rawMwb = d && d.minWriteBuild;
-      const minWriteBuild = (typeof rawMwb === "number" && Number.isFinite(rawMwb) && rawMwb >= 0)
-        ? Math.floor(rawMwb) : 0;
-      DB.frameSchedule.settings = {
-        caps: {
-          crewhd: Number(d.caps && d.caps.crewhd) || 0,
-          std:    Number(d.caps && d.caps.std)    || 0,
-        },
-        bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
-        publishToken,
-        lastPublishedAt,
-        scheduleMode,
-        minWriteBuild,
-        updatedAt: row.updated_at || null,
-      };
-      // v7.6 Fire the banner (defined in js/25) when hydration
-      // arrives on a stale tab. Also runs on every realtime /
-      // poll refresh -- the banner helper is idempotent so a
-      // repeated call is cheap.
-      if (typeof window !== "undefined"
-          && typeof window._fsCheckWriteBlockedAndBanner === "function") {
-        try { window._fsCheckWriteBlockedAndBanner(); } catch (_) { /* never fatal */ }
-      }
-      continue;
-    }
-    // Regular per-week row. v2 added `slot: {pn, locked, source}`
-    // on the slot-START week. v2.0 rows still had per-week `caps`
-    // on `data` — we IGNORE that field now that caps are global
-    // (the settings sentinel above owns them). Old rows continue
-    // to be readable; their stale caps are silently dropped.
-    const slot = (d.slot && typeof d.slot === "object" && d.slot.pn)
-      ? {
-          pn: String(d.slot.pn),
-          // v3.3: optional pn2 for 1-week split runs. Absent =
-          // whole-run slot (both weeks are pn). Old rows without
-          // pn2 continue to read as whole runs.
-          pn2: (typeof d.slot.pn2 === "string" && d.slot.pn2) ? d.slot.pn2 : null,
-          locked: !!d.slot.locked,
-          // v7.1 source accepts "weekly-auto" alongside the
-          // legacy set. Anything else falls back to "auto"
-          // so unknown values from a future writer read safely.
-          source: (d.slot.source === "manual" || d.slot.source === "seed" || d.slot.source === "weekly-auto")
-                    ? d.slot.source : "auto",
-          // v7.1 mode: "weekly" marks a single-week pin from the
-          // weekly-cover scheduler (persisted per-week, not
-          // spread across a 2-week slot). Absent / anything else
-          // reads as the legacy 2-week slot mode.
-          mode: d.slot.mode === "weekly" ? "weekly" : null,
-          // v7.2 qty / qty2: optional explicit build quantities
-          // for the weekly-mode scheduler's mix candidates.
-          // Non-negative integers only; drop anything else.
-          // Absent on legacy rows (and on legacy slot mode)
-          // signals the sim should compute qty via its own
-          // demand + catchup math (v7.0 pin behavior).
-          qty:  (typeof d.slot.qty  === "number" && d.slot.qty  >= 0 && Number.isFinite(d.slot.qty))  ? Math.floor(d.slot.qty)  : null,
-          qty2: (typeof d.slot.qty2 === "number" && d.slot.qty2 >= 0 && Number.isFinite(d.slot.qty2)) ? Math.floor(d.slot.qty2) : null,
-        }
-      : null;
-    // v4.1: onHandAtClose = {pn: units, ...} snapshot of each
-    // frame's on-hand at week close. Lifted here so the client
-    // can compute "actual /wk" burn = prevOnHand + received −
-    // thisOnHand across consecutive snapshots. Missing = no
-    // snapshot yet for that week.
-    let onHandAtClose = null;
-    if (d.onHandAtClose && typeof d.onHandAtClose === "object") {
-      onHandAtClose = {};
-      for (const [k, v] of Object.entries(d.onHandAtClose)) {
-        const n = Number(v);
-        if (Number.isFinite(n)) onHandAtClose[k] = n;
-      }
-    }
-    // v5.5 qtyOverride = {pn: units} manual per-cell qty
-    // constraints. Non-negative integers only; empties dropped.
-    // Read here so the sim (which honors overrides as hard
-    // constraints) sees them on the next render. Absent /
-    // legacy rows read as null.
-    let qtyOverride = null;
-    if (d.qtyOverride && typeof d.qtyOverride === "object") {
-      qtyOverride = {};
-      for (const [k, v] of Object.entries(d.qtyOverride)) {
-        const n = Math.floor(Number(v));
-        if (Number.isFinite(n) && n >= 0) qtyOverride[k] = n;
-      }
-      if (Object.keys(qtyOverride).length === 0) qtyOverride = null;
-    }
-    DB.frameSchedule.weeks.set(key, {
-      qty: (d.qty && typeof d.qty === "object") ? d.qty : {},
-      slot,
-      onHandAtClose,
-      qtyOverride,
-      updatedAt: row.updated_at || null,
-    });
-  }
+  for (const row of rows) _frameScheduleApplyRow(row);
   DB.frameSchedule.loaded = true;
+  return changed;
 }
+
+// Apply ONE frame_schedule row (settings sentinel or a week) into the
+// mirror. Shared by the full populate above, the broadcast delta
+// handler, and the poll.
+function _frameScheduleApplyRow(row) {
+  if (!row || !row.fg_sku) return;
+  const key = String(row.fg_sku);
+  const d = row.data || {};
+  if (key === "__settings__") {
+    // v2.1 global caps sentinel. Row's `data.caps` carries the
+    // whole-tab CREW/HD and STD per-week caps.
+    // v4.1: `data.bufferWeeks` (float, min-cover-in-weeks
+    // safety buffer) lifted alongside the caps. Legacy
+    // `data.buffer` (integer units) is intentionally IGNORED —
+    // the units-based term was superseded by the weeks-based
+    // formulation before it saw production use.
+    const bw = Number(d.bufferWeeks);
+    // v5 publishToken: lifted so the supplier-snapshot Publish
+    // button reuses the same URL across republishes. Shape:
+    // 24..128 URL-safe chars ("fs-<uuid>" from the client mint).
+    // Absent on legacy rows → null → client mints on first click.
+    const rawTok = d && d.publishToken;
+    const publishToken = (typeof rawTok === "string" && /^[A-Za-z0-9._-]{24,128}$/.test(rawTok))
+      ? rawTok : null;
+    // v5 lastPublishedAt: ISO timestamp of the most recent
+    // successful publish. Rendered next to the URL in the
+    // client's status area so the operator always knows how
+    // fresh the supplier's copy is. Null on legacy rows /
+    // before the first publish.
+    const rawLp = d && d.lastPublishedAt;
+    const lastPublishedAt = (typeof rawLp === "string" && rawLp.length > 0) ? rawLp : null;
+    // v7 scheduleMode: "weekly" or "slots". Default "weekly"
+    // per the v7 cover-driven scheduler ticket; legacy rows
+    // without the field also land on "weekly".
+    const rawSm = d && d.scheduleMode;
+    const scheduleMode = (rawSm === "slots") ? "slots" : "weekly";
+    // v7.6 minWriteBuild: highest APP_BUILD any client has
+    // ever pushed. Any newer settings writer raises this to
+    // its own APP_BUILD; clients running an older APP_BUILD
+    // refuse to write and show the write-blocked banner.
+    const rawMwb = d && d.minWriteBuild;
+    const minWriteBuild = (typeof rawMwb === "number" && Number.isFinite(rawMwb) && rawMwb >= 0)
+      ? Math.floor(rawMwb) : 0;
+    // v8 maxCoverWeeks -- the ceiling. Same validation as
+    // bufferWeeks (finite, > 0); null when unset so the reader
+    // falls back to its default. (v10: previously never read here,
+    // so browsers showed 8 while the saved value and the server
+    // compute used 6.)
+    const mc = Number(d.maxCoverWeeks);
+    // v10 closedWeeks: [{ weekIso, workdays }] -- kept as the raw
+    // array (the shared scheduler validates); null when the row
+    // has no list so the lib seed applies.
+    const closedWeeks = Array.isArray(d.closedWeeks) ? d.closedWeeks.slice() : null;
+    // v10 lastPublishedQty: { iso: { pn: qty } } of the lock window
+    // as last published to the supplier page.
+    const lastPublishedQty = (d.lastPublishedQty && typeof d.lastPublishedQty === "object" && !Array.isArray(d.lastPublishedQty))
+      ? d.lastPublishedQty : null;
+    DB.frameSchedule.settings = {
+      caps: {
+        crewhd: Number(d.caps && d.caps.crewhd) || 0,
+        std:    Number(d.caps && d.caps.std)    || 0,
+      },
+      bufferWeeks: (Number.isFinite(bw) && bw >= 0) ? bw : null,
+      maxCoverWeeks: (Number.isFinite(mc) && mc > 0) ? mc : null,
+      closedWeeks,
+      lastPublishedQty,
+      publishToken,
+      lastPublishedAt,
+      scheduleMode,
+      minWriteBuild: Math.max(minWriteBuild, _fsServerMinBuild || 0),
+      updatedAt: row.updated_at || null,
+    };
+    // v7.6 Fire the banner (defined in js/25) when hydration
+    // arrives on a stale tab. Also runs on every realtime /
+    // poll refresh -- the banner helper is idempotent so a
+    // repeated call is cheap.
+    if (typeof window !== "undefined"
+        && typeof window._fsCheckWriteBlockedAndBanner === "function") {
+      try { window._fsCheckWriteBlockedAndBanner(); } catch (_) { /* never fatal */ }
+    }
+    return;
+  }
+  // Regular per-week row. v2 added `slot: {pn, locked, source}`
+  // on the slot-START week. v2.0 rows still had per-week `caps`
+  // on `data` — we IGNORE that field now that caps are global
+  // (the settings sentinel above owns them). Old rows continue
+  // to be readable; their stale caps are silently dropped.
+  const slot = (d.slot && typeof d.slot === "object" && d.slot.pn)
+    ? {
+        pn: String(d.slot.pn),
+        // v3.3: optional pn2 for 1-week split runs. Absent =
+        // whole-run slot (both weeks are pn). Old rows without
+        // pn2 continue to read as whole runs.
+        pn2: (typeof d.slot.pn2 === "string" && d.slot.pn2) ? d.slot.pn2 : null,
+        locked: !!d.slot.locked,
+        // v7.1 source accepts "weekly-auto" alongside the
+        // legacy set. Anything else falls back to "auto"
+        // so unknown values from a future writer read safely.
+        source: (d.slot.source === "manual" || d.slot.source === "seed" || d.slot.source === "weekly-auto")
+                  ? d.slot.source : "auto",
+        // v7.1 mode: "weekly" marks a single-week pin from the
+        // weekly-cover scheduler (persisted per-week, not
+        // spread across a 2-week slot). Absent / anything else
+        // reads as the legacy 2-week slot mode.
+        mode: d.slot.mode === "weekly" ? "weekly" : null,
+        // v7.2 qty / qty2: optional explicit build quantities
+        // for the weekly-mode scheduler's mix candidates.
+        // Non-negative integers only; drop anything else.
+        // Absent on legacy rows (and on legacy slot mode)
+        // signals the sim should compute qty via its own
+        // demand + catchup math (v7.0 pin behavior).
+        qty:  (typeof d.slot.qty  === "number" && d.slot.qty  >= 0 && Number.isFinite(d.slot.qty))  ? Math.floor(d.slot.qty)  : null,
+        qty2: (typeof d.slot.qty2 === "number" && d.slot.qty2 >= 0 && Number.isFinite(d.slot.qty2)) ? Math.floor(d.slot.qty2) : null,
+      }
+    : null;
+  // v4.1: onHandAtClose = {pn: units, ...} snapshot of each
+  // frame's on-hand at week close. Lifted here so the client
+  // can compute "actual /wk" burn = prevOnHand + received −
+  // thisOnHand across consecutive snapshots. Missing = no
+  // snapshot yet for that week.
+  let onHandAtClose = null;
+  if (d.onHandAtClose && typeof d.onHandAtClose === "object") {
+    onHandAtClose = {};
+    for (const [k, v] of Object.entries(d.onHandAtClose)) {
+      const n = Number(v);
+      if (Number.isFinite(n)) onHandAtClose[k] = n;
+    }
+  }
+  // v5.5 qtyOverride = {pn: units} manual per-cell qty
+  // constraints. Non-negative integers only; empties dropped.
+  // Read here so the sim (which honors overrides as hard
+  // constraints) sees them on the next render. Absent /
+  // legacy rows read as null.
+  let qtyOverride = null;
+  if (d.qtyOverride && typeof d.qtyOverride === "object") {
+    qtyOverride = {};
+    for (const [k, v] of Object.entries(d.qtyOverride)) {
+      const n = Math.floor(Number(v));
+      if (Number.isFinite(n) && n >= 0) qtyOverride[k] = n;
+    }
+    if (Object.keys(qtyOverride).length === 0) qtyOverride = null;
+  }
+  DB.frameSchedule.weeks.set(key, {
+    qty: (d.qty && typeof d.qty === "object") ? d.qty : {},
+    slot,
+    onHandAtClose,
+    qtyOverride,
+    updatedAt: row.updated_at || null,
+  });
+}
+
+// v10 Re-fetch frame_schedule on demand and apply it (unless a local
+// write is mid-flight, in which case wait briefly; if writes are still
+// in flight after ~2.4 s, leave the mirror alone and report it). Used
+// by both persisters right before they write, and after the server
+// answers a write with reason "lock-horizon" so the screen shows the
+// database's numbers. Returns { ok, changed }. With silent:false a
+// changed mirror also triggers the normal debounced redraw.
+let _fsRefetchInFlight = null;
+async function refetchFrameScheduleCloud(opts) {
+  const o = opts || {};
+  if (_fsRefetchInFlight) return _fsRefetchInFlight;
+  _fsRefetchInFlight = (async () => {
+    try {
+      if (!_supa) return { ok: false, changed: false, reason: "cloud not ready" };
+      for (let attempt = 0; attempt < 3 && _fsWritesInFlight > 0; attempt++) {
+        await new Promise(r => setTimeout(r, 800));
+      }
+      if (_fsWritesInFlight > 0) return { ok: false, changed: false, reason: "writes in flight" };
+      const rows = await _fetchAllFrameSchedule();
+      if (rows === null) return { ok: false, changed: false, reason: "fetch failed" };
+      const changed = _populateFrameScheduleFromRows(rows);
+      if (changed) console.log(`[cloud] frame_schedule refetch: mirror changed (${rows.length} rows)`);
+      if (changed && !o.silent) _applyAndRefresh();
+      return { ok: true, changed, rows: rows.length };
+    } finally {
+      _fsRefetchInFlight = null;
+    }
+  })();
+  return _fsRefetchInFlight;
+}
+if (typeof window !== "undefined") window.refetchFrameScheduleCloud = refetchFrameScheduleCloud;
 
 // Upsert one week (isoMonday key). Optimistic mirror + revert-on-error.
 // Last-write-wins on the (fg_sku) primary key — Frame Schedule is
@@ -1203,6 +1299,19 @@ async function _fsPostFrameScheduleWrite(body) {
   if (!token) {
     console.warn("[frame-schedule cloud] FS_EDIT_TOKEN_CLIENT missing from js/01-config.js -- server will 401");
   }
+  // v10 in-flight bookkeeping so the poll / broadcast / refetch paths
+  // don't overwrite the mirror with a pre-write snapshot while a
+  // write is landing.
+  _fsWritesInFlight++;
+  _fsLastLocalWriteAt = Date.now();
+  try {
+    return await _fsPostFrameScheduleWriteInner(body, token);
+  } finally {
+    _fsWritesInFlight = Math.max(0, _fsWritesInFlight - 1);
+    _fsLastLocalWriteAt = Date.now();
+  }
+}
+async function _fsPostFrameScheduleWriteInner(body, token) {
   let resp;
   try {
     resp = await fetch("/.netlify/functions/frame-schedule-write", {
@@ -1234,10 +1343,21 @@ async function _fsPostFrameScheduleWrite(body) {
     return { ok: false, error: new Error("edit token rejected by server (config mismatch)"), status: 401 };
   }
   if (resp.status === 409) {
+    // v10 The server's floor is authoritative: raise the mirror's
+    // minWriteBuild so _fsWriteBlocked() flips true and the banner
+    // appears even when the __settings__ row still carries an older
+    // value (hard floor in frame-schedule-write.js).
+    const srvMin = Number(json && json.minWriteBuild) || 0;
+    if (srvMin > 0) {
+      _fsServerMinBuild = Math.max(_fsServerMinBuild, srvMin);
+      if (DB && DB.frameSchedule && DB.frameSchedule.settings) {
+        DB.frameSchedule.settings.minWriteBuild = Math.max(Number(DB.frameSchedule.settings.minWriteBuild) || 0, srvMin);
+      }
+    }
     if (typeof window !== "undefined" && typeof window._fsCheckWriteBlockedAndBanner === "function") {
       try { window._fsCheckWriteBlockedAndBanner(); } catch (_) {}
     }
-    console.warn("[frame-schedule cloud] 409 -- app build stale vs DB minWriteBuild=" + (json && json.minWriteBuild));
+    console.warn("[frame-schedule cloud] 409 -- app build stale vs server minWriteBuild=" + (json && json.minWriteBuild));
     return { ok: false, error: new Error("app build stale"), status: 409, minWriteBuild: json && json.minWriteBuild };
   }
   if (!resp.ok) {
@@ -1749,10 +1869,30 @@ async function setFrameScheduleWriteBatch(writes) {
   // Toast the skipped-count so a stale-mirror bulk pass reports
   // "N weeks skipped -- manually pinned elsewhere" instead of
   // failing silently.
-  const skipped = results.filter(r => r && r.skipped).length;
+  const lockSkipped = results.filter(r => r && r.skipped && r.reason === "lock-horizon");
+  const skipped = results.filter(r => r && r.skipped && r.reason !== "lock-horizon").length;
   if (skipped > 0 && typeof showToast === "function") {
     showToast(`${skipped} week${skipped === 1 ? "" : "s"} skipped -- manually pinned elsewhere`, "warn");
   }
+  // v10 lock-horizon: the server kept the database's slot + qty for
+  // these weeks. Re-fetch so the screen shows what the DB holds
+  // (the optimistic mirror mutation is now wrong).
+  if (lockSkipped.length > 0) {
+    console.warn("[frame-schedule cloud] lock-horizon: server kept the database numbers for", lockSkipped.map(r => r.iso));
+    if (typeof showToast === "function") {
+      showToast(`${lockSkipped.length} locked week${lockSkipped.length === 1 ? "" : "s"} unchanged -- reloaded from the database`, "warn", "Frame schedule");
+    }
+    refetchFrameScheduleCloud().catch(() => {});
+  }
+  // v10 Tell other tabs so they delta-fetch frame_schedule now
+  // instead of waiting for their next poll.
+  const wrote = results.filter(r => r && r.ok && !r.skipped).length;
+  const skippedIsos = new Set(results.filter(r => r && r.skipped).map(r => r.iso));
+  const planChange = writes.some(w => {
+    const p = w && w.payload;
+    return !!p && !skippedIsos.has(w.iso) && ("qty" in p || "slot" in p || "qtyOverride" in p);
+  });
+  if (wrote > 0 && planChange && typeof _sendDataChanged === "function") _sendDataChanged(["frame_schedule"]);
   return res;
 }
 
@@ -1850,6 +1990,16 @@ async function setFrameScheduleSettingsCloud(caps) {
   const prevMinWriteBuild = (prev && Number.isFinite(prev.minWriteBuild)) ? Number(prev.minWriteBuild) : 0;
   const myBuild = (typeof APP_BUILD === "number" && Number.isFinite(APP_BUILD)) ? APP_BUILD : 0;
   const minWriteBuild = Math.max(prevMinWriteBuild, myBuild);
+  // v10 closedWeeks / lastPublishedQty: preserve-on-omit like the
+  // other fields. An explicit closedWeeks array (even empty) replaces
+  // the prior list; the server validates entries.
+  const closedWeeks = Array.isArray(caps && caps.closedWeeks)
+    ? caps.closedWeeks.slice()
+    : (prev && Array.isArray(prev.closedWeeks) ? prev.closedWeeks : null);
+  const lpqArg = caps && caps.lastPublishedQty;
+  const lastPublishedQty = (lpqArg && typeof lpqArg === "object" && !Array.isArray(lpqArg))
+    ? lpqArg
+    : (prev && prev.lastPublishedQty && typeof prev.lastPublishedQty === "object" ? prev.lastPublishedQty : null);
   const nowIso = new Date().toISOString();
   const dataOut = { caps: { crewhd, std } };
   if (bufferWeeks !== null) dataOut.bufferWeeks = bufferWeeks;
@@ -1861,7 +2011,9 @@ async function setFrameScheduleSettingsCloud(caps) {
   // installation still lands on the new scheduler.
   dataOut.scheduleMode = scheduleMode;
   if (minWriteBuild > 0) dataOut.minWriteBuild = minWriteBuild;
-  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, maxCoverWeeks, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
+  if (closedWeeks !== null) dataOut.closedWeeks = closedWeeks;
+  if (lastPublishedQty !== null) dataOut.lastPublishedQty = lastPublishedQty;
+  DB.frameSchedule.settings = { caps: { crewhd, std }, bufferWeeks, maxCoverWeeks, closedWeeks, lastPublishedQty, publishToken, lastPublishedAt, scheduleMode, minWriteBuild, updatedAt: nowIso };
   // v7.11 Route the settings write through the frame-schedule-write
   // Netlify function (service key + token + build guard). The
   // function re-sanitizes the settings payload against the CURRENT
@@ -1873,6 +2025,8 @@ async function setFrameScheduleSettingsCloud(caps) {
   if (publishToken !== null) settingsForFn.publishToken = publishToken;
   if (lastPublishedAt !== null) settingsForFn.lastPublishedAt = lastPublishedAt;
   settingsForFn.scheduleMode = scheduleMode;
+  if (closedWeeks !== null) settingsForFn.closedWeeks = closedWeeks;
+  if (lastPublishedQty !== null) settingsForFn.lastPublishedQty = lastPublishedQty;
   const res = await _fsPostFrameScheduleWrite({ settings: settingsForFn });
   if (!res.ok) {
     DB.frameSchedule.settings = prev;
@@ -1882,6 +2036,7 @@ async function setFrameScheduleSettingsCloud(caps) {
     }
     return { ok: false, error: res.error };
   }
+  if (typeof _sendDataChanged === "function") _sendDataChanged(["frame_schedule"]);
   return { ok: true };
 }
 
@@ -2864,6 +3019,7 @@ function _stampRemoteApplyAt(table, row) {
     case "audit":         pk = row.id; break;
     case "usage":         pk = row.id; break;
     case "supplier_contacts": pk = row.id; break;
+    case "frame_schedule": pk = row.fg_sku; break;
     default: return;
   }
   if (pk != null) m.set(pk, now);
@@ -2884,6 +3040,7 @@ function _broadcastRowPk(table, row) {
     case "audit":         return row.id;
     case "usage":         return row.id;
     case "supplier_contacts": return row.id;
+    case "frame_schedule": return row.fg_sku;
     default:              return null;
   }
 }
@@ -2937,6 +3094,7 @@ const _BROADCAST_FETCHERS = {
   audit:          _fetchAuditSince,
   usage:          _fetchUsageSince,
   supplier_contacts: _fetchSupplierContactsSince,
+  frame_schedule:    _fetchFrameScheduleSince,
 };
 
 // Dispatch a delta-fetched row through the SAME postgres_changes-handler
@@ -2960,6 +3118,7 @@ function _applyBroadcastRow(table, row) {
     case "audit":         _handleRealtimeAudit({ eventType: "UPDATE", new: row }); break;
     case "usage":         _handleRealtimeUsage({ eventType: "UPDATE", new: row }); break;
     case "supplier_contacts": _handleRealtimeSupplierContact({ eventType: "UPDATE", new: row }); break;
+    case "frame_schedule": _handleRealtimeFrameSchedule({ eventType: "UPDATE", new: row }); break;
     default:              console.warn(`[cloud] broadcast: unknown table "${table}" — ignored`);
   }
 }
@@ -3555,9 +3714,10 @@ async function _cloudPollTick() {
   const fetchStartAt = Date.now();
   try {
     // Parallel fetch — READ-ONLY, paginated helpers.
-    const [cloudPosRows, cloudPartsRows] = await Promise.all([
+    const [cloudPosRows, cloudPartsRows, cloudFsRows] = await Promise.all([
       _fetchAllPos(),
       _fetchAllParts(),
+      _fetchAllFrameSchedule(),   // v10: open tabs must track pins / replans
     ]);
 
     let posChanged = 0;
@@ -3743,6 +3903,19 @@ async function _cloudPollTick() {
       }
     }
 
+    // ── frame_schedule (v10) — full-row signature compare ──────────
+    // Skipped while a local write is in flight or just landed so a
+    // pre-write snapshot can't overwrite the optimistic mirror.
+    let fsChanged = false;
+    if (Array.isArray(cloudFsRows)) {
+      if (_fsWritesInFlight > 0 || (Date.now() - _fsLastLocalWriteAt) < RECENT_SAVE_MS || fetchStartAt <= _fsLastLocalWriteAt) {
+        console.debug("[cloud] poll: frame_schedule apply deferred (local write in flight / just landed)");
+      } else {
+        fsChanged = _populateFrameScheduleFromRows(cloudFsRows);
+        if (fsChanged) console.log(`[cloud] poll: frame_schedule changed (${cloudFsRows.length} rows) — mirror refreshed`);
+      }
+    }
+
     // Freshness: bump ONLY when both fetches returned plausible data.
     // Array.isArray([]) is truthy for empty arrays, so the old guard
     // was flashing SYNCED even when Supabase silently returned zero
@@ -3769,7 +3942,7 @@ async function _cloudPollTick() {
         `Indicator will age into STALE. Check Supabase auth / RLS / connection.`
       );
     }
-    if (posChanged > 0 || partsChanged > 0 || posPhantomSuppressed > 0 || partsPhantomSuppressed > 0) {
+    if (posChanged > 0 || partsChanged > 0 || posPhantomSuppressed > 0 || partsPhantomSuppressed > 0 || fsChanged) {
       // Extended log: how many real changes, how many phantom-suppressed,
       // plus first 3 samples of each so any lingering phantom or real
       // data-shape issue is inspectable straight from the console.
@@ -3782,7 +3955,7 @@ async function _cloudPollTick() {
           ? { partsSamples: partsChangedSamples, posSamples: posChangedSamples }
           : ""
       );
-      if (posChanged > 0 || partsChanged > 0) _applyAndRefresh();
+      if (posChanged > 0 || partsChanged > 0 || fsChanged) _applyAndRefresh();
     }
   } catch (e) {
     // Non-fatal. Log and let the next tick retry. Deliberately don't
@@ -4239,6 +4412,24 @@ function _handleRealtimeFollowMark(payload) {
 // us ends with ONE _applyAndRefresh(), which redraws the current route
 // — so an open Settings page picks up another tab's edit without a
 // reload. Content-equality skip drops the echo of our own upsert.
+// v10 frame_schedule delta row (broadcast path only -- the table is
+// not in the realtime publication). Applies one row into the mirror.
+// Skipped while this tab has a write in flight or just finished one
+// (self-echo / stale snapshot); the next poll reconciles.
+function _handleRealtimeFrameSchedule(payload) {
+  const row = payload && payload.new;
+  if (!row || !row.fg_sku) return;
+  if (_fsWritesInFlight > 0 || (Date.now() - _fsLastLocalWriteAt) < RECENT_SAVE_MS) {
+    console.debug(`[cloud] frame_schedule delta for ${row.fg_sku} deferred (local write in flight / just landed)`);
+    return;
+  }
+  if (!DB.frameSchedule || !(DB.frameSchedule.weeks instanceof Map)) {
+    DB.frameSchedule = { settings: null, weeks: new Map(), loaded: false };
+  }
+  _frameScheduleApplyRow(row);
+  _fsRowsSig = null;   // mirror no longer matches the last full fetch
+}
+
 function _handleRealtimeSupplierContact(payload) {
   if (!(DB.supplierContacts instanceof Map)) DB.supplierContacts = new Map();
   const { eventType, new: row, old } = payload;

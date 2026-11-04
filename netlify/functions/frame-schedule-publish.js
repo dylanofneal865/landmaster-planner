@@ -33,6 +33,11 @@ const { createClient } = require("@supabase/supabase-js");
 // js/25-page-frame-schedule.js) and the view function.
 const TOKEN_RE = /^[A-Za-z0-9._-]{24,128}$/;
 
+// v10 Hard build floor, same value as frame-schedule-write.js and
+// APP_BUILD in js/01-config.js. An old tab must not be able to push
+// a stale snapshot to the supplier page.
+const MIN_CLIENT_BUILD = 1793750400;   // 2026-11-04 00:00:00 UTC
+
 // Build the CORS headers for one request. Same-origin calls don't
 // strictly need CORS but the browser preflight fires on POSTs with
 // content-type: application/json, so we echo the Origin header and
@@ -94,6 +99,15 @@ exports.handler = async (event) => {
       statusCode: 401,
       headers: { ...cors, "content-type": "application/json" },
       body: JSON.stringify({ error: "invalid or missing x-fs-edit-token" }),
+    };
+  }
+  // v10 build floor -- mirrors frame-schedule-write.js.
+  const clientBuild = Number(headersIn["x-app-build"] || headersIn["X-App-Build"] || "");
+  if (!Number.isFinite(clientBuild) || clientBuild < MIN_CLIENT_BUILD) {
+    return {
+      statusCode: 409,
+      headers: { ...cors, "content-type": "application/json" },
+      body: JSON.stringify({ error: "app build is stale (server requires a newer planner build)", minWriteBuild: MIN_CLIENT_BUILD, clientBuild }),
     };
   }
 
