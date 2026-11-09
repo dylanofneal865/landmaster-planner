@@ -735,6 +735,15 @@ function renderOrderQueueFor(itemType) {
                       ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(_bq.action + (_bq.triggerReason ? ` · trigger: ${_bq.triggerReason}` : "") + (_bq.daysToTrigger != null ? ` (${_bq.daysToTrigger}d)` : "") + ` · ${fmtNum(_bq.blanketOpen || 0)} open on the blanket`)}">BLANKET RELEASE</span>`
                       : "";
                     const flagPillFinal = blanketReleasePill ? "" : flagPill;
+                    // v-frame-queue: a frame (FRAME_PNS) is on the queue only
+                    // because open POs don't cover the locked frame-schedule
+                    // weeks (partsWithStatus -> _frameQueue). The pill carries
+                    // the reason; the cover cell below shows the shortfall.
+                    const _fq = p._frameQueue || null;
+                    const _fqShort = !!(_fq && _fq.admitOverride === true);
+                    const frameShortPill = _fqShort
+                      ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="${esc(_fq.reason + ` · scheduled ${fmtNum(_fq.required)} in locked weeks ${_fq.curMondayIso}..${_fq.horizonEndIso} · covered ${fmtNum(_fq.covered)} (${fmtNum(_fq.coveredOpen)} open + ${fmtNum(_fq.coveredOnHold)} on hold; blanket excluded)`)}">FRAME SHORT ${fmtNum(_fq.short)}</span>`
+                      : "";
                     // v-cycle-admit: CYCLE pill. Shows the cycle date the PO
                     // has to go out on and, in the tooltip, why the part
                     // cannot wait for the cycle after it. Red when the
@@ -758,15 +767,21 @@ function renderOrderQueueFor(itemType) {
                     }
                     return `
                     <tr class="clickable" data-oq-row data-oq-row-pn="${esc(p.pn)}" data-oq-pn="${esc(oqHeaderValue(p, "pn"))}" data-oq-desc="${esc(oqHeaderValue(p, "desc"))}" data-oq-supplier="${esc(oqHeaderValue(p, "supplier"))}" data-oq-lead="${esc(oqHeaderValue(p, "lead"))}" data-oq-lead-days="${Number(p.leadDays || 0)}">
-                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPillFinal}${blanketReleasePill}${cyclePill}${blkPill}</td>
+                      <td class="pn" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.pn)}${p.phasingOut ? ' <span class="pill warn" style="font-size:9px;padding:1px 5px;margin-left:4px;text-transform:none;letter-spacing:0">phasing out</span>' : ''}${risk ? ` <span class="pill crit" style="font-weight:700;letter-spacing:0.04em;font-size:9px;padding:1px 6px;margin-left:4px" title="Transition risk — chain runs dry in ${risk.runoutDays}d, replacement order not yet placed">TRANS</span>` : ''}${flagPillFinal}${blanketReleasePill}${cyclePill}${frameShortPill}${blkPill}</td>
                       <td class="oq-desc-cell" title="${esc(p.desc || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.desc)}</td>
                       <td class="dim oq-supplier-cell" title="${esc(p.supplier || '')}" onclick="openPartDetail('${esc(p.pn)}')">${esc(p.supplier)}</td>
                       <td class="right" onclick="openPartDetail('${esc(p.pn)}')"${(() => {
+                        if (_fqShort) return ` title="${esc(_fq.reason)}"`;
                         if (_bqRelease) return ` title="Blanket-covered but inside the ${_releaseWindowDays}-day release trigger (${_bq.triggerReason || "trigger"}) — release from blanket now."`;
                         const s = stockoutDateStr(p.daysOfCover);
                         return s ? ` title="Projected stockout: ${s}"` : '';
                       })()}>
-                        ${_bqRelease ? `
+                        ${_fqShort ? `
+                        <span class="meter" style="opacity:1" title="${esc(_fq.reason)}">
+                          <span class="meter-bar crit"><i style="width:100%"></i></span>
+                          <span class="num bold text-crit">short ${fmtNum(_fq.short)}</span>
+                        </span>
+                        ` : _bqRelease ? `
                         <span class="meter" style="opacity:1">
                           <span class="meter-bar" style="background:var(--info-soft,#e0eaff);border-color:var(--info,#4a7cff)"><i style="background:var(--info,#4a7cff);width:100%"></i></span>
                           <span class="num bold" style="color:var(--info-d,var(--info,#2f5edb))">release in ${Number.isFinite(_bq.daysToTrigger) ? _bq.daysToTrigger + 'd' : '—'}</span>

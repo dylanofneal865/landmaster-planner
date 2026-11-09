@@ -3989,6 +3989,209 @@ function blanketReleaseDecision(part, ctx) {
 // directions -- the live cache is neither read nor overwritten -- and the
 // override is restored in finally. With no opts every caller is
 // byte-identical. Used by the Backup Buy Queue.
+/* ------------------------------------------------------------------
+   v-frame-queue: Base BOM Queue admission for the six Mor-Ryde frames
+   (FRAME_PNS, js/25). The frame schedule decides what Mor-Ryde ships,
+   so lead-time / days-of-cover math must never put a frame in the
+   queue. A frame is admitted ONLY when open POs do not cover what is
+   scheduled inside the lock window (current Monday .. Monday +
+   LOCK_HORIZON_DAYS):
+     required = sum of the frame's scheduled qty per in-window week,
+                read from the mirror (DB.frameSchedule.weeks[iso].qty;
+                a qtyOverride for the cell replaces it). Closed weeks
+                (0 workdays) contribute 0. Current week only:
+                max(0, scheduled - receivedSinceMonday), never
+                subtracting more than this week's own scheduled qty
+                (Mor-Ryde ships early and late, so this week's receipts
+                can belong to earlier weeks).
+     covered  = open qty on NORMAL lines (Open AND On Hold), via the
+                planner's isLineOpen gate (blanket lines excluded,
+                PO dates ignored). Acumatica's openQty when present,
+                else qty - qtyReceived.
+     short    = required - covered. > 0 -> admit, status critical,
+                suggested = short rounded UP to a pack of 3.
+                <= 0 -> never in the queue.
+   Mirror not loaded -> frames are not admitted at all (no fallback
+   to days-of-cover). Read-only: never writes the mirror, DB.pos or
+   DB.poReceipts. Console audit: _printFrameQueue().
+   ------------------------------------------------------------------ */
+const _FRAME_QUEUE_PNS_FALLBACK = ["UT101001", "UT101002", "UT101003", "UT101004", "UT101005", "UT101006"];
+const _FRAME_QUEUE_PACK = 3;
+function _frameQueuePns() {
+  return (typeof FRAME_PNS !== "undefined" && Array.isArray(FRAME_PNS) && FRAME_PNS.length) ? FRAME_PNS : _FRAME_QUEUE_PNS_FALLBACK;
+}
+function isFrameQueuePn(pn) {
+  return _frameQueuePns().indexOf(pn) >= 0;
+}
+function _frameQueueLocalIso(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+// Lock window as ISO Mondays: current Monday .. current Monday + LOCK_HORIZON_DAYS.
+function _frameQueueWindow() {
+  const lockDays = (typeof LOCK_HORIZON_DAYS === "number" && Number.isFinite(LOCK_HORIZON_DAYS)) ? LOCK_HORIZON_DAYS : 42;
+  const mon = new Date(TODAY);
+  mon.setHours(0, 0, 0, 0);
+  mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7));
+  const end = new Date(mon);
+  end.setDate(end.getDate() + lockDays);
+  return { curMondayIso: _frameQueueLocalIso(mon), horizonEndIso: _frameQueueLocalIso(end) };
+}
+// The frame-schedule mirror, or null when it has not loaded this session.
+function _frameQueueMirror() {
+  const fs = (typeof DB !== "undefined" && DB) ? DB.frameSchedule : null;
+  if (!fs || !fs.loaded || !(fs.weeks instanceof Map)) return null;
+  return fs;
+}
+function _frameQueueWeekIsClosed(iso) {
+  return typeof _fsWorkdaysFor === "function" && _fsWorkdaysFor(iso) === 0;
+}
+// Effective scheduled qty of one frame in one mirror week.
+function _frameQueueWeekQty(wk, pn) {
+  if (!wk) return 0;
+  if (wk.qtyOverride && typeof wk.qtyOverride === "object" && Object.prototype.hasOwnProperty.call(wk.qtyOverride, pn)) {
+    return Math.max(0, Math.floor(Number(wk.qtyOverride[pn]) || 0));
+  }
+  return Math.max(0, Math.round(Number(wk.qty && wk.qty[pn]) || 0));
+}
+// Receipts of one frame dated on/after isoFrom (DB.poReceipts, populated
+// by the daily PO-receipts sync; receiptDate is YYYY-MM-DD).
+function _frameQueueReceivedSince(pn, isoFrom) {
+  const recs = (typeof DB !== "undefined" && DB && Array.isArray(DB.poReceipts)) ? DB.poReceipts : [];
+  let total = 0;
+  for (const rec of recs) {
+    if (!rec || rec.pn !== pn) continue;
+    const d = String(rec.receiptDate || "").slice(0, 10);
+    if (!d || d < isoFrom) continue;
+    total += Math.max(0, Number(rec.qty) || 0);
+  }
+  return total;
+}
+// Covered = open qty on normal lines. `lines` is the part's
+// _buildOpenPOLineIndex slice (already isLineOpen-gated, so blanket
+// and closed lines are gone); On Hold is split out for the audit.
+function _frameQueueCovered(pn, lines) {
+  let coveredOpen = 0, coveredOnHold = 0;
+  const detail = [];
+  for (const e of (lines || [])) {
+    const ln = e && e.ln, po = e && e.po;
+    if (!ln || isBlanketLine(ln)) continue;
+    const q = (ln.openQty !== undefined && ln.openQty !== null && Number.isFinite(Number(ln.openQty)))
+      ? Math.max(0, Number(ln.openQty)) : (Number(e.remaining) || 0);
+    if (q <= 0) continue;
+    const onHold = String((po && po.acumStatus) || "").trim() === "On Hold"
+                || String(ln.acumStatus || "").trim() === "On Hold";
+    if (onHold) coveredOnHold += q; else coveredOpen += q;
+    detail.push({ po: (po && po.num) || "", qty: q, onHold });
+  }
+  return { coveredOpen, coveredOnHold, covered: coveredOpen + coveredOnHold, lines: detail };
+}
+function _frameQueueFmtWeek(iso) {
+  const d = iso && typeof parseDateLocal === "function" ? parseDateLocal(iso) : null;
+  if (!d || isNaN(d.getTime())) return iso || "";
+  return (d.getMonth() + 1) + "/" + d.getDate() + "/" + d.getFullYear();
+}
+// The decision. Null for non-frame parts.
+function frameQueueDecision(p, lines, opts) {
+  if (!p || !isFrameQueuePn(p.pn)) return null;
+  const muted = !!(opts && opts.muted);
+  const win = _frameQueueWindow();
+  const cov = _frameQueueCovered(p.pn, lines);
+  const mirror = _frameQueueMirror();
+  if (!mirror) {
+    return {
+      loaded: false, required: null, covered: cov.covered, coveredOpen: cov.coveredOpen, coveredOnHold: cov.coveredOnHold,
+      coveredLines: cov.lines, short: null, suggestedQty: 0, firstShortWeek: null, weeks: [],
+      receivedThisWeek: 0, curMondayIso: win.curMondayIso, horizonEndIso: win.horizonEndIso,
+      admitOverride: false, muted, reason: "Frame schedule not loaded yet; frames stay out of the queue",
+    };
+  }
+  const isos = [];
+  for (const iso of mirror.weeks.keys()) {
+    if (typeof iso === "string" && iso >= win.curMondayIso && iso <= win.horizonEndIso) isos.push(iso);
+  }
+  isos.sort();
+  let required = 0, receivedThisWeek = 0;
+  const weeks = [];
+  for (const iso of isos) {
+    const scheduled = _frameQueueWeekIsClosed(iso) ? 0 : _frameQueueWeekQty(mirror.weeks.get(iso), p.pn);
+    let counted = scheduled;
+    if (iso === win.curMondayIso) {
+      receivedThisWeek = _frameQueueReceivedSince(p.pn, win.curMondayIso);
+      counted = Math.max(0, scheduled - Math.min(scheduled, receivedThisWeek));
+    }
+    weeks.push({ iso, scheduled, counted });
+    required += counted;
+  }
+  const short = required - cov.covered;
+  let firstShortWeek = null, running = 0;
+  for (const w of weeks) {
+    running += w.counted;
+    if (running > cov.covered) { firstShortWeek = w.iso; break; }
+  }
+  const suggestedQty = short > 0 ? Math.ceil(short / _FRAME_QUEUE_PACK) * _FRAME_QUEUE_PACK : 0;
+  const reason = short > 0
+    ? "Short " + short + " for locked weeks \u2014 first short week " + _frameQueueFmtWeek(firstShortWeek)
+    : "Covered: " + cov.covered + " open on PO vs " + required + " scheduled in the locked weeks";
+  return {
+    loaded: true, required, covered: cov.covered, coveredOpen: cov.coveredOpen, coveredOnHold: cov.coveredOnHold,
+    coveredLines: cov.lines, short, suggestedQty, firstShortWeek, weeks,
+    receivedThisWeek, curMondayIso: win.curMondayIso, horizonEndIso: win.horizonEndIso,
+    admitOverride: short > 0 && !muted, muted, reason,
+  };
+}
+// Cheap signature of every frame-queue input that lives OUTSIDE
+// DB.parts / DB.pos (the mirror's in-window maps + this week's frame
+// receipts). partsWithStatus drops its cache when it moves, so a pin,
+// qty edit or Replan on the Frame Schedule tab (which never calls
+// bumpStatusCache) reaches the queue on the next read.
+function _frameQueueSig() {
+  const mirror = _frameQueueMirror();
+  if (!mirror) return "fs:unloaded";
+  const win = _frameQueueWindow();
+  const pns = _frameQueuePns();
+  const parts = [win.curMondayIso];
+  const isos = [];
+  for (const iso of mirror.weeks.keys()) if (typeof iso === "string" && iso >= win.curMondayIso && iso <= win.horizonEndIso) isos.push(iso);
+  isos.sort();
+  for (const iso of isos) {
+    const wk = mirror.weeks.get(iso);
+    parts.push(iso + ":" + pns.map(pn => _frameQueueWeekQty(wk, pn)).join(","));
+  }
+  parts.push("rcv:" + pns.map(pn => _frameQueueReceivedSince(pn, win.curMondayIso)).join(","));
+  return parts.join("|");
+}
+// Console audit, one row per frame.
+function _printFrameQueue() {
+  const stats = partsWithStatus();
+  const queued = new Set(queueParts("base_bom").map(p => p && p.pn));
+  const rows = [];
+  for (const pn of _frameQueuePns()) {
+    const p = stats.find(s => s && s.pn === pn);
+    const fq = p && p._frameQueue;
+    if (!fq) { rows.push({ pn, note: p ? "no decision" : "not in DB.parts" }); continue; }
+    const thisWeek = fq.weeks.length && fq.weeks[0].iso === fq.curMondayIso ? fq.weeks[0] : null;
+    rows.push({
+      pn,
+      window: fq.curMondayIso + ".." + fq.horizonEndIso,
+      required: fq.required === null ? "n/a (mirror not loaded)" : fq.required,
+      thisWeekScheduled: thisWeek ? thisWeek.scheduled : 0,
+      receivedSinceMonday: fq.receivedThisWeek,
+      thisWeekCounted: thisWeek ? thisWeek.counted : 0,
+      coveredOpen: fq.coveredOpen,
+      coveredOnHold: fq.coveredOnHold,
+      covered: fq.covered,
+      short: fq.short === null ? "n/a" : fq.short,
+      suggested: fq.suggestedQty,
+      firstShortWeek: fq.firstShortWeek || "-",
+      inQueue: queued.has(pn),
+      reason: fq.reason,
+    });
+  }
+  console.log("[frame-queue] required = scheduled qty in the locked weeks (current week net of receipts since Monday, capped at this week's schedule); covered = open NORMAL PO lines, Open + On Hold, blanket excluded; short = required - covered; suggested = short rounded up to a pack of 3");
+  console.table(rows);
+  return rows;
+}
+
 function partsWithStatus(opts) {
   if (opts && Array.isArray(opts.parts)) {
     const prevOverride = _partsOverride;
@@ -4002,6 +4205,11 @@ function partsWithStatus(opts) {
       _partsOverride = prevOverride;
     }
   }
+  // v-frame-queue: the cache also keys on the frame-schedule mirror +
+  // this week's frame receipts (neither lives in DB.parts / DB.pos, and
+  // the Frame Schedule tab never bumps the cache).
+  const _frameSig = _frameQueueSig();
+  if (_statusCache && _statusCache._frameSig !== _frameSig) _statusCache = null;
   if (_statusCache) return _statusCache;
   // Build the per-PN open-PO-line index ONCE and reuse it so we don't
   // rescan DB.pos for every part during the .map below.
@@ -4223,6 +4431,10 @@ function partsWithStatus(opts) {
           suggestedQty: undefined,
         })
       : null;
+    // v-frame-queue: frame admission is decided by the frame schedule
+    // (frameQueueDecision). Null for every non-frame part, so their
+    // rows stay byte-identical.
+    const _frameQueue = frameQueueDecision(p, lines, { muted });
     return {
       ...p,
       onPO,
@@ -4302,8 +4514,23 @@ function partsWithStatus(opts) {
       ...(_blanketQueue ? { _blanketQueue } : {}),
       _suggestedQty: cycleAwareSuggestedQty(p, onPO),
       ...(view && view.isFinal ? { _chainBoost: _supersessionDemandBoost(p) } : {}),
+      // v-frame-queue: placed LAST. The frame's suggested qty is the
+      // locked-week shortfall (0 when covered) so the queue row, Est $
+      // and "+ Add" all read it; a short frame is critical with urgency
+      // = days until the first short week.
+      ...(_frameQueue ? {
+        _frameQueue,
+        _suggestedQty: _frameQueue.suggestedQty,
+        ...(_frameQueue.admitOverride === true ? {
+          status: "critical",
+          urgency: _frameQueue.firstShortWeek && typeof parseDateLocal === "function"
+            ? Math.max(0, Math.round((parseDateLocal(_frameQueue.firstShortWeek).getTime() - TODAY.getTime()) / 86400000))
+            : 0,
+        } : {}),
+      } : {}),
     };
   });
+  out._frameSig = _frameSig;
   _statusCache = out;
   return out;
 }
@@ -5007,6 +5234,14 @@ function queueParts(itemType, opts) {
     //   release → admit (even when normal rules would stay quiet)
     //   silent  → suppress (even when normal rules say warning/critical)
     //   order   → no active blanket; fall through to normal rules
+    // v-frame-queue: for the six frames the frame schedule is
+    // AUTHORITATIVE -- admitted only when open POs do not cover the
+    // locked weeks (frameQueueDecision); never on days-of-cover, status,
+    // cycle or blanket rules. Mirror not loaded -> suppressed.
+    // Non-frame parts carry no _frameQueue and are unaffected.
+    const fq = p._frameQueue;
+    if (fq && fq.admitOverride === true) return true;
+    if (fq && fq.admitOverride === false) return false;
     // Non-blanket parts carry no _blanketQueue and are unaffected.
     const bq = p._blanketQueue;
     if (bq && bq.admitOverride === true) return true;
