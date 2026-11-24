@@ -125,7 +125,7 @@ function _draftItemLines(item) {
   }];
 }
 
-function draftOrderAdd(pn, qty, qtySource) {
+function draftOrderAdd(pn, qty, qtySource, extra) {
   const existing = DRAFT_ORDER.find(d => d.pn === pn);
   const split = _computeBlanketSplit(pn, qty);
   const first = split.releases[0] || null;
@@ -178,6 +178,10 @@ function draftOrderAdd(pn, qty, qtySource) {
       // writes back to part.cost.
       _costOverride: null,
       _costOverrideDate: null,
+      // v-draft-manual-add: optional extra fields for a NEW line only.
+      // Today that is just the one-off flags (custom / customDesc /
+      // customSupplier / customCost). Absent on every queue / catalog add.
+      ...((extra && typeof extra === "object") ? extra : {}),
     });
   }
   draftOrderSave();
@@ -215,7 +219,11 @@ function draftOrderTotals() {
   let itemCount = 0;
   let grandTotal = 0;
   for (const item of DRAFT_ORDER) {
-    const part = DB.parts.find(p => p.pn === item.pn);
+    // v-draft-manual-add: a one-off line (item.custom === true) has no
+    // DB.parts row; _draftPartFor hands back a stand-in built from the
+    // line's own description / supplier / cost. Catalog lines resolve
+    // exactly as before.
+    const part = _draftPartFor(item);
     if (!part) continue;
     // Per-line supplier override: user-chosen supplier wins over the part's
     // primary. Empty / null / whitespace-only override → fall back to
@@ -232,10 +240,11 @@ function draftOrderTotals() {
     // newer of manual cost / last PO, per orderUnitCostSource). part.cost is
     // NEVER written from here.
     const hasCostOverride = item._costOverride != null && Number.isFinite(Number(item._costOverride));
-    const noCost = hasCostOverride ? false : hasNoOrderCost(part);
+    const isCustom = part._custom === true;
+    const noCost = hasCostOverride ? false : (isCustom ? !(part.cost > 0) : hasNoOrderCost(part));
     const unit = hasCostOverride
       ? Number(item._costOverride)
-      : (noCost ? 0 : orderUnitCost(part));
+      : (noCost ? 0 : (isCustom ? part.cost : orderUnitCost(part)));
     const totalQty = Number(item.qty || 0);
     const totalLineTotal = totalQty * unit;
     const parts = _draftItemLines(item);
@@ -252,6 +261,9 @@ function draftOrderTotals() {
         // regular "cycle"/"standard" draft without re-looking up
         // the DRAFT_ORDER item.
         _qtySource: item.qtySource || null,
+        // One-off line flag: the drawer renders an editable description /
+        // supplier / cost row and the PDF prints "—" for stock columns.
+        _custom: isCustom,
         // Split-awareness for the drawer: the drawer collapses a multi-line
         // split into one editable primary row + read-only sub-rows so the
         // math is transparent without duplicating the qty input. The PDF
@@ -350,7 +362,7 @@ function quickAddToDraft(pn) {
   showToast(`${pn} × ${fmtNum(qty)} added to Draft Order`, "ok", "Added");
 }
 
-function openDraftOrderDrawer() {
+function openDraftOrderDrawer(opts) {
   const { itemCount, grandTotal, supplierGroups } = draftOrderTotals();
   const supplierKeys = Object.keys(supplierGroups).sort();
   // ALL suppliers in DB.parts — used ONLY by the typo-hint guard (scope
@@ -370,10 +382,11 @@ function openDraftOrderDrawer() {
       <button class="drawer-x" data-close>×</button>
     </div>
     <div class="drawer-body">
+      ${_draftAddRowHtml(_allSuppliers)}
       ${itemCount === 0 ? `
-        <div class="empty">
+        <div class="empty" style="padding:36px 20px">
           <div class="empty-title">No items yet</div>
-          <div class="empty-msg">Add parts from the Order Queue, Dashboard, or Parts Catalog to build your draft.</div>
+          <div class="empty-msg">Search above to add a part by hand, or add parts from the Order Queue, Dashboard, or Parts Catalog.</div>
         </div>
       ` : supplierKeys.map(s => {
         const grp = supplierGroups[s];
@@ -397,6 +410,9 @@ function openDraftOrderDrawer() {
                 // PRIMARY row — one per PN entry. Rendered on the FIRST split
                 // slice; carries the editable TOTAL qty input and the total
                 // line total. Sub-rows below reference this by data-draft-pn.
+                // One-off line: its own editable row (never splits, never
+                // has a blanket), rendered by _draftRenderCustomRow.
+                if (line._custom) return _draftRenderCustomRow(part, line, s);
                 if (line._splitIsFirst) {
                   const totalQty = line._splitTotalQty;
                   const totalLineTotal = line._splitTotalLineTotal;
@@ -565,6 +581,13 @@ function openDraftOrderDrawer() {
     </div>
   `;
   openDrawer(html, { wide: true });
+  // The Add part row was just rebuilt with the rest of the drawer, so its
+  // search state starts clean. Put the cursor in the search box when the
+  // draft is empty (nothing else to act on) or when a manual add asked for
+  // it (opts.focusAdd), so several parts can be added in a row. The top-bar
+  // pill passes its click event here; that has no focusAdd and is ignored.
+  _draftAddReset();
+  if (itemCount === 0 || (opts && opts.focusAdd === true)) _draftAddFocusSearch();
 }
 
 // Render one sub-row inside a cap-and-split. Read-only qty display, indented
@@ -597,6 +620,563 @@ function _draftRenderSubLine(part, line, unit, noCost) {
       <td style="background:var(--bg-1)"></td>
     </tr>
   `;
+}
+
+/* =====================================================
+   MANUAL ADD (v-draft-manual-add)
+   The "Add part" row at the top of the drawer, plus one-off lines.
+
+   Catalog parts go through draftOrderAdd(pn, qty, "manual") — the same
+   add path the queues use, so supplier grouping, cost, blanket split and
+   totals are identical to a queue add.
+
+   One-off lines are draft items flagged custom:true. They are NOT in
+   DB.parts and are never written there. Each carries customDesc /
+   customSupplier / customCost and a synthetic pn ("ONEOFF-…") so every
+   pn-keyed path (qty edit, remove, row lookup, cloud sync) works as-is.
+   ===================================================== */
+
+const DRAFT_ONEOFF_PREFIX = "ONEOFF-";
+const DRAFT_ADD_MAX_RESULTS = 8;
+
+// Stand-in "part" for a one-off line, shaped like the fields the drawer,
+// totals and PDF read off a catalog part. null for anything not flagged.
+function _draftCustomPart(item) {
+  if (!item || item.custom !== true) return null;
+  const cost = Number(item.customCost);
+  return {
+    pn: item.pn,
+    desc: String(item.customDesc || ""),
+    supplier: String(item.customSupplier || ""),
+    cost: (Number.isFinite(cost) && cost > 0) ? cost : 0,
+    _custom: true,
+  };
+}
+
+// The part behind a draft item: the catalog row, or the stand-in for a
+// one-off line. undefined / null when a catalog pn no longer exists.
+function _draftPartFor(item) {
+  if (!item) return null;
+  if (item.custom === true) return _draftCustomPart(item);
+  return DB.parts.find(p => p.pn === item.pn);
+}
+
+// Search every part in DB.parts (any item type). Ranking: part number
+// starts with the text (exact match first), then part number contains it,
+// then description contains every word typed. Returns the first `limit`
+// plus the full match count so the list can say "8 of 35".
+function draftAddSearchParts(query, limit) {
+  const max = limit || DRAFT_ADD_MAX_RESULTS;
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return { list: [], total: 0 };
+  const words = q.split(/\s+/);
+  const prefix = [], pnHas = [], descHas = [];
+  for (const p of (DB.parts || [])) {
+    if (!p || typeof p.pn !== "string" || !p.pn) continue;
+    const pn = p.pn.toLowerCase();
+    if (pn.startsWith(q)) { prefix.push(p); continue; }
+    if (pn.includes(q)) { pnHas.push(p); continue; }
+    const desc = String(p.desc || "").toLowerCase();
+    if (desc && words.every(w => desc.includes(w))) descHas.push(p);
+  }
+  const byPn = (a, b) => a.pn.localeCompare(b.pn, undefined, { numeric: true, sensitivity: "base" });
+  prefix.sort((a, b) => ((a.pn.length === q.length ? 0 : 1) - (b.pn.length === q.length ? 0 : 1)) || byPn(a, b));
+  pnHas.sort(byPn);
+  descHas.sort(byPn);
+  const all = prefix.concat(pnHas, descHas);
+  return { list: all.slice(0, max), total: all.length };
+}
+
+// Default qty for a hand-added part: MOQ or pack size, whichever is
+// larger, never below 1.
+function draftAddDefaultQty(part) {
+  const moq = Number(part && part.moq) || 0;
+  const pack = Number(part && part.packSize) || 0;
+  return Math.max(1, moq, pack);
+}
+
+// Snap a typed supplier to the catalog's spelling when it is the same name
+// apart from case, spacing and punctuation ("cp global sourcing llc" ->
+// "CP GLOBAL SOURCING, LLC"), so a one-off line groups with that
+// supplier's other lines instead of opening a near-duplicate group.
+// Anything else is kept as typed.
+function _draftCanonSupplier(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const loose = s => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const norm = loose(raw);
+  if (!norm) return raw;
+  let hit = null;
+  for (const p of (DB.parts || [])) {
+    const s = p && p.supplier;
+    if (!s) continue;
+    if (s === raw) return raw;
+    if (!hit && loose(s) === norm) hit = s;
+  }
+  return hit || raw;
+}
+
+function _draftNewOneOffId() {
+  let id;
+  do {
+    id = DRAFT_ONEOFF_PREFIX + (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)).toUpperCase();
+  } while (draftOrderHas(id) || (DB.parts || []).some(p => p && p.pn === id));
+  return id;
+}
+
+// Add-row UI state. Lives only as long as one render of the drawer —
+// openDraftOrderDrawer resets it right after rebuilding the DOM.
+let _draftAdd = null;
+function _draftAddReset() {
+  _draftAdd = { list: [], total: 0, hi: 0, noMatch: false, pickedPn: null, customOpen: false, qtyAuto: true };
+}
+_draftAddReset();
+
+function _draftAddFocusSearch() {
+  const el = $("#draft-add-search");
+  if (!el) return;
+  // preventScroll: the drawer is still sliding in on a fresh open.
+  try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+}
+
+function _draftAddRowHtml(allSuppliers) {
+  return `
+    <style>
+      .draft-add { margin-bottom: 16px; }
+      .draft-add-bar { display: flex; gap: 8px; align-items: flex-start; }
+      .draft-add-search { position: relative; flex: 1; min-width: 0; }
+      .draft-add-results { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 30; background: var(--bg-2); border: 1px solid var(--line-strong); border-radius: 6px; box-shadow: var(--shadow-md); max-height: 360px; overflow-y: auto; }
+      .draft-add-opt { display: grid; grid-template-columns: 104px minmax(0, 1fr) minmax(0, 170px) 76px; gap: 10px; align-items: center; padding: 7px 10px; font-size: 12px; color: var(--t2); cursor: pointer; border-bottom: 1px solid var(--line-soft); }
+      .draft-add-opt:last-child { border-bottom: 0; }
+      .draft-add-opt.hi { background: var(--bg-3); box-shadow: inset 2px 0 0 var(--accent); }
+      .draft-add-opt > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .draft-add-opt .pn, .draft-add-opt .cost { color: var(--t1); }
+      .draft-add-opt .cost { text-align: right; }
+      .draft-add-opt.oneoff { display: block; color: var(--t1); }
+      .draft-add-opt .tag { font-size: 9px; padding: 1px 5px; margin-right: 6px; letter-spacing: 0.04em; }
+      .draft-add-more { padding: 6px 10px; font-size: 11px; color: var(--t3); }
+      .draft-add-picked { margin-top: 6px; font-size: 11px; color: var(--t2); }
+      .draft-add-custom { margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line-strong); border-radius: 6px; background: var(--bg-1); }
+      .draft-add-custom-fields { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 110px; gap: 8px; }
+      .draft-add-custom label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--t3); margin-bottom: 3px; }
+      @media (max-width: 640px) {
+        .draft-add-custom-fields { grid-template-columns: 1fr; }
+        .draft-add-opt { grid-template-columns: 92px minmax(0, 1fr) 70px; }
+        .draft-add-opt .sup { display: none; }
+      }
+    </style>
+    <div class="draft-add" id="draft-add">
+      <div class="dr-section" style="margin-top:0">Add part</div>
+      <div class="draft-add-bar">
+        <div class="draft-add-search">
+          <input class="input" id="draft-add-search" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Search part # or description"
+                 role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="draft-add-results" aria-label="Search parts to add"
+                 oninput="draftAddOnSearch(this.value)" onkeydown="draftAddOnSearchKey(event)"
+                 onfocus="draftAddOnSearchFocus()" onblur="draftAddOnSearchBlur()">
+          <div class="draft-add-results" id="draft-add-results" role="listbox" hidden></div>
+        </div>
+        <input class="input num" id="draft-add-qty" type="number" min="0" step="1" value="1" style="width:88px;text-align:right"
+               aria-label="Quantity" title="Quantity"
+               oninput="draftAddOnQtyInput()" onkeydown="draftAddOnQtyKey(event)">
+        <button class="btn primary" id="draft-add-btn" onclick="draftAddSubmit()">Add</button>
+      </div>
+      <div class="draft-add-picked" id="draft-add-picked" hidden></div>
+      <div class="draft-add-custom" id="draft-add-custom" hidden>
+        <div class="tiny" style="color:var(--t2);margin-bottom:8px">One-off line. It goes on this draft and its PDF only, and is not added to the Parts Catalog.</div>
+        <div class="draft-add-custom-fields">
+          <div>
+            <label for="draft-add-c-desc">Description</label>
+            <input class="input" id="draft-add-c-desc" type="text" autocomplete="off" onkeydown="draftAddOnCustomKey(event)">
+          </div>
+          <div>
+            <label for="draft-add-c-supplier">Supplier</label>
+            <input class="input" id="draft-add-c-supplier" type="text" autocomplete="off" list="draft-add-supplier-list" onkeydown="draftAddOnCustomKey(event)">
+          </div>
+          <div>
+            <label for="draft-add-c-cost">Unit cost</label>
+            <input class="input num" id="draft-add-c-cost" type="number" min="0" step="0.01" placeholder="0.00" style="text-align:right" onkeydown="draftAddOnCustomKey(event)">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+          <button class="btn sm" onclick="draftAddCancelCustom()">Cancel</button>
+          <button class="btn sm primary" onclick="draftAddSubmit()">Add one-off line</button>
+        </div>
+      </div>
+      <datalist id="draft-add-supplier-list">${(allSuppliers || []).map(s => `<option value="${esc(s)}"></option>`).join("")}</datalist>
+    </div>
+  `;
+}
+
+function _draftAddHideResults() {
+  const box = $("#draft-add-results");
+  if (box) { box.hidden = true; box.innerHTML = ""; }
+  const input = $("#draft-add-search");
+  if (input) { input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); }
+}
+
+function _draftAddResultsOpen() {
+  const box = $("#draft-add-results");
+  return !!(box && !box.hidden);
+}
+
+function _draftAddRenderResults(q) {
+  const box = $("#draft-add-results");
+  const input = $("#draft-add-search");
+  if (!box) return;
+  const st = _draftAdd;
+  if (!q) { _draftAddHideResults(); return; }
+  if (st.noMatch) {
+    box.innerHTML = `<div class="draft-add-opt oneoff hi" id="draft-add-opt-0" role="option" aria-selected="true" onmousedown="event.preventDefault(); draftAddOpenCustom()">Add '${esc(q)}' as a one-off line <span style="color:var(--t3)">· no part matches</span></div>`;
+  } else {
+    box.innerHTML = st.list.map((p, i) => {
+      const noCost = hasNoOrderCost(p);
+      const tags = [];
+      if (draftOrderHas(p.pn)) tags.push(`<span class="pill muted tag">IN DRAFT</span>`);
+      if (p.itemType === "kit") tags.push(`<span class="pill warn tag">KIT</span>`);
+      if (p.itemType === "do_not_order") tags.push(`<span class="pill warn tag">DO NOT ORDER</span>`);
+      if (p.phasingOut) tags.push(`<span class="pill warn tag">PHASING OUT</span>`);
+      return `
+        <div class="draft-add-opt${i === st.hi ? " hi" : ""}" id="draft-add-opt-${i}" role="option" aria-selected="${i === st.hi ? "true" : "false"}"
+             onmousedown="event.preventDefault(); draftAddPick(${i})" onmousemove="draftAddHover(${i})">
+          <span class="pn mono" style="font-weight:600" title="${esc(p.pn)}">${esc(p.pn)}</span>
+          <span title="${esc(p.desc || "")}">${tags.join("")}${esc(p.desc || "—")}</span>
+          <span class="sup" title="${esc(p.supplier || "")}">${esc(p.supplier || "—")}</span>
+          <span class="cost mono">${noCost ? "—" : fmtMoneyDec(orderUnitCost(p))}</span>
+        </div>`;
+    }).join("") + (st.total > st.list.length
+      ? `<div class="draft-add-more">Showing ${st.list.length} of ${fmtNum(st.total)} matches. Keep typing to narrow.</div>`
+      : "");
+  }
+  box.hidden = false;
+  if (input) {
+    input.setAttribute("aria-expanded", "true");
+    input.setAttribute("aria-activedescendant", "draft-add-opt-" + st.hi);
+  }
+}
+
+function _draftAddSetHi(i, viaKeyboard) {
+  const st = _draftAdd;
+  const n = st.noMatch ? 1 : st.list.length;
+  if (!n) return;
+  const next = ((i % n) + n) % n;
+  if (next === st.hi && !viaKeyboard) return;
+  st.hi = next;
+  $$("#draft-add-results .draft-add-opt").forEach((el, idx) => {
+    el.classList.toggle("hi", idx === st.hi);
+    el.setAttribute("aria-selected", idx === st.hi ? "true" : "false");
+  });
+  const input = $("#draft-add-search");
+  if (input) input.setAttribute("aria-activedescendant", "draft-add-opt-" + st.hi);
+  if (viaKeyboard) {
+    const el = $("#draft-add-opt-" + st.hi);
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function draftAddHover(i) { _draftAddSetHi(i, false); }
+
+// Drop the picked part (if any) so the search box is a search again.
+function _draftAddClearPick() {
+  const st = _draftAdd;
+  st.pickedPn = null;
+  const picked = $("#draft-add-picked");
+  if (picked) { picked.hidden = true; picked.innerHTML = ""; }
+  // A qty the row filled in for the old pick should not carry over.
+  if (st.qtyAuto) { const qtyEl = $("#draft-add-qty"); if (qtyEl) qtyEl.value = 1; }
+}
+
+function _draftAddHideCustom() {
+  _draftAdd.customOpen = false;
+  const form = $("#draft-add-custom");
+  if (form) form.hidden = true;
+}
+
+// Back to a blank Add row (search text, results, pick, one-off form, qty).
+function _draftAddClear() {
+  _draftAddReset();
+  const input = $("#draft-add-search");
+  if (input) input.value = "";
+  _draftAddHideResults();
+  const picked = $("#draft-add-picked");
+  if (picked) { picked.hidden = true; picked.innerHTML = ""; }
+  const form = $("#draft-add-custom");
+  if (form) form.hidden = true;
+  const qtyEl = $("#draft-add-qty");
+  if (qtyEl) qtyEl.value = 1;
+}
+
+function draftAddOnSearch(value) {
+  const st = _draftAdd;
+  // Typing again after a pick, or with the one-off form open, starts over.
+  if (st.pickedPn) _draftAddClearPick();
+  if (st.customOpen) _draftAddHideCustom();
+  const q = String(value || "").trim();
+  const res = draftAddSearchParts(q, DRAFT_ADD_MAX_RESULTS);
+  st.list = res.list;
+  st.total = res.total;
+  st.hi = 0;
+  st.noMatch = !!q && res.total === 0;
+  _draftAddRenderResults(q);
+}
+
+function draftAddOnSearchFocus() {
+  const st = _draftAdd;
+  const input = $("#draft-add-search");
+  if (!input || st.pickedPn || st.customOpen) return;
+  if (input.value.trim() && !_draftAddResultsOpen()) draftAddOnSearch(input.value);
+}
+
+function draftAddOnSearchBlur() {
+  // Option clicks use mousedown + preventDefault, so focus never leaves the
+  // box for those. Any real blur closes the list.
+  setTimeout(() => {
+    const input = $("#draft-add-search");
+    if (input && document.activeElement !== input) _draftAddHideResults();
+  }, 0);
+}
+
+function draftAddOnSearchKey(e) {
+  const st = _draftAdd;
+  const open = _draftAddResultsOpen();
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!open) return;
+    e.preventDefault();
+    _draftAddSetHi(st.hi + (e.key === "ArrowDown" ? 1 : -1), true);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    draftAddSubmit();
+  } else if (e.key === "Escape") {
+    // Close the list (or the one-off form) first; a second Escape reaches
+    // the global handler and closes the drawer as usual.
+    if (open) { e.stopPropagation(); _draftAddHideResults(); }
+    else if (st.customOpen) { e.stopPropagation(); draftAddCancelCustom(); }
+  }
+}
+
+function draftAddOnQtyInput() { _draftAdd.qtyAuto = false; }
+
+function draftAddOnQtyKey(e) {
+  if (e.key === "Enter") { e.preventDefault(); draftAddSubmit(); }
+}
+
+function draftAddOnCustomKey(e) {
+  if (e.key === "Enter") { e.preventDefault(); draftAddSubmit(); }
+  else if (e.key === "Escape") { e.stopPropagation(); draftAddCancelCustom(); }
+}
+
+// The primary (editable) drawer row for a pn. Matched on the dataset value
+// instead of a CSS attribute selector so odd characters in a pn can't
+// break the lookup.
+function _draftPrimaryRow(pn) {
+  return $$("#drawer tr[data-draft-primary]").find(r => r.dataset.draftPn === pn) || null;
+}
+
+// The part is already on the draft: no second line. Point at the one that
+// is there instead.
+function _draftAddFocusExisting(pn) {
+  _draftAddClear();
+  showToast("Already in the draft — qty is editable here", "info");
+  const row = _draftPrimaryRow(pn);
+  const qtyInput = row ? row.querySelector('input[type="number"]') : null;
+  if (!qtyInput) return;
+  if (row.scrollIntoView) row.scrollIntoView({ block: "center" });
+  try { qtyInput.focus({ preventScroll: true }); } catch (e) { qtyInput.focus(); }
+  if (qtyInput.select) qtyInput.select();
+}
+
+// Pick result #i: show what was picked, default the qty, move to the qty
+// field. Enter there (or Add) puts it on the draft.
+function draftAddPick(i) {
+  const st = _draftAdd;
+  const part = st.list[i];
+  if (!part) return;
+  if (draftOrderHas(part.pn)) { _draftAddFocusExisting(part.pn); return; }
+  st.pickedPn = part.pn;
+  const input = $("#draft-add-search");
+  if (input) input.value = part.pn;
+  _draftAddHideResults();
+  const qtyEl = $("#draft-add-qty");
+  if (qtyEl) { qtyEl.value = draftAddDefaultQty(part); st.qtyAuto = true; }
+  const picked = $("#draft-add-picked");
+  if (picked) {
+    const noCost = hasNoOrderCost(part);
+    const bits = [];
+    if (Number(part.moq) > 0) bits.push(`MOQ ${fmtNum(Number(part.moq))}`);
+    if (Number(part.packSize) > 1) bits.push(`pack ${fmtNum(Number(part.packSize))}`);
+    const caution = part.itemType === "kit"
+      ? ` <span style="color:var(--warn)">· kit, normally ordered as its components</span>`
+      : (part.itemType === "do_not_order" ? ` <span style="color:var(--warn)">· marked do not order</span>` : "");
+    picked.innerHTML = `<span class="mono" style="color:var(--t1);font-weight:600">${esc(part.pn)}</span> · ${esc(part.desc || "—")} · ${esc(part.supplier || "(No supplier)")} · ${noCost ? "no cost on file" : fmtMoneyDec(orderUnitCost(part))}${bits.length ? ` · ${bits.join(" · ")}` : ""}${caution}`;
+    picked.hidden = false;
+  }
+  if (qtyEl) { qtyEl.focus(); if (qtyEl.select) qtyEl.select(); }
+}
+
+// "Add '<text>' as a one-off line": open the three fields, description
+// pre-filled with what was typed.
+function draftAddOpenCustom() {
+  const st = _draftAdd;
+  const input = $("#draft-add-search");
+  const text = input ? input.value.trim() : "";
+  if (!text) return;
+  _draftAddHideResults();
+  st.customOpen = true;
+  const form = $("#draft-add-custom");
+  if (form) form.hidden = false;
+  const descEl = $("#draft-add-c-desc"), supEl = $("#draft-add-c-supplier"), costEl = $("#draft-add-c-cost");
+  if (descEl) descEl.value = text;
+  if (supEl) supEl.value = "";
+  if (costEl) costEl.value = "";
+  if (st.qtyAuto) { const qtyEl = $("#draft-add-qty"); if (qtyEl) qtyEl.value = 1; }
+  if (supEl) supEl.focus();
+}
+
+function draftAddCancelCustom() {
+  _draftAddHideCustom();
+  _draftAddFocusSearch();
+}
+
+function _draftAddReadQty() {
+  const qtyEl = $("#draft-add-qty");
+  const qty = Math.max(0, parseFloat(qtyEl ? qtyEl.value : "") || 0);
+  if (qty > 0) return qty;
+  showToast("Enter a quantity greater than 0", "warn");
+  if (qtyEl) { qtyEl.focus(); if (qtyEl.select) qtyEl.select(); }
+  return 0;
+}
+
+// After any manual add: flip the queue row underneath to IN DRAFT, redraw
+// the drawer (which clears the Add row) and put the cursor back in search.
+function _draftAddAfterAdd() {
+  _refreshQueueIfActive();
+  openDraftOrderDrawer({ focusAdd: true });
+}
+
+// Add button, Enter in the search box, Enter in the qty field, and Enter
+// in the one-off fields all land here.
+function draftAddSubmit() {
+  const st = _draftAdd;
+  if (st.customOpen) { _draftAddSubmitCustom(); return; }
+  const input = $("#draft-add-search");
+  if (!st.pickedPn) {
+    // Nothing picked yet: behave like Enter on the result list.
+    const q = input ? input.value.trim() : "";
+    if (!q) { _draftAddFocusSearch(); return; }
+    if (!_draftAddResultsOpen()) draftAddOnSearch(q);
+    if (st.noMatch) draftAddOpenCustom();
+    else if (st.list.length) draftAddPick(st.hi);
+    return;
+  }
+  const pn = st.pickedPn;
+  const part = DB.parts.find(p => p.pn === pn);
+  if (!part) {
+    showToast(`${pn} is no longer in the planner`, "warn");
+    _draftAddClear();
+    _draftAddFocusSearch();
+    return;
+  }
+  if (draftOrderHas(pn)) { _draftAddFocusExisting(pn); return; }
+  const qty = _draftAddReadQty();
+  if (!(qty > 0)) return;
+  draftOrderAdd(pn, qty, "manual");
+  showToast(`${pn} × ${fmtNum(qty)} added to Draft Order`, "ok", "Added", 2000);
+  _draftAddAfterAdd();
+}
+
+function _draftAddSubmitCustom() {
+  const descEl = $("#draft-add-c-desc"), supEl = $("#draft-add-c-supplier"), costEl = $("#draft-add-c-cost");
+  const desc = descEl ? descEl.value.trim() : "";
+  if (!desc) {
+    showToast("Give the one-off line a description", "warn");
+    if (descEl) descEl.focus();
+    return;
+  }
+  const costRaw = costEl ? String(costEl.value).trim() : "";
+  const cost = costRaw === "" ? 0 : Number(costRaw);
+  if (!Number.isFinite(cost) || cost < 0) {
+    showToast("Unit cost must be 0 or more", "warn");
+    if (costEl) costEl.focus();
+    return;
+  }
+  const qty = _draftAddReadQty();
+  if (!(qty > 0)) return;
+  const supplier = _draftCanonSupplier(supEl ? supEl.value : "");
+  draftOrderAdd(_draftNewOneOffId(), qty, "manual", {
+    custom: true,
+    customDesc: desc,
+    customSupplier: supplier,
+    customCost: cost,
+  });
+  showToast(`${desc} × ${fmtNum(qty)} added as a one-off line`, "ok", "Added", 2000);
+  _draftAddAfterAdd();
+}
+
+// Drawer row for a one-off line. Same five columns as a catalog row, but
+// description, supplier and unit cost are the line's own editable fields.
+function _draftRenderCustomRow(part, line, supplierKey) {
+  const pn = esc(part.pn);
+  const totalQty = line._splitTotalQty;
+  return `
+    <tr data-draft-pn="${pn}" data-draft-supplier="${esc(supplierKey)}" data-draft-primary data-draft-custom>
+      <td>
+        <div class="pn"><span class="pill info" style="font-size:9px;padding:1px 6px;letter-spacing:0.04em" title="One-off line: on this draft and its PDF only, not in the Parts Catalog.">ONE-OFF</span></div>
+        <div style="margin-top:4px">
+          <input class="input" type="text" value="${esc(part.desc)}" placeholder="Description" aria-label="Description"
+                 onchange="draftOrderSetCustom('${pn}', 'desc', this.value)"
+                 style="max-width:360px;font-size:12px">
+        </div>
+        <div class="tiny" style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span class="dim" style="min-width:56px">Supplier:</span>
+          <input class="input" type="text" list="draft-add-supplier-list" value="${esc(part.supplier)}"
+                 placeholder="no supplier" aria-label="Supplier"
+                 onchange="draftOrderSetCustom('${pn}', 'supplier', this.value)"
+                 style="max-width:240px;padding:2px 6px;font-size:11px">
+        </div>
+      </td>
+      <td class="right" style="width:90px">
+        <input class="input num" type="number" min="0" value="${totalQty}" aria-label="Quantity" oninput="draftOrderUpdateQty('${pn}', this.value)">
+      </td>
+      <td class="right" style="width:110px">
+        <input class="input num" type="number" min="0" step="0.01" value="${part.cost > 0 ? part.cost : ""}" placeholder="0.00" aria-label="Unit cost"
+               oninput="draftOrderSetCustom('${pn}', 'cost', this.value)" style="width:96px">
+      </td>
+      <td class="right num bold" data-draft-line-total>${line.noCost ? '—' : fmtMoney(line._splitTotalLineTotal)}</td>
+      <td><button class="btn sm ghost" onclick="draftOrderRemoveLine('${pn}')" title="Remove">×</button></td>
+    </tr>
+  `;
+}
+
+// Edit one field of a one-off line from its drawer row.
+//   desc     — saved in place (blank is ignored; the old text stays).
+//   cost     — saved, then line / supplier / grand totals are patched in
+//              place so the cost box keeps focus while typing.
+//   supplier — saved, then a full redraw because the row changes group.
+function draftOrderSetCustom(pn, field, value) {
+  const item = DRAFT_ORDER.find(d => d.pn === pn);
+  if (!item || item.custom !== true) return;
+  if (field === "desc") {
+    const v = String(value || "").trim();
+    if (!v) {
+      const row = _draftPrimaryRow(pn);
+      const el = row ? row.querySelector('input[type="text"]') : null;
+      if (el) el.value = item.customDesc || "";
+      return;
+    }
+    item.customDesc = v;
+    draftOrderSave();
+  } else if (field === "cost") {
+    const n = Number(String(value).trim());
+    item.customCost = (String(value).trim() !== "" && Number.isFinite(n) && n > 0) ? n : 0;
+    // draftOrderUpdateQty at the unchanged qty re-saves and runs its
+    // in-place totals patch, which reads the new cost via _draftPartFor.
+    draftOrderUpdateQty(pn, item.qty);
+  } else if (field === "supplier") {
+    item.customSupplier = _draftCanonSupplier(value);
+    draftOrderSave();
+    openDraftOrderDrawer();
+    updateDraftOrderPill();
+  }
 }
 
 function draftOrderUpdateQty(pn, value) {
@@ -651,9 +1231,10 @@ function draftOrderUpdateQty(pn, value) {
   }
 
   // Same split shape — patch DOM in place so the input keeps focus.
-  const part = DB.parts.find(p => p.pn === pn);
-  const noCost = part ? hasNoOrderCost(part) : true;
-  const unit = (part && !noCost) ? orderUnitCost(part) : 0;
+  const part = _draftPartFor(existing);
+  const isCustom = !!(part && part._custom === true);
+  const noCost = part ? (isCustom ? !(part.cost > 0) : hasNoOrderCost(part)) : true;
+  const unit = (part && !noCost) ? (isCustom ? part.cost : orderUnitCost(part)) : 0;
   const totalLineTotal = qty * unit;
   const row = $(`tr[data-draft-pn="${pn}"][data-draft-primary]`);
   if (row) {
@@ -1019,7 +1600,26 @@ async function _buildDraftOrderPDF() {
   const rowStatuses = [];
   for (const supplier of supplierKeys) {
     const grp = supplierGroups[supplier];
-    for (const { part, qty, unit, lineTotal, noCost, blanketPoNum, _qtySource } of grp.lines) {
+    for (const { part, qty, unit, lineTotal, noCost, blanketPoNum, _qtySource, _custom } of grp.lines) {
+      // v-draft-manual-add: a one-off line has no catalog part, so there is
+      // no stock, cover, lead time or status to print. Same nine columns,
+      // "—" in the three planner-derived cells (em-dash is WinAnsi-safe,
+      // see the note below).
+      if (_custom) {
+        allRows.push([
+          supplier,
+          "ONE-OFF",
+          part.desc || "",
+          "—",
+          "—",
+          "—",
+          fmtNum(qty),
+          noCost ? "—" : fmtMoneyDec(unit),
+          noCost ? "—" : fmtMoney(lineTotal),
+        ]);
+        rowStatuses.push(null);
+        continue;
+      }
       const stat = partStatus(part);
       // CHAIN-AWARE Days Cover on the PDF — the draft-order path bypasses
       // partsWithStatus (it looks up parts via DB.parts.find in
